@@ -133,25 +133,38 @@ static uint32_t midx_pack_perm(struct write_midx_context *ctx,
 static int should_include_pack(const struct write_midx_context *ctx,
 			       const char *file_name)
 {
+	struct multi_pack_index *m = ctx->m;
 	/*
-	 * Note that at most one of ctx->m and ctx->to_include are set,
-	 * so we are testing midx_contains_pack() and
-	 * string_list_has_string() independently (guarded by the
-	 * appropriate NULL checks).
-	 *
-	 * We could support passing to_include while reusing an existing
-	 * MIDX, but don't currently since the reuse process drags
-	 * forward all packs from an existing MIDX (without checking
-	 * whether or not they appear in the to_include list).
-	 *
-	 * If we added support for that, these next two conditional
-	 * should be performed independently (likely checking
-	 * to_include before the existing MIDX).
+	 * When writing incrementally, ctx->m may contain layers above
+	 * the selected base MIDX, which must be included in the new
+	 * layer.
 	 */
-	if (ctx->m && midx_contains_pack(ctx->m, file_name))
-		return 0;
-	else if (ctx->base_midx && midx_contains_pack(ctx->base_midx,
-						      file_name))
+	if (ctx->incremental)
+		m = ctx->base_midx;
+
+	/*
+	 * Note that it is OK for both ctx->base_midx and
+	 * ctx->to_include to be non-NULL, but at most one of ctx->m
+	 * and ctx->to_include may be non-NULL.
+	 *
+	 * When ctx->m is NULL we are writing a new MIDX without reusing
+	 * any packs from the previous layer(s). In that case, we care
+	 * that both:
+	 *
+	 *   - the new layer's base MIDX (ctx->base_midx) does not
+	 *     already contain the pack we are considering, or the new
+	 *     layer has no base (including --incremental --base=none)
+	 *
+	 *   - the pack appears in ctx->to_include, or ctx->to_include
+	 *     is NULL, meaning that we can include any pack provided
+	 *     the above condition is met.
+	 *
+	 * When ctx->m is non-NULL for a non-incremental write, we reuse
+	 * its packs without checking ctx->to_include. We could support
+	 * filtering those packs too, but currently don't. Incremental
+	 * writes instead exclude only packs covered by ctx->base_midx.
+	 */
+	if (m && midx_contains_pack(m, file_name))
 		return 0;
 	else if (ctx->to_include &&
 		 !string_list_has_string(ctx->to_include, file_name))
