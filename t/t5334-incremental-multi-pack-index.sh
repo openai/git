@@ -119,7 +119,7 @@ test_expect_success 'write MIDX layer with --base without --no-write-chain-file'
 	test_grep "cannot use --base without --no-write-chain-file" err
 '
 
-test_expect_failure 'write MIDX layer with --base=none and --no-write-chain-file' '
+test_expect_success 'write MIDX layer with --base=none and --no-write-chain-file' '
 	test_commit base-none &&
 	git repack -d &&
 
@@ -136,7 +136,7 @@ test_expect_failure 'write MIDX layer with --base=none and --no-write-chain-file
 	cp "$midx_chain.bak" "$midx_chain"
 '
 
-test_expect_failure 'write MIDX layer with --base=<hash> and --no-write-chain-file' '
+test_expect_success 'write MIDX layer with --base=<hash> and --no-write-chain-file' '
 	test_commit base-hash &&
 	git repack -d &&
 
@@ -155,6 +155,28 @@ test_expect_failure 'write MIDX layer with --base=<hash> and --no-write-chain-fi
 	test-tool read-midx --show-objects "$objdir" "$layer" >midx.objects &&
 	test_grep "^$(git rev-parse 2.2) " midx.objects &&
 	cp "$midx_chain.bak" "$midx_chain"
+'
+
+test_expect_success 'write MIDX layer with --stdin-packs and a custom base' '
+	base="$(nth_line 1 "$midx_chain")" &&
+	test-tool read-midx "$objdir" "$base" >base.midx &&
+	test-tool read-midx "$objdir" >tip.midx &&
+	sed -n "/^pack-.*\\.idx$/p" base.midx >base.packs &&
+	sed -n "/^pack-.*\\.idx$/p" tip.midx >tip.packs &&
+	test_line_count = 2 tip.packs &&
+	sed -n 1p tip.packs >expect &&
+	cat base.packs expect >packs &&
+	layer="$(git multi-pack-index write --incremental --stdin-packs \
+		--no-write-chain-file --base="$base" <packs)" &&
+	cp "$midx_chain" chain.bak &&
+	test_when_finished "mv chain.bak \"$midx_chain\"" &&
+	{
+		echo "$base" &&
+		echo "$layer"
+	} >"$midx_chain" &&
+	test-tool read-midx "$objdir" >layer.midx &&
+	sed -n "/^pack-.*\\.idx$/p" layer.midx >actual &&
+	test_cmp expect actual
 '
 
 for reuse in false single multi
