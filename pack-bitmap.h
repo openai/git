@@ -92,6 +92,9 @@ int test_bitmap_pseudo_merge_objects(struct repository *r, uint32_t n);
 
 struct list_objects_filter_options;
 
+/* Check whether the filter can be computed via the bitmap. */
+bool can_filter_bitmap(const struct list_objects_filter_options *filter);
+
 /*
  * Filter bitmapped objects and iterate through all resulting objects,
  * executing `show_reach` for each of them. Returns `-1` in case the filter is

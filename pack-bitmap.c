@@ -2039,11 +2039,10 @@ static int filter_bitmap(struct bitmap_index *bitmap_git,
 	return -1;
 }
 
-static int can_filter_bitmap(const struct list_objects_filter_options *filter)
+bool can_filter_bitmap(const struct list_objects_filter_options *filter)
 {
 	return !filter_bitmap(NULL, NULL, NULL, filter);
 }
-
 
 static void filter_packed_objects_from_bitmap(struct bitmap_index *bitmap_git,
 					      struct bitmap *result)
