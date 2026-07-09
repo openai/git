@@ -96,7 +96,7 @@ struct list_objects_filter_options;
  * not supported, `0` otherwise.
  */
 int for_each_bitmapped_object(struct bitmap_index *bitmap_git,
-			      struct list_objects_filter_options *filter,
+			      const struct list_objects_filter_options *filter,
 			      show_reachable_fn show_reach,
 			      void *payload);
 
