@@ -680,60 +680,53 @@ static int load_bitmap(struct repository *r, struct bitmap_index *bitmap_git,
 	return 0;
 }
 
-static int open_pack_bitmap(struct repository *r,
-			    struct bitmap_index *bitmap_git)
+static int open_bitmap_for_source(struct odb_source_packed *source,
+				  struct bitmap_index *bitmap_git)
 {
-	struct packed_git *p;
+	struct multi_pack_index *midx = get_multi_pack_index(source);
+	struct packfile_list_entry *e;
 	int ret = -1;
 
-	repo_for_each_pack(r, p) {
-		if (open_pack_bitmap_1(bitmap_git, p) == 0) {
-			ret = 0;
-			/*
-			 * The only reason to keep looking is to report
-			 * duplicates.
-			 */
-			if (!trace2_is_enabled())
-				break;
-		}
+	if (midx && !open_midx_bitmap_1(bitmap_git, midx))
+		ret = 0;
+
+	for (e = packfile_store_get_packs(source); e; e = e->next) {
+		/*
+		 * When tracing is enabled we want to keep looking to report
+		 * duplicates even if we have already found a bitmap.
+		 */
+		if (!ret && !trace2_is_enabled())
+			break;
+
+		if (open_pack_bitmap_1(bitmap_git, e->pack))
+			continue;
+		ret = 0;
 	}
 
-	return ret;
-}
-
-static int open_midx_bitmap(struct repository *r,
-			    struct bitmap_index *bitmap_git)
-{
-	struct odb_source *source;
-	int ret = -1;
-
-	assert(!bitmap_git->map);
-
-	odb_prepare_alternates(r->objects);
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct multi_pack_index *midx = get_multi_pack_index(files->packed);
-		if (midx && !open_midx_bitmap_1(bitmap_git, midx))
-			ret = 0;
-	}
 	return ret;
 }
 
 static int open_bitmap(struct repository *r,
 		       struct bitmap_index *bitmap_git)
 {
-	int found;
+	struct odb_source *source;
+	int found = 0;
 
 	assert(!bitmap_git->map);
 
-	found = !open_midx_bitmap(r, bitmap_git);
+	odb_prepare_alternates(r->objects);
+	for (source = r->objects->sources; source; source = source->next) {
+		struct odb_source_files *files = odb_source_files_downcast(source);
 
-	/*
-	 * these will all be skipped if we opened a midx bitmap; but run it
-	 * anyway if tracing is enabled to report the duplicates
-	 */
-	if (!found || trace2_is_enabled())
-		found |= !open_pack_bitmap(r, bitmap_git);
+		found |= !open_bitmap_for_source(files->packed, bitmap_git);
+
+		/*
+		 * The only reason to keep looking after having found a bitmap
+		 * is to report duplicates.
+		 */
+		if (found && !trace2_is_enabled())
+			break;
+	}
 
 	return found ? 0 : -1;
 }
