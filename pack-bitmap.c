@@ -1695,7 +1695,7 @@ static void init_type_iterator(struct ewah_or_iterator *it,
 	}
 }
 
-static void show_objects_for_type(
+static int show_objects_for_type(
 	struct bitmap_index *bitmap_git,
 	struct bitmap *objects,
 	enum object_type object_type,
@@ -1704,6 +1704,7 @@ static void show_objects_for_type(
 {
 	size_t i = 0;
 	uint32_t offset;
+	int ret;
 
 	struct ewah_or_iterator it;
 	eword_t filter;
@@ -1749,11 +1750,17 @@ static void show_objects_for_type(
 
 			hash = bitmap_name_hash(bitmap_git, index_pos);
 
-			show_reach(&oid, object_type, 0, hash, pack, ofs, payload);
+			ret = show_reach(&oid, object_type, 0, hash, pack, ofs, payload);
+			if (ret)
+				goto out;
 		}
 	}
 
+	ret = 0;
+
+out:
 	ewah_or_iterator_release(&it);
+	return ret;
 }
 
 static int in_bitmapped_pack(struct bitmap_index *bitmap_git,
@@ -2062,6 +2069,12 @@ int for_each_bitmapped_object(struct bitmap_index *bitmap_git,
 			      show_reachable_fn show_reach,
 			      void *payload)
 {
+	const enum object_type types[] = {
+		OBJ_COMMIT,
+		OBJ_TREE,
+		OBJ_BLOB,
+		OBJ_TAG,
+	};
 	struct bitmap *filtered_bitmap = NULL;
 	uint32_t objects_nr;
 	size_t full_word_count;
@@ -2086,14 +2099,12 @@ int for_each_bitmapped_object(struct bitmap_index *bitmap_git,
 		goto out;
 	}
 
-	show_objects_for_type(bitmap_git, filtered_bitmap,
-			      OBJ_COMMIT, show_reach, payload);
-	show_objects_for_type(bitmap_git, filtered_bitmap,
-			      OBJ_TREE, show_reach, payload);
-	show_objects_for_type(bitmap_git, filtered_bitmap,
-			      OBJ_BLOB, show_reach, payload);
-	show_objects_for_type(bitmap_git, filtered_bitmap,
-			      OBJ_TAG, show_reach, payload);
+	for (size_t i = 0; i < ARRAY_SIZE(types); i++) {
+		ret = show_objects_for_type(bitmap_git, filtered_bitmap,
+					    types[i], show_reach, payload);
+		if (ret)
+			goto out;
+	}
 
 	ret = 0;
 out:
