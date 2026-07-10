@@ -1999,27 +1999,55 @@ struct load_index_extensions
 static void *load_index_extensions(void *_data)
 {
 	struct load_index_extensions *p = _data;
-	unsigned long src_offset = p->src_offset;
+	size_t src_offset = p->src_offset;
+	size_t end;
+	int extension_error = 0;
 
-	while (src_offset <= p->mmap_size - the_hash_algo->rawsz - 8) {
+	if (p->mmap_size < the_hash_algo->rawsz) {
+		extension_error = 1;
+		goto done;
+	}
+	end = p->mmap_size - the_hash_algo->rawsz;
+	if (src_offset > end) {
+		extension_error = 1;
+		goto done;
+	}
+
+	while (src_offset < end) {
 		/* After an array of active_nr index entries,
 		 * there can be arbitrary number of extended
 		 * sections, each of which is prefixed with
 		 * extension name (4-byte) and section length
 		 * in 4-byte network byte order.
 		 */
-		uint32_t extsize = get_be32(p->mmap + src_offset + 4);
+		uint32_t extsize;
+
+		if (end - src_offset < 8) {
+			extension_error = 1;
+			break;
+		}
+		extsize = get_be32(p->mmap + src_offset + 4);
+		if (extsize > end - src_offset - 8) {
+			extension_error = 1;
+			break;
+		}
 		if (read_index_extension(p->istate,
 					 p->mmap + src_offset,
 					 p->mmap + src_offset + 8,
 					 extsize) < 0) {
-			munmap((void *)p->mmap, p->mmap_size);
-			die(_("index file corrupt"));
+			extension_error = 1;
+			break;
 		}
-		src_offset += 8;
-		src_offset += extsize;
+		src_offset += 8 + extsize;
 	}
+	if (src_offset != end)
+		extension_error = 1;
 
+done:
+	if (extension_error) {
+		munmap((void *)p->mmap, p->mmap_size);
+		die(_("index file corrupt"));
+	}
 	return NULL;
 }
 
