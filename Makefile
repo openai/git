@@ -1540,6 +1540,7 @@ CLAR_TEST_SUITES += u-ctype
 CLAR_TEST_SUITES += u-dir
 CLAR_TEST_SUITES += u-example-decorate
 CLAR_TEST_SUITES += u-fsmonitor-attributes
+CLAR_TEST_SUITES += u-fsmonitor-response
 CLAR_TEST_SUITES += u-hash
 CLAR_TEST_SUITES += u-hashmap
 CLAR_TEST_SUITES += u-list-objects-filter-options
