@@ -2,6 +2,7 @@
 #define HASH_FRAMING_H
 
 #include "hash.h"
+#include "strbuf.h"
 
 static inline void hash_length_delimited(struct git_hash_ctx *ctx,
 					 const void *data, size_t len)
@@ -36,6 +37,15 @@ static inline void hash_buffer_digest(const struct git_hash_algo *algo,
 	git_hash_init(&ctx, algo);
 	git_hash_update(&ctx, data, len);
 	git_hash_final(hash, &ctx);
+}
+
+static inline void hash_append_checksum(struct strbuf *out,
+					const struct git_hash_algo *algo)
+{
+	unsigned char hash[GIT_MAX_RAWSZ];
+
+	hash_buffer_digest(algo, out->buf, out->len, hash);
+	strbuf_add(out, hash, algo->rawsz);
 }
 
 #endif /* HASH_FRAMING_H */
