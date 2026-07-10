@@ -6,6 +6,7 @@
 #include "fsmonitor-settings.h"
 #include "object.h"
 #include "read-cache-ll.h"
+#include "strbuf.h"
 #include "trace.h"
 
 /*
@@ -14,6 +15,28 @@
  * responsibility.
  */
 void fsmonitor_invalidate_cache_entry(struct cache_entry *ce);
+
+enum fsmonitor_query_outcome {
+	FSMONITOR_QUERY_ERROR = 0,
+	FSMONITOR_QUERY_DELTA,
+	FSMONITOR_QUERY_TRIVIAL,
+};
+
+struct fsmonitor_query_result {
+	enum fsmonitor_query_outcome outcome;
+	struct strbuf token;
+	struct strbuf paths;
+};
+
+#define FSMONITOR_QUERY_RESULT_INIT { \
+	.outcome = FSMONITOR_QUERY_ERROR, \
+	.token = STRBUF_INIT, \
+	.paths = STRBUF_INIT, \
+}
+
+void fsmonitor_query_result_release(struct fsmonitor_query_result *result);
+enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
+	const struct strbuf *raw, struct fsmonitor_query_result *result);
 
 /*
  * A pathname monitor cannot prove that every name for a multiply-linked
