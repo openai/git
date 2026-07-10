@@ -55,6 +55,31 @@ test_lazy_prereq UNTRACKED_CACHE '
 	test $ret -ne 1
 '
 
+test_expect_success PERL_TEST_HELPERS \
+	'index reader rejects an out-of-bounds extension size' '
+	test_when_finished "rm -rf oversized-index-extension" &&
+	test_create_repo oversized-index-extension &&
+	(
+		cd oversized-index-extension &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		test_grep FSMN .git/index >/dev/null &&
+		perl -0777 -pe "
+			\$pos = index(\$_, q(FSMN));
+			die q(FSMN-not-found) if \$pos < 0;
+			substr(\$_, \$pos + 4, 4) = pack(q(N), 0xffffffff);
+		" .git/index >.git/index.bad &&
+		mv .git/index.bad .git/index &&
+		test_must_fail git status --porcelain=v2 2>err &&
+		test_grep "index file corrupt" err
+	)
+'
+
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
 test_expect_success 'incompatible bare repo' '
 	test_when_finished "rm -rf ./bare-clone actual expect" &&
