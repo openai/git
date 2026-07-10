@@ -333,6 +333,7 @@ libgit_sources = [
   'checkout.c',
   'chunk-format.c',
   'clean-status-config.c',
+  'clean-status-manifest.c',
   'color.c',
   'column.c',
   'combine-diff.c',
