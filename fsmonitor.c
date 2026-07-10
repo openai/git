@@ -731,6 +731,90 @@ static int is_trivial_response_at(const struct strbuf *result, size_t offset)
 	return 1;
 }
 
+void fsmonitor_query_result_release(struct fsmonitor_query_result *result)
+{
+	strbuf_release(&result->token);
+	strbuf_release(&result->paths);
+}
+
+static int fsmonitor_valid_worktree_path(const char *path, size_t len)
+{
+	struct strbuf copy = STRBUF_INIT;
+	int valid = 0;
+
+	if (!len || is_dir_sep(path[0]) || has_dos_drive_prefix(path))
+		return 0;
+	strbuf_add(&copy, path, len);
+	if (is_dir_sep(copy.buf[copy.len - 1]))
+		strbuf_setlen(&copy, copy.len - 1);
+	if (!copy.len || is_dir_sep(copy.buf[copy.len - 1]))
+		goto done;
+	valid = verify_path(copy.buf, 0);
+
+done:
+	strbuf_release(&copy);
+	return valid;
+}
+
+enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
+	const struct strbuf *raw, struct fsmonitor_query_result *result)
+{
+	const char *nul, *p, *end;
+
+	if (!raw->len)
+		goto malformed;
+	nul = memchr(raw->buf, '\0', raw->len);
+	if (!nul || nul == raw->buf || nul - raw->buf > FSMONITOR_TOKEN_MAX)
+		goto malformed;
+	strbuf_add(&result->token, raw->buf, nul - raw->buf);
+	if (!starts_with(result->token.buf, "builtin:"))
+		goto malformed;
+
+	p = nul + 1;
+	end = raw->buf + raw->len;
+	if (p == end) {
+		result->outcome = FSMONITOR_QUERY_DELTA;
+		return result->outcome;
+	}
+	if (end[-1] != '\0')
+		goto malformed;
+	if (end - p == 2 && p[0] == '/' && p[1] == '\0') {
+		result->outcome = FSMONITOR_QUERY_TRIVIAL;
+		return result->outcome;
+	}
+
+	while (p < end) {
+		nul = memchr(p, '\0', end - p);
+		if (!nul || nul == p)
+			goto malformed;
+		if (strcmp(p, FSMONITOR_PATH_GLOBAL_INVALIDATE) &&
+		    !fsmonitor_valid_worktree_path(p, nul - p))
+			goto malformed;
+		p = nul + 1;
+	}
+	strbuf_add(&result->paths, raw->buf + result->token.len + 1,
+		   end - (raw->buf + result->token.len + 1));
+	result->outcome = FSMONITOR_QUERY_DELTA;
+	return result->outcome;
+
+malformed:
+	strbuf_reset(&result->token);
+	strbuf_reset(&result->paths);
+	trace2_data_intmax("fsm_client", NULL, "query/invalid-response", 1);
+	return FSMONITOR_QUERY_ERROR;
+}
+
+static enum fsmonitor_query_outcome query_builtin_fsmonitor(
+	const char *since_token, struct fsmonitor_query_result *result)
+{
+	struct strbuf raw = STRBUF_INIT;
+
+	if (!fsmonitor_ipc__send_query(since_token, &raw))
+		fsmonitor_parse_builtin_response(&raw, result);
+	strbuf_release(&raw);
+	return result->outcome;
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
@@ -762,24 +846,19 @@ void refresh_fsmonitor(struct index_state *istate)
 	trace_printf_key(&trace_fsmonitor, "refresh fsmonitor");
 
 	if (fsm_mode == FSMONITOR_MODE_IPC) {
-		query_success = !fsmonitor_ipc__send_query(
+		struct fsmonitor_query_result result =
+			FSMONITOR_QUERY_RESULT_INIT;
+
+		query_builtin_fsmonitor(
 			istate->fsmonitor_last_update ?
 			istate->fsmonitor_last_update : "builtin:fake",
-			&query_result);
-		if (query_success) {
-			/*
-			 * The response contains a series of nul terminated
-			 * strings.  The first is the new token.
-			 *
-			 * Use `char *buf` as an interlude to trick the CI
-			 * static analysis to let us use `strbuf_addstr()`
-			 * here (and only copy the token) rather than
-			 * `strbuf_addbuf()`.
-			 */
-			buf = query_result.buf;
-			strbuf_addstr(&last_update_token, buf);
-			bol = last_update_token.len + 1;
-			is_trivial = is_trivial_response_at(&query_result, bol);
+			&result);
+		if (result.outcome != FSMONITOR_QUERY_ERROR) {
+			query_success = 1;
+			strbuf_addbuf(&last_update_token, &result.token);
+			is_trivial = result.outcome == FSMONITOR_QUERY_TRIVIAL;
+			if (!is_trivial)
+				strbuf_addbuf(&query_result, &result.paths);
 			if (is_trivial)
 				trace2_data_intmax("fsm_client", NULL,
 						   "query/trivial-response", 1);
@@ -795,6 +874,7 @@ void refresh_fsmonitor(struct index_state *istate)
 			 */
 			strbuf_addstr(&last_update_token, "builtin:fake");
 		}
+		fsmonitor_query_result_release(&result);
 
 		goto apply_results;
 	}
