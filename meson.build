@@ -380,6 +380,7 @@ libgit_sources = [
   'fetch-pack.c',
   'fmt-merge-msg.c',
   'fsck.c',
+  'fsmonitor-clean-proof.c',
   'fsmonitor.c',
   'fsmonitor-ipc.c',
   'fsmonitor-settings.c',
