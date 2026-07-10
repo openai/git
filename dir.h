@@ -611,6 +611,11 @@ void untracked_cache_invalidate_trimmed_path(struct index_state *,
 void untracked_cache_remove_from_index(struct index_state *, const char *);
 void untracked_cache_add_to_index(struct index_state *, const char *);
 
+struct untracked_cache_preload;
+struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
+	struct index_state *, unsigned int dir_flags);
+void untracked_cache_preload_release(struct untracked_cache_preload *);
+
 void free_untracked_cache(struct untracked_cache *);
 struct untracked_cache *read_untracked_extension(const void *data, unsigned long sz);
 void write_untracked_extension(struct strbuf *out, struct untracked_cache *untracked);

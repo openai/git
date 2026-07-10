@@ -71,6 +71,92 @@ struct cached_dir {
 	struct untracked_cache_dir *ucd;
 };
 
+struct untracked_cache_preload_task {
+	struct untracked_cache_dir *ucd;
+	char *path;
+	struct stat_data stat_data;
+	unsigned int was_valid : 1;
+	unsigned int stat_checked : 1;
+	unsigned int stat_matches : 1;
+	unsigned int update_stat_data : 1;
+};
+
+struct untracked_cache_preload {
+	struct repository *repo;
+	struct untracked_cache *uc;
+	struct untracked_cache_dir *root;
+	struct untracked_cache_preload_task *tasks;
+	struct cache_time index_timestamp;
+	size_t nr;
+	unsigned int dir_flags;
+};
+
+static void collect_untracked_cache_preload_tasks(
+	struct untracked_cache_dir *ucd,
+	struct strbuf *path,
+	struct untracked_cache_preload_task **tasks,
+	size_t *nr,
+	size_t *alloc)
+{
+	size_t i;
+
+	ALLOC_GROW(*tasks, *nr + 1, *alloc);
+	memset(&(*tasks)[*nr], 0, sizeof(**tasks));
+	(*tasks)[*nr].ucd = ucd;
+	(*tasks)[*nr].path = xstrdup(path->len ? path->buf : ".");
+	(*tasks)[*nr].stat_data = ucd->stat_data;
+	(*tasks)[*nr].was_valid = ucd->valid;
+	(*nr)++;
+
+	for (i = 0; i < ucd->dirs_nr; i++) {
+		struct untracked_cache_dir *child = ucd->dirs[i];
+		size_t old_len = path->len;
+
+		if (path->len)
+			strbuf_addch(path, '/');
+		strbuf_addstr(path, child->name);
+		collect_untracked_cache_preload_tasks(child, path, tasks, nr,
+					      alloc);
+		strbuf_setlen(path, old_len);
+	}
+}
+
+struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
+	struct index_state *istate, unsigned int dir_flags)
+{
+	struct untracked_cache *uc = istate->untracked;
+	struct untracked_cache_preload *preload;
+	struct strbuf path = STRBUF_INIT;
+	size_t alloc = 0;
+
+	if (!uc || !uc->root || uc->use_fsmonitor ||
+	    uc->dir_flags != dir_flags)
+		return NULL;
+
+	CALLOC_ARRAY(preload, 1);
+	preload->repo = istate->repo;
+	preload->uc = uc;
+	preload->root = uc->root;
+	preload->index_timestamp = istate->timestamp;
+	preload->dir_flags = dir_flags;
+	collect_untracked_cache_preload_tasks(
+		uc->root, &path, &preload->tasks, &preload->nr, &alloc);
+	strbuf_release(&path);
+	return preload;
+}
+
+void untracked_cache_preload_release(struct untracked_cache_preload *preload)
+{
+	size_t i;
+
+	if (!preload)
+		return;
+	for (i = 0; i < preload->nr; i++)
+		free(preload->tasks[i].path);
+	free(preload->tasks);
+	free(preload);
+}
+
 /*
  * Unlike cache entries, an untracked-cache directory has no later content
  * check to correct a false stat match.  Compare every field saved in UNTR,
