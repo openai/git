@@ -33,6 +33,8 @@
 #include "strbuf.h"
 #include "submodule-config.h"
 #include "symlinks.h"
+#include "thread-utils.h"
+#include "trace.h"
 #include "trace2.h"
 #include "tree.h"
 #include "hex.h"
@@ -81,19 +83,35 @@ struct untracked_cache_preload_task {
 	unsigned int update_stat_data : 1;
 };
 
+struct untracked_cache_preload;
+
+struct untracked_cache_preload_data {
+	pthread_t pthread;
+	struct untracked_cache_preload *preload;
+	size_t offset, nr;
+	int started;
+};
+
 struct untracked_cache_preload {
 	struct repository *repo;
 	struct untracked_cache *uc;
 	struct untracked_cache_dir *root;
 	struct untracked_cache_preload_task *tasks;
+	struct untracked_cache_preload_data *data;
 	struct cache_time index_timestamp;
 	size_t nr;
+	int threads;
 	unsigned int dir_flags;
+	uint64_t started_at;
 };
+
+#define UNTRACKED_CACHE_MAX_OVERLAP_THREADS 6
+#define UNTRACKED_CACHE_PRELOAD_COST 1000
 
 static int match_untracked_dir_stat_racy(const struct cache_time *timestamp,
 					 const struct stat_data *sd,
 					 const struct stat *st);
+static void *preload_untracked_cache_thread(void *data);
 
 static void collect_untracked_cache_preload_tasks(
 	struct untracked_cache_dir *ucd,
@@ -131,7 +149,9 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	struct untracked_cache *uc = istate->untracked;
 	struct untracked_cache_preload *preload;
 	struct strbuf path = STRBUF_INIT;
-	size_t alloc = 0;
+	size_t alloc = 0, offset = 0, work, i;
+	unsigned long test_threads;
+	int threads, online, create_threads = 1;
 
 	if (!uc || !uc->root || uc->use_fsmonitor ||
 	    uc->dir_flags != dir_flags)
@@ -146,15 +166,61 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	collect_untracked_cache_preload_tasks(
 		uc->root, &path, &preload->tasks, &preload->nr, &alloc);
 	strbuf_release(&path);
+
+	threads = HAVE_THREADS ? preload->nr / UNTRACKED_CACHE_PRELOAD_COST : 1;
+	online = HAVE_THREADS ? online_cpus() : 1;
+	if (threads > online * 3)
+		threads = online * 3;
+	if (threads > UNTRACKED_CACHE_MAX_OVERLAP_THREADS)
+		threads = UNTRACKED_CACHE_MAX_OVERLAP_THREADS;
+	test_threads = git_env_ulong("GIT_TEST_UNTRACKED_CACHE_THREADS", 0);
+	if (test_threads && HAVE_THREADS)
+		threads = test_threads > UNTRACKED_CACHE_MAX_OVERLAP_THREADS ?
+			UNTRACKED_CACHE_MAX_OVERLAP_THREADS : test_threads;
+	if (threads < 1)
+		threads = 1;
+	if ((size_t)threads > preload->nr)
+		threads = preload->nr;
+	preload->threads = threads;
+
+	preload->started_at = getnanotime();
+	trace2_data_intmax("dir", istate->repo,
+			   "preload_untracked_cache/threads", threads);
+	CALLOC_ARRAY(preload->data, threads);
+	work = DIV_ROUND_UP(preload->nr, threads);
+	for (i = 0; i < threads; i++) {
+		struct untracked_cache_preload_data *data = &preload->data[i];
+		int err;
+
+		data->preload = preload;
+		data->offset = offset;
+		data->nr = offset < preload->nr ?
+			(preload->nr - offset < work ?
+			 preload->nr - offset : work) : 0;
+		offset += data->nr;
+		if (threads == 1 || !create_threads)
+			continue;
+		err = pthread_create(&data->pthread, NULL,
+				     preload_untracked_cache_thread, data);
+		if (err) {
+			create_threads = 0;
+			trace2_data_intmax(
+				"dir", istate->repo,
+				"preload_untracked_cache/thread_failure", err);
+			continue;
+		}
+		data->started = 1;
+	}
 	return preload;
 }
 
-static void validate_untracked_cache_preload(
-	struct untracked_cache_preload *preload)
+static void *preload_untracked_cache_thread(void *_data)
 {
+	struct untracked_cache_preload_data *data = _data;
+	struct untracked_cache_preload *preload = data->preload;
 	size_t i;
 
-	for (i = 0; i < preload->nr; i++) {
+	for (i = data->offset; i < data->offset + data->nr; i++) {
 		struct untracked_cache_preload_task *task = &preload->tasks[i];
 		struct stat st;
 
@@ -174,6 +240,43 @@ static void validate_untracked_cache_preload(
 		fill_stat_data(&task->stat_data, &st);
 		task->update_stat_data = 1;
 	}
+	return NULL;
+}
+
+static void untracked_cache_preload_join(
+	struct untracked_cache_preload *preload)
+{
+	int i;
+
+	if (preload->threads == 1) {
+		preload_untracked_cache_thread(&preload->data[0]);
+		return;
+	}
+	for (i = 0; i < preload->threads; i++) {
+		if (!preload->data[i].started) {
+			preload_untracked_cache_thread(&preload->data[i]);
+			continue;
+		}
+		if (pthread_join(preload->data[i].pthread, NULL))
+			die(_("unable to join untracked-cache preload thread"));
+	}
+}
+
+static void untracked_cache_preload_free(
+	struct untracked_cache_preload *preload)
+{
+	size_t i;
+
+	trace2_data_intmax("dir", preload->repo,
+			   "preload_untracked_cache/dirs", preload->nr);
+	trace2_data_intmax("dir", preload->repo,
+			   "preload_untracked_cache/wall_us",
+			   (getnanotime() - preload->started_at) / 1000);
+	free(preload->data);
+	for (i = 0; i < preload->nr; i++)
+		free(preload->tasks[i].path);
+	free(preload->tasks);
+	free(preload);
 }
 
 int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
@@ -187,7 +290,7 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 
 	if (!preload)
 		return 0;
-	validate_untracked_cache_preload(preload);
+	untracked_cache_preload_join(preload);
 	uc = istate->untracked;
 	if (uc != preload->uc || !uc || uc->root != preload->root ||
 	    dir_flags != preload->dir_flags)
@@ -217,20 +320,16 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 done:
 	trace2_data_intmax("dir", istate->repo,
 			   "preload_untracked_cache/applied", applied);
-	untracked_cache_preload_release(preload);
+	untracked_cache_preload_free(preload);
 	return applied;
 }
 
 void untracked_cache_preload_release(struct untracked_cache_preload *preload)
 {
-	size_t i;
-
 	if (!preload)
 		return;
-	for (i = 0; i < preload->nr; i++)
-		free(preload->tasks[i].path);
-	free(preload->tasks);
-	free(preload);
+	untracked_cache_preload_join(preload);
+	untracked_cache_preload_free(preload);
 }
 
 /*
