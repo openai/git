@@ -182,6 +182,9 @@ struct untracked_cache_dir {
 	/* all data except 'dirs' in this struct are good */
 	unsigned int valid : 1;
 	unsigned int recurse : 1;
+	/* transient results from directory-stat preloading */
+	unsigned int stat_checked : 1;
+	unsigned int stat_matches : 1;
 	/* null object ID means this directory does not have .gitignore */
 	struct object_id exclude_oid;
 	char name[FLEX_ARRAY];
@@ -353,6 +356,7 @@ struct dir_struct {
 		/* Stats about the traversal */
 		unsigned visited_paths;
 		unsigned visited_directories;
+		unsigned untracked_cache_preloaded : 1;
 	} internal;
 };
 

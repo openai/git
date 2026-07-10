@@ -2572,15 +2572,23 @@ static int valid_cached_dir(struct dir_struct *dir,
 	 */
 	refresh_fsmonitor(istate);
 	if (!(dir->untracked->use_fsmonitor && untracked->valid)) {
-		if (lstat(path->len ? path->buf : ".", &st)) {
-			memset(&untracked->stat_data, 0, sizeof(untracked->stat_data));
-			return 0;
-		}
-		if (!untracked->valid ||
-		    match_untracked_dir_stat_racy(
-			    &istate->timestamp, &untracked->stat_data, &st)) {
-			fill_stat_data(&untracked->stat_data, &st);
-			return 0;
+		if (dir->internal.untracked_cache_preloaded &&
+		    untracked->stat_checked) {
+			if (!untracked->valid || !untracked->stat_matches)
+				return 0;
+		} else {
+			if (lstat(path->len ? path->buf : ".", &st)) {
+				memset(&untracked->stat_data, 0,
+				       sizeof(untracked->stat_data));
+				return 0;
+			}
+			if (!untracked->valid ||
+			    match_untracked_dir_stat_racy(
+				    &istate->timestamp,
+				    &untracked->stat_data, &st)) {
+				fill_stat_data(&untracked->stat_data, &st);
+				return 0;
+			}
 		}
 	}
 
@@ -3179,6 +3187,7 @@ int read_directory(struct dir_struct *dir, struct index_state *istate,
 	dir->internal.visited_directories = 0;
 
 	if (has_symlink_leading_path(path, len)) {
+		dir->internal.untracked_cache_preloaded = 0;
 		trace2_region_leave("dir", "read_directory", istate->repo);
 		return dir->nr;
 	}
@@ -3217,6 +3226,7 @@ int read_directory(struct dir_struct *dir, struct index_state *istate,
 		}
 	}
 
+	dir->internal.untracked_cache_preloaded = 0;
 	return dir->nr;
 }
 
