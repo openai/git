@@ -91,6 +91,10 @@ struct untracked_cache_preload {
 	unsigned int dir_flags;
 };
 
+static int match_untracked_dir_stat_racy(const struct cache_time *timestamp,
+					 const struct stat_data *sd,
+					 const struct stat *st);
+
 static void collect_untracked_cache_preload_tasks(
 	struct untracked_cache_dir *ucd,
 	struct strbuf *path,
@@ -143,6 +147,78 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 		uc->root, &path, &preload->tasks, &preload->nr, &alloc);
 	strbuf_release(&path);
 	return preload;
+}
+
+static void validate_untracked_cache_preload(
+	struct untracked_cache_preload *preload)
+{
+	size_t i;
+
+	for (i = 0; i < preload->nr; i++) {
+		struct untracked_cache_preload_task *task = &preload->tasks[i];
+		struct stat st;
+
+		if (!task->was_valid)
+			continue;
+		task->stat_checked = 1;
+		if (lstat(task->path, &st)) {
+			memset(&task->stat_data, 0, sizeof(task->stat_data));
+			task->update_stat_data = 1;
+			continue;
+		}
+		if (!match_untracked_dir_stat_racy(
+				&preload->index_timestamp, &task->stat_data, &st)) {
+			task->stat_matches = 1;
+			continue;
+		}
+		fill_stat_data(&task->stat_data, &st);
+		task->update_stat_data = 1;
+	}
+}
+
+int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
+				   struct index_state *istate,
+				   unsigned int dir_flags)
+{
+	struct untracked_cache *uc;
+	size_t i;
+	int applied = 0;
+	int valid = 1;
+
+	if (!preload)
+		return 0;
+	validate_untracked_cache_preload(preload);
+	uc = istate->untracked;
+	if (uc != preload->uc || !uc || uc->root != preload->root ||
+	    dir_flags != preload->dir_flags)
+		goto done;
+
+	for (i = 0; i < preload->nr; i++) {
+		struct untracked_cache_preload_task *task = &preload->tasks[i];
+		struct untracked_cache_dir *ucd = task->ucd;
+
+		ucd->stat_checked = 0;
+		ucd->stat_matches = 0;
+		/* Invalidation performed after the snapshot always wins. */
+		if (!task->was_valid || !ucd->valid) {
+			valid = 0;
+			continue;
+		}
+		ucd->stat_checked = task->stat_checked;
+		ucd->stat_matches = task->stat_matches;
+		if (!task->stat_checked || !task->stat_matches)
+			valid = 0;
+		if (task->update_stat_data)
+			ucd->stat_data = task->stat_data;
+	}
+	trace2_data_intmax("dir", istate->repo,
+			   "preload_untracked_cache/valid", valid);
+	applied = 1;
+done:
+	trace2_data_intmax("dir", istate->repo,
+			   "preload_untracked_cache/applied", applied);
+	untracked_cache_preload_release(preload);
+	return applied;
 }
 
 void untracked_cache_preload_release(struct untracked_cache_preload *preload)
