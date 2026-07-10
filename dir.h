@@ -614,6 +614,8 @@ void untracked_cache_add_to_index(struct index_state *, const char *);
 struct untracked_cache_preload;
 struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	struct index_state *, unsigned int dir_flags);
+int untracked_cache_preload_finish(struct untracked_cache_preload *,
+				   struct index_state *, unsigned int dir_flags);
 void untracked_cache_preload_release(struct untracked_cache_preload *);
 
 void free_untracked_cache(struct untracked_cache *);
