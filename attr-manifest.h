@@ -34,6 +34,9 @@ struct attr_manifest_writer {
 	uint32_t nr;
 };
 
+typedef int (*attr_manifest_change_fn)(const struct attr_manifest_entry *entry,
+				       void *data);
+
 void attr_manifest_writer_init(struct attr_manifest_writer *writer,
 			       struct strbuf *buf,
 			       const struct git_hash_algo *algo);
@@ -48,5 +51,9 @@ int attr_manifest_cursor_next(struct attr_manifest_cursor *cursor,
 			      struct attr_manifest_entry *entry);
 int attr_manifest_valid(const void *data, size_t len,
 			const struct git_hash_algo *algo);
+int attr_manifest_for_each_changed(const void *old_data, size_t old_len,
+				   const void *new_data, size_t new_len,
+				   const struct git_hash_algo *algo,
+				   attr_manifest_change_fn fn, void *data);
 
 #endif /* ATTR_MANIFEST_H */
