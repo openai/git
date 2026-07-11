@@ -33,10 +33,13 @@ static const char *kind_name(enum semantic_verify_kind kind)
 
 int cmd__semantic_verify(int argc, const char **argv)
 {
+	struct semantic_verify_options options = SEMANTIC_VERIFY_OPTIONS_INIT;
 	struct semantic_verify_proof *proof = NULL;
 	struct semantic_verify_stats stats;
+	int thread_count = 0;
 	int show_results = 0;
 	int apply = 0;
+	int validate_filter_scope = 0;
 	int applied = -2;
 	int before_uptodate = 0, after_uptodate = 0;
 	int before_valid = 0, after_valid = 0;
@@ -47,9 +50,13 @@ int cmd__semantic_verify(int argc, const char **argv)
 		NULL
 	};
 	struct option opts[] = {
+		OPT_INTEGER(0, "threads", &thread_count,
+			    "number of verifier threads"),
 		OPT_BOOL(0, "show-results", &show_results,
 			 "show one result per cache entry"),
 		OPT_BOOL(0, "apply", &apply, "apply the completed proof"),
+		OPT_BOOL(0, "validate-filter-scope", &validate_filter_scope,
+			 "classify filter use for every index entry"),
 		OPT_STRING(0, "replace-after-prepare", &replace_after_prepare,
 			   "path", "replace an entry after preparing the proof"),
 		OPT_END()
@@ -58,6 +65,10 @@ int cmd__semantic_verify(int argc, const char **argv)
 	argc = parse_options(argc, argv, NULL, opts, usage, 0);
 	if (argc)
 		usage_with_options(usage, opts);
+	if (thread_count < 0)
+		die("negative semantic verifier thread count");
+	options.nr_threads = thread_count;
+	options.validate_filter_scope = validate_filter_scope;
 
 	setup_git_directory(the_repository);
 	repo_config(the_repository, git_default_config, NULL);
@@ -65,7 +76,7 @@ int cmd__semantic_verify(int argc, const char **argv)
 	the_repository->settings.command_requires_full_index = 0;
 	if (repo_read_index(the_repository) < 0)
 		die("unable to read index");
-	ret = semantic_verify_prepare(the_repository->index, &proof);
+	ret = semantic_verify_prepare(the_repository->index, &options, &proof);
 	semantic_verify_get_stats(proof, &stats);
 	if (replace_after_prepare) {
 		struct index_state *istate = the_repository->index;
@@ -118,7 +129,8 @@ int cmd__semantic_verify(int argc, const char **argv)
 	       " bytes=%"PRIuMAX" stat_updates=%"PRIuMAX
 	       " root_stable=%d namespace_stable=%d applied=%d"
 	       " before_uptodate=%d before_valid=%d"
-	       " after_uptodate=%d after_valid=%d\n",
+	       " after_uptodate=%d after_valid=%d"
+	       " active_filters=%"PRIuMAX" filter_scope_checked=%d\n",
 	       (uintmax_t)stats.cache_nr, (uintmax_t)stats.raw_clean,
 	       (uintmax_t)stats.raw_modified, (uintmax_t)stats.sensitive,
 	       (uintmax_t)stats.structural, (uintmax_t)stats.unstable,
@@ -127,7 +139,8 @@ int cmd__semantic_verify(int argc, const char **argv)
 	       (uintmax_t)stats.stat_updates_nr,
 	       semantic_verify_root_is_stable(proof),
 	       !stats.namespace_unstable, applied,
-	       before_uptodate, before_valid, after_uptodate, after_valid);
+	       before_uptodate, before_valid, after_uptodate, after_valid,
+	       (uintmax_t)stats.active_filters, stats.filter_scope_checked);
 	semantic_verify_proof_clear(proof);
 	return !!ret;
 }
