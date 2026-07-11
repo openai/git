@@ -37,6 +37,14 @@ static int attr_manifest_entry_cmp(const struct attr_manifest_entry *a,
 	return a->path_len < b->path_len ? -1 : a->path_len > b->path_len;
 }
 
+static int attr_manifest_entry_equal(const struct attr_manifest_entry *a,
+				     const struct attr_manifest_entry *b,
+				     const struct git_hash_algo *algo)
+{
+	return !attr_manifest_entry_cmp(a, b) && a->source == b->source &&
+		!memcmp(a->hash, b->hash, algo->rawsz);
+}
+
 void attr_manifest_writer_init(struct attr_manifest_writer *writer,
 			       struct strbuf *buf,
 			       const struct git_hash_algo *algo)
@@ -170,4 +178,55 @@ int attr_manifest_valid(const void *data, size_t len,
 	while ((ret = attr_manifest_cursor_next(&cursor, &entry)) > 0)
 		;
 	return !ret;
+}
+
+int attr_manifest_for_each_changed(const void *old_data, size_t old_len,
+				   const void *new_data, size_t new_len,
+				   const struct git_hash_algo *algo,
+				   attr_manifest_change_fn fn, void *data)
+{
+	struct attr_manifest_cursor old_cursor, new_cursor;
+	struct attr_manifest_entry old_entry, new_entry;
+	int old_ret, new_ret;
+
+	/*
+	 * Callers use this as a transactional change set. Validate both
+	 * streams before allowing the callback to observe any entry.
+	 */
+	if (!attr_manifest_valid(old_data, old_len, algo) ||
+	    !attr_manifest_valid(new_data, new_len, algo))
+		return -1;
+	if (attr_manifest_cursor_init(&old_cursor, old_data, old_len, algo) ||
+	    attr_manifest_cursor_init(&new_cursor, new_data, new_len, algo))
+		return -1;
+	old_ret = attr_manifest_cursor_next(&old_cursor, &old_entry);
+	new_ret = attr_manifest_cursor_next(&new_cursor, &new_entry);
+	while (old_ret > 0 || new_ret > 0) {
+		struct attr_manifest_entry changed;
+		int has_changed = 1;
+		int cmp;
+
+		if (old_ret <= 0)
+			cmp = 1;
+		else if (new_ret <= 0)
+			cmp = -1;
+		else
+			cmp = attr_manifest_entry_cmp(&old_entry, &new_entry);
+		if (cmp < 0) {
+			changed = old_entry;
+			old_ret = attr_manifest_cursor_next(&old_cursor, &old_entry);
+		} else if (cmp > 0) {
+			changed = new_entry;
+			new_ret = attr_manifest_cursor_next(&new_cursor, &new_entry);
+		} else {
+			changed = new_entry;
+			has_changed = !attr_manifest_entry_equal(
+				&old_entry, &new_entry, algo);
+			old_ret = attr_manifest_cursor_next(&old_cursor, &old_entry);
+			new_ret = attr_manifest_cursor_next(&new_cursor, &new_entry);
+		}
+		if (has_changed && fn(&changed, data))
+			return -1;
+	}
+	return old_ret < 0 || new_ret < 0 ? -1 : 0;
 }
