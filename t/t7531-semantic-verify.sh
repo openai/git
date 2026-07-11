@@ -1,0 +1,104 @@
+#!/bin/sh
+
+test_description='descriptor-anchored semantic verification'
+
+. ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-semantic-verify.sh
+
+verify_repo () {
+	repo=$1 &&
+	shift &&
+	(
+		cd "$repo" &&
+		test-tool semantic-verify "$@"
+	)
+}
+
+test_expect_success !SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'unsupported platforms decline semantic verification' '
+	test_create_repo anchored-open-unsupported &&
+	test_commit -C anchored-open-unsupported base tracked &&
+	(
+		cd anchored-open-unsupported &&
+		test_must_fail test-tool semantic-verify --show-results
+	) >actual &&
+	test_grep "^tracked error persist=0 error=[1-9][0-9]*$" actual &&
+	test_grep "^entries=1 clean=0 modified=0 sensitive=0 structural=0 " \
+		actual &&
+	test_grep " unstable=0 errors=1 hardlinks=0 bytes=0 " actual &&
+	test_grep " stat_updates=0 root_stable=0 namespace_stable=1" \
+		actual
+'
+
+test_lazy_prereq HARDLINKS '
+	rm -f hardlink-source hardlink-alias &&
+	: >hardlink-source &&
+	ln hardlink-source hardlink-alias
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'classifies raw, converted, nested, and modified files' '
+	test_create_repo classify &&
+	mkdir -p classify/a/b &&
+	test_write_lines "converted text" >classify/.gitattributes &&
+	for path in raw converted modified deleted a/b/nested
+	do
+		test_write_lines original >"classify/$path" || return 1
+	done &&
+	test-tool chmtime -120 classify/raw classify/converted \
+		classify/modified classify/deleted classify/a/b/nested &&
+	git -C classify add . &&
+	git -C classify commit -m base &&
+	cp -p classify/modified classify/mtime-reference &&
+	test_write_lines replaced >classify/modified &&
+	touch -r classify/mtime-reference classify/modified &&
+	rm classify/deleted classify/mtime-reference &&
+
+	verify_repo classify --show-results >actual &&
+	test_grep "^.gitattributes raw-clean persist=1" actual &&
+	test_grep "^raw raw-clean persist=1" actual &&
+	test_grep "^a/b/nested raw-clean persist=1" actual &&
+	test_grep "^converted sensitive" actual &&
+	test_grep "^modified raw-modified" actual &&
+	test_grep "^deleted raw-modified" actual &&
+	test_grep "entries=6 clean=3 modified=2 sensitive=1" actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN,HARDLINKS \
+	'clean hardlinks are not persistable' '
+	test_create_repo hardlink &&
+	test_write_lines content >hardlink/tracked &&
+	git -C hardlink add tracked &&
+	git -C hardlink commit -m base &&
+	ln hardlink/tracked hardlink/alias &&
+
+	verify_repo hardlink --show-results >actual &&
+	test_grep "^tracked raw-clean persist=0" actual &&
+	test_grep "hardlinks=1" actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'classifies structural index state' '
+	test_create_repo structural &&
+	test_write_lines tracked >structural/tracked &&
+	git -C structural add tracked &&
+	git -C structural commit -m base &&
+	test_write_lines intent >structural/intent &&
+	git -C structural add -N intent &&
+
+	verify_repo structural --show-results >actual &&
+	test_grep "^intent structural" actual &&
+	test_grep "structural=1" actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'raw hashing uses the repository object format' '
+	git init --object-format=sha256 sha256 &&
+	test_write_lines sha256 >sha256/tracked &&
+	git -C sha256 add tracked &&
+	git -C sha256 commit -m base &&
+	verify_repo sha256 --show-results >actual &&
+	test_grep "^tracked raw-clean persist=1" actual
+'
+
+test_done

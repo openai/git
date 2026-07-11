@@ -44,6 +44,7 @@ struct semantic_verify_root {
 
 int semantic_verify_root_init(struct repository *repo,
 			      struct semantic_verify_root **root_out);
+int semantic_verify_root_stable(const struct semantic_verify_root *root);
 void semantic_verify_root_clear(struct semantic_verify_root *root);
 
 int semantic_verify_openat(int dirfd, const char *path, int flags);
@@ -108,5 +109,24 @@ struct semantic_verify_worker {
 };
 
 void semantic_verify_worker_run(struct semantic_verify_worker *worker);
+
+struct semantic_verify_proof {
+	struct index_state *istate;
+	struct semantic_verify_root *root;
+	struct semantic_verify_result *results;
+	struct semantic_verify_stat_update *stat_updates;
+	size_t cache_nr;
+	size_t stat_updates_nr;
+	size_t bytes_hashed;
+	size_t raw_clean;
+	size_t raw_modified;
+	size_t sensitive;
+	size_t structural;
+	size_t skipped;
+	size_t unstable;
+	size_t errors;
+	size_t hardlinks;
+	unsigned int namespace_unstable;
+};
 
 #endif /* SEMANTIC_VERIFY_INTERNAL_H */
