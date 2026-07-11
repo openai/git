@@ -1123,6 +1123,7 @@ LIB_OBJS += cbtree.o
 LIB_OBJS += chdir-notify.o
 LIB_OBJS += checkout.o
 LIB_OBJS += chunk-format.o
+LIB_OBJS += clean-status-config.o
 LIB_OBJS += color.o
 LIB_OBJS += column.o
 LIB_OBJS += combine-diff.o
@@ -1542,6 +1543,7 @@ THIRD_PARTY_SOURCES += sha1dc/%
 THIRD_PARTY_SOURCES += $(UNIT_TEST_DIR)/clar/%
 THIRD_PARTY_SOURCES += $(UNIT_TEST_DIR)/clar/clar/%
 
+CLAR_TEST_SUITES += u-clean-status-config
 CLAR_TEST_SUITES += u-ctype
 CLAR_TEST_SUITES += u-dir
 CLAR_TEST_SUITES += u-example-decorate
