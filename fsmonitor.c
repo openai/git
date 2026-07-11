@@ -177,6 +177,7 @@ int read_fsmonitor_extension(struct index_state *istate, const void *data,
 		ewah_free(istate->fsmonitor_dirty);
 	istate->fsmonitor_last_update = strbuf_detach(&last_update, NULL);
 	istate->fsmonitor_dirty = fsmonitor_dirty;
+	istate->fsmonitor_token_valid = 1;
 
 	trace2_data_string("index", NULL, "extension/fsmn/read/token",
 			   istate->fsmonitor_last_update);
@@ -187,6 +188,8 @@ int read_fsmonitor_extension(struct index_state *istate, const void *data,
 
 invalid:
 	istate->fsmonitor_extension_seen = 1;
+	istate->fsmonitor_token_valid = 0;
+	istate->fsmonitor_untracked_valid = 0;
 	FREE_AND_NULL(istate->fsmonitor_last_update);
 	if (istate->fsmonitor_dirty) {
 		ewah_free(istate->fsmonitor_dirty);
@@ -229,6 +232,7 @@ int read_fsmonitor_untracked_extension(struct index_state *istate,
 invalid:
 	istate->fsmonitor_untracked_extension_seen = 1;
 	istate->fsmonitor_untracked_extension_invalid = 1;
+	istate->fsmonitor_untracked_valid = 0;
 	FREE_AND_NULL(istate->fsmonitor_untracked_token);
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "untracked/invalid-extension", 1);
@@ -244,6 +248,18 @@ void write_fsmonitor_untracked_extension(struct strbuf *sb,
 	strbuf_add(sb, &version, sizeof(version));
 	strbuf_addstr(sb, istate->fsmonitor_last_update);
 	strbuf_addch(sb, '\0');
+}
+
+void prepare_fsmonitor_untracked(struct index_state *istate)
+{
+	istate->fsmonitor_untracked_valid =
+		!istate->fsmonitor_untracked_extension_invalid &&
+		(!istate->untracked || !istate->untracked->root ||
+		 (istate->fsmonitor_token_valid &&
+		  istate->fsmonitor_last_update &&
+		  istate->fsmonitor_untracked_token &&
+		  !strcmp(istate->fsmonitor_last_update,
+			  istate->fsmonitor_untracked_token)));
 }
 
 void fill_fsmonitor_bitmap(struct index_state *istate)

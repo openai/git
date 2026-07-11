@@ -3,6 +3,7 @@
 #include "test-tool.h"
 #include "attr.h"
 #include "config.h"
+#include "dir.h"
 #include "environment.h"
 #include "ewah/ewok.h"
 #include "ewah/ewok_rlw.h"
@@ -57,6 +58,8 @@ static int test_fsuc_parser(void)
 {
 	struct index_state duplicate = INDEX_STATE_INIT(the_repository);
 	struct index_state truncated = INDEX_STATE_INIT(the_repository);
+	struct untracked_cache untracked = { 0 };
+	struct untracked_cache_dir root = { 0 };
 	struct strbuf encoded = STRBUF_INIT;
 	struct strbuf written = STRBUF_INIT;
 	uint32_t version;
@@ -77,6 +80,17 @@ static int test_fsuc_parser(void)
 	if (written.len != encoded.len ||
 	    memcmp(written.buf, encoded.buf, encoded.len))
 		return error("FSUC did not round-trip");
+	duplicate.fsmonitor_token_valid = 1;
+	duplicate.untracked = &untracked;
+	untracked.root = &root;
+	prepare_fsmonitor_untracked(&duplicate);
+	if (!duplicate.fsmonitor_untracked_valid)
+		return error("matching FSMN and FSUC tokens were not paired");
+	free(duplicate.fsmonitor_last_update);
+	duplicate.fsmonitor_last_update = xstrdup("other");
+	prepare_fsmonitor_untracked(&duplicate);
+	if (duplicate.fsmonitor_untracked_valid)
+		return error("mismatched FSMN and FSUC tokens were paired");
 	read_fsmonitor_untracked_extension(
 		&duplicate, encoded.buf, encoded.len);
 	if (!fsuc_failed_closed(&duplicate))
@@ -145,7 +159,8 @@ static void make_raw_fsmn(struct strbuf *out, uint32_t bit_size,
 static int fsmn_failed_closed(const struct index_state *istate)
 {
 	return istate->fsmonitor_extension_seen &&
-		!istate->fsmonitor_last_update && !istate->fsmonitor_dirty;
+		!istate->fsmonitor_last_update && !istate->fsmonitor_dirty &&
+		!istate->fsmonitor_token_valid;
 }
 
 static int check_invalid_fsmn(const struct strbuf *encoded,
@@ -156,6 +171,7 @@ static int check_invalid_fsmn(const struct strbuf *encoded,
 	invalid.cache_nr = 1;
 	invalid.fsmonitor_last_update = xstrdup("old");
 	invalid.fsmonitor_dirty = ewah_new();
+	invalid.fsmonitor_token_valid = 1;
 	read_fsmonitor_extension(&invalid, encoded->buf, encoded->len);
 	if (!fsmn_failed_closed(&invalid))
 		return error("%s FSMN was published", description);
@@ -173,7 +189,8 @@ static int test_fsmn_parser(void)
 	duplicate.cache_nr = truncated.cache_nr = 1;
 	make_valid_fsmn(&encoded);
 	read_fsmonitor_extension(&duplicate, encoded.buf, encoded.len);
-	if (!duplicate.fsmonitor_last_update ||
+	if (!duplicate.fsmonitor_token_valid ||
+	    !duplicate.fsmonitor_last_update ||
 	    strcmp(duplicate.fsmonitor_last_update, "token") ||
 	    !duplicate.fsmonitor_dirty)
 		return error("valid FSMN was not published");
@@ -183,6 +200,7 @@ static int test_fsmn_parser(void)
 
 	truncated.fsmonitor_last_update = xstrdup("old");
 	truncated.fsmonitor_dirty = ewah_new();
+	truncated.fsmonitor_token_valid = 1;
 	read_fsmonitor_extension(&truncated, encoded.buf, encoded.len - 1);
 	if (!fsmn_failed_closed(&truncated))
 		return error("truncated FSMN was partially published");
