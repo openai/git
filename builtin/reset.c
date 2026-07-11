@@ -487,14 +487,15 @@ int cmd_reset(int argc,
 		die(_("the option '%s' requires '%s'"), "-N", "--mixed");
 
 	/*
-	 * A no-path mixed reset is a candidate for a stat-only rewrite even
-	 * when its target commit differs from HEAD. Attach history early
-	 * enough for the initial index read, but keep it only if
-	 * read_from_tree() confirms that no logical entries changed.
+	 * A no-path mixed or hard reset is a candidate for a stat-only
+	 * rewrite even when its target commit differs from HEAD. Attach
+	 * history early enough for the initial index read. Mixed reset
+	 * checks its in-place result below; hard reset lets unpack_trees()
+	 * transfer only an equal logical index.
 	 */
-	if (reset_type == MIXED && !pathspec.nr && !intent_to_add &&
-	    !unborn) {
-		preserve_mixed_history = 1;
+	if ((reset_type == MIXED || reset_type == HARD) &&
+	    !pathspec.nr && !intent_to_add && !unborn) {
+		preserve_mixed_history = reset_type == MIXED;
 		clean_status_set_config_digest(the_repository, &clean_digest);
 	}
 
