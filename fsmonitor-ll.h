@@ -4,6 +4,9 @@
 struct index_state;
 struct strbuf;
 
+/* A provider-only marker; worktree-relative paths cannot begin with '/'. */
+#define FSMONITOR_PATH_GLOBAL_INVALIDATE "//"
+
 extern struct trace_key trace_fsmonitor;
 
 /*
