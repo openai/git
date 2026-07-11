@@ -991,4 +991,30 @@ test_expect_success 'empty repo (no index) and core.untrackedCache' '
 	git -C emptyrepo -c core.untrackedCache=true write-tree
 '
 
+test_expect_success 'directory snapshots ignore weak file-stat configuration' '
+	test_create_repo weak-dir &&
+	(
+		cd weak-dir &&
+		mkdir nested &&
+		echo tracked >tracked &&
+		echo one >nested/one &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		git config core.trustCtime false &&
+		git config core.checkStat minimal &&
+		avoid_racy &&
+		git status --porcelain -uall >/dev/null &&
+		git status --porcelain -uall >/dev/null &&
+		dir_mtime=$(test-tool chmtime --get nested) &&
+		mv nested/one nested/two &&
+		test-tool chmtime =$dir_mtime nested &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain -uall >.git/expect &&
+		git status --porcelain -uall >.git/actual &&
+		test_cmp .git/expect .git/actual
+	)
+'
+
 test_done

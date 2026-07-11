@@ -71,6 +71,42 @@ struct cached_dir {
 	struct untracked_cache_dir *ucd;
 };
 
+/*
+ * Unlike cache entries, an untracked-cache directory has no later content
+ * check to correct a false stat match.  Compare every field saved in UNTR,
+ * regardless of core.checkStat or core.trustCtime.
+ */
+static int match_untracked_dir_stat(const struct stat_data *sd,
+				    const struct stat *st)
+{
+	return !S_ISDIR(st->st_mode) ||
+		sd->sd_ctime.sec != (unsigned int)st->st_ctime ||
+		sd->sd_ctime.nsec != ST_CTIME_NSEC(*st) ||
+		sd->sd_mtime.sec != (unsigned int)st->st_mtime ||
+		sd->sd_mtime.nsec != ST_MTIME_NSEC(*st) ||
+		sd->sd_dev != (unsigned int)st->st_dev ||
+		sd->sd_ino != (unsigned int)st->st_ino ||
+		sd->sd_uid != (unsigned int)st->st_uid ||
+		sd->sd_gid != (unsigned int)st->st_gid ||
+		sd->sd_size != (unsigned int)st->st_size;
+}
+
+static int match_untracked_dir_stat_racy(const struct cache_time *timestamp,
+					 const struct stat_data *sd,
+					 const struct stat *st)
+{
+	if (timestamp->sec &&
+#ifdef USE_NSEC
+	    (timestamp->sec < sd->sd_mtime.sec ||
+	     (timestamp->sec == sd->sd_mtime.sec &&
+	      timestamp->nsec <= sd->sd_mtime.nsec)))
+#else
+	    timestamp->sec <= sd->sd_mtime.sec)
+#endif
+		return MTIME_CHANGED;
+	return match_untracked_dir_stat(sd, st);
+}
+
 static enum path_treatment read_directory_recursive(struct dir_struct *dir,
 	struct index_state *istate, const char *path, int len,
 	struct untracked_cache_dir *untracked,
@@ -2541,7 +2577,8 @@ static int valid_cached_dir(struct dir_struct *dir,
 			return 0;
 		}
 		if (!untracked->valid ||
-			match_stat_data_racy(istate, &untracked->stat_data, &st)) {
+		    match_untracked_dir_stat_racy(
+			    &istate->timestamp, &untracked->stat_data, &st)) {
 			fill_stat_data(&untracked->stat_data, &st);
 			return 0;
 		}
