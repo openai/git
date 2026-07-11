@@ -899,6 +899,14 @@ static int merge_working_tree(const struct checkout_opts *opts,
 	struct tree *new_tree;
 
 	repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
+	/*
+	 * A discarding switch may rewrite only worktree/stat state when the
+	 * target tree matches the index. Let unpack_trees() transfer the
+	 * proof only after it proves that the rebuilt index is identical.
+	 */
+	if (opts->discard_changes)
+		clean_status_set_config_digest(the_repository,
+					       &opts->clean_digest);
 	if (repo_read_index_preload(the_repository, NULL, 0) < 0) {
 		rollback_lock_file(&lock_file);
 		return error(_("index file corrupt"));
