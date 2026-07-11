@@ -110,6 +110,26 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	test_grep "after_uptodate=0 after_valid=0" actual
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN,PTHREADS \
+	'parallel verification preserves index-order results' '
+	test_create_repo parallel &&
+	i=0 &&
+	while test $i -lt 16
+	do
+		mkdir "parallel/d$i" &&
+		printf "*.txt -text attr_%s=value\n" "$i" \
+			>"parallel/d$i/.gitattributes" &&
+		printf "content %s\n" "$i" >"parallel/d$i/file.txt" &&
+		i=$((i + 1)) || return 1
+	done &&
+	git -C parallel add . &&
+	git -C parallel commit -m base &&
+
+	verify_repo parallel --threads=1 --show-results >expect &&
+	verify_repo parallel --threads=4 --show-results >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'raw hashing uses the repository object format' '
 	git init --object-format=sha256 sha256 &&
@@ -118,6 +138,33 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	git -C sha256 commit -m base &&
 	verify_repo sha256 --show-results >actual &&
 	test_grep "^tracked raw-clean persist=1" actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'filter scope includes early semantic exits' '
+	test_create_repo filter-scope &&
+	printf "unmatched filter=demo\n" >filter-scope/.gitattributes &&
+	test_write_lines content >filter-scope/ordinary &&
+	test_write_lines content >filter-scope/assumed &&
+	git -C filter-scope add . &&
+	git -C filter-scope commit -m base &&
+	git -C filter-scope config filter.demo.clean cat &&
+	git -C filter-scope update-index --assume-unchanged assumed &&
+	verify_repo filter-scope --threads=4 --validate-filter-scope \
+		--apply >actual.unused &&
+	test_grep "applied=2 .*active_filters=0 " actual.unused &&
+	test_grep "filter_scope_checked=1" actual.unused &&
+
+	test_write_lines "ordinary filter=demo" "assumed filter=demo" \
+		>filter-scope/.gitattributes &&
+	git -C filter-scope add .gitattributes &&
+	git -C filter-scope commit -m attributes &&
+
+	verify_repo filter-scope --threads=4 --validate-filter-scope \
+		--show-results --apply >actual &&
+	test_grep "^assumed skipped" actual &&
+	test_grep "applied=-1 .*active_filters=2 " actual &&
+	test_grep "filter_scope_checked=1" actual
 '
 
 test_done
