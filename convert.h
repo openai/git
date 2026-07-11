@@ -92,6 +92,12 @@ struct conv_attrs {
 void convert_attrs(struct index_state *istate,
 		   struct conv_attrs *ca, const char *path);
 
+/*
+ * Prepare conversion configuration and the default attribute source on the
+ * main thread before using per-thread attribute checks below.
+ */
+void convert_attrs_prepare(struct index_state *istate);
+
 /* Allocate the exact six-attribute check used by convert_attrs(). */
 struct attr_check *convert_attrs_check_alloc(void);
 
