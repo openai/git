@@ -584,6 +584,7 @@ libgit_sources = [
   'walker.c',
   'wildmatch.c',
   'worktree.c',
+  'worktree-attr-manifest.c',
   'worktree-attr-source.c',
   'wrapper.c',
   'write-or-die.c',
