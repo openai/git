@@ -336,6 +336,7 @@ libgit_sources = [
   'clean-status.c',
   'clean-status-config.c',
   'clean-status-identity.c',
+  'clean-status-index.c',
   'clean-status-manifest.c',
   'color.c',
   'column.c',
