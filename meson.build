@@ -526,6 +526,7 @@ libgit_sources = [
   'semantic-verify-file.c',
   'semantic-verify-path.c',
   'semantic-verify-root.c',
+  'semantic-verify-worker.c',
   'serve.c',
   'server-info.c',
   'setup.c',
