@@ -159,7 +159,6 @@ void test_clean_status_history__preserves_unbound_manifests(void)
 	strbuf_release(&rewritten);
 	fixture_release(&fixture);
 }
-
 void test_clean_status_history__advances_only_current_proofs(void)
 {
 	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
@@ -197,5 +196,44 @@ void test_clean_status_history__advances_only_current_proofs(void)
 		FSMONITOR_CLEAN_PROOF_FULL_INDEX);
 
 	strbuf_release(&rewritten);
+	fixture_release(&fixture);
+}
+
+void test_clean_status_history__copies_validated_history(void)
+{
+	struct history_fixture fixture;
+	struct repository dst_repo = {
+		.hash_algo = &hash_algos[GIT_HASH_SHA1],
+	};
+	struct index_state dst = INDEX_STATE_INIT(&dst_repo);
+	struct index_state invalid_dst = INDEX_STATE_INIT(&dst_repo);
+	struct clean_status_state *dst_state;
+
+	fixture_init(&fixture, &hash_algos[GIT_HASH_SHA1]);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	move_index_extensions(&dst, &fixture.istate);
+	dst_state = dst.clean_status;
+	cl_assert(dst_state != NULL);
+	cl_assert(dst_state->disk_config_valid);
+	cl_assert(!dst_state->disk_config_invalid);
+	cl_assert(dst_state->disk_semantic_valid);
+	cl_assert(dst_state->disk_attr_valid);
+	cl_assert(dst_state->manifest.disk_valid);
+	cl_assert_equal_i(dst_state->manifest.disk_flags,
+			  FSMONITOR_CLEAN_PROOF_ALL);
+	cl_assert_equal_i(dst_state->disk_config_raw.len,
+			  fixture.encoded.len);
+
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	move_index_extensions(&invalid_dst, &fixture.istate);
+	cl_assert(!invalid_dst.clean_status);
+	cl_assert(dst_state->disk_config_valid);
+	cl_assert_equal_i(dst_state->disk_config_raw.len,
+			  fixture.encoded.len);
+
+	release_index(&invalid_dst);
+	release_index(&dst);
 	fixture_release(&fixture);
 }
