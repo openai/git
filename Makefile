@@ -1317,6 +1317,7 @@ LIB_OBJS += resolve-undo.o
 LIB_OBJS += revision.o
 LIB_OBJS += run-command.o
 LIB_OBJS += send-pack.o
+LIB_OBJS += semantic-verify-file.o
 LIB_OBJS += semantic-verify-path.o
 LIB_OBJS += semantic-verify-root.o
 LIB_OBJS += sequencer.o
