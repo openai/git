@@ -1396,6 +1396,15 @@ int convert_attrs_are_raw_safe(const struct conv_attrs *ca)
 		ca->crlf_action == CRLF_BINARY;
 }
 
+int convert_attrs_is_raw_safe(struct index_state *istate, const char *path,
+			      struct attr_check *attr_check)
+{
+	struct conv_attrs ca;
+
+	convert_attrs_with_check(istate, &ca, path, attr_check);
+	return convert_attrs_are_raw_safe(&ca);
+}
+
 void reset_parsed_attributes(void)
 {
 	struct convert_driver *drv, *next;
