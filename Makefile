@@ -1110,6 +1110,7 @@ LIB_OBJS += archive-tar.o
 LIB_OBJS += archive-zip.o
 LIB_OBJS += archive.o
 LIB_OBJS += attr.o
+LIB_OBJS += attr-manifest.o
 LIB_OBJS += base85.o
 LIB_OBJS += bisect.o
 LIB_OBJS += blame.o
@@ -1543,6 +1544,7 @@ THIRD_PARTY_SOURCES += sha1dc/%
 THIRD_PARTY_SOURCES += $(UNIT_TEST_DIR)/clar/%
 THIRD_PARTY_SOURCES += $(UNIT_TEST_DIR)/clar/clar/%
 
+CLAR_TEST_SUITES += u-attr-manifest
 CLAR_TEST_SUITES += u-clean-status-config
 CLAR_TEST_SUITES += u-ctype
 CLAR_TEST_SUITES += u-dir
