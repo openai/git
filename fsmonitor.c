@@ -7,6 +7,7 @@
 #include "dir.h"
 #include "environment.h"
 #include "ewah/ewok.h"
+#include "ewah/ewok_rlw.h"
 #include "fsmonitor.h"
 #include "fsmonitor-ipc.h"
 #include "name-hash.h"
@@ -17,6 +18,7 @@
 
 #define INDEX_EXTENSION_VERSION1	(1)
 #define INDEX_EXTENSION_VERSION2	(2)
+#define FSMONITOR_TOKEN_MAX		(4096)
 #define HOOK_INTERFACE_VERSION1		(1)
 #define HOOK_INTERFACE_VERSION2		(2)
 
@@ -40,6 +42,46 @@ static void fsmonitor_ewah_callback(size_t pos, void *is)
 	ce->ce_flags &= ~CE_FSMONITOR_VALID;
 }
 
+static int fsmonitor_ewah_is_valid(struct ewah_bitmap *bitmap)
+{
+	size_t pointer = 0, expanded_words = 0;
+	size_t logical_words = bitmap->bit_size / BITS_IN_EWORD +
+		!!(bitmap->bit_size % BITS_IN_EWORD);
+	size_t padding = bitmap->bit_size % BITS_IN_EWORD;
+	eword_t *last_rlw = NULL;
+
+	while (pointer < bitmap->buffer_size) {
+		eword_t *rlw = &bitmap->buffer[pointer];
+		size_t running_words = rlw_get_running_len(rlw);
+		size_t literal_words = rlw_get_literal_words(rlw);
+		size_t i;
+
+		last_rlw = rlw;
+		if (literal_words > bitmap->buffer_size - pointer - 1)
+			return 0;
+		if (running_words > logical_words - expanded_words)
+			return 0;
+		expanded_words += running_words;
+		if (rlw_get_run_bit(rlw) && running_words && padding &&
+		    expanded_words == logical_words)
+			return 0;
+		if (literal_words > logical_words - expanded_words)
+			return 0;
+		for (i = 0; i < literal_words; i++) {
+			eword_t literal = bitmap->buffer[pointer + 1 + i];
+
+			if (padding &&
+			    expanded_words + i + 1 == logical_words &&
+			    literal >> padding)
+				return 0;
+		}
+		expanded_words += literal_words;
+		pointer += 1 + literal_words;
+	}
+
+	return expanded_words == logical_words && bitmap->rlw == last_rlw;
+}
+
 static int fsmonitor_hook_version(void)
 {
 	int hook_version;
@@ -60,50 +102,99 @@ int read_fsmonitor_extension(struct index_state *istate, const void *data,
 	unsigned long sz)
 {
 	const char *index = data;
+	const char *end = index + sz;
+	const char *nul;
 	uint32_t hdr_version;
 	uint32_t ewah_size;
+	uint32_t ewah_words;
+	uint32_t ewah_rlw;
 	struct ewah_bitmap *fsmonitor_dirty;
 	int ret;
 	uint64_t timestamp;
 	struct strbuf last_update = STRBUF_INIT;
 
-	if (sz < sizeof(uint32_t) + 1 + sizeof(uint32_t))
-		return error("corrupt fsmonitor extension (too short)");
+	if (istate->fsmonitor_extension_seen)
+		goto invalid;
+	istate->fsmonitor_extension_seen = 1;
+	if (end - index < sizeof(uint32_t))
+		goto invalid;
 
 	hdr_version = get_be32(index);
 	index += sizeof(uint32_t);
 	if (hdr_version == INDEX_EXTENSION_VERSION1) {
+		if (end - index < sizeof(uint64_t))
+			goto invalid;
 		timestamp = get_be64(index);
 		strbuf_addf(&last_update, "%"PRIu64"", timestamp);
 		index += sizeof(uint64_t);
 	} else if (hdr_version == INDEX_EXTENSION_VERSION2) {
-		strbuf_addstr(&last_update, index);
-		index += last_update.len + 1;
+		nul = memchr(index, '\0', end - index);
+		if (!nul || nul == index || nul - index > FSMONITOR_TOKEN_MAX)
+			goto invalid;
+		strbuf_add(&last_update, index, nul - index);
+		index = nul + 1;
 	} else {
-		return error("bad fsmonitor version %d", hdr_version);
+		goto invalid;
 	}
 
-	istate->fsmonitor_last_update = strbuf_detach(&last_update, NULL);
-
+	if (end - index < sizeof(uint32_t))
+		goto invalid;
 	ewah_size = get_be32(index);
 	index += sizeof(uint32_t);
+	if (ewah_size != end - index || ewah_size < 3 * sizeof(uint32_t))
+		goto invalid;
+
+	/* Reject impossible EWAH lengths before its parser allocates memory. */
+	ewah_words = get_be32(index + sizeof(uint32_t));
+	if (ewah_words > (ewah_size - 3 * sizeof(uint32_t)) /
+			 sizeof(eword_t) ||
+	    3 * sizeof(uint32_t) + (size_t)ewah_words * sizeof(eword_t) !=
+		    ewah_size)
+		goto invalid;
+	ewah_rlw = get_be32(index + ewah_size - sizeof(uint32_t));
+	if (ewah_rlw >= ewah_words)
+		goto invalid;
 
 	fsmonitor_dirty = ewah_new();
 	ret = ewah_read_mmap(fsmonitor_dirty, index, ewah_size);
 	if (ret != ewah_size) {
 		ewah_free(fsmonitor_dirty);
-		return error("failed to parse ewah bitmap reading fsmonitor index extension");
+		goto invalid;
 	}
-	istate->fsmonitor_dirty = fsmonitor_dirty;
+	if (!fsmonitor_ewah_is_valid(fsmonitor_dirty)) {
+		ewah_free(fsmonitor_dirty);
+		goto invalid;
+	}
+	if (!istate->split_index &&
+	    fsmonitor_dirty->bit_size > istate->cache_nr) {
+		ewah_free(fsmonitor_dirty);
+		goto invalid;
+	}
 
-	if (!istate->split_index)
-		assert_index_minimum(istate, istate->fsmonitor_dirty->bit_size);
+	/* Publish only after the complete optional extension is validated. */
+	FREE_AND_NULL(istate->fsmonitor_last_update);
+	if (istate->fsmonitor_dirty)
+		ewah_free(istate->fsmonitor_dirty);
+	istate->fsmonitor_last_update = strbuf_detach(&last_update, NULL);
+	istate->fsmonitor_dirty = fsmonitor_dirty;
 
 	trace2_data_string("index", NULL, "extension/fsmn/read/token",
 			   istate->fsmonitor_last_update);
 	trace_printf_key(&trace_fsmonitor,
 			 "read fsmonitor extension successful '%s'",
 			 istate->fsmonitor_last_update);
+	return 0;
+
+invalid:
+	istate->fsmonitor_extension_seen = 1;
+	FREE_AND_NULL(istate->fsmonitor_last_update);
+	if (istate->fsmonitor_dirty) {
+		ewah_free(istate->fsmonitor_dirty);
+		istate->fsmonitor_dirty = NULL;
+	}
+	strbuf_release(&last_update);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "extension/invalid", 1);
 	return 0;
 }
 
