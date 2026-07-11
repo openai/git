@@ -5,13 +5,18 @@
 #include "hash-framing.h"
 #include "object.h"
 #include "odb.h"
+#include "parse.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "semantic-verify-internal.h"
 #include "string-list.h"
 #include "strbuf.h"
+#include "thread-utils.h"
 #include "worktree-attr-manifest.h"
 #include "worktree-attr-source.h"
+
+#define ATTR_MANIFEST_FILES_PER_THREAD 256
+#define ATTR_MANIFEST_MAX_THREADS 32
 
 struct attr_manifest_candidate {
 	unsigned char worktree_hash[GIT_MAX_RAWSZ];
@@ -28,6 +33,12 @@ struct attr_manifest_probe_data {
 	size_t start;
 	size_t end;
 	unsigned int namespace_unstable;
+};
+
+struct attr_manifest_thread {
+	struct attr_manifest_probe_data probe;
+	pthread_t pthread;
+	unsigned int started : 1;
 };
 
 static int collect_candidates(struct index_state *istate,
@@ -114,9 +125,9 @@ static int collect_index_sources(struct index_state *istate,
 	return ret;
 }
 
-static void probe_attr_manifest_candidates(
-	struct attr_manifest_probe_data *data)
+static void *probe_attr_manifest_candidates(void *cb_data)
 {
+	struct attr_manifest_probe_data *data = cb_data;
 	struct semantic_verify_path *path =
 		semantic_verify_path_new(data->root);
 	size_t i;
@@ -133,21 +144,83 @@ static void probe_attr_manifest_candidates(
 			candidate->worktree_present = found;
 	}
 	semantic_verify_path_free(path, &data->namespace_unstable, NULL);
+	return NULL;
+}
+
+static size_t select_thread_count(size_t candidates)
+{
+	size_t cpus, test_threads, threads;
+
+	if (!HAVE_THREADS)
+		return 1;
+	threads = DIV_ROUND_UP(candidates, ATTR_MANIFEST_FILES_PER_THREAD);
+	cpus = online_cpus();
+	if (threads > cpus * 2)
+		threads = cpus * 2;
+	test_threads = git_env_ulong("GIT_TEST_ATTR_MANIFEST_THREADS", 0);
+	if (test_threads)
+		threads = test_threads;
+	if (threads > ATTR_MANIFEST_MAX_THREADS)
+		threads = ATTR_MANIFEST_MAX_THREADS;
+	if (threads > candidates)
+		threads = candidates;
+	return threads ? threads : 1;
+}
+
+static int create_probe_thread(struct attr_manifest_thread *worker,
+			       size_t thread_id)
+{
+	if (git_env_ulong("GIT_TEST_ATTR_MANIFEST_THREAD_FAIL_AT",
+			  ULONG_MAX) == thread_id)
+		return EAGAIN;
+	return pthread_create(&worker->pthread, NULL,
+			      probe_attr_manifest_candidates, &worker->probe);
 }
 
 static int probe_candidates(struct string_list *candidates,
 			    struct semantic_verify_root *root,
-			    const struct git_hash_algo *algo)
+			    const struct git_hash_algo *algo,
+			    struct worktree_attr_manifest_stats *stats)
 {
-	struct attr_manifest_probe_data data = {
-		.candidates = candidates,
-		.root = root,
-		.algo = algo,
-		.end = candidates->nr,
-	};
+	struct attr_manifest_thread *workers;
+	size_t thread_id, threads = select_thread_count(candidates->nr);
+	int create_threads = HAVE_THREADS;
+	int ret = 0;
 
-	probe_attr_manifest_candidates(&data);
-	return data.namespace_unstable ? -1 : 0;
+	CALLOC_ARRAY(workers, threads);
+	for (thread_id = 0; thread_id < threads; thread_id++) {
+		struct attr_manifest_thread *worker = &workers[thread_id];
+		struct attr_manifest_probe_data *data = &worker->probe;
+		int err;
+
+		data->candidates = candidates;
+		data->root = root;
+		data->algo = algo;
+		data->start = st_mult(candidates->nr, thread_id) / threads;
+		data->end = st_mult(candidates->nr, thread_id + 1) / threads;
+		if (threads == 1 || !create_threads) {
+			probe_attr_manifest_candidates(data);
+			continue;
+		}
+		err = create_probe_thread(worker, thread_id);
+		if (!err) {
+			worker->started = 1;
+			continue;
+		}
+		stats->thread_failures++;
+		create_threads = 0;
+		probe_attr_manifest_candidates(data);
+	}
+	for (thread_id = 0; thread_id < threads; thread_id++) {
+		struct attr_manifest_thread *worker = &workers[thread_id];
+
+		if (worker->started && pthread_join(worker->pthread, NULL))
+			die("unable to join attribute manifest thread");
+		ret |= worker->probe.namespace_unstable;
+	}
+	stats->threads = threads;
+	free(workers);
+	return ret ? -1 : 0;
 }
 
 int worktree_attr_manifest_build(
@@ -170,7 +243,7 @@ int worktree_attr_manifest_build(
 	    collect_index_sources(istate, &candidates))
 		goto done;
 	stats->candidates = candidates.nr;
-	if (probe_candidates(&candidates, root, algo))
+	if (probe_candidates(&candidates, root, algo, stats))
 		goto done;
 	attr_manifest_writer_init(&writer, manifest, algo);
 	for (i = 0; i < candidates.nr; i++) {

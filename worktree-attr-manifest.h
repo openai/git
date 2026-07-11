@@ -6,8 +6,10 @@ struct strbuf;
 
 struct worktree_attr_manifest_stats {
 	size_t candidates;
+	size_t threads;
 	size_t worktree_sources;
 	size_t index_sources;
+	size_t thread_failures;
 };
 
 int worktree_attr_manifest_build(
