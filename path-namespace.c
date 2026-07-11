@@ -184,6 +184,18 @@ void path_namespace_hash(struct git_hash_ctx *ctx,
 	}
 }
 
+void path_namespace_hash_stat(struct git_hash_ctx *ctx, const struct stat *st)
+{
+	struct path_stat_identity identity;
+	uint64_t field;
+
+	path_stat_identity_init(&identity, st);
+	for (size_t i = 0; i < ARRAY_SIZE(identity.fields); i++) {
+		put_be64(&field, identity.fields[i]);
+		hash_length_delimited(ctx, &field, sizeof(field));
+	}
+}
+
 int path_namespace_stat_equal(const struct stat *a, const struct stat *b)
 {
 	struct path_stat_identity first, second;
