@@ -523,6 +523,7 @@ libgit_sources = [
   'run-command.c',
   'send-pack.c',
   'sequencer.c',
+  'semantic-verify-path.c',
   'semantic-verify-root.c',
   'serve.c',
   'server-info.c',
