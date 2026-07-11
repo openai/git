@@ -8,8 +8,14 @@
 #include "semantic-verify-internal.h"
 #include "setup.h"
 #include "strbuf.h"
+#include "thread-utils.h"
 #include "worktree-attr-manifest.h"
 #include "wrapper.h"
+
+#define ATTR_MANIFEST_TEST_THREADS "GIT_TEST_ATTR_MANIFEST_THREADS"
+#define ATTR_MANIFEST_TEST_THREAD_FAIL_AT \
+	"GIT_TEST_ATTR_MANIFEST_THREAD_FAIL_AT"
+#define ATTR_MANIFEST_TEST_SOURCE_NR 257
 
 static void fill_hash(unsigned char *hash, unsigned char value,
 		      const struct git_hash_algo *algo)
@@ -435,6 +441,141 @@ void test_attr_manifest__rejects_missing_index_source(void)
 	release_index(&istate);
 	odb_free(repo.objects);
 	remove_worktree(worktree);
+#endif
+}
+
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+struct many_sources_fixture {
+	const struct git_hash_algo *algo;
+	char *worktree;
+	struct repository repo;
+	struct index_state istate;
+};
+
+static void many_sources_fixture_init(struct many_sources_fixture *fixture)
+{
+	struct strbuf path = STRBUF_INIT;
+	size_t i;
+
+	memset(fixture, 0, sizeof(*fixture));
+	fixture->algo = &hash_algos[GIT_HASH_SHA1];
+	fixture->worktree = create_worktree();
+	fixture->repo.worktree = fixture->worktree;
+	fixture->repo.hash_algo = fixture->algo;
+	index_state_init(&fixture->istate, &fixture->repo);
+	CALLOC_ARRAY(fixture->istate.cache, ATTR_MANIFEST_TEST_SOURCE_NR);
+	fixture->istate.cache_alloc = fixture->istate.cache_nr =
+		ATTR_MANIFEST_TEST_SOURCE_NR;
+
+	for (i = 0; i < ATTR_MANIFEST_TEST_SOURCE_NR; i++) {
+		strbuf_reset(&path);
+		strbuf_addf(&path, "%s/d%03" PRIuMAX,
+			    fixture->worktree, (uintmax_t)i);
+		cl_assert_equal_i(mkdir(path.buf, 0777), 0);
+		strbuf_addstr(&path, "/" GITATTRIBUTES_FILE);
+		write_file(path.buf, "source %" PRIuMAX "\n", (uintmax_t)i);
+		strbuf_reset(&path);
+		strbuf_addf(&path, "d%03" PRIuMAX "/file", (uintmax_t)i);
+		add_index_path(&fixture->istate, i, path.buf, 0);
+	}
+	strbuf_release(&path);
+}
+
+static void many_sources_fixture_release(struct many_sources_fixture *fixture)
+{
+	release_index(&fixture->istate);
+	remove_worktree(fixture->worktree);
+}
+
+static void clear_attr_manifest_thread_env(void *unused UNUSED)
+{
+	unsetenv(ATTR_MANIFEST_TEST_THREADS);
+	unsetenv(ATTR_MANIFEST_TEST_THREAD_FAIL_AT);
+}
+#endif
+
+void test_attr_manifest__parallel_probes_match_serial_output(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	struct many_sources_fixture fixture;
+	struct worktree_attr_manifest_stats serial_stats, parallel_stats;
+	struct strbuf serial = STRBUF_INIT, parallel = STRBUF_INIT;
+	unsigned char serial_hash[GIT_MAX_RAWSZ];
+	unsigned char parallel_hash[GIT_MAX_RAWSZ];
+
+	if (!HAVE_THREADS)
+		return;
+	cl_set_cleanup(clear_attr_manifest_thread_env, NULL);
+	many_sources_fixture_init(&fixture);
+
+	xsetenv(ATTR_MANIFEST_TEST_THREADS, "1", 1);
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&fixture.istate, &serial, serial_hash, &serial_stats), 0);
+	cl_assert_equal_i(serial_stats.candidates,
+			  ATTR_MANIFEST_TEST_SOURCE_NR + 1);
+	cl_assert_equal_i(serial_stats.threads, 1);
+	cl_assert_equal_i(serial_stats.worktree_sources,
+			  ATTR_MANIFEST_TEST_SOURCE_NR);
+
+	xsetenv(ATTR_MANIFEST_TEST_THREADS, "2", 1);
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&fixture.istate, &parallel, parallel_hash, &parallel_stats), 0);
+	cl_assert_equal_i(parallel_stats.candidates,
+			  ATTR_MANIFEST_TEST_SOURCE_NR + 1);
+	cl_assert_equal_i(parallel_stats.threads, 2);
+	cl_assert_equal_i(parallel_stats.thread_failures, 0);
+	cl_assert_equal_i(parallel_stats.worktree_sources,
+			  ATTR_MANIFEST_TEST_SOURCE_NR);
+	cl_assert_equal_i(serial.len, parallel.len);
+	cl_assert(!memcmp(serial.buf, parallel.buf, serial.len));
+	cl_assert(!memcmp(serial_hash, parallel_hash, fixture.algo->rawsz));
+
+	strbuf_release(&parallel);
+	strbuf_release(&serial);
+	many_sources_fixture_release(&fixture);
+	clear_attr_manifest_thread_env(NULL);
+#endif
+}
+
+void test_attr_manifest__thread_failure_completes_remaining_ranges(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	struct many_sources_fixture fixture;
+	struct worktree_attr_manifest_stats serial_stats, fallback_stats;
+	struct strbuf serial = STRBUF_INIT, fallback = STRBUF_INIT;
+	unsigned char serial_hash[GIT_MAX_RAWSZ];
+	unsigned char fallback_hash[GIT_MAX_RAWSZ];
+
+	if (!HAVE_THREADS)
+		return;
+	cl_set_cleanup(clear_attr_manifest_thread_env, NULL);
+	many_sources_fixture_init(&fixture);
+
+	xsetenv(ATTR_MANIFEST_TEST_THREADS, "1", 1);
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&fixture.istate, &serial, serial_hash, &serial_stats), 0);
+	xsetenv(ATTR_MANIFEST_TEST_THREADS, "2", 1);
+	xsetenv(ATTR_MANIFEST_TEST_THREAD_FAIL_AT, "1", 1);
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&fixture.istate, &fallback, fallback_hash, &fallback_stats), 0);
+	cl_assert_equal_i(fallback_stats.candidates,
+			  ATTR_MANIFEST_TEST_SOURCE_NR + 1);
+	cl_assert_equal_i(fallback_stats.threads, 2);
+	cl_assert_equal_i(fallback_stats.thread_failures, 1);
+	cl_assert_equal_i(fallback_stats.worktree_sources,
+			  ATTR_MANIFEST_TEST_SOURCE_NR);
+	cl_assert_equal_i(serial.len, fallback.len);
+	cl_assert(!memcmp(serial.buf, fallback.buf, serial.len));
+	cl_assert(!memcmp(serial_hash, fallback_hash, fixture.algo->rawsz));
+
+	strbuf_release(&fallback);
+	strbuf_release(&serial);
+	many_sources_fixture_release(&fixture);
+	clear_attr_manifest_thread_env(NULL);
 #endif
 }
 
