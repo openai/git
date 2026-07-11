@@ -16,6 +16,19 @@
 void fsmonitor_invalidate_cache_entry(struct cache_entry *ce);
 
 /*
+ * A pathname monitor cannot prove that every name for a multiply-linked
+ * inode is inside its watch cone. When the platform reports real link
+ * counts, keep such regular files out of the persistent valid bitmap so
+ * that every new process checks their stat data. Platforms that synthesize
+ * link counts retain their existing fsmonitor behavior. The in-process
+ * CE_UPTODATE bit is still safe after the caller's lstat().
+ */
+static inline int fsmonitor_stat_can_be_valid(const struct stat *st)
+{
+	return !S_ISREG(st->st_mode) || st->st_nlink <= 1;
+}
+
+/*
  * Check if refresh_fsmonitor has been called at least once.
  * refresh_fsmonitor is idempotent. Returns true if fsmonitor is
  * not enabled (since the state will be "fresh" w/ CE_FSMONITOR_VALID unset)
