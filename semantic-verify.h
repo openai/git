@@ -4,6 +4,12 @@
 struct index_state;
 struct semantic_verify_proof;
 
+struct semantic_verify_options {
+	unsigned int nr_threads;
+};
+
+#define SEMANTIC_VERIFY_OPTIONS_INIT { 0 }
+
 enum semantic_verify_kind {
 	SEMANTIC_VERIFY_UNCHECKED = 0,
 	SEMANTIC_VERIFY_SKIPPED,
@@ -45,6 +51,7 @@ struct semantic_verify_stats {
 
 /* Build a proof candidate without changing the index. */
 int semantic_verify_prepare(struct index_state *istate,
+			    const struct semantic_verify_options *options,
 			    struct semantic_verify_proof **proof_out);
 int semantic_verify_apply_after_closure(
 	struct index_state *istate,

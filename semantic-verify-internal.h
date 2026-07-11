@@ -3,6 +3,7 @@
 
 #include "hash.h"
 #include "statinfo.h"
+#include "thread-utils.h"
 
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -98,6 +99,8 @@ struct semantic_verify_entry_identity {
 };
 
 struct semantic_verify_worker {
+	pthread_t pthread;
+	unsigned int started;
 	struct index_state *istate;
 	struct semantic_verify_root *root;
 	struct semantic_verify_result *results;
