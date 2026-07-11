@@ -14,6 +14,7 @@
 #include "tree.h"
 #include "tree-walk.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "unpack-trees.h"
 #include "progress.h"
 #include "refs.h"
@@ -2076,6 +2077,9 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 
 	ret = check_updates(o, &o->internal.result) ? (-2) : 0;
 	if (o->dst_index) {
+		if (!ret)
+			clean_status_transfer_current_proof_if_same_index(
+				&o->internal.result, o->src_index);
 		move_index_extensions(&o->internal.result, o->src_index);
 		if (!ret) {
 			if (git_env_bool("GIT_TEST_CHECK_CACHE_TREE", 0) &&
