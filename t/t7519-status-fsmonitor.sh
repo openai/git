@@ -60,6 +60,10 @@ test_lazy_prereq HARDLINKS '
 	ln hardlink-a hardlink-b
 '
 
+test_expect_success 'FSMN parser fails closed' '
+	test-tool read-cache --test-fsmn-parser
+'
+
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
 test_expect_success 'incompatible bare repo' '
 	test_when_finished "rm -rf ./bare-clone actual expect" &&
