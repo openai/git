@@ -1112,6 +1112,15 @@ static void invalidate_gitignore(struct untracked_cache *uc,
 	do_invalidate_gitignore(dir);
 }
 
+void untracked_cache_invalidate_all(struct index_state *istate)
+{
+	if (!istate->untracked || !istate->untracked->root)
+		return;
+	invalidate_gitignore(istate->untracked, istate->untracked->root);
+	istate->untracked->use_fsmonitor = 0;
+	istate->cache_changed |= UNTRACKED_CHANGED;
+}
+
 static void invalidate_directory(struct untracked_cache *uc,
 				 struct untracked_cache_dir *dir)
 {

@@ -227,6 +227,9 @@ enum git_attr_direction {
 };
 void git_attr_set_direction(enum git_attr_direction new_direction);
 
+/* Discard cached attributes after a provider-wide invalidation. */
+void git_attr_invalidate_all(void);
+
 void attr_start(void);
 
 /* Return the system gitattributes file. */
