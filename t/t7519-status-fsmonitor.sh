@@ -55,6 +55,11 @@ test_lazy_prereq UNTRACKED_CACHE '
 	test $ret -ne 1
 '
 
+test_lazy_prereq HARDLINKS '
+	: >hardlink-a &&
+	ln hardlink-a hardlink-b
+'
+
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
 test_expect_success 'incompatible bare repo' '
 	test_when_finished "rm -rf ./bare-clone actual expect" &&
@@ -647,6 +652,32 @@ test_expect_success 'provider global marker invalidates every tracked entry' '
 		printf "bbbb\n" >tracked &&
 		test-tool chmtime =$mtime tracked &&
 		> .git/global &&
+		git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual
+	)
+'
+
+test_expect_success HARDLINKS,!MINGW,!CYGWIN \
+	'multiply-linked files stay fsmonitor-invalid' '
+	test_when_finished "rm -f hardlink-alias" &&
+	test_create_repo hardlink-validity &&
+	(
+		cd hardlink-validity &&
+		echo content >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		ln tracked ../hardlink-alias &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		git ls-files -f >.git/flags &&
+		test_grep "^H tracked$" .git/flags &&
+		echo changed >>../hardlink-alias &&
 		git status --porcelain=v2 >.git/actual &&
 		test_grep "^1 \.M .* tracked$" .git/actual
 	)
