@@ -536,6 +536,11 @@ static void drop_all_attr_stacks(void)
 	vector_unlock();
 }
 
+void git_attr_invalidate_all(void)
+{
+	drop_all_attr_stacks();
+}
+
 struct attr_check *attr_check_alloc(void)
 {
 	struct attr_check *c = xcalloc(1, sizeof(struct attr_check));
