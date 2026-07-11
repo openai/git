@@ -64,19 +64,30 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 		struct cache_entry *ce = worker->istate->cache[i];
 		struct semantic_verify_result *result = &worker->results[i];
 		struct semantic_verify_file_result file;
+		int active_filter;
 
-		if (!semantic_verify_classify_entry(worker->istate, ce, check, 0,
+		if (!semantic_verify_classify_entry(worker->istate, ce, check,
+						    worker->validate_filter_scope,
 						    &file)) {
 			result->kind = file.kind;
+			if (file.active_filter) {
+				result->flags |= SEMANTIC_VERIFY_ACTIVE_FILTER;
+				worker->active_filters++;
+			}
 			count_result(worker, result->kind);
 			continue;
 		}
+		active_filter = file.active_filter;
 
 		semantic_verify_file(worker->root, path, ce, i,
 				     worker->istate->repo,
 				     buffer, &file);
 		result->kind = file.kind;
 		result->error = file.error > UINT16_MAX ? EIO : file.error;
+		if (active_filter) {
+			result->flags |= SEMANTIC_VERIFY_ACTIVE_FILTER;
+			worker->active_filters++;
+		}
 		worker->bytes_hashed += file.bytes_hashed;
 		if (result->kind == SEMANTIC_VERIFY_RAW_CLEAN) {
 			if (file.persistable)
