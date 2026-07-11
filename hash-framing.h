@@ -27,4 +27,15 @@ static inline void hash_optional_cstring(struct git_hash_ctx *ctx,
 		hash_length_delimited(ctx, &missing, sizeof(missing));
 }
 
+static inline void hash_buffer_digest(const struct git_hash_algo *algo,
+				      const void *data, size_t len,
+				      unsigned char *hash)
+{
+	struct git_hash_ctx ctx;
+
+	git_hash_init(&ctx, algo);
+	git_hash_update(&ctx, data, len);
+	git_hash_final(hash, &ctx);
+}
+
 #endif /* HASH_FRAMING_H */
