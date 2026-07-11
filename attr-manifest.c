@@ -92,3 +92,82 @@ int attr_manifest_writer_add(struct attr_manifest_writer *writer,
 	put_be32(writer->buf->buf, ++writer->nr);
 	return 0;
 }
+
+int attr_manifest_cursor_init(struct attr_manifest_cursor *cursor,
+			      const void *data, size_t len,
+			      const struct git_hash_algo *algo)
+{
+	const unsigned char *bytes = data;
+	size_t minimum_entry_size;
+
+	if (!algo)
+		BUG("attribute manifest requires a hash algorithm");
+	if (len < sizeof(uint32_t))
+		return -1;
+	minimum_entry_size = sizeof(uint32_t) + 4 + algo->rawsz + 1;
+	cursor->p = bytes + sizeof(uint32_t);
+	cursor->end = bytes + len;
+	cursor->last_path = NULL;
+	cursor->algo = algo;
+	cursor->last_path_len = 0;
+	cursor->remaining = get_be32(bytes);
+	if (cursor->remaining >
+	    (len - sizeof(uint32_t)) / minimum_entry_size)
+		return -1;
+	return 0;
+}
+
+int attr_manifest_cursor_next(struct attr_manifest_cursor *cursor,
+			      struct attr_manifest_entry *entry)
+{
+	struct attr_manifest_entry previous;
+	uint32_t path_len;
+	size_t available;
+
+	if (!cursor->remaining)
+		return cursor->p == cursor->end ? 0 : -1;
+	available = cursor->end - cursor->p;
+	if (available < sizeof(uint32_t) + 4 + cursor->algo->rawsz)
+		return -1;
+	path_len = get_be32(cursor->p);
+	cursor->p += sizeof(uint32_t);
+	entry->source = cursor->p[0];
+	if ((entry->source != ATTR_MANIFEST_WORKTREE &&
+	     entry->source != ATTR_MANIFEST_INDEX) ||
+	    cursor->p[1] || cursor->p[2] || cursor->p[3])
+		return -1;
+	cursor->p += 4;
+	entry->hash = cursor->p;
+	cursor->p += cursor->algo->rawsz;
+	available = cursor->end - cursor->p;
+	if (!path_len || available < path_len ||
+	    !attr_manifest_path_valid(cursor->p, path_len))
+		return -1;
+	entry->path = cursor->p;
+	entry->path_len = path_len;
+	if (cursor->last_path) {
+		previous.path = cursor->last_path;
+		previous.path_len = cursor->last_path_len;
+		if (attr_manifest_entry_cmp(&previous, entry) >= 0)
+			return -1;
+	}
+	cursor->last_path = entry->path;
+	cursor->last_path_len = entry->path_len;
+	cursor->p += path_len;
+	cursor->remaining--;
+	return 1;
+}
+
+int attr_manifest_valid(const void *data, size_t len,
+			const struct git_hash_algo *algo)
+{
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	int ret;
+
+	if (attr_manifest_cursor_init(&cursor, data, len, algo))
+		return 0;
+	while ((ret = attr_manifest_cursor_next(&cursor, &entry)) > 0)
+		;
+	return !ret;
+}
