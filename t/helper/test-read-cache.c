@@ -4,11 +4,62 @@
 #include "attr.h"
 #include "config.h"
 #include "environment.h"
+#include "ewah/ewok.h"
+#include "ewah/ewok_rlw.h"
 #include "fsmonitor.h"
 #include "fsmonitor-ll.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "setup.h"
+#include "strbuf.h"
+
+static void wrap_fsmn_ewah(struct strbuf *out, const struct strbuf *ewah)
+{
+	uint32_t value;
+
+	put_be32(&value, 2);
+	strbuf_add(out, &value, sizeof(value));
+	strbuf_addstr(out, "token");
+	strbuf_addch(out, '\0');
+	put_be32(&value, ewah->len);
+	strbuf_add(out, &value, sizeof(value));
+	strbuf_addbuf(out, ewah);
+}
+
+static void make_valid_fsmn(struct strbuf *out)
+{
+	struct ewah_bitmap *dirty = ewah_new();
+	struct strbuf ewah = STRBUF_INIT;
+
+	ewah_set(dirty, 0);
+	ewah_serialize_strbuf(dirty, &ewah);
+	wrap_fsmn_ewah(out, &ewah);
+	ewah_free(dirty);
+	strbuf_release(&ewah);
+}
+
+static void make_raw_fsmn(struct strbuf *out, uint32_t bit_size,
+			  const eword_t *words, uint32_t word_count,
+			  uint32_t rlw)
+{
+	struct strbuf ewah = STRBUF_INIT;
+	uint32_t value;
+	uint32_t i;
+
+	put_be32(&value, bit_size);
+	strbuf_add(&ewah, &value, sizeof(value));
+	put_be32(&value, word_count);
+	strbuf_add(&ewah, &value, sizeof(value));
+	for (i = 0; i < word_count; i++) {
+		eword_t word = htonll(words[i]);
+
+		strbuf_add(&ewah, &word, sizeof(word));
+	}
+	put_be32(&value, rlw);
+	strbuf_add(&ewah, &value, sizeof(value));
+	wrap_fsmn_ewah(out, &ewah);
+	strbuf_release(&ewah);
+}
 
 static int test_fsmonitor_content_recovery(const char *path)
 {
@@ -40,6 +91,83 @@ static int test_fsmonitor_content_recovery(const char *path)
 	if (!(ce->ce_flags & CE_UPDATE_IN_BASE) ||
 	    !(istate->cache_changed & CE_ENTRY_CHANGED))
 		return error("verified stat refresh was not marked for persistence");
+	return 0;
+}
+
+static int fsmn_failed_closed(const struct index_state *istate)
+{
+	return istate->fsmonitor_extension_seen &&
+		!istate->fsmonitor_last_update && !istate->fsmonitor_dirty;
+}
+
+static int check_invalid_fsmn(const struct strbuf *encoded,
+			      const char *description)
+{
+	struct index_state invalid = INDEX_STATE_INIT(the_repository);
+
+	invalid.cache_nr = 1;
+	invalid.fsmonitor_last_update = xstrdup("old");
+	invalid.fsmonitor_dirty = ewah_new();
+	read_fsmonitor_extension(&invalid, encoded->buf, encoded->len);
+	if (!fsmn_failed_closed(&invalid))
+		return error("%s FSMN was published", description);
+	return 0;
+}
+
+static int test_fsmn_parser(void)
+{
+	struct index_state duplicate = INDEX_STATE_INIT(the_repository);
+	struct index_state truncated = INDEX_STATE_INIT(the_repository);
+	struct strbuf encoded = STRBUF_INIT;
+	struct strbuf malformed = STRBUF_INIT;
+	eword_t words[2] = { 0 };
+
+	duplicate.cache_nr = truncated.cache_nr = 1;
+	make_valid_fsmn(&encoded);
+	read_fsmonitor_extension(&duplicate, encoded.buf, encoded.len);
+	if (!duplicate.fsmonitor_last_update ||
+	    strcmp(duplicate.fsmonitor_last_update, "token") ||
+	    !duplicate.fsmonitor_dirty)
+		return error("valid FSMN was not published");
+	read_fsmonitor_extension(&duplicate, encoded.buf, encoded.len);
+	if (!fsmn_failed_closed(&duplicate))
+		return error("duplicate FSMN did not fail closed");
+
+	truncated.fsmonitor_last_update = xstrdup("old");
+	truncated.fsmonitor_dirty = ewah_new();
+	read_fsmonitor_extension(&truncated, encoded.buf, encoded.len - 1);
+	if (!fsmn_failed_closed(&truncated))
+		return error("truncated FSMN was partially published");
+
+	rlw_set_literal_words(&words[0], 1);
+	make_raw_fsmn(&malformed, 1, words, 1, 0);
+	if (check_invalid_fsmn(&malformed, "out-of-bounds literal"))
+		return 1;
+	strbuf_reset(&malformed);
+
+	words[0] = 0;
+	rlw_set_run_bit(&words[0], 1);
+	rlw_set_running_len(&words[0], 1);
+	make_raw_fsmn(&malformed, 1, words, 1, 0);
+	if (check_invalid_fsmn(&malformed, "oversized set-bit run"))
+		return 1;
+	strbuf_reset(&malformed);
+
+	words[0] = words[1] = 0;
+	rlw_set_literal_words(&words[0], 1);
+	words[1] = 2;
+	make_raw_fsmn(&malformed, 1, words, 2, 0);
+	if (check_invalid_fsmn(&malformed, "set padding bit"))
+		return 1;
+	strbuf_reset(&malformed);
+
+	words[1] = 1;
+	make_raw_fsmn(&malformed, 1, words, 2, 1);
+	if (check_invalid_fsmn(&malformed, "non-final RLW"))
+		return 1;
+
+	strbuf_release(&malformed);
+	strbuf_release(&encoded);
 	return 0;
 }
 
@@ -90,6 +218,8 @@ int cmd__read_cache(int argc, const char **argv)
 	if (argc == 3 &&
 	    !strcmp(argv[1], "--test-fsmonitor-content-recovery"))
 		return test_fsmonitor_content_recovery(argv[2]);
+	if (argc == 2 && !strcmp(argv[1], "--test-fsmn-parser"))
+		return test_fsmn_parser();
 	if (argc == 2 &&
 	    !strcmp(argv[1], "--test-fsmonitor-directory-attributes"))
 		return test_fsmonitor_directory_attributes();
