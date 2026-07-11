@@ -832,6 +832,23 @@ static int apply_fsmonitor_paths(struct index_state *istate,
 	return count;
 }
 
+static void invalidate_all_fsmonitor(struct index_state *istate)
+{
+	unsigned int i;
+	int changed = 0;
+
+	for (i = 0; i < istate->cache_nr; i++) {
+		if (istate->cache[i]->ce_flags & CE_FSMONITOR_VALID)
+			changed = 1;
+		istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
+	}
+	istate->fsmonitor_untracked_valid = 0;
+	if (istate->untracked)
+		istate->untracked->use_fsmonitor = 0;
+	if (changed)
+		istate->cache_changed |= FSMONITOR_CHANGED;
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
@@ -1029,24 +1046,7 @@ apply_results:
 		 * we've actually changed entries, so keep track if we
 		 * actually changed entries or not.
 		 */
-		int is_cache_changed = 0;
-
-		for (i = 0; i < istate->cache_nr; i++) {
-			if (istate->cache[i]->ce_flags & CE_FSMONITOR_VALID) {
-				is_cache_changed = 1;
-				istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
-			}
-		}
-
-		/*
-		 * If we're going to check every file, ensure we save
-		 * the results.
-		 */
-		if (is_cache_changed)
-			istate->cache_changed |= FSMONITOR_CHANGED;
-
-		if (istate->untracked)
-			istate->untracked->use_fsmonitor = 0;
+		invalidate_all_fsmonitor(istate);
 	}
 	trace2_region_leave("fsmonitor", "apply_results", istate->repo);
 
