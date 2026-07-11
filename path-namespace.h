@@ -25,6 +25,8 @@ int path_namespace_target_present(
 	const struct path_namespace_snapshot *snapshot);
 void path_namespace_hash(struct git_hash_ctx *ctx,
 			 const struct path_namespace_snapshot *snapshot);
+void path_namespace_hash_stat(struct git_hash_ctx *ctx,
+			      const struct stat *st);
 int path_namespace_stat_equal(const struct stat *a, const struct stat *b);
 int path_namespace_reopen_component(
 	int parent_fd, const char *component, int flags,
