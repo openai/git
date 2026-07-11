@@ -1,6 +1,15 @@
 #include "unit-test.h"
 #include "attr-manifest.h"
+#include "dir.h"
+#include "hash.h"
+#include "odb.h"
+#include "read-cache-ll.h"
+#include "repository.h"
+#include "semantic-verify-internal.h"
+#include "setup.h"
 #include "strbuf.h"
+#include "worktree-attr-manifest.h"
+#include "wrapper.h"
 
 static void fill_hash(unsigned char *hash, unsigned char value,
 		      const struct git_hash_algo *algo)
@@ -186,4 +195,279 @@ void test_attr_manifest__rejects_malformed_tail_before_callbacks(void)
 	strbuf_release(&changed);
 	strbuf_release(&new);
 	strbuf_release(&old);
+}
+
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+static char *create_worktree(void)
+{
+	const char *tmp = getenv("TMPDIR");
+	char *path = xstrfmt("%s/attr-manifest.XXXXXX", tmp ? tmp : "/tmp");
+
+	cl_assert(mkdtemp(path) != NULL);
+	return path;
+}
+
+static void remove_worktree(char *worktree)
+{
+	struct strbuf path = STRBUF_INIT;
+
+	strbuf_addstr(&path, worktree);
+	cl_assert_equal_i(remove_dir_recursively(&path, 0), 0);
+	strbuf_release(&path);
+	free(worktree);
+}
+
+static struct cache_entry *add_index_path(struct index_state *istate,
+					  size_t pos, const char *path,
+					  unsigned int stage)
+{
+	size_t len = strlen(path);
+	struct cache_entry *ce = make_empty_cache_entry(istate, len);
+
+	ce->ce_mode = S_IFREG | 0644;
+	ce->ce_flags = create_ce_flags(stage);
+	ce->ce_namelen = len;
+	memcpy(ce->name, path, len + 1);
+	istate->cache[pos] = ce;
+	return ce;
+}
+
+static void init_object_store(struct repository *repo, const char *worktree)
+{
+	struct strbuf object_dir = STRBUF_INIT;
+
+	strbuf_addf(&object_dir, "%s/objects", worktree);
+	repo->objects = odb_new(repo, object_dir.buf, "");
+	strbuf_release(&object_dir);
+}
+#endif
+
+void test_attr_manifest__builds_sources_for_tracked_scopes(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	char *worktree = create_worktree();
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct git_hash_ctx ctx;
+	struct strbuf path = STRBUF_INIT, manifest = STRBUF_INIT;
+	char root_source[] = "*.root text\n";
+	unsigned char expected[GIT_MAX_RAWSZ], hash[GIT_MAX_RAWSZ];
+
+	strbuf_addf(&path, "%s/a", worktree);
+	cl_assert_equal_i(mkdir(path.buf, 0777), 0);
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/b", worktree);
+	cl_assert_equal_i(mkdir(path.buf, 0777), 0);
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/.gitattributes", worktree);
+	write_file_buf(path.buf, root_source, strlen(root_source));
+	git_hash_init(&ctx, algo);
+	git_hash_update(&ctx, root_source, strlen(root_source));
+	git_hash_final(expected, &ctx);
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/a/.gitattributes", worktree);
+	write_file(path.buf, "*.dat -text\n");
+
+	CALLOC_ARRAY(istate.cache, 2);
+	istate.cache_alloc = istate.cache_nr = 2;
+	add_index_path(&istate, 0, "a/file", 0);
+	add_index_path(&istate, 1, "b/file", 0);
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats), 0);
+	cl_assert_equal_i(stats.candidates, 3);
+	cl_assert_equal_i(stats.worktree_sources, 2);
+	cl_assert_equal_i(stats.index_sources, 0);
+	cl_assert(attr_manifest_valid(manifest.buf, manifest.len, algo));
+
+	cl_assert_equal_i(attr_manifest_cursor_init(
+		&cursor, manifest.buf, manifest.len, algo), 0);
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+	cl_assert_equal_i(entry.source, ATTR_MANIFEST_WORKTREE);
+	cl_assert_equal_i(entry.path_len, strlen(GITATTRIBUTES_FILE));
+	cl_assert(!memcmp(entry.path, GITATTRIBUTES_FILE, entry.path_len));
+	cl_assert(!memcmp(entry.hash, expected, algo->rawsz));
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+	cl_assert_equal_i(entry.source, ATTR_MANIFEST_WORKTREE);
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 0);
+
+	strbuf_release(&manifest);
+	strbuf_release(&path);
+	release_index(&istate);
+	remove_worktree(worktree);
+#endif
+}
+
+void test_attr_manifest__falls_back_to_index_source(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	char *worktree = create_worktree();
+	char source[] = "*.dat text\n";
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct cache_entry *attributes;
+	struct strbuf manifest = STRBUF_INIT;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int have_repository, ret;
+
+	init_object_store(&repo, worktree);
+	CALLOC_ARRAY(istate.cache, 1);
+	istate.cache_alloc = istate.cache_nr = 1;
+	attributes = add_index_path(&istate, 0, GITATTRIBUTES_FILE, 0);
+	cl_must_pass(odb_pretend_object(
+		repo.objects, source, strlen(source), OBJ_BLOB,
+		&attributes->oid));
+
+	have_repository = startup_info->have_repository;
+	startup_info->have_repository = 1;
+	ret = worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats);
+	startup_info->have_repository = have_repository;
+	cl_assert_equal_i(ret, 0);
+	cl_assert_equal_i(stats.candidates, 1);
+	cl_assert_equal_i(stats.worktree_sources, 0);
+	cl_assert_equal_i(stats.index_sources, 1);
+	cl_assert_equal_i(attr_manifest_cursor_init(
+		&cursor, manifest.buf, manifest.len, algo), 0);
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+	cl_assert_equal_i(entry.source, ATTR_MANIFEST_INDEX);
+	cl_assert_equal_i(entry.path_len, strlen(GITATTRIBUTES_FILE));
+	cl_assert(!memcmp(entry.path, GITATTRIBUTES_FILE, entry.path_len));
+	cl_assert(!memcmp(entry.hash, attributes->oid.hash, algo->rawsz));
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 0);
+
+	strbuf_release(&manifest);
+	release_index(&istate);
+	odb_free(repo.objects);
+	remove_worktree(worktree);
+#endif
+}
+
+void test_attr_manifest__rejects_hardlinked_source_over_index(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	char *worktree = create_worktree();
+	char indexed_source[] = "*.dat text\n";
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct cache_entry *attributes;
+	struct strbuf source = STRBUF_INIT, alias = STRBUF_INIT;
+	struct strbuf manifest = STRBUF_INIT;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int have_repository, ret;
+
+	init_object_store(&repo, worktree);
+	strbuf_addf(&source, "%s/a", worktree);
+	cl_assert_equal_i(mkdir(source.buf, 0777), 0);
+	strbuf_addstr(&source, "/" GITATTRIBUTES_FILE);
+	write_file(source.buf, "*.dat -text\n");
+	strbuf_addf(&alias, "%s/attributes-alias", worktree);
+	cl_assert_equal_i(link(source.buf, alias.buf), 0);
+
+	CALLOC_ARRAY(istate.cache, 2);
+	istate.cache_alloc = istate.cache_nr = 2;
+	attributes = add_index_path(
+		&istate, 0, "a/" GITATTRIBUTES_FILE, 0);
+	add_index_path(&istate, 1, "a/file", 0);
+	cl_must_pass(odb_pretend_object(
+		repo.objects, indexed_source, strlen(indexed_source), OBJ_BLOB,
+		&attributes->oid));
+
+	have_repository = startup_info->have_repository;
+	startup_info->have_repository = 1;
+	ret = worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats);
+	startup_info->have_repository = have_repository;
+	cl_assert_equal_i(ret, -1);
+	cl_assert_equal_i(manifest.len, 0);
+	cl_assert_equal_i(stats.worktree_sources, 0);
+	cl_assert_equal_i(stats.index_sources, 0);
+
+	strbuf_release(&manifest);
+	strbuf_release(&alias);
+	strbuf_release(&source);
+	release_index(&istate);
+	odb_free(repo.objects);
+	remove_worktree(worktree);
+#endif
+}
+
+void test_attr_manifest__rejects_missing_index_source(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	char *worktree = create_worktree();
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct cache_entry *attributes;
+	struct strbuf manifest = STRBUF_INIT;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	unsigned char missing[GIT_MAX_RAWSZ];
+
+	init_object_store(&repo, worktree);
+	CALLOC_ARRAY(istate.cache, 1);
+	istate.cache_alloc = istate.cache_nr = 1;
+	attributes = add_index_path(&istate, 0, GITATTRIBUTES_FILE, 0);
+	fill_hash(missing, 0x42, algo);
+	oidread(&attributes->oid, missing, algo);
+	strbuf_addstr(&manifest, "discard me");
+
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats), -1);
+	cl_assert_equal_i(manifest.len, 0);
+
+	strbuf_release(&manifest);
+	release_index(&istate);
+	odb_free(repo.objects);
+	remove_worktree(worktree);
+#endif
+}
+
+void test_attr_manifest__builder_rejects_structural_indexes(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	char *worktree = create_worktree();
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct strbuf manifest = STRBUF_INIT;
+	unsigned char hash[GIT_MAX_RAWSZ];
+
+	CALLOC_ARRAY(istate.cache, 1);
+	istate.cache_alloc = istate.cache_nr = 1;
+	add_index_path(&istate, 0, "file", 1);
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats), -1);
+	cl_assert_equal_i(manifest.len, 0);
+	istate.cache[0]->ce_flags = create_ce_flags(0);
+	istate.sparse_index = INDEX_COLLAPSED;
+	cl_assert_equal_i(worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats), -1);
+	cl_assert_equal_i(manifest.len, 0);
+
+	strbuf_release(&manifest);
+	release_index(&istate);
+	remove_worktree(worktree);
+#endif
 }
