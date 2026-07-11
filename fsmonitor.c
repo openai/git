@@ -198,6 +198,54 @@ invalid:
 	return 0;
 }
 
+#define FSMONITOR_UNTRACKED_EXTENSION_VERSION 1
+
+int read_fsmonitor_untracked_extension(struct index_state *istate,
+				       const void *data, unsigned long sz)
+{
+	const char *p = data;
+	const char *nul;
+	uint32_t version;
+
+	if (istate->fsmonitor_untracked_extension_seen)
+		goto invalid;
+	istate->fsmonitor_untracked_extension_seen = 1;
+	if (sz < sizeof(version) + 2)
+		goto invalid;
+	version = get_be32(p);
+	p += sizeof(version);
+	sz -= sizeof(version);
+	if (version != FSMONITOR_UNTRACKED_EXTENSION_VERSION)
+		goto invalid;
+	nul = memchr(p, '\0', sz);
+	if (!nul || nul == p || (size_t)(nul - p + 1) != sz ||
+	    nul - p > FSMONITOR_TOKEN_MAX)
+		goto invalid;
+
+	FREE_AND_NULL(istate->fsmonitor_untracked_token);
+	istate->fsmonitor_untracked_token = xstrdup(p);
+	return 0;
+
+invalid:
+	istate->fsmonitor_untracked_extension_seen = 1;
+	istate->fsmonitor_untracked_extension_invalid = 1;
+	FREE_AND_NULL(istate->fsmonitor_untracked_token);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "untracked/invalid-extension", 1);
+	return 0;
+}
+
+void write_fsmonitor_untracked_extension(struct strbuf *sb,
+					 struct index_state *istate)
+{
+	uint32_t version;
+
+	put_be32(&version, FSMONITOR_UNTRACKED_EXTENSION_VERSION);
+	strbuf_add(sb, &version, sizeof(version));
+	strbuf_addstr(sb, istate->fsmonitor_last_update);
+	strbuf_addch(sb, '\0');
+}
+
 void fill_fsmonitor_bitmap(struct index_state *istate)
 {
 	unsigned int i, skipped = 0;
