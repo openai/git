@@ -2,6 +2,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "attr.h"
 #include "config.h"
 #include "dir.h"
 #include "environment.h"
@@ -436,12 +437,26 @@ static size_t handle_path_with_trailing_slash(
 static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 {
 	int len = strlen(name);
-	int pos = index_name_pos(istate, name, len);
+	int pos;
 	size_t nr_in_cone;
 
 	trace_printf_key(&trace_fsmonitor,
 			 "fsmonitor_refresh_callback '%s' (pos %d)",
-			 name, pos);
+			 name, !strcmp(name, FSMONITOR_PATH_GLOBAL_INVALIDATE) ?
+			 -1 : index_name_pos(istate, name, len));
+	if (!strcmp(name, FSMONITOR_PATH_GLOBAL_INVALIDATE)) {
+		unsigned int i;
+
+		git_attr_invalidate_all();
+		untracked_cache_invalidate_all(istate);
+		for (i = 0; i < istate->cache_nr; i++)
+			fsmonitor_invalidate_cache_entry(istate->cache[i]);
+		istate->cache_changed |= FSMONITOR_CHANGED;
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/global-invalidation", 1);
+		return;
+	}
+	pos = index_name_pos(istate, name, len);
 
 	if (name[len - 1] == '/')
 		nr_in_cone = handle_path_with_trailing_slash(istate, name, pos);
@@ -504,6 +519,19 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
  */
 static int fsmonitor_force_update_threshold = 100;
 
+static int is_trivial_response_at(const struct strbuf *result, size_t offset)
+{
+	size_t i;
+
+	if (offset >= result->len || result->buf[offset] != '/')
+		return 0;
+	for (i = offset + 1; i < result->len; i++)
+		if (result->buf[i] != '\0' && result->buf[i] != '\n' &&
+		    result->buf[i] != '\r')
+			return 0;
+	return 1;
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
@@ -552,7 +580,7 @@ void refresh_fsmonitor(struct index_state *istate)
 			buf = query_result.buf;
 			strbuf_addstr(&last_update_token, buf);
 			bol = last_update_token.len + 1;
-			is_trivial = query_result.buf[bol] == '/';
+			is_trivial = is_trivial_response_at(&query_result, bol);
 			if (is_trivial)
 				trace2_data_intmax("fsm_client", NULL,
 						   "query/trivial-response", 1);
@@ -613,7 +641,8 @@ void refresh_fsmonitor(struct index_state *istate)
 					query_success = 0;
 				} else {
 					bol = last_update_token.len + 1;
-					is_trivial = query_result.buf[bol] == '/';
+					is_trivial = is_trivial_response_at(
+						&query_result, bol);
 				}
 			} else if (hook_version < 0) {
 				hook_version = HOOK_INTERFACE_VERSION1;
@@ -627,7 +656,7 @@ void refresh_fsmonitor(struct index_state *istate)
 				r, HOOK_INTERFACE_VERSION1,
 				istate->fsmonitor_last_update, &query_result);
 			if (query_success)
-				is_trivial = query_result.buf[0] == '/';
+				is_trivial = is_trivial_response_at(&query_result, 0);
 		}
 
 		if (is_trivial)
