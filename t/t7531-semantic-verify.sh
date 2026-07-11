@@ -54,41 +54,60 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	touch -r classify/mtime-reference classify/modified &&
 	rm classify/deleted classify/mtime-reference &&
 
-	verify_repo classify --show-results >actual &&
+	verify_repo classify --show-results --apply >actual &&
 	test_grep "^.gitattributes raw-clean persist=1" actual &&
 	test_grep "^raw raw-clean persist=1" actual &&
 	test_grep "^a/b/nested raw-clean persist=1" actual &&
 	test_grep "^converted sensitive" actual &&
 	test_grep "^modified raw-modified" actual &&
 	test_grep "^deleted raw-modified" actual &&
-	test_grep "entries=6 clean=3 modified=2 sensitive=1" actual
+	test_grep "entries=6 clean=3 modified=2 sensitive=1" actual &&
+	test_grep "applied=3 .* after_uptodate=3" actual
 '
 
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN,HARDLINKS \
-	'clean hardlinks are not persistable' '
+	'clean hardlinks require the ordinary tail' '
 	test_create_repo hardlink &&
 	test_write_lines content >hardlink/tracked &&
 	git -C hardlink add tracked &&
 	git -C hardlink commit -m base &&
 	ln hardlink/tracked hardlink/alias &&
 
-	verify_repo hardlink --show-results >actual &&
+	verify_repo hardlink --show-results --apply >actual &&
 	test_grep "^tracked raw-clean persist=0" actual &&
-	test_grep "hardlinks=1" actual
+	test_grep "hardlinks=1" actual &&
+	test_grep "applied=1 .* after_uptodate=0 after_valid=0" actual
 '
 
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'classifies structural index state' '
+	'structural index state rejects the whole proof' '
 	test_create_repo structural &&
-	test_write_lines tracked >structural/tracked &&
-	git -C structural add tracked &&
+	test_write_lines tracked >structural/a-tracked &&
+	git -C structural add a-tracked &&
 	git -C structural commit -m base &&
-	test_write_lines intent >structural/intent &&
-	git -C structural add -N intent &&
+	test_write_lines intent >structural/z-intent &&
+	git -C structural add -N z-intent &&
 
-	verify_repo structural --show-results >actual &&
-	test_grep "^intent structural" actual &&
-	test_grep "structural=1" actual
+	verify_repo structural --show-results --apply >actual &&
+	test_grep "^a-tracked raw-clean persist=1" actual &&
+	test_grep "^z-intent structural" actual &&
+	test_grep "applied=-1 .* after_uptodate=0" actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'replaced index entries reject the whole proof' '
+	test_create_repo replaced-entry &&
+	test_write_lines tracked >replaced-entry/a-tracked &&
+	test_write_lines replaced >replaced-entry/z-replaced &&
+	git -C replaced-entry add . &&
+	git -C replaced-entry commit -m base &&
+
+	verify_repo replaced-entry --show-results --apply \
+		--replace-after-prepare=z-replaced >actual &&
+	test_grep "^a-tracked raw-clean persist=1" actual &&
+	test_grep "^z-replaced raw-clean persist=1" actual &&
+	test_grep "applied=-1 before_uptodate=0 before_valid=0 " actual &&
+	test_grep "after_uptodate=0 after_valid=0" actual
 '
 
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
