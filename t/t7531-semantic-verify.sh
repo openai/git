@@ -110,6 +110,26 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	test_grep "after_uptodate=0 after_valid=0" actual
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN,PTHREADS \
+	'parallel verification preserves index-order results' '
+	test_create_repo parallel &&
+	i=0 &&
+	while test $i -lt 16
+	do
+		mkdir "parallel/d$i" &&
+		printf "*.txt -text attr_%s=value\n" "$i" \
+			>"parallel/d$i/.gitattributes" &&
+		printf "content %s\n" "$i" >"parallel/d$i/file.txt" &&
+		i=$((i + 1)) || return 1
+	done &&
+	git -C parallel add . &&
+	git -C parallel commit -m base &&
+
+	verify_repo parallel --threads=1 --show-results >expect &&
+	verify_repo parallel --threads=4 --show-results >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'raw hashing uses the repository object format' '
 	git init --object-format=sha256 sha256 &&

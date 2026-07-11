@@ -13,6 +13,37 @@
 #define SEMANTIC_VERIFY_ENTRY_FLAGS \
 	(CE_VALID | CE_STAGEMASK | CE_INTENT_TO_ADD | CE_SKIP_WORKTREE | \
 	 CE_UPTODATE | CE_FSMONITOR_VALID | CE_CONTENT_CHECK_REQUIRED)
+#define SEMANTIC_VERIFY_MAX_THREADS 32
+
+static void *run_worker(void *data)
+{
+	semantic_verify_worker_run(data);
+	return NULL;
+}
+
+static unsigned int select_thread_count(
+	size_t cache_nr,
+	const struct semantic_verify_options *options)
+{
+	unsigned int nr;
+
+	if (!HAVE_THREADS)
+		return 1;
+	if (options && options->nr_threads) {
+		nr = options->nr_threads;
+	} else {
+		unsigned int cpus = online_cpus();
+
+		nr = cpus > SEMANTIC_VERIFY_MAX_THREADS / 2 ?
+			SEMANTIC_VERIFY_MAX_THREADS : cpus * 2;
+	}
+	if (nr > SEMANTIC_VERIFY_MAX_THREADS)
+		nr = SEMANTIC_VERIFY_MAX_THREADS;
+	if (nr > cache_nr && cache_nr)
+		nr = cache_nr;
+	return nr;
+}
+
 static void combine_worker(struct semantic_verify_proof *proof,
 			   struct semantic_verify_worker *worker)
 {
@@ -41,17 +72,20 @@ static void combine_worker(struct semantic_verify_proof *proof,
 }
 
 int semantic_verify_prepare(struct index_state *istate,
+			    const struct semantic_verify_options *options,
 			    struct semantic_verify_proof **proof_out)
 {
 	struct semantic_verify_proof *proof;
-	struct semantic_verify_worker worker = { 0 };
+	struct semantic_verify_worker *workers;
+	unsigned int nr_threads;
+	size_t updates_nr = 0;
+	int create_threads = 1;
 
 	if (!istate || !proof_out)
 		BUG("semantic_verify_prepare requires an index and output");
 	if (sizeof(struct semantic_verify_result) != 8)
 		BUG("semantic verify result unexpectedly grew to %"PRIuMAX" bytes",
 		    (uintmax_t)sizeof(struct semantic_verify_result));
-
 	CALLOC_ARRAY(proof, 1);
 	proof->istate = istate;
 	proof->cache_nr = istate->cache_nr;
@@ -94,18 +128,54 @@ int semantic_verify_prepare(struct index_state *istate,
 
 	/* Initialize conversion config and default attribute state serially. */
 	convert_attrs_prepare(istate);
+	nr_threads = select_thread_count(proof->cache_nr, options);
+	CALLOC_ARRAY(workers, nr_threads);
 	trace2_region_enter("semantic_verify", "prepare", istate->repo);
-	trace2_data_intmax("semantic_verify", istate->repo, "threads", 1);
+	trace2_data_intmax("semantic_verify", istate->repo,
+			   "threads", nr_threads);
 	trace2_data_intmax("semantic_verify", istate->repo,
 			   "result-bytes", sizeof(struct semantic_verify_result));
 
-	worker.istate = istate;
-	worker.root = proof->root;
-	worker.results = proof->results;
-	worker.end = proof->cache_nr;
-	semantic_verify_worker_run(&worker);
-	ALLOC_ARRAY(proof->stat_updates, worker.updates_nr);
-	combine_worker(proof, &worker);
+	for (unsigned int i = 0; i < nr_threads; i++) {
+		struct semantic_verify_worker *worker = &workers[i];
+		int err;
+
+		worker->istate = istate;
+		worker->root = proof->root;
+		worker->results = proof->results;
+		worker->start = st_mult(proof->cache_nr, i) / nr_threads;
+		worker->end = st_mult(proof->cache_nr, i + 1) / nr_threads;
+		if (nr_threads == 1 || !create_threads) {
+			semantic_verify_worker_run(worker);
+			continue;
+		}
+		err = pthread_create(&worker->pthread, NULL, run_worker, worker);
+		if (!err) {
+			worker->started = 1;
+			continue;
+		}
+		create_threads = 0;
+		trace2_data_intmax("semantic_verify", istate->repo,
+				   "thread-failure", err);
+		semantic_verify_worker_run(worker);
+	}
+	for (unsigned int i = 0; i < nr_threads; i++) {
+		int err;
+
+		if (!workers[i].started)
+			continue;
+		err = pthread_join(workers[i].pthread, NULL);
+		if (err)
+			die("could not join semantic verifier thread: %s",
+			    strerror(err));
+	}
+
+	for (unsigned int i = 0; i < nr_threads; i++)
+		updates_nr += workers[i].updates_nr;
+	ALLOC_ARRAY(proof->stat_updates, updates_nr);
+	for (unsigned int i = 0; i < nr_threads; i++)
+		combine_worker(proof, &workers[i]);
+	free(workers);
 
 	trace2_data_intmax("semantic_verify", istate->repo,
 			   "raw-clean", proof->raw_clean);

@@ -33,8 +33,10 @@ static const char *kind_name(enum semantic_verify_kind kind)
 
 int cmd__semantic_verify(int argc, const char **argv)
 {
+	struct semantic_verify_options options = SEMANTIC_VERIFY_OPTIONS_INIT;
 	struct semantic_verify_proof *proof = NULL;
 	struct semantic_verify_stats stats;
+	int thread_count = 0;
 	int show_results = 0;
 	int apply = 0;
 	int applied = -2;
@@ -47,6 +49,8 @@ int cmd__semantic_verify(int argc, const char **argv)
 		NULL
 	};
 	struct option opts[] = {
+		OPT_INTEGER(0, "threads", &thread_count,
+			    "number of verifier threads"),
 		OPT_BOOL(0, "show-results", &show_results,
 			 "show one result per cache entry"),
 		OPT_BOOL(0, "apply", &apply, "apply the completed proof"),
@@ -58,6 +62,9 @@ int cmd__semantic_verify(int argc, const char **argv)
 	argc = parse_options(argc, argv, NULL, opts, usage, 0);
 	if (argc)
 		usage_with_options(usage, opts);
+	if (thread_count < 0)
+		die("negative semantic verifier thread count");
+	options.nr_threads = thread_count;
 
 	setup_git_directory(the_repository);
 	repo_config(the_repository, git_default_config, NULL);
@@ -65,7 +72,7 @@ int cmd__semantic_verify(int argc, const char **argv)
 	the_repository->settings.command_requires_full_index = 0;
 	if (repo_read_index(the_repository) < 0)
 		die("unable to read index");
-	ret = semantic_verify_prepare(the_repository->index, &proof);
+	ret = semantic_verify_prepare(the_repository->index, &options, &proof);
 	semantic_verify_get_stats(proof, &stats);
 	if (replace_after_prepare) {
 		struct index_state *istate = the_repository->index;
