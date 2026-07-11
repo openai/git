@@ -183,7 +183,9 @@ struct index_state {
 		 updated_workdir : 1,
 		 updated_skipworktree : 1,
 		 fsmonitor_has_run_once : 1,
+		 fsmonitor_token_valid : 1,
 		 fsmonitor_extension_seen : 1,
+		 fsmonitor_untracked_valid : 1,
 		 fsmonitor_untracked_extension_seen : 1,
 		 fsmonitor_untracked_extension_invalid : 1;
 	enum sparse_index_mode sparse_index;
