@@ -144,6 +144,19 @@ int semantic_verify_root_init(struct repository *repo UNUSED,
 }
 #endif
 
+int semantic_verify_root_stable(const struct semantic_verify_root *root)
+{
+	struct stat fd_stat, path_stat;
+
+	if (!root || root->fd < 0)
+		return 0;
+	if (fstat(root->fd, &fd_stat) || lstat(root->path, &path_stat) ||
+	    !S_ISDIR(path_stat.st_mode))
+		return 0;
+	return path_namespace_stat_equal(&root->stat, &fd_stat) &&
+		path_namespace_stat_equal(&fd_stat, &path_stat);
+}
+
 void semantic_verify_root_clear(struct semantic_verify_root *root)
 {
 	if (!root)
