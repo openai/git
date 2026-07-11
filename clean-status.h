@@ -28,6 +28,8 @@ int clean_status_should_write_fsmonitor_config(
 	const struct index_state *istate);
 void clean_status_write_fsmonitor_config(struct strbuf *out,
 					 const struct index_state *istate);
+void clean_status_copy_fsmonitor_history(struct index_state *dst,
+					 const struct index_state *src);
 
 void clean_status_release(struct index_state *istate);
 

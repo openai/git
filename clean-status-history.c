@@ -175,3 +175,37 @@ void clean_status_write_fsmonitor_config(struct strbuf *out,
 		out, state->disk_config_raw.buf, state->disk_config_raw.len, algo))
 		BUG("cannot preserve validated fsmonitor clean proof");
 }
+
+void clean_status_copy_fsmonitor_history(struct index_state *dst,
+					 const struct index_state *src)
+{
+	const struct clean_status_state *src_state = src->clean_status;
+	struct clean_status_state *dst_state;
+
+	if (!src_state || !src_state->disk_config_valid ||
+	    src_state->disk_config_invalid || !src_state->disk_config_raw.len)
+		return;
+	dst_state = clean_status_get_state(dst);
+	FREE_AND_NULL(dst_state->disk_config_token);
+	strbuf_reset(&dst_state->disk_config_raw);
+	dst_state->disk_config_token =
+		xstrdup_or_null(src_state->disk_config_token);
+	strbuf_addbuf(&dst_state->disk_config_raw,
+		      &src_state->disk_config_raw);
+	memcpy(dst_state->disk_config_hash, src_state->disk_config_hash,
+	       dst->repo->hash_algo->rawsz);
+	memcpy(dst_state->disk_semantic_hash, src_state->disk_semantic_hash,
+	       dst->repo->hash_algo->rawsz);
+	memcpy(dst_state->disk_attr_hash, src_state->disk_attr_hash,
+	       dst->repo->hash_algo->rawsz);
+	if (clean_status_manifest_load(
+		&dst_state->manifest, src_state->manifest.disk.buf,
+		src_state->manifest.disk.len, src_state->manifest.disk_flags,
+		dst->repo->hash_algo))
+		BUG("cannot copy validated clean-status manifest");
+	dst_state->disk_config_seen = 1;
+	dst_state->disk_config_valid = 1;
+	dst_state->disk_semantic_valid = src_state->disk_semantic_valid;
+	dst_state->disk_attr_valid = src_state->disk_attr_valid;
+	dst_state->disk_config_invalid = 0;
+}

@@ -3575,6 +3575,7 @@ void *read_blob_data_from_index(struct index_state *istate,
 
 void move_index_extensions(struct index_state *dst, struct index_state *src)
 {
+	clean_status_copy_fsmonitor_history(dst, src);
 	dst->untracked = src->untracked;
 	src->untracked = NULL;
 	dst->cache_tree = src->cache_tree;
