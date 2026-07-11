@@ -15,6 +15,11 @@ extern struct trace_key trace_fsmonitor;
  */
 int read_fsmonitor_extension(struct index_state *istate, const void *data, unsigned long sz);
 
+int read_fsmonitor_untracked_extension(struct index_state *istate,
+				       const void *data, unsigned long sz);
+void write_fsmonitor_untracked_extension(struct strbuf *sb,
+					 struct index_state *istate);
+
 /*
  * Fill the fsmonitor_dirty ewah bits with their state from the index,
  * before it is split during writing.
