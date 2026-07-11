@@ -104,6 +104,10 @@ void convert_attrs_with_check(struct index_state *istate,
 			      struct conv_attrs *ca, const char *path,
 			      struct attr_check *check);
 
+/* True only when hashing the worktree bytes verbatim is exact. */
+int convert_attrs_is_raw_safe(struct index_state *istate, const char *path,
+			      struct attr_check *check);
+
 extern enum eol core_eol;
 extern char *check_roundtrip_encoding;
 const char *get_cached_convert_stats_ascii(struct index_state *istate,
