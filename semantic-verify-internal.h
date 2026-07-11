@@ -1,6 +1,7 @@
 #ifndef SEMANTIC_VERIFY_INTERNAL_H
 #define SEMANTIC_VERIFY_INTERNAL_H
 
+#include "hash.h"
 #include "statinfo.h"
 
 #ifdef __linux__
@@ -87,6 +88,15 @@ struct semantic_verify_stat_update {
 	struct stat_data stat_data;
 };
 
+struct semantic_verify_entry_identity {
+	const struct cache_entry *entry;
+	struct object_id oid;
+	struct stat_data stat_data;
+	char *name;
+	unsigned int mode;
+	unsigned int flags;
+};
+
 struct semantic_verify_worker {
 	struct index_state *istate;
 	struct semantic_verify_root *root;
@@ -114,6 +124,7 @@ struct semantic_verify_proof {
 	struct index_state *istate;
 	struct semantic_verify_root *root;
 	struct semantic_verify_result *results;
+	struct semantic_verify_entry_identity *entry_identities;
 	struct semantic_verify_stat_update *stat_updates;
 	size_t cache_nr;
 	size_t stat_updates_nr;
