@@ -317,6 +317,7 @@ libgit_sources = [
   'archive-tar.c',
   'archive-zip.c',
   'archive.c',
+  'attr-manifest.c',
   'attr.c',
   'base85.c',
   'bisect.c',
