@@ -1982,6 +1982,7 @@ static void post_read_index_from(struct index_state *istate)
 	check_ce_order(istate);
 	tweak_untracked_cache(istate);
 	tweak_split_index(istate);
+	prepare_fsmonitor_untracked(istate);
 	tweak_fsmonitor(istate);
 }
 
@@ -3071,6 +3072,22 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 
 		write_fsmonitor_extension(&sb, istate);
 		err = write_index_ext_header(f, eoie_c, CACHE_EXT_FSMONITOR, sb.len) < 0;
+		hashwrite(f, sb.buf, sb.len);
+		if (err) {
+			ret = -1;
+			goto out;
+		}
+	}
+	if (write_extensions & WRITE_FSMONITOR_EXTENSION &&
+	    istate->untracked &&
+	    istate->fsmonitor_last_update &&
+	    istate->fsmonitor_untracked_valid) {
+		strbuf_reset(&sb);
+
+		write_fsmonitor_untracked_extension(&sb, istate);
+		err = write_index_ext_header(f, eoie_c,
+					     CACHE_EXT_FSMONITOR_UNTRACKED,
+					     sb.len) < 0;
 		hashwrite(f, sb.buf, sb.len);
 		if (err) {
 			ret = -1;
