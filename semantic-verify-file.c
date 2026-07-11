@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "convert.h"
 #include "environment.h"
 #include "object-file.h"
 #include "path-namespace.h"
@@ -77,6 +78,43 @@ static unsigned int classify_resolve_error(int error)
 	return SEMANTIC_VERIFY_ERROR;
 }
 #endif
+
+int semantic_verify_classify_entry(struct index_state *istate,
+				   const struct cache_entry *ce,
+				   struct attr_check *check,
+				   int validate_filter_scope,
+				   struct semantic_verify_file_result *result)
+{
+	struct conv_attrs ca;
+	int attrs_resolved = 0;
+
+	memset(result, 0, sizeof(*result));
+	if (validate_filter_scope) {
+		convert_attrs_with_check(istate, &ca, ce->name, check);
+		attrs_resolved = 1;
+		result->active_filter = convert_attrs_has_clean_filter(&ca);
+	}
+	if (ce_skip_worktree(ce) || (ce->ce_flags & CE_VALID)) {
+		result->kind = SEMANTIC_VERIFY_SKIPPED;
+		return 0;
+	}
+	if (ce_stage(ce) || ce_intent_to_add(ce) ||
+	    S_ISSPARSEDIR(ce->ce_mode)) {
+		result->kind = SEMANTIC_VERIFY_STRUCTURAL;
+		return 0;
+	}
+	if (!S_ISREG(ce->ce_mode)) {
+		result->kind = SEMANTIC_VERIFY_SENSITIVE;
+		return 0;
+	}
+	if (!attrs_resolved)
+		convert_attrs_with_check(istate, &ca, ce->name, check);
+	if (!convert_attrs_are_raw_safe(&ca)) {
+		result->kind = SEMANTIC_VERIFY_SENSITIVE;
+		return 0;
+	}
+	return 1;
+}
 
 #if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
 void semantic_verify_file_at(int parent_fd, const char *basename,
