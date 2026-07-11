@@ -71,6 +71,7 @@
 #define CACHE_EXT_LINK 0x6c696e6b	  /* "link" */
 #define CACHE_EXT_UNTRACKED 0x554E5452	  /* "UNTR" */
 #define CACHE_EXT_FSMONITOR 0x46534D4E	  /* "FSMN" */
+#define CACHE_EXT_FSMONITOR_UNTRACKED 0x46535543 /* "FSUC" */
 #define CACHE_EXT_ENDOFINDEXENTRIES 0x454F4945	/* "EOIE" */
 #define CACHE_EXT_INDEXENTRYOFFSETTABLE 0x49454F54 /* "IEOT" */
 #define CACHE_EXT_SPARSE_DIRECTORIES 0x73646972 /* "sdir" */
@@ -1777,6 +1778,9 @@ static int read_index_extension(struct index_state *istate,
 	case CACHE_EXT_FSMONITOR:
 		read_fsmonitor_extension(istate, data, sz);
 		break;
+	case CACHE_EXT_FSMONITOR_UNTRACKED:
+		read_fsmonitor_untracked_extension(istate, data, sz);
+		break;
 	case CACHE_EXT_ENDOFINDEXENTRIES:
 	case CACHE_EXT_INDEXENTRYOFFSETTABLE:
 		/* already handled in do_read_index() */
@@ -2466,6 +2470,7 @@ void release_index(struct index_state *istate)
 	free_name_hash(istate);
 	cache_tree_free(&(istate->cache_tree));
 	free(istate->fsmonitor_last_update);
+	free(istate->fsmonitor_untracked_token);
 	free(istate->cache);
 	discard_split_index(istate);
 	free_untracked_cache(istate->untracked);
