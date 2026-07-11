@@ -64,6 +64,10 @@ test_expect_success 'FSMN parser fails closed' '
 	test-tool read-cache --test-fsmn-parser
 '
 
+test_expect_success 'FSUC parser fails closed' '
+	test-tool read-cache --test-fsuc-parser
+'
+
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
 test_expect_success 'incompatible bare repo' '
 	test_when_finished "rm -rf ./bare-clone actual expect" &&
