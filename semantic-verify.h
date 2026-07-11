@@ -12,4 +12,9 @@ enum semantic_verify_kind {
 	SEMANTIC_VERIFY_ERROR,
 };
 
+struct semantic_verify_result {
+	uint16_t error;
+	uint8_t kind;
+};
+
 #endif /* SEMANTIC_VERIFY_H */

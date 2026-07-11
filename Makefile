@@ -1320,6 +1320,7 @@ LIB_OBJS += send-pack.o
 LIB_OBJS += semantic-verify-file.o
 LIB_OBJS += semantic-verify-path.o
 LIB_OBJS += semantic-verify-root.o
+LIB_OBJS += semantic-verify-worker.o
 LIB_OBJS += sequencer.o
 LIB_OBJS += serve.o
 LIB_OBJS += server-info.o
