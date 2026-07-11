@@ -1383,6 +1383,7 @@ LIB_OBJS += versioncmp.o
 LIB_OBJS += walker.o
 LIB_OBJS += wildmatch.o
 LIB_OBJS += worktree.o
+LIB_OBJS += worktree-attr-manifest.o
 LIB_OBJS += worktree-attr-source.o
 LIB_OBJS += wrapper.o
 LIB_OBJS += write-or-die.o
