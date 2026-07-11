@@ -18,9 +18,13 @@ enum semantic_verify_kind {
 enum semantic_verify_result_flags {
 	/* The clean result may receive persistent fsmonitor validity. */
 	SEMANTIC_VERIFY_PERSISTABLE = (1u << 0),
+	/* The selected driver can affect conversion into the index. */
+	SEMANTIC_VERIFY_ACTIVE_FILTER = (1u << 1),
 };
 
+/* Exactly eight bytes per cache entry. */
 struct semantic_verify_result {
+	uint32_t stat_update_index;
 	uint16_t error;
 	uint8_t kind;
 	uint8_t flags;
@@ -44,6 +48,9 @@ struct semantic_verify_stats {
 /* Build a proof candidate without changing the index. */
 int semantic_verify_prepare(struct index_state *istate,
 			    struct semantic_verify_proof **proof_out);
+int semantic_verify_apply_after_closure(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof);
 int semantic_verify_root_is_stable(
 	const struct semantic_verify_proof *proof);
 void semantic_verify_proof_clear(struct semantic_verify_proof *proof);
