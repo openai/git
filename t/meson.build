@@ -1,4 +1,5 @@
 clar_test_suites = [
+  'unit-tests/u-attr-fingerprint.c',
   'unit-tests/u-attr-manifest.c',
   'unit-tests/u-clean-status-config.c',
   'unit-tests/u-clean-status-manifest.c',
