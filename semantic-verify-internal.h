@@ -26,9 +26,12 @@
 #define SEMANTIC_VERIFY_HAS_ANCHORED_OPEN 0
 #endif
 
+struct attr_check;
 struct repository;
 struct cache_entry;
 struct git_hash_algo;
+struct index_state;
+struct semantic_verify_result;
 struct semantic_verify_path;
 
 #define SEMANTIC_VERIFY_HASH_BUFFER_SIZE (256 * 1024)
@@ -60,8 +63,14 @@ struct semantic_verify_file_result {
 	int error;
 	unsigned int kind;
 	unsigned int persistable;
+	unsigned int active_filter;
 };
 
+int semantic_verify_classify_entry(struct index_state *istate,
+				   const struct cache_entry *ce,
+				   struct attr_check *check,
+				   int validate_filter_scope,
+				   struct semantic_verify_file_result *result);
 void semantic_verify_file(struct semantic_verify_root *root,
 			  struct semantic_verify_path *path,
 			  const struct cache_entry *ce, size_t cache_pos,
@@ -73,5 +82,33 @@ void semantic_verify_file_at(int parent_fd, const char *basename,
 			     const struct cache_entry *ce,
 			     struct repository *repo, void *buffer,
 			     struct semantic_verify_file_result *result);
+
+struct semantic_verify_stat_update {
+	uint32_t cache_pos;
+	struct stat_data stat_data;
+};
+
+struct semantic_verify_worker {
+	struct index_state *istate;
+	struct semantic_verify_root *root;
+	struct semantic_verify_result *results;
+	size_t start;
+	size_t end;
+	struct semantic_verify_stat_update *updates;
+	size_t updates_nr;
+	size_t updates_alloc;
+	size_t bytes_hashed;
+	size_t raw_clean;
+	size_t raw_modified;
+	size_t sensitive;
+	size_t structural;
+	size_t skipped;
+	size_t unstable;
+	size_t errors;
+	size_t hardlinks;
+	unsigned int namespace_unstable;
+};
+
+void semantic_verify_worker_run(struct semantic_verify_worker *worker);
 
 #endif /* SEMANTIC_VERIFY_INTERNAL_H */
