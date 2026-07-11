@@ -2274,6 +2274,7 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 
 	if (fstat(fd, &st))
 		die_errno(_("%s: cannot stat the open index"), path);
+	clean_status_record_source_identity(istate, &st);
 
 	mmap_size = xsize_t(st.st_size);
 	if (mmap_size < sizeof(struct cache_header) + the_hash_algo->rawsz)
@@ -2762,6 +2763,9 @@ static int verify_index_from(const struct index_state *istate, const char *path)
 		goto out;
 
 	if (st.st_size < sizeof(struct cache_header) + the_hash_algo->rawsz)
+		goto out;
+	if (is_null_oid(&istate->oid) &&
+	    !clean_status_verify_null_index(istate, &st))
 		goto out;
 
 	n = pread_in_full(fd, hash, the_hash_algo->rawsz, st.st_size - the_hash_algo->rawsz);
