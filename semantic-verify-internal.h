@@ -27,7 +27,11 @@
 #endif
 
 struct repository;
+struct cache_entry;
+struct git_hash_algo;
 struct semantic_verify_path;
+
+#define SEMANTIC_VERIFY_HASH_BUFFER_SIZE (256 * 1024)
 
 struct semantic_verify_root {
 	int fd;
@@ -49,5 +53,25 @@ int semantic_verify_resolve_parent(struct semantic_verify_path *path,
 void semantic_verify_path_free(struct semantic_verify_path *path,
 			       unsigned int *namespace_unstable,
 			       size_t *namespace_unstable_from);
+
+struct semantic_verify_file_result {
+	struct stat_data stat_data;
+	size_t bytes_hashed;
+	int error;
+	unsigned int kind;
+	unsigned int persistable;
+};
+
+void semantic_verify_file(struct semantic_verify_root *root,
+			  struct semantic_verify_path *path,
+			  const struct cache_entry *ce, size_t cache_pos,
+			  struct repository *repo, void *buffer,
+			  struct semantic_verify_file_result *result);
+void semantic_verify_file_at(int parent_fd, const char *basename,
+			     const struct stat *observed,
+			     dev_t root_dev,
+			     const struct cache_entry *ce,
+			     struct repository *repo, void *buffer,
+			     struct semantic_verify_file_result *result);
 
 #endif /* SEMANTIC_VERIFY_INTERNAL_H */
