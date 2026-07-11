@@ -59,6 +59,7 @@ test_tool_sources = [
   'test-rot13-filter.c',
   'test-run-command.c',
   'test-scrap-cache-tree.c',
+  'test-semantic-verify.c',
   'test-serve-v2.c',
   'test-sha1.c',
   'test-sha256.c',

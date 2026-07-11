@@ -1336,6 +1336,13 @@ struct attr_check *convert_attrs_check_alloc(void)
 				NULL);
 }
 
+void convert_attrs_prepare(struct index_state *istate)
+{
+	convert_attrs_init();
+	/* Prime default_attr_source() and the root attribute stack on main. */
+	git_check_attr(istate, "", check);
+}
+
 void convert_attrs_with_check(struct index_state *istate,
 			      struct conv_attrs *ca, const char *path,
 			      struct attr_check *attr_check)
