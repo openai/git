@@ -1,11 +1,13 @@
 #ifndef CLEAN_STATUS_INTERNAL_H
 #define CLEAN_STATUS_INTERNAL_H
 
+#include "clean-status-identity.h"
 #include "hash.h"
 
 struct index_state;
 
 struct clean_status_state {
+	struct clean_status_identity source_identity;
 	unsigned char current_config_hash[GIT_MAX_RAWSZ];
 	unsigned char current_semantic_hash[GIT_MAX_RAWSZ];
 	unsigned char current_attr_hash[GIT_MAX_RAWSZ];
@@ -17,6 +19,7 @@ struct clean_status_state {
 	unsigned current_attr_sources_present : 1;
 	unsigned config_enforced : 1;
 	unsigned unsafe_filter : 1;
+	unsigned source_identity_valid : 1;
 };
 
 struct clean_status_state *clean_status_get_state(struct index_state *istate);

@@ -12,5 +12,7 @@ struct clean_status_identity {
 int clean_status_identity_from_stat(struct clean_status_identity *identity,
 				    const struct stat *st);
 int clean_status_identity_is_durable(void);
+int clean_status_identity_equal(const struct clean_status_identity *a,
+				const struct clean_status_identity *b);
 
 #endif /* CLEAN_STATUS_IDENTITY_H */

@@ -19,3 +19,9 @@ int clean_status_identity_is_durable(void)
 	return 0;
 #endif
 }
+
+int clean_status_identity_equal(const struct clean_status_identity *a,
+				const struct clean_status_identity *b)
+{
+	return path_stat_identity_equal(&a->stat, &b->stat);
+}
