@@ -27,6 +27,7 @@
 #endif
 
 struct repository;
+struct semantic_verify_path;
 
 struct semantic_verify_root {
 	int fd;
@@ -39,5 +40,14 @@ int semantic_verify_root_init(struct repository *repo,
 void semantic_verify_root_clear(struct semantic_verify_root *root);
 
 int semantic_verify_openat(int dirfd, const char *path, int flags);
+
+struct semantic_verify_path *semantic_verify_path_new(
+	struct semantic_verify_root *root);
+int semantic_verify_resolve_parent(struct semantic_verify_path *path,
+				   const char *name, size_t cache_pos,
+				   int *parent_fd, const char **basename);
+void semantic_verify_path_free(struct semantic_verify_path *path,
+			       unsigned int *namespace_unstable,
+			       size_t *namespace_unstable_from);
 
 #endif /* SEMANTIC_VERIFY_INTERNAL_H */
