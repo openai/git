@@ -828,15 +828,16 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 		untracked_cache_preload_start_ordinary(istate, dir_flags);
 }
 
-static void wt_status_collect_untracked(struct wt_status *s)
+static int wt_status_collect_untracked_1(struct wt_status *s, int collect)
 {
 	int i;
+	int used_untracked_cache;
 	struct dir_struct dir = DIR_INIT;
 	uint64_t t_begin = getnanotime();
 	struct index_state *istate = s->repo->index;
 
 	if (!s->show_untracked_files)
-		return;
+		return 0;
 
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
 		dir.flags |= wt_status_untracked_dir_flags(s);
@@ -859,25 +860,35 @@ static void wt_status_collect_untracked(struct wt_status *s)
 		s->untracked_cache_preloaded;
 
 	fill_directory(&dir, istate, &s->pathspec);
+	used_untracked_cache = dir.untracked &&
+		dir.untracked == istate->untracked;
 
-	for (i = 0; i < dir.nr; i++) {
-		struct dir_entry *ent = dir.entries[i];
-		if (index_name_is_other(istate, ent->name, ent->len))
-			string_list_append(&s->untracked, ent->name);
-	}
-	string_list_sort_u(&s->untracked, 0);
+	if (collect) {
+		for (i = 0; i < dir.nr; i++) {
+			struct dir_entry *ent = dir.entries[i];
+			if (index_name_is_other(istate, ent->name, ent->len))
+				string_list_append(&s->untracked, ent->name);
+		}
+		string_list_sort_u(&s->untracked, 0);
 
-	for (i = 0; i < dir.ignored_nr; i++) {
-		struct dir_entry *ent = dir.ignored[i];
-		if (index_name_is_other(istate, ent->name, ent->len))
-			string_list_append(&s->ignored, ent->name);
+		for (i = 0; i < dir.ignored_nr; i++) {
+			struct dir_entry *ent = dir.ignored[i];
+			if (index_name_is_other(istate, ent->name, ent->len))
+				string_list_append(&s->ignored, ent->name);
+		}
+		string_list_sort_u(&s->ignored, 0);
 	}
-	string_list_sort_u(&s->ignored, 0);
 
 	dir_clear(&dir);
 
-	if (advice_enabled(ADVICE_STATUS_U_OPTION))
+	if (collect && advice_enabled(ADVICE_STATUS_U_OPTION))
 		s->untracked_in_ms = (getnanotime() - t_begin) / 1000000;
+	return used_untracked_cache;
+}
+
+static int wt_status_collect_untracked(struct wt_status *s)
+{
+	return wt_status_collect_untracked_1(s, 1);
 }
 
 static int has_unmerged(struct wt_status *s)
