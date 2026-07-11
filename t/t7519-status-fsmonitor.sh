@@ -619,4 +619,37 @@ test_expect_success 'verified reported paths restore poisoned stat data' '
 	)
 '
 
+test_expect_success 'provider global marker invalidates every tracked entry' '
+	test_create_repo global-invalidate &&
+	(
+		cd global-invalidate &&
+		printf "aaaa\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			if test -f .git/global
+			then
+				printf "token1\0//\0"
+			else
+				printf "token0\0"
+			fi
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+		> .git/global &&
+		git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual
+	)
+'
+
 test_done
