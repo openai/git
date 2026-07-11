@@ -53,6 +53,11 @@ test_lazy_prereq FSMONITOR_WORKS '
 	return $ret
 '
 
+test_lazy_prereq HARDLINKS '
+	: >hardlink-a &&
+	ln hardlink-a hardlink-b
+'
+
 if ! test_have_prereq FSMONITOR_WORKS
 then
 	skip_all="filesystem does not deliver fsmonitor events (container/overlayfs?)"
@@ -1406,6 +1411,41 @@ test_expect_success CASE_INSENSITIVE_FS 'fsmonitor file case wrong on disk' '
 	# the worktree scan to visit them and mark them as modified.
 	test_grep -q " M dir1/dir2/dir3/file-3-a" "$PWD/file_case_wrong-try3.out" &&
 	test_grep -q " M dir1/dir2/dir4/FILE-4-A" "$PWD/file_case_wrong-try3.out"
+'
+
+test_expect_success MACOS,HARDLINKS 'hardlink events invalidate all tracked paths' '
+	test_when_finished "git -C hardlink-event fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo hardlink-event &&
+	(
+		cd hardlink-event &&
+		printf "AAAA\\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		cp -p tracked .git/mtime-reference &&
+		start_daemon --tf "$PWD/../hardlink-event.trace" &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		printf "ignore\n" >.git/hardlink-source &&
+		ln .git/hardlink-source .git/hardlink-alias &&
+		printf "still-ignore\n" >.git/hardlink-alias &&
+		test-tool fsmonitor-client query >.git/gitdir-query &&
+		test_grep ! "^event: //$" ../hardlink-event.trace &&
+		ln tracked alias &&
+		printf "BBBB\\n" >alias &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		touch -r .git/mtime-reference alias &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "^event: //$" ../hardlink-event.trace &&
+		git fsmonitor--daemon stop
+	)
 '
 
 test_done
