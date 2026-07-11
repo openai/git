@@ -80,7 +80,9 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 		result->error = file.error > UINT16_MAX ? EIO : file.error;
 		worker->bytes_hashed += file.bytes_hashed;
 		if (result->kind == SEMANTIC_VERIFY_RAW_CLEAN) {
-			if (!file.persistable)
+			if (file.persistable)
+				result->flags |= SEMANTIC_VERIFY_PERSISTABLE;
+			else
 				worker->hardlinks++;
 			if (memcmp(&file.stat_data, &ce->ce_stat_data,
 				   sizeof(file.stat_data)))
@@ -98,6 +100,7 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 			if (result->kind != SEMANTIC_VERIFY_RAW_CLEAN)
 				continue;
 			result->kind = SEMANTIC_VERIFY_UNSTABLE;
+			result->flags = 0;
 			result->error = EAGAIN;
 			worker->raw_clean--;
 			worker->unstable++;
