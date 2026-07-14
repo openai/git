@@ -99,7 +99,7 @@ jobs:
             asset_platform: windows
             arch: arm64
             binary: /tmp/build/git/clangarm64/bin/git.exe
-            file_pattern: PE32\+.*Aarch64
+            file_pattern: PE32\+.*ARM64
             has_gcm: true
             sdk_arch: aarch64
             sdk_flavor: full
