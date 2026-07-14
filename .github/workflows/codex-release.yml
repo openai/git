@@ -278,7 +278,7 @@ jobs:
             NO_INSTALL_HARDLINKS=YesPlease
             NO_CROSS_DIRECTORY_HARDLINKS=YesPlease
           )
-          jobs="$(nproc)"
+          jobs="${NUMBER_OF_PROCESSORS:-2}"
           make -j"$jobs" "${make_args[@]}" all
           make "${make_args[@]}" DESTDIR=/tmp/build/git strip install
 
