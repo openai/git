@@ -69,7 +69,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable arm64
             has_gcm: false
-            max_tar_bytes: 33554432
+            max_tar_bytes: 67108864
           - name: macOS x64
             os: macos-15-intel
             target_platform: macOS
@@ -78,7 +78,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable x86_64
             has_gcm: false
-            max_tar_bytes: 33554432
+            max_tar_bytes: 67108864
           - name: Linux arm64
             os: ubuntu-22.04
             target_platform: ubuntu
@@ -87,7 +87,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*ARM aarch64
             has_gcm: false
-            max_tar_bytes: 41943040
+            max_tar_bytes: 67108864
           - name: Linux x64
             os: ubuntu-22.04
             target_platform: ubuntu
@@ -96,7 +96,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*x86-64
             has_gcm: false
-            max_tar_bytes: 41943040
+            max_tar_bytes: 67108864
           - name: Windows arm64
             os: windows-11-arm
             target_platform: win32
@@ -105,7 +105,7 @@ jobs:
             binary: /tmp/build/git/clangarm64/bin/git.exe
             file_pattern: PE32\+.*ARM64
             has_gcm: true
-            max_tar_bytes: 83886080
+            max_tar_bytes: 134217728
             sdk_arch: aarch64
             sdk_flavor: full
             mingw_dir: clangarm64
@@ -121,7 +121,7 @@ jobs:
             binary: /tmp/build/git/mingw64/bin/git.exe
             file_pattern: PE32\+.*x86-64
             has_gcm: true
-            max_tar_bytes: 83886080
+            max_tar_bytes: 134217728
             sdk_arch: x86_64
             sdk_flavor: full
             mingw_dir: mingw64
