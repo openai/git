@@ -183,9 +183,16 @@ struct ewah_bitmap *bitmap_for_commit(struct bitmap_index *bitmap_git,
 				      struct commit *commit);
 struct ewah_bitmap *pseudo_merge_bitmap_for_commit(struct bitmap_index *bitmap_git,
 						   struct commit *commit);
+enum bitmap_writer_selection_mode {
+	BITMAP_SELECTION_REFS_ONLY,
+	BITMAP_SELECTION_REFS_AND_BOUNDARY_TIPS,
+};
 void bitmap_writer_select_commits(struct bitmap_writer *writer,
 				  struct commit **indexed_commits,
-				  unsigned int indexed_commits_nr);
+				  unsigned int indexed_commits_nr,
+				  struct commit **tips,
+				  size_t tips_nr,
+				  enum bitmap_writer_selection_mode mode);
 int bitmap_writer_build(struct bitmap_writer *writer);
 void bitmap_writer_finish(struct bitmap_writer *writer,
 			  struct pack_idx_entry **index,

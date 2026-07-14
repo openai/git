@@ -14,6 +14,7 @@
 #include "pack-bitmap.h"
 #include "refs.h"
 #include "revision.h"
+#include "tag.h"
 #include "list-objects.h"
 #include "path.h"
 #include "pack-revindex.h"
@@ -751,9 +752,15 @@ static void prepare_midx_packing_data(struct packing_data *pdata,
 	trace2_region_leave("midx", "prepare_midx_packing_data", ctx->repo);
 }
 
-static int add_ref_to_pending(const struct reference *ref, void *cb_data)
+struct bitmap_ref_cb {
+	struct rev_info *revs;
+	struct commit_stack *tips;
+};
+
+static int add_ref_to_pending(const struct reference *ref, void *_data)
 {
-	struct rev_info *revs = (struct rev_info*)cb_data;
+	struct bitmap_ref_cb *data = _data;
+	struct rev_info *revs = data->revs;
 	const struct object_id *maybe_peeled = ref->oid;
 	struct object_id peeled;
 	struct object *object;
@@ -770,6 +777,7 @@ static int add_ref_to_pending(const struct reference *ref, void *cb_data)
 	if (object->type != OBJ_COMMIT)
 		return 0;
 
+	commit_stack_push(data->tips, (struct commit *)object);
 	add_pending_object(revs, object, "");
 	if (bitmap_is_preferred_refname(revs->repo, ref->name))
 		object->flags |= NEEDS_BITMAP;
@@ -801,7 +809,8 @@ static void bitmap_show_commit(struct commit *commit, void *_data)
 }
 
 static int read_refs_snapshot(const char *refs_snapshot,
-			      struct rev_info *revs)
+			      struct rev_info *revs,
+			      struct commit_stack *tips)
 {
 	struct strbuf buf = STRBUF_INIT;
 	struct object_id oid;
@@ -809,6 +818,7 @@ static int read_refs_snapshot(const char *refs_snapshot,
 
 	while (strbuf_getline(&buf, f) != EOF) {
 		struct object *object;
+		struct object *peeled;
 		int preferred = 0;
 		char *hex = buf.buf;
 		const char *end = NULL;
@@ -824,8 +834,14 @@ static int read_refs_snapshot(const char *refs_snapshot,
 			die(_("malformed line: %s"), buf.buf);
 
 		object = parse_object_or_die(revs->repo, &oid, NULL);
-		if (preferred)
+		peeled = deref_tag(revs->repo, object, NULL, 0);
+		if (peeled && peeled->type == OBJ_COMMIT) {
+			commit_stack_push(tips, (struct commit *)peeled);
+			if (preferred)
+				peeled->flags |= NEEDS_BITMAP;
+		} else if (preferred) {
 			object->flags |= NEEDS_BITMAP;
+		}
 
 		add_pending_object(revs, object, "");
 	}
@@ -836,21 +852,23 @@ static int read_refs_snapshot(const char *refs_snapshot,
 }
 
 static void find_commits_for_midx_bitmap(struct commit_stack *commits,
+					 struct commit_stack *tips,
 					 const char *refs_snapshot,
 					 struct write_midx_context *ctx)
 {
 	struct rev_info revs;
 	struct bitmap_commit_cb cb = { .commits = commits, .ctx = ctx };
+	struct bitmap_ref_cb ref_cb = { .revs = &revs, .tips = tips };
 
 	trace2_region_enter("midx", "find_commits_for_midx_bitmap", ctx->repo);
 
 	repo_init_revisions(ctx->repo, &revs, NULL);
 	if (refs_snapshot) {
-		read_refs_snapshot(refs_snapshot, &revs);
+		read_refs_snapshot(refs_snapshot, &revs, tips);
 	} else {
 		setup_revisions(0, NULL, &revs, NULL);
 		refs_for_each_ref(get_main_ref_store(ctx->repo),
-				  add_ref_to_pending, &revs);
+				  add_ref_to_pending, &ref_cb);
 	}
 
 	/*
@@ -883,6 +901,8 @@ static int write_midx_bitmap(struct write_midx_context *ctx,
 			     struct packing_data *pdata,
 			     struct commit **commits,
 			     uint32_t commits_nr,
+			     struct commit **tips,
+			     size_t tips_nr,
 			     unsigned flags)
 {
 	int ret;
@@ -936,7 +956,9 @@ static int write_midx_bitmap(struct write_midx_context *ctx,
 	for (uint32_t i = 0; i < pdata->nr_objects; i++)
 		index[ctx->pack_order[i]] = &pdata->objects[i].idx;
 
-	bitmap_writer_select_commits(&writer, commits, commits_nr);
+	bitmap_writer_select_commits(&writer, commits, commits_nr,
+				     tips, tips_nr,
+				     BITMAP_SELECTION_REFS_AND_BOUNDARY_TIPS);
 	ret = bitmap_writer_build(&writer);
 	if (ret < 0)
 		goto cleanup;
@@ -1696,13 +1718,15 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	if (opts->flags & MIDX_WRITE_BITMAP) {
 		struct packing_data pdata;
 		struct commit_stack commits = COMMIT_STACK_INIT;
+		struct commit_stack tips = COMMIT_STACK_INIT;
 
 		if (!ctx.entries_nr)
 			BUG("cannot write a bitmap without any objects");
 
 		prepare_midx_packing_data(&pdata, &ctx);
 
-		find_commits_for_midx_bitmap(&commits, opts->refs_snapshot, &ctx);
+		find_commits_for_midx_bitmap(&commits, &tips,
+					     opts->refs_snapshot, &ctx);
 
 		/*
 		 * The previous steps translated the information from
@@ -1714,15 +1738,18 @@ static int write_midx_internal(struct write_midx_opts *opts)
 		ctx.entries_nr = 0;
 
 		if (write_midx_bitmap(&ctx, midx_hash, &pdata, commits.items,
-				      commits.nr, opts->flags) < 0) {
+				      commits.nr, tips.items, tips.nr,
+				      opts->flags) < 0) {
 			error(_("could not write multi-pack bitmap"));
 			clear_packing_data(&pdata);
 			commit_stack_clear(&commits);
+			commit_stack_clear(&tips);
 			goto cleanup;
 		}
 
 		clear_packing_data(&pdata);
 		commit_stack_clear(&commits);
+		commit_stack_clear(&tips);
 	}
 	/*
 	 * NOTE: Do not use ctx.entries beyond this point, since it might

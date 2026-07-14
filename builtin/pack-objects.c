@@ -340,6 +340,7 @@ static uint32_t reused, reused_delta;
 static struct commit **indexed_commits;
 static unsigned int indexed_commits_nr;
 static unsigned int indexed_commits_alloc;
+static struct commit_stack bitmap_tips = COMMIT_STACK_INIT;
 
 static void index_commit_for_bitmap(struct commit *commit)
 {
@@ -349,6 +350,27 @@ static void index_commit_for_bitmap(struct commit *commit)
 	}
 
 	indexed_commits[indexed_commits_nr++] = commit;
+}
+
+static void record_bitmap_tips(struct rev_info *revs)
+{
+	unsigned int i;
+
+	/*
+	 * Refs expanded by --all are recorded on the command line. Reflogs,
+	 * indexed objects, and explicit positive revisions are not live ref tips.
+	 */
+	for (i = 0; i < revs->cmdline.nr; i++) {
+		struct rev_cmdline_entry *entry = &revs->cmdline.rev[i];
+		struct object *object;
+
+		if ((entry->flags & UNINTERESTING) ||
+		    entry->whence != REV_CMD_REF)
+			continue;
+		object = deref_tag(revs->repo, entry->item, NULL, 0);
+		if (object && object->type == OBJ_COMMIT)
+			commit_stack_push(&bitmap_tips, (struct commit *)object);
+	}
 }
 
 static void *get_delta(struct object_entry *entry)
@@ -1475,7 +1497,10 @@ static void write_pack_file(void)
 							    progress);
 				bitmap_writer_select_commits(&bitmap_writer,
 							     indexed_commits,
-							     indexed_commits_nr);
+							     indexed_commits_nr,
+							     bitmap_tips.items,
+							     bitmap_tips.nr,
+							     BITMAP_SELECTION_REFS_ONLY);
 				if (bitmap_writer_build(&bitmap_writer) < 0)
 					die(_("failed to write bitmap index"));
 				bitmap_writer_finish(&bitmap_writer,
@@ -4898,6 +4923,8 @@ static void get_object_list(struct rev_info *revs, struct strvec *argv)
 	}
 
 	cfg->warn_on_object_refname_ambiguity = save_warning;
+	if (write_bitmap_index)
+		record_bitmap_tips(revs);
 
 	if (use_bitmap_index && !get_object_list_from_bitmap(revs))
 		return;
@@ -5484,6 +5511,7 @@ int cmd_pack_objects(int argc,
 
 cleanup:
 	clear_packing_data(&to_pack);
+	commit_stack_clear(&bitmap_tips);
 	list_objects_filter_release(&filter_options);
 	string_list_clear(&keep_pack_list, 0);
 	strvec_clear(&rp);

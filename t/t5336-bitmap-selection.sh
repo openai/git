@@ -71,7 +71,26 @@ test_expect_success 'selection follows ancestry despite alternating clock skew' 
 		test-tool bitmap list-commits >bitmaps &&
 		git rev-list --first-parent --reverse main >commits &&
 		bitmap_max_selection_gap bitmaps commits >actual &&
-		test "$(cat actual)" -le 16
+		test "$(cat actual)" -le 16 &&
+
+		: >trace &&
+		distance=1 &&
+		while test $distance -le 512
+		do
+			GIT_TRACE2_EVENT="$(pwd)/trace" \
+				git rev-list --use-bitmap-index --objects \
+				main "^main~$distance" >/dev/null &&
+			distance=$((distance * 2)) || return 1
+		done &&
+		sed -n '"'"'s/.*"key":"bitmap\/misses","value":"\([0-9][0-9]*\)".*/\1/p'"'"' \
+			trace >misses &&
+		test_line_count = 10 misses &&
+		awk '"'"'{
+			sum += $1
+			if (max < $1)
+				max = $1
+		}
+		END { exit sum > 4 || max > 2 }'"'"' misses
 	)
 '
 
@@ -122,6 +141,45 @@ test_expect_success 'shallow merge tips do not crowd out deep history' '
 			refs/heads/main >main-commits &&
 		bitmap_max_selection_gap bitmaps main-commits >actual &&
 		test "$(cat actual)" -le 16
+	)
+'
+
+test_expect_success 'reflog-only descendants do not displace advertised history' '
+	git init --bare reflog-descendants.git &&
+	(
+		cd reflog-descendants.git &&
+		git config core.logAllRefUpdates true &&
+		{
+			i=1 &&
+			while test $i -le 1000
+			do
+				write_fast_import_commit refs/heads/main "$i" \
+					"$((1400000000 + i))" &&
+				if test $i -gt 1
+				then
+					printf "from :%s\n" "$((i - 1))"
+				fi &&
+				printf "\n" &&
+				i=$((i + 1)) || return 1
+			done
+		} | git fast-import --quiet &&
+		git symbolic-ref HEAD refs/heads/main &&
+		old_tip=$(git rev-parse refs/heads/main) &&
+		live_tip=$(git rev-parse refs/heads/main~900) &&
+		git update-ref -m reset refs/heads/main "$live_tip" "$old_tip" &&
+		test "$(git rev-list --all --count)" = 100 &&
+		test "$(git rev-list --all --reflog --count)" = 1000 &&
+
+		git repack -adb &&
+		test-tool bitmap list-commits >bitmaps &&
+		git rev-list refs/heads/main | sort >live &&
+		git rev-list "$old_tip" --not refs/heads/main | sort \
+			>reflog-only &&
+		sort bitmaps >bitmaps.sorted &&
+		comm -12 live bitmaps.sorted >selected-live &&
+		comm -12 reflog-only bitmaps.sorted >selected-reflog-only &&
+		test_line_count -ge 100 selected-live &&
+		test_line_count -le 14 selected-reflog-only
 	)
 '
 

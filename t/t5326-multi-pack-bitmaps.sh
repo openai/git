@@ -103,6 +103,90 @@ test_midx_bitmap_cases () {
 	bitmap_reuse_tests 'MIDX' 'pack' "$writeBitmapLookupTable"
 	bitmap_reuse_tests 'MIDX' 'MIDX' "$writeBitmapLookupTable"
 
+	# These cases exercise selection, not the optional lookup table.
+	if test "$writeLookupTable" = false
+	then
+		test_expect_success 'pack, MIDX, and refs snapshot selection use the same tips' '
+			rm -fr repo &&
+			git init repo &&
+			test_when_finished "rm -fr repo" &&
+			(
+				cd repo &&
+				git config pack.writeBitmapLookupTable '"$writeLookupTable"' &&
+
+				test_commit_bulk --message="%s" 102 &&
+				git log --format="create refs/tags/query/%s %H" >refs &&
+				git update-ref --stdin <refs &&
+
+				git repack -adb &&
+				test-tool bitmap list-commits | sort >pack.commits &&
+				rm "$objdir"/pack/*.bitmap &&
+
+				git multi-pack-index write --bitmap &&
+				test-tool bitmap list-commits | sort >midx.commits &&
+				test_cmp pack.commits midx.commits &&
+
+				git log --format=%H | sort >commits &&
+				comm -23 commits midx.commits >unselected &&
+				preferred=$(sed -n "1p" unselected) &&
+				test -n "$preferred" &&
+				git tag -a preferred/annotated -m preferred "$preferred" &&
+
+				rm "$objdir"/pack/multi-pack-index-*.bitmap "$midx" &&
+				git -c pack.preferBitmapTips=refs/tags/preferred \
+					repack -adb &&
+				test-tool bitmap list-commits | sort >preferred-pack.commits &&
+				grep -Fx "$preferred" preferred-pack.commits &&
+
+				git for-each-ref --format="%(objectname)" \
+					refs/tags/query >snapshot &&
+				printf "+%s\n" \
+					"$(git rev-parse refs/tags/preferred/annotated)" \
+					>>snapshot &&
+				rm "$objdir"/pack/*.bitmap &&
+				git multi-pack-index write --bitmap \
+					--refs-snapshot=snapshot &&
+				test-tool bitmap list-commits | sort >snapshot.commits &&
+				grep -Fx "$preferred" snapshot.commits &&
+				test_cmp preferred-pack.commits snapshot.commits
+			)
+		'
+
+		test_expect_success 'partial MIDX keeps its induced boundary in the query frontier' '
+			rm -fr repo &&
+			git init repo &&
+			test_when_finished "rm -fr repo" &&
+			(
+				cd repo &&
+				git config pack.writeBitmapLookupTable '"$writeLookupTable"' &&
+				git config maintenance.auto false &&
+
+				test_commit_bulk --notick --id=base \
+					--ref=refs/heads/main 1 &&
+				git branch topic main &&
+				test_commit_bulk --notick --id=main --start=2 \
+					--ref=refs/heads/main 120 &&
+				test_commit_bulk --notick --id=topic --start=122 \
+					--ref=refs/heads/topic 120 &&
+				git symbolic-ref HEAD refs/heads/main &&
+
+				git -c repack.writeBitmaps=false repack -ad &&
+				packed_topic=$(git rev-parse refs/heads/topic) &&
+				tree=$(git rev-parse refs/heads/topic^{tree}) &&
+				test_tick &&
+				loose_topic=$(echo loose | \
+					git commit-tree "$tree" -p "$packed_topic") &&
+				git update-ref refs/heads/topic \
+					"$loose_topic" "$packed_topic" &&
+
+				git multi-pack-index write --bitmap &&
+				git rev-list -n 16 "$packed_topic" >near-boundary &&
+				test-tool bitmap list-commits >bitmaps &&
+				grep -Fxf near-boundary bitmaps
+			)
+		'
+	fi
+
 	test_expect_success 'missing object closure fails gracefully' '
 		rm -fr repo &&
 		git init repo &&

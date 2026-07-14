@@ -1070,21 +1070,50 @@ static int bitmap_selection_date_cmp(const void *_a, const void *_b)
 
 struct bitmap_selection_commit {
 	struct commit *path_parent;
+	uint64_t have_weight;
+	uint64_t prefix_have_nr;
+	uint32_t prefix_root_nr;
+	uint32_t prefix_reference_nr;
+	uint32_t prefix_query_nr;
 	unsigned int child_nr;
 	unsigned int parent_nr;
 	unsigned int path_length;
 	unsigned int height;
 	unsigned candidate : 1;
 	unsigned assigned : 1;
-	unsigned hard_boundary : 1;
+	unsigned reference : 1;
+	unsigned descendant_reachable : 1;
+	unsigned root : 1;
+	unsigned query : 1;
 };
 
+struct bitmap_selection_score {
+	uint64_t hi;
+	uint64_t mid;
+	uint64_t lo;
+};
+
+struct bitmap_selection_workload {
+	uint64_t query_nr;
+	uint64_t reference_nr;
+	uint64_t have_nr;
+	uint64_t root_nr;
+};
+
+/*
+ * Let N be indexed_commits_nr, which is less than UINT_MAX. Query,
+ * reference, and root counts are at most N. Each maximal root owns a
+ * disjoint path prefix; its HAVE bands have less than 64 times that prefix's
+ * mass, so the total HAVE mass is less than 64N. Every four-class objective
+ * term is therefore below 64N^5, and their sum is below 2^168. Three 64-bit
+ * limbs are ample.
+ */
 struct bitmap_selection_gap {
 	struct commit **path;
 	unsigned int left;
 	unsigned int right;
 	unsigned int split;
-	uint64_t gain;
+	struct bitmap_selection_score gain;
 };
 
 define_commit_slab(bitmap_selection_data, struct bitmap_selection_commit);
@@ -1096,6 +1125,102 @@ static struct bitmap_selection_commit *bitmap_selection_candidate_peek(
 		bitmap_selection_data_peek(data, commit);
 
 	return ent && ent->candidate ? ent : NULL;
+}
+
+/* Return the full 128-bit product of two 64-bit integers in three limbs. */
+static struct bitmap_selection_score bitmap_selection_mul64(uint64_t a,
+							      uint64_t b)
+{
+	uint64_t a_lo = (uint32_t)a;
+	uint64_t a_hi = a >> 32;
+	uint64_t b_lo = (uint32_t)b;
+	uint64_t b_hi = b >> 32;
+	uint64_t p0 = a_lo * b_lo;
+	uint64_t p1 = a_lo * b_hi;
+	uint64_t p2 = a_hi * b_lo;
+	uint64_t p3 = a_hi * b_hi;
+	uint64_t middle = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
+	struct bitmap_selection_score result;
+
+	result.lo = (p0 & UINT32_MAX) | (middle << 32);
+	result.mid = p3 + (p1 >> 32) + (p2 >> 32) + (middle >> 32);
+	result.hi = 0;
+	return result;
+}
+
+/* Return the full 192-bit product of three 64-bit integers. */
+static struct bitmap_selection_score bitmap_selection_mul64_3(uint64_t a,
+								uint64_t b,
+								uint64_t c)
+{
+	struct bitmap_selection_score ab = bitmap_selection_mul64(a, b);
+	struct bitmap_selection_score lower = bitmap_selection_mul64(ab.lo, c);
+	struct bitmap_selection_score upper = bitmap_selection_mul64(ab.mid, c);
+	struct bitmap_selection_score result;
+
+	result.lo = lower.lo;
+	result.mid = lower.mid + upper.lo;
+	result.hi = upper.mid + (result.mid < lower.mid);
+	return result;
+}
+
+static struct bitmap_selection_score bitmap_selection_score_mul64(
+	struct bitmap_selection_score a, uint64_t b)
+{
+	struct bitmap_selection_score low = bitmap_selection_mul64(a.lo, b);
+	struct bitmap_selection_score middle = bitmap_selection_mul64(a.mid, b);
+	struct bitmap_selection_score high = bitmap_selection_mul64(a.hi, b);
+	struct bitmap_selection_score result;
+	uint64_t carry;
+	uint64_t hi;
+
+	result.lo = low.lo;
+	result.mid = low.mid + middle.lo;
+	carry = result.mid < low.mid;
+	hi = middle.mid + high.lo;
+	if (hi < middle.mid)
+		BUG("bitmap selection score overflow");
+	result.hi = hi + carry;
+	if (result.hi < hi || high.mid)
+		BUG("bitmap selection score overflow");
+	return result;
+}
+
+static struct bitmap_selection_score bitmap_selection_mul64_4(uint64_t a,
+								uint64_t b,
+								uint64_t c,
+								uint64_t d)
+{
+	return bitmap_selection_score_mul64(
+		bitmap_selection_mul64_3(a, b, c), d);
+}
+
+static struct bitmap_selection_score bitmap_selection_score_add(
+	struct bitmap_selection_score a, struct bitmap_selection_score b)
+{
+	struct bitmap_selection_score result;
+	uint64_t mid;
+	int carry;
+
+	result.lo = a.lo + b.lo;
+	carry = result.lo < a.lo;
+	mid = a.mid + b.mid;
+	result.mid = mid + carry;
+	carry = mid < a.mid || result.mid < mid;
+	result.hi = a.hi + b.hi + carry;
+	return result;
+}
+
+static int bitmap_selection_score_cmp(struct bitmap_selection_score a,
+				      struct bitmap_selection_score b)
+{
+	if (a.hi != b.hi)
+		return a.hi > b.hi ? 1 : -1;
+	if (a.mid != b.mid)
+		return a.mid > b.mid ? 1 : -1;
+	if (a.lo != b.lo)
+		return a.lo > b.lo ? 1 : -1;
+	return 0;
 }
 
 static int bitmap_selection_height_cmp(const void *_a, const void *_b,
@@ -1125,30 +1250,25 @@ static struct commit *bitmap_selection_gap_commit(
 }
 
 /* Negative means that a is the more valuable gap. */
-static int bitmap_selection_gap_cmp(const void *_a, const void *_b, void *_data)
+static int bitmap_selection_gap_cmp(const void *_a, const void *_b,
+				    void *data UNUSED)
 {
 	const struct bitmap_selection_gap *a = _a;
 	const struct bitmap_selection_gap *b = _b;
-	struct bitmap_selection_data *data = _data;
 	struct commit *a_commit = bitmap_selection_gap_commit(a);
 	struct commit *b_commit = bitmap_selection_gap_commit(b);
-	struct bitmap_selection_commit *a_ent =
-		bitmap_selection_data_at(data, a_commit);
-	struct bitmap_selection_commit *b_ent =
-		bitmap_selection_data_at(data, b_commit);
 	unsigned int a_distance = a->split - a->left;
 	unsigned int b_distance = b->split - b->left;
+	int cmp = bitmap_selection_score_cmp(a->gain, b->gain);
 	int a_preferred = !!(a_commit->object.flags & NEEDS_BITMAP);
 	int b_preferred = !!(b_commit->object.flags & NEEDS_BITMAP);
 
-	if (a->gain != b->gain)
-		return a->gain > b->gain ? -1 : 1;
+	if (cmp)
+		return -cmp;
 	if (a_distance != b_distance)
 		return a_distance > b_distance ? -1 : 1;
 	if (a_preferred != b_preferred)
 		return a_preferred ? -1 : 1;
-	if (a_ent->height != b_ent->height)
-		return a_ent->height > b_ent->height ? -1 : 1;
 	return oidcmp(&a_commit->object.oid, &b_commit->object.oid);
 }
 
@@ -1159,31 +1279,92 @@ static int bitmap_selection_gap_reverse_cmp(const void *a, const void *b,
 	return bitmap_selection_gap_cmp(b, a, data);
 }
 
-static uint64_t bitmap_selection_gap_gain(
-	const struct bitmap_selection_gap *gap, unsigned int split)
+static struct bitmap_selection_score bitmap_selection_gap_gain(
+	struct bitmap_selection_gap *gap, unsigned int split,
+	struct bitmap_selection_data *data,
+	const struct bitmap_selection_workload *workload)
 {
-	uint64_t coverage = (uint64_t)split - gap->left;
-	uint64_t suffix = (uint64_t)gap->right - split + 1;
+	struct bitmap_selection_commit *right =
+		bitmap_selection_data_at(data, gap->path[gap->right - 1]);
+	uint64_t before_root_nr = 0;
+	uint64_t before_reference_nr = 0;
+	uint64_t before_query_nr = 0;
+	uint64_t before_have_nr = 0;
+	uint64_t suffix_root_nr;
+	uint64_t suffix_reference_nr;
+	uint64_t suffix_query_nr;
+	uint64_t suffix_have_nr;
+	uint64_t distance = split - gap->left;
+	struct bitmap_selection_score queries, references, roots;
 
-	if (coverage && suffix > UINT64_MAX / coverage)
-		BUG("bitmap selection score overflow");
-	return coverage * suffix;
+	if (split > 1) {
+		struct bitmap_selection_commit *before =
+			bitmap_selection_data_at(data, gap->path[split - 2]);
+
+		before_root_nr = before->prefix_root_nr;
+		before_reference_nr = before->prefix_reference_nr;
+		before_query_nr = before->prefix_query_nr;
+		before_have_nr = before->prefix_have_nr;
+	}
+	suffix_root_nr = right->prefix_root_nr - before_root_nr;
+	suffix_reference_nr = right->prefix_reference_nr - before_reference_nr;
+	suffix_query_nr = right->prefix_query_nr - before_query_nr;
+	suffix_have_nr = right->prefix_have_nr - before_have_nr;
+
+	if (!workload->have_nr) {
+		queries = bitmap_selection_mul64_3(
+			distance * suffix_query_nr,
+			workload->reference_nr, workload->root_nr);
+		references = bitmap_selection_mul64_3(
+			distance * suffix_reference_nr,
+			workload->query_nr, workload->root_nr);
+		roots = bitmap_selection_mul64_3(
+			distance * suffix_root_nr,
+			workload->query_nr, workload->reference_nr);
+		return bitmap_selection_score_add(
+			bitmap_selection_score_add(queries, references), roots);
+	} else {
+		struct bitmap_selection_score haves;
+
+		queries = bitmap_selection_mul64_4(
+			distance * suffix_query_nr,
+			workload->reference_nr, workload->have_nr,
+			workload->root_nr);
+		references = bitmap_selection_mul64_4(
+			distance * suffix_reference_nr,
+			workload->query_nr, workload->have_nr,
+			workload->root_nr);
+		haves = bitmap_selection_mul64_4(
+			distance, suffix_have_nr,
+			workload->query_nr * workload->reference_nr,
+			workload->root_nr);
+		roots = bitmap_selection_mul64_3(
+			distance * suffix_root_nr,
+			workload->query_nr * workload->reference_nr,
+			workload->have_nr);
+		return bitmap_selection_score_add(
+			bitmap_selection_score_add(queries, references),
+			bitmap_selection_score_add(haves, roots));
+	}
 }
 
-static void bitmap_selection_score_gap(struct bitmap_selection_gap *gap)
+static void bitmap_selection_score_gap(
+	struct bitmap_selection_gap *gap, struct bitmap_selection_data *data,
+	const struct bitmap_selection_workload *workload)
 {
 	unsigned int length = gap->right - gap->left;
 	unsigned int distance = 1;
 	unsigned int last = 0;
 
-	gap->gain = 0;
+	memset(&gap->gain, 0, sizeof(gap->gain));
 	gap->split = 0;
 	for (;;) {
 		unsigned int split = gap->left + distance;
-		uint64_t gain = bitmap_selection_gap_gain(gap, split);
+		struct bitmap_selection_score gain = bitmap_selection_gap_gain(
+			gap, split, data, workload);
+		int cmp = bitmap_selection_score_cmp(gain, gap->gain);
 
-		if (gain > gap->gain ||
-		    (gain == gap->gain && split > gap->split)) {
+		if (cmp > 0 || (cmp == 0 && split > gap->split)) {
 			gap->gain = gain;
 			gap->split = split;
 		}
@@ -1195,10 +1376,11 @@ static void bitmap_selection_score_gap(struct bitmap_selection_gap *gap)
 
 	if (last != length) {
 		unsigned int split = gap->right;
-		uint64_t gain = bitmap_selection_gap_gain(gap, split);
+		struct bitmap_selection_score gain = bitmap_selection_gap_gain(
+			gap, split, data, workload);
+		int cmp = bitmap_selection_score_cmp(gain, gap->gain);
 
-		if (gain > gap->gain ||
-		    (gain == gap->gain && split > gap->split)) {
+		if (cmp > 0 || (cmp == 0 && split > gap->split)) {
 			gap->gain = gain;
 			gap->split = split;
 		}
@@ -1206,7 +1388,9 @@ static void bitmap_selection_score_gap(struct bitmap_selection_gap *gap)
 }
 
 static struct bitmap_selection_gap *bitmap_selection_gap_new(
-	struct commit **path, unsigned int left, unsigned int right)
+	struct commit **path, unsigned int left, unsigned int right,
+	struct bitmap_selection_data *data,
+	const struct bitmap_selection_workload *workload)
 {
 	struct bitmap_selection_gap *gap;
 
@@ -1217,7 +1401,7 @@ static struct bitmap_selection_gap *bitmap_selection_gap_new(
 	gap->path = path;
 	gap->left = left;
 	gap->right = right;
-	bitmap_selection_score_gap(gap);
+	bitmap_selection_score_gap(gap, data, workload);
 	return gap;
 }
 
@@ -1246,7 +1430,8 @@ static void bitmap_selection_keep_initial_gap(
 static void bitmap_selection_offer_initial_gap(
 	struct prio_queue *queue, struct commit **path, unsigned int left,
 	unsigned int right, unsigned int budget,
-	struct bitmap_selection_data *data)
+	struct bitmap_selection_data *data,
+	const struct bitmap_selection_workload *workload)
 {
 	struct bitmap_selection_gap gap = {
 		.path = path,
@@ -1256,7 +1441,7 @@ static void bitmap_selection_offer_initial_gap(
 
 	if (left >= right || !budget)
 		return;
-	bitmap_selection_score_gap(&gap);
+	bitmap_selection_score_gap(&gap, data, workload);
 	bitmap_selection_keep_initial_gap(queue, &gap, budget, data);
 }
 
@@ -1269,19 +1454,33 @@ static void bitmap_selection_offer_initial_gap(
  * of the complete bitmap walk.
  *
  * Within a path, selecting s after the preceding bitmap a saves (s-a) steps
- * for every query at or after s. Treat every candidate as one query and
- * repeatedly split the gap with the greatest saved coverage. Testing only
+ * for every query at or after s. Model four query classes with equal total
+ * weight: commits in the live reference union model arbitrary commit-started
+ * revision walks, explicit reference tips model ref-based walks, maximal
+ * roots model maximal-root and fetch-positive walks, and their ancestors
+ * model fetch HAVEs.
+ *
+ * HAVE demand is scale-free. If a maximal root has p ancestors in its path,
+ * give the ancestor at distance d weight
+ * 2^(ceil(log2(p+1))-floor(log2(d))). Thus every complete dyadic distance
+ * band has the same mass, while recent HAVEs stay dense. Maximal roots cannot
+ * share an ancestry path, so assigning these weights visits each path commit
+ * at most once.
+ *
+ * Repeatedly split the gap with the greatest saved weight. Testing only
  * power-of-two distances from a gap's left edge bounds each split to O(log N)
  * score evaluations. It also retains at least half of the best path-local
  * gain: rounding a distance down to a power of two halves the distance at
- * worst and can only increase the suffix size.
+ * worst and can only increase the suffix demand.
  */
 static void bitmap_selection_order_by_graph(
 	struct commit **indexed_commits, unsigned int indexed_commits_nr,
+	struct commit **tips, size_t tips_nr,
+	enum bitmap_writer_selection_mode mode,
 	unsigned int budget, struct bitmap_selection_data *data)
 {
 	struct commit **order;
-	struct commit **boundaries = NULL;
+	struct commit **preferred = NULL;
 	struct prio_queue initial = {
 		.compare = bitmap_selection_gap_reverse_cmp,
 		.cb_data = data,
@@ -1290,12 +1489,13 @@ static void bitmap_selection_order_by_graph(
 		.compare = bitmap_selection_gap_cmp,
 		.cb_data = data,
 	};
+	struct bitmap_selection_workload workload = { 0 };
+	unsigned int supplied_reference_nr = 0;
 	unsigned int preferred_nr = 0;
-	unsigned int tip_nr = 0;
-	unsigned int boundary_nr = 0;
-	unsigned int selected_boundary_nr = 0;
+	unsigned int selected_preferred_nr = 0;
 	unsigned int gap_budget = budget;
 	unsigned int i, nr = 0, next = 0;
+	size_t tip_idx;
 
 	if (indexed_commits_nr == UINT_MAX)
 		BUG("too many commits for bitmap selection");
@@ -1312,8 +1512,16 @@ static void bitmap_selection_order_by_graph(
 			BUG("duplicate bitmap candidate: %s",
 			    oid_to_hex(&commit->object.oid));
 		ent->candidate = 1;
-		if (commit->object.flags & NEEDS_BITMAP)
-			preferred_nr++;
+	}
+
+	for (tip_idx = 0; tip_idx < tips_nr; tip_idx++) {
+		struct bitmap_selection_commit *ent =
+			bitmap_selection_candidate_peek(data, tips[tip_idx]);
+
+		if (ent && !ent->reference) {
+			ent->reference = 1;
+			supplied_reference_nr++;
+		}
 	}
 
 	for (i = 0; i < indexed_commits_nr; i++) {
@@ -1333,51 +1541,44 @@ static void bitmap_selection_order_by_graph(
 	}
 
 	for (i = 0; i < indexed_commits_nr; i++) {
+		struct commit *commit = indexed_commits[i];
 		struct bitmap_selection_commit *ent =
-			bitmap_selection_data_at(data, indexed_commits[i]);
+			bitmap_selection_data_at(data, commit);
 
+		if (commit->object.flags & NEEDS_BITMAP) {
+			preferred_nr++;
+			ent->reference = 1;
+		}
 		if (!ent->child_nr) {
-			order[nr++] = indexed_commits[i];
-			if (!(indexed_commits[i]->object.flags & NEEDS_BITMAP))
-				tip_nr++;
+			order[nr++] = commit;
+			/*
+			 * A MIDX may cover only part of a ref's history. Its induced
+			 * graph tips are useful boundary queries. A regular pack may
+			 * instead contain reflog-only descendants, so its caller does
+			 * not enable this mode.
+			 */
+			if (mode == BITMAP_SELECTION_REFS_AND_BOUNDARY_TIPS ||
+			    !supplied_reference_nr)
+				ent->reference = 1;
 		}
-	}
-
-	/*
-	 * Configured preferred tips are hard boundaries when all of them fit.
-	 * Candidate-graph tips are useful query starting points, too; include
-	 * those as boundaries when they fit in the remaining budget.
-	 */
-	if (preferred_nr <= budget) {
-		for (i = 0; i < indexed_commits_nr; i++) {
-			struct bitmap_selection_commit *ent =
-				bitmap_selection_data_at(data, indexed_commits[i]);
-
-			if (indexed_commits[i]->object.flags & NEEDS_BITMAP) {
-				ent->hard_boundary = 1;
-				boundary_nr++;
-			}
-		}
-		if (tip_nr <= budget - boundary_nr) {
-			for (i = 0; i < nr; i++) {
-				struct bitmap_selection_commit *ent =
-					bitmap_selection_data_at(data, order[i]);
-
-				if (!ent->hard_boundary) {
-					ent->hard_boundary = 1;
-					boundary_nr++;
-				}
-			}
-		}
-	}
-	if (boundary_nr) {
-		ALLOC_ARRAY(boundaries, boundary_nr);
-		gap_budget -= boundary_nr;
 	}
 
 	while (next < nr) {
 		struct commit *commit = order[next++];
+		struct bitmap_selection_commit *ent =
+			bitmap_selection_data_at(data, commit);
 		struct commit_list *p;
+		int reachable = ent->reference || ent->descendant_reachable;
+
+		workload.reference_nr += ent->reference;
+		if (reachable) {
+			ent->query = 1;
+			workload.query_nr++;
+		}
+		if (ent->reference && !ent->descendant_reachable) {
+			ent->root = 1;
+			workload.root_nr++;
+		}
 
 		for (p = commit->parents; p; p = p->next) {
 			struct bitmap_selection_commit *parent =
@@ -1385,6 +1586,8 @@ static void bitmap_selection_order_by_graph(
 
 			if (!parent)
 				continue;
+			if (reachable)
+				parent->descendant_reachable = 1;
 			if (!parent->child_nr)
 				BUG("bitmap candidate child count underflow");
 			if (!--parent->child_nr)
@@ -1394,6 +1597,15 @@ static void bitmap_selection_order_by_graph(
 
 	if (nr != indexed_commits_nr)
 		BUG("bitmap candidate graph is not acyclic");
+	if (!workload.root_nr || !workload.query_nr ||
+	    !workload.reference_nr)
+		BUG("bitmap selection found no positive query roots");
+
+	/* Preferred tips become hard gap boundaries when all of them fit. */
+	if (preferred_nr && preferred_nr <= budget) {
+		ALLOC_ARRAY(preferred, preferred_nr);
+		gap_budget -= preferred_nr;
+	}
 
 	for (i = nr; i > 0; i--) {
 		struct commit *commit = order[i - 1];
@@ -1424,6 +1636,7 @@ static void bitmap_selection_order_by_graph(
 			bitmap_selection_data_at(data, start);
 		struct commit *commit, *previous;
 		struct commit **path;
+		unsigned int root_position = UINT_MAX;
 		unsigned int length = 0;
 
 		if (start_ent->assigned)
@@ -1486,6 +1699,35 @@ static void bitmap_selection_order_by_graph(
 			commit = ent->path_parent;
 		}
 		bitmap_selection_data_at(data, path[0])->path_length = length;
+
+		for (unsigned int position = 0; position < length; position++) {
+			struct bitmap_selection_commit *ent =
+				bitmap_selection_data_at(data, path[position]);
+
+			if (!ent->root)
+				continue;
+			if (root_position != UINT_MAX)
+				BUG("bitmap path contains multiple maximal roots");
+			root_position = position;
+		}
+
+		if (root_position != UINT_MAX && root_position) {
+			uint64_t scale = 1ULL << (log2u(root_position) + 1);
+
+			for (unsigned int position = 0;
+			     position < root_position; position++) {
+				struct bitmap_selection_commit *ent =
+					bitmap_selection_data_at(data,
+							 path[position]);
+				unsigned int distance = root_position - position;
+				uint64_t weight = scale >> log2u(distance);
+
+				ent->have_weight = weight;
+				if (workload.have_nr > UINT64_MAX - weight)
+					BUG("bitmap HAVE workload overflow");
+				workload.have_nr += weight;
+			}
+		}
 	}
 
 	if (nr != indexed_commits_nr)
@@ -1496,6 +1738,10 @@ static void bitmap_selection_order_by_graph(
 		struct commit **path = order + i;
 		struct bitmap_selection_commit *first =
 			bitmap_selection_data_at(data, path[0]);
+		uint64_t path_root_nr = 0;
+		uint64_t path_reference_nr = 0;
+		uint64_t path_query_nr = 0;
+		uint64_t path_have_nr = 0;
 		unsigned int left = 0;
 		unsigned int length = first->path_length;
 		unsigned int position;
@@ -1507,15 +1753,27 @@ static void bitmap_selection_order_by_graph(
 			struct bitmap_selection_commit *ent =
 				bitmap_selection_data_at(data, commit);
 
-			if (!ent->hard_boundary)
+			path_root_nr += ent->root;
+			path_reference_nr += ent->reference;
+			path_query_nr += ent->query;
+			path_have_nr += ent->have_weight;
+			ent->prefix_root_nr = path_root_nr;
+			ent->prefix_reference_nr = path_reference_nr;
+			ent->prefix_query_nr = path_query_nr;
+			ent->prefix_have_nr = path_have_nr;
+
+			if (!preferred ||
+			    !(commit->object.flags & NEEDS_BITMAP))
 				continue;
 			bitmap_selection_offer_initial_gap(
-				&initial, path, left, position, gap_budget, data);
-			boundaries[selected_boundary_nr++] = commit;
+				&initial, path, left, position, gap_budget, data,
+				&workload);
+			preferred[selected_preferred_nr++] = commit;
 			left = position + 1;
 		}
 		bitmap_selection_offer_initial_gap(
-			&initial, path, left, length, gap_budget, data);
+			&initial, path, left, length, gap_budget, data,
+			&workload);
 		i += length;
 	}
 
@@ -1533,11 +1791,11 @@ static void bitmap_selection_order_by_graph(
 	}
 	clear_prio_queue(&initial);
 
-	if (selected_boundary_nr != boundary_nr)
-		BUG("selected %u bitmap boundaries, expected %u",
-		    selected_boundary_nr, boundary_nr);
-	for (i = 0; i < selected_boundary_nr; i++)
-		indexed_commits[i] = boundaries[i];
+	if (selected_preferred_nr != (preferred ? preferred_nr : 0))
+		BUG("selected %u preferred bitmap tips, expected %u",
+		    selected_preferred_nr, preferred_nr);
+	for (i = 0; i < selected_preferred_nr; i++)
+		indexed_commits[i] = preferred[i];
 
 	for (; i < budget; i++) {
 		struct bitmap_selection_gap *gap = prio_queue_get(&gaps);
@@ -1547,9 +1805,11 @@ static void bitmap_selection_order_by_graph(
 			BUG("ran out of bitmap selection gaps after %u commits", i);
 		indexed_commits[i] = bitmap_selection_gap_commit(gap);
 		left = bitmap_selection_gap_new(gap->path, gap->left,
-						gap->split - 1);
+						gap->split - 1, data,
+						&workload);
 		right = bitmap_selection_gap_new(gap->path, gap->split,
-						 gap->right);
+						 gap->right, data,
+						 &workload);
 		free(gap);
 		if (left)
 			prio_queue_put(&gaps, left);
@@ -1566,13 +1826,16 @@ static void bitmap_selection_order_by_graph(
 	}
 	clear_prio_queue(&gaps);
 
-	free(boundaries);
+	free(preferred);
 	free(order);
 }
 
 void bitmap_writer_select_commits(struct bitmap_writer *writer,
 				  struct commit **indexed_commits,
-				  unsigned int indexed_commits_nr)
+				  unsigned int indexed_commits_nr,
+				  struct commit **tips,
+				  size_t tips_nr,
+				  enum bitmap_writer_selection_mode mode)
 {
 	struct bitmap_selection_data data;
 	unsigned int i;
@@ -1590,7 +1853,7 @@ void bitmap_writer_select_commits(struct bitmap_writer *writer,
 	}
 
 	bitmap_selection_order_by_graph(indexed_commits, indexed_commits_nr,
-					budget, &data);
+					tips, tips_nr, mode, budget, &data);
 
 	if (writer->show_progress)
 		writer->progress = start_progress(writer->repo,
