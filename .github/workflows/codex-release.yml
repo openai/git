@@ -235,14 +235,6 @@ jobs:
             dependencies.json >"$updated"
           mv "$updated" dependencies.json
 
-      - name: Set up Git for Windows SDK
-        if: matrix.target_platform == 'win32'
-        uses: git-for-windows/setup-git-for-windows-sdk@v2
-        with:
-          architecture: ${{ matrix.sdk_arch }}
-          flavor: ${{ matrix.sdk_flavor }}
-          cache: false
-
       # Dugite cross-compiles several targets. Keep Git's optional Rust
       # library disabled until its Makefile can direct Cargo at those targets.
       - name: Build the Dugite Native distribution
@@ -254,11 +246,15 @@ jobs:
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          if test "$TARGET_PLATFORM" = win32
-          then
-            . /etc/profile
-          fi
           script/build.sh
+
+      - name: Set up Git for Windows SDK
+        if: matrix.target_platform == 'win32'
+        uses: git-for-windows/setup-git-for-windows-sdk@v2
+        with:
+          architecture: ${{ matrix.sdk_arch }}
+          flavor: ${{ matrix.sdk_flavor }}
+          cache: false
 
       # Dugite Native compiles its Git submodule on macOS and Linux. On
       # Windows it starts from MinGit, so replace MinGit's Git programs with
