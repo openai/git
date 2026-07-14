@@ -1035,6 +1035,29 @@ static inline unsigned int next_commit_index(unsigned int idx)
 	return (next > MIN_COMMITS) ? next : MIN_COMMITS;
 }
 
+/*
+ * Keep the number of ordinary bitmap entries independent of the selection
+ * strategy. This is the number produced by the historical date-window
+ * schedule encoded by next_commit_index(); pseudo-merge entries are accounted
+ * for separately.
+ */
+static unsigned int bitmap_selection_budget(unsigned int indexed_commits_nr)
+{
+	unsigned int count = 0;
+	unsigned int i = 0;
+
+	while (i < indexed_commits_nr) {
+		unsigned int next = next_commit_index(i);
+
+		if (next >= indexed_commits_nr - i)
+			break;
+		count++;
+		i += next + 1;
+	}
+
+	return count;
+}
+
 static int date_compare(const void *_a, const void *_b)
 {
 	struct commit *a = *(struct commit **)_a;
@@ -1047,12 +1070,16 @@ void bitmap_writer_select_commits(struct bitmap_writer *writer,
 				  unsigned int indexed_commits_nr)
 {
 	unsigned int i = 0, j, next;
+	unsigned int budget = bitmap_selection_budget(indexed_commits_nr);
 
 	QSORT(indexed_commits, indexed_commits_nr, date_compare);
 
 	if (indexed_commits_nr < 100) {
 		for (i = 0; i < indexed_commits_nr; ++i)
 			bitmap_writer_push_commit(writer, indexed_commits[i], 0);
+		if (bitmap_writer_nr_selected_commits(writer) != budget)
+			BUG("selected %d bitmap commits, expected %u",
+			    bitmap_writer_nr_selected_commits(writer), budget);
 
 		select_pseudo_merges(writer);
 
@@ -1068,7 +1095,7 @@ void bitmap_writer_select_commits(struct bitmap_writer *writer,
 
 		next = next_commit_index(i);
 
-		if (i + next >= indexed_commits_nr)
+		if (next >= indexed_commits_nr - i)
 			break;
 
 		if (next == 0) {
@@ -1096,6 +1123,9 @@ void bitmap_writer_select_commits(struct bitmap_writer *writer,
 	}
 
 	stop_progress(&writer->progress);
+	if (bitmap_writer_nr_selected_commits(writer) != budget)
+		BUG("selected %d bitmap commits, expected %u",
+		    bitmap_writer_nr_selected_commits(writer), budget);
 
 	select_pseudo_merges(writer);
 }
