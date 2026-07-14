@@ -68,7 +68,8 @@ jobs:
             arch: arm64
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable arm64
-            has_gcm: true
+            has_gcm: false
+            max_tar_bytes: 33554432
           - name: macOS x64
             os: macos-15-intel
             target_platform: macOS
@@ -76,7 +77,8 @@ jobs:
             arch: x64
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable x86_64
-            has_gcm: true
+            has_gcm: false
+            max_tar_bytes: 33554432
           - name: Linux arm64
             os: ubuntu-22.04
             target_platform: ubuntu
@@ -85,6 +87,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*ARM aarch64
             has_gcm: false
+            max_tar_bytes: 41943040
           - name: Linux x64
             os: ubuntu-22.04
             target_platform: ubuntu
@@ -92,7 +95,8 @@ jobs:
             arch: x64
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*x86-64
-            has_gcm: true
+            has_gcm: false
+            max_tar_bytes: 41943040
           - name: Windows arm64
             os: windows-11-arm
             target_platform: win32
@@ -101,6 +105,7 @@ jobs:
             binary: /tmp/build/git/clangarm64/bin/git.exe
             file_pattern: PE32\+.*ARM64
             has_gcm: true
+            max_tar_bytes: 83886080
             sdk_arch: aarch64
             sdk_flavor: full
             mingw_dir: clangarm64
@@ -116,6 +121,7 @@ jobs:
             binary: /tmp/build/git/mingw64/bin/git.exe
             file_pattern: PE32\+.*x86-64
             has_gcm: true
+            max_tar_bytes: 83886080
             sdk_arch: x86_64
             sdk_flavor: full
             mingw_dir: mingw64
@@ -235,6 +241,20 @@ jobs:
             dependencies.json >"$updated"
           mv "$updated" dependencies.json
 
+      # Codex does not configure or invoke GCM on macOS or Linux. The
+      # self-contained .NET payload accounts for most of those bundles, while
+      # Windows MinGit configures credential.helper=manager and must retain it.
+      - name: Omit unused GCM from POSIX bundles
+        if: matrix.target_platform != 'win32'
+        shell: bash
+        working-directory: dugite-native
+        run: |
+          set -euo pipefail
+          updated="$(mktemp)"
+          jq '."git-credential-manager".files = []' \
+            dependencies.json >"$updated"
+          mv "$updated" dependencies.json
+
       # Dugite cross-compiles several targets. Keep Git's optional Rust
       # library disabled until its Makefile can direct Cargo at those targets.
       - name: Build the Dugite Native distribution
@@ -259,6 +279,8 @@ jobs:
       # Dugite Native compiles its Git submodule on macOS and Linux. On
       # Windows it starts from MinGit, so replace MinGit's Git programs with
       # the build from this repository while retaining the portable runtime.
+      # MinGit omits dashed builtin aliases; installing them as copies would
+      # add hundreds of redundant MiB to the archive.
       - name: Install this Git build into the Windows distribution
         if: matrix.target_platform == 'win32'
         shell: bash
@@ -276,6 +298,7 @@ jobs:
             NO_GETTEXT=YesPlease
             NO_INSTALL_HARDLINKS=YesPlease
             NO_CROSS_DIRECTORY_HARDLINKS=YesPlease
+            SKIP_DASHED_BUILT_INS=YesPlease
           )
           jobs="${NUMBER_OF_PROCESSORS:-2}"
           make -j"$jobs" "${make_args[@]}" all
@@ -296,6 +319,7 @@ jobs:
             test -f /tmp/build/git/cmd/git.exe
             test -f "/tmp/build/git/$MINGW_DIR/libexec/git-core/git-lfs.exe"
             test -d "/tmp/build/git/$MINGW_DIR/share/git-core/templates"
+            test ! -e "/tmp/build/git/$MINGW_DIR/libexec/git-core/git-add.exe"
             if test "$HAS_GCM" = true
             then
               test -f "/tmp/build/git/$MINGW_DIR/bin/git-credential-manager.exe"
@@ -306,6 +330,8 @@ jobs:
             if test "$HAS_GCM" = true
             then
               test -x /tmp/build/git/libexec/git-core/git-credential-manager
+            else
+              test ! -e /tmp/build/git/libexec/git-core/git-credential-manager
             fi
           fi
           test -f /tmp/build/git/etc/gitconfig
@@ -320,6 +346,7 @@ jobs:
         env:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           MINGW_DIR: ${{ matrix.mingw_dir }}
+          HAS_GCM: ${{ matrix.has_gcm }}
         run: |
           set -euo pipefail
           smoke=/tmp/codex-git-smoke
@@ -352,7 +379,10 @@ jobs:
           printf '%s\n' "$build_options"
           grep -F "built from commit: $GITHUB_SHA" <<<"$build_options"
           env "${git_env[@]}" "$git_binary" lfs version
-          env "${git_env[@]}" "$git_binary" credential-manager --version
+          if test "$HAS_GCM" = true
+          then
+            env "${git_env[@]}" "$git_binary" credential-manager --version
+          fi
 
           env "${git_env[@]}" "$git_binary" init --quiet "$smoke/repo"
           echo test >"$smoke/repo/file"
@@ -371,6 +401,7 @@ jobs:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           TARGET_ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.version.outputs.version }}
+          MAX_TAR_BYTES: ${{ matrix.max_tar_bytes }}
         run: |
           set -euo pipefail
           script/package.sh
@@ -400,6 +431,11 @@ jobs:
             fi
             test "$actual" = "$expected"
           done
+
+          tarball="output/git-$VERSION-$ASSET_PLATFORM-$TARGET_ARCH.tar.gz"
+          tar_bytes="$(wc -c <"$tarball")"
+          printf '%s bytes: %s\n' "$tar_bytes" "$tarball"
+          test "$tar_bytes" -le "$MAX_TAR_BYTES"
 
       - name: Upload release assets
         uses: actions/upload-artifact@v7
