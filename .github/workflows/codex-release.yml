@@ -94,7 +94,7 @@ jobs:
             file_pattern: ELF 64-bit.*x86-64
             has_gcm: true
           - name: Windows arm64
-            os: windows-2025
+            os: windows-11-arm
             target_platform: win32
             asset_platform: windows
             arch: arm64
@@ -314,8 +314,8 @@ jobs:
           grep -E "$FILE_PATTERN" /tmp/git-file-type
           strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
 
-      - name: Smoke-test the native x64 distribution
-        if: matrix.arch == 'x64'
+      - name: Smoke-test the native distribution
+        if: matrix.arch == 'x64' || matrix.target_platform == 'win32'
         shell: bash
         env:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
