@@ -117,7 +117,7 @@ jobs:
             file_pattern: PE32\+.*x86-64
             has_gcm: true
             sdk_arch: x86_64
-            sdk_flavor: minimal
+            sdk_flavor: full
             mingw_dir: mingw64
             mingit_arch: amd64
             mingit_filename: MinGit-2.55.0.2-64-bit.zip
@@ -267,7 +267,6 @@ jobs:
           MINGW_DIR: ${{ matrix.mingw_dir }}
         run: |
           set -euo pipefail
-          . /etc/profile
 
           make_args=(
             "prefix=/$MINGW_DIR"
@@ -294,7 +293,6 @@ jobs:
           set -euo pipefail
           if test "$TARGET_PLATFORM" = win32
           then
-            . /etc/profile
             test -f /tmp/build/git/cmd/git.exe
             test -f "/tmp/build/git/$MINGW_DIR/libexec/git-core/git-lfs.exe"
             test -d "/tmp/build/git/$MINGW_DIR/share/git-core/templates"
@@ -329,7 +327,6 @@ jobs:
 
           if test "$TARGET_PLATFORM" = win32
           then
-            . /etc/profile
             git_binary=/tmp/build/git/cmd/git.exe
             git_env=(
               "PATH=/tmp/build/git/cmd:/tmp/build/git/$MINGW_DIR/bin:/tmp/build/git/usr/bin:$PATH"
@@ -376,10 +373,6 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          if test "$TARGET_PLATFORM" = win32
-          then
-            . /etc/profile
-          fi
           script/package.sh
 
           for extension in tar.gz lzma
@@ -415,6 +408,15 @@ jobs:
           path: dugite-native/output/git-*
           if-no-files-found: error
           retention-days: 7
+
+      # The arm64 SDK puts its target Git first on PATH, but action cleanup
+      # runs on the x64 host and therefore needs the runner's native Git.
+      - name: Restore native Git for action cleanup
+        if: always() && matrix.target_platform == 'win32'
+        shell: pwsh
+        run: |
+          "C:\Program Files\Git\cmd" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
   release:
     name: Publish GitHub prerelease
