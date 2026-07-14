@@ -144,6 +144,142 @@ test_expect_success 'shallow merge tips do not crowd out deep history' '
 	)
 '
 
+test_expect_success 'criss-cross histories retain graph-path coverage' '
+	git init --bare criss-cross.git &&
+	(
+		cd criss-cross.git &&
+		{
+			write_fast_import_commit refs/heads/base 1 1400000001 &&
+			printf "\n" &&
+			write_fast_import_commit refs/heads/a 2 1400000002 &&
+			printf "from :1\n\n" &&
+			write_fast_import_commit refs/heads/b 3 1400000003 &&
+			printf "from :1\n\n" &&
+			a=2 && b=3 && mark=3 && round=1 &&
+			while test $round -le 200
+			do
+				old_a=$a && old_b=$b &&
+				mark=$((mark + 1)) && new_a=$mark &&
+				write_fast_import_commit refs/heads/a \
+					"$new_a" "$((1400000000 + new_a))" &&
+				printf "from :%s\nmerge :%s\n\n" "$old_a" "$old_b" &&
+				mark=$((mark + 1)) && new_b=$mark &&
+				write_fast_import_commit refs/heads/b \
+					"$new_b" "$((1400000000 + new_b))" &&
+				printf "from :%s\nmerge :%s\n\n" "$old_b" "$old_a" &&
+				a=$new_a && b=$new_b &&
+				round=$((round + 1)) || return 1
+			done
+		} | git fast-import --quiet &&
+		git update-ref -d refs/heads/base &&
+		git symbolic-ref HEAD refs/heads/a &&
+		test "$(git rev-list --all --count)" = 403 &&
+		git repack -adb &&
+
+		: >trace &&
+		distance=1 &&
+		while test $distance -le 128
+		do
+			for ref in a b
+			do
+				GIT_TRACE2_EVENT="$(pwd)/trace" \
+					git rev-list --use-bitmap-index --objects \
+					"refs/heads/$ref" \
+					"^refs/heads/$ref~$distance" >/dev/null ||
+					return 1
+			done &&
+			distance=$((distance * 2)) || return 1
+		done &&
+		sed -n '"'"'s/.*"key":"bitmap\/misses","value":"\([0-9][0-9]*\)".*/\1/p'"'"' \
+			trace >misses &&
+		test_line_count = 16 misses &&
+		awk '"'"'{
+			sum += $1
+			if (max < $1)
+				max = $1
+		}
+		END { exit sum > 80 || max > 8 }'"'"' misses
+	)
+'
+
+test_expect_success 'path coverage follows dominated history, not hop count' '
+	git init --bare dominated-path.git &&
+	(
+		cd dominated-path.git &&
+		{
+			write_fast_import_commit refs/heads/base 1 1400000001 &&
+			printf "\n" &&
+			mark=1 && a=$mark && i=1 &&
+			while test $i -le 40
+			do
+				mark=$((mark + 1)) &&
+				write_fast_import_commit refs/heads/a "$mark" \
+					"$((1400000000 + mark))" &&
+				printf "from :%s\n\n" "$a" &&
+				a=$mark && i=$((i + 1)) || return 1
+			done &&
+			b=1 && round=1 &&
+			while test $round -le 10
+			do
+				old=$b && first=0 && side=1 &&
+				while test $side -le 16
+				do
+					mark=$((mark + 1)) &&
+					write_fast_import_commit refs/heads/side \
+						"$mark" "$((1400000000 + mark))" &&
+					printf "from :%s\n\n" "$old" &&
+					if test "$first" = 0
+					then
+						first=$mark
+					fi &&
+					side=$((side + 1)) || return 1
+				done &&
+				mark=$((mark + 1)) &&
+				write_fast_import_commit refs/heads/b "$mark" \
+					"$((1400000000 + mark))" &&
+				printf "from :%s\n" "$old" &&
+				side_mark=$first &&
+				while test $side_mark -lt "$mark"
+				do
+					printf "merge :%s\n" "$side_mark" &&
+					side_mark=$((side_mark + 1)) || return 1
+				done &&
+				printf "\n" &&
+				b=$mark && round=$((round + 1)) || return 1
+			done &&
+			mark=$((mark + 1)) &&
+			write_fast_import_commit refs/heads/main "$mark" \
+				"$((1400000000 + mark))" &&
+			printf "from :%s\nmerge :%s\n\n" "$a" "$b"
+		} | git fast-import --quiet &&
+		git update-ref -d refs/heads/base &&
+		git update-ref -d refs/heads/a &&
+		git update-ref -d refs/heads/b &&
+		git update-ref -d refs/heads/side &&
+		git symbolic-ref HEAD refs/heads/main &&
+		test "$(git rev-list --all --count)" = 212 &&
+		git rev-list --parents --all |
+			awk '"'"'NF > 10 {
+				for (i = 3; i <= NF; i++)
+					print $i
+			}'"'"' >side-tips &&
+		test_line_count = 160 side-tips &&
+
+		git repack -adb &&
+		: >trace &&
+		while read tip
+		do
+			GIT_TRACE2_EVENT="$(pwd)/trace" \
+				git rev-list --use-bitmap-index --objects "$tip" \
+				>/dev/null || return 1
+		done <side-tips &&
+		sed -n '"'"'s/.*"key":"bitmap\/misses","value":"\([0-9][0-9]*\)".*/\1/p'"'"' \
+			trace >misses &&
+		test_line_count = 160 misses &&
+		awk '"'"'{ sum += $1 } END { exit sum > 190 }'"'"' misses
+	)
+'
+
 test_expect_success 'reflog-only descendants do not displace advertised history' '
 	git init --bare reflog-descendants.git &&
 	(
