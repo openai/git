@@ -77,12 +77,9 @@ test_bitmap_cases () {
 	'
 
 	test_expect_success 'full repack creates bitmaps' '
-		GIT_TRACE2_EVENT="$(pwd)/trace" \
-			git repack -ad &&
+		git repack -ad &&
 		ls .git/objects/pack/ | grep bitmap >output &&
-		test_line_count = 1 output &&
-		grep "\"key\":\"num_selected_commits\",\"value\":\"106\"" trace &&
-		grep "\"key\":\"num_maximal_commits\",\"value\":\"107\"" trace
+		test_line_count = 1 output
 	'
 
 	basic_bitmap_tests

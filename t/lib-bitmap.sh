@@ -443,7 +443,15 @@ midx_bitmap_partial_tests () {
 		test_path_is_file $midx-$(midx_checksum $objdir).bitmap
 	'
 
-	test_rev_exists HEAD~ "$rev_kind"
+	test_expect_success 'find a selected commit in packed history' '
+		test-tool bitmap list-commits >bitmap-commits &&
+		git rev-list HEAD~ >packed-commits &&
+		grep -Fxf bitmap-commits packed-commits >selected-ancestors &&
+		partial_bitmap_tip=$(sed -n "1p" selected-ancestors) &&
+		test -n "$partial_bitmap_tip"
+	'
 
-	basic_bitmap_tests HEAD~
+	test_rev_exists "$partial_bitmap_tip" "$rev_kind"
+
+	basic_bitmap_tests "$partial_bitmap_tip"
 }

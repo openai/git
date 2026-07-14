@@ -1359,7 +1359,7 @@ test_expect_success 'pack.preferBitmapTips interprets patterns as hierarchy' '
 		# Create enough commits that not all will receive bitmap
 		# coverage even if they are all at the tip of some reference.
 		test_commit_bulk --message="%s" 103 &&
-		git log --format="create refs/tags/%s %H" HEAD >refs &&
+		git log --format="create refs/tags/%s/tag %H" HEAD >refs &&
 		git update-ref --stdin <refs &&
 
 		# Create the bitmap via the MIDX.
