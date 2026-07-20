@@ -10,6 +10,8 @@
 #include "parse-options.h"
 #include "pkt-line.h"
 #include "read-cache-ll.h"
+#include "trace.h"
+#include "trace2.h"
 
 static void packet_to_pc_item(const char *buffer, int len,
 			      struct parallel_checkout_item *pc_item)
@@ -84,8 +86,15 @@ static void release_pc_item_data(struct parallel_checkout_item *pc_item)
 
 static void worker_loop(struct checkout *state)
 {
+	struct {
+		uintmax_t items, written, collided, failed;
+		uintmax_t bytes, slowest_item_bytes, slowest_item_ns;
+	} stats = { 0 };
+	int collect_stats = trace2_is_enabled();
+
 	while (1) {
 		struct parallel_checkout_item pc_item;
+		uint64_t start_ns = 0;
 		int len = packet_read(0, packet_buffer, sizeof(packet_buffer),
 				      0);
 
@@ -95,12 +104,62 @@ static void worker_loop(struct checkout *state)
 			break;
 
 		packet_to_pc_item(packet_buffer, len, &pc_item);
+		if (collect_stats)
+			start_ns = getnanotime();
 		write_pc_item(&pc_item, state);
+
+		if (collect_stats) {
+			uintmax_t item_bytes = 0;
+			uintmax_t item_ns = getnanotime() - start_ns;
+
+			stats.items++;
+			switch (pc_item.status) {
+			case PC_ITEM_WRITTEN:
+				stats.written++;
+				if (pc_item.st.st_size > 0)
+					item_bytes = pc_item.st.st_size;
+				stats.bytes += item_bytes;
+				break;
+			case PC_ITEM_COLLIDED:
+				stats.collided++;
+				break;
+			case PC_ITEM_FAILED:
+				stats.failed++;
+				break;
+			default:
+				BUG("unknown checkout item status in worker");
+			}
+
+			if (item_ns > stats.slowest_item_ns) {
+				stats.slowest_item_ns = item_ns;
+				stats.slowest_item_bytes = item_bytes;
+			}
+		}
+
 		report_result(&pc_item);
 		release_pc_item_data(&pc_item);
 	}
 
 	packet_flush(1);
+
+	if (collect_stats) {
+		trace2_data_intmax("pcheckout", the_repository, "worker/items",
+				   stats.items);
+		trace2_data_intmax("pcheckout", the_repository, "worker/written",
+				   stats.written);
+		trace2_data_intmax("pcheckout", the_repository, "worker/collided",
+				   stats.collided);
+		trace2_data_intmax("pcheckout", the_repository, "worker/failed",
+				   stats.failed);
+		trace2_data_intmax("pcheckout", the_repository, "worker/bytes",
+				   stats.bytes);
+		trace2_data_intmax("pcheckout", the_repository,
+				   "worker/slowest-item-us",
+				   stats.slowest_item_ns / 1000);
+		trace2_data_intmax("pcheckout", the_repository,
+				   "worker/slowest-item-bytes",
+				   stats.slowest_item_bytes);
+	}
 }
 
 static const char * const checkout_worker_usage[] = {

@@ -228,6 +228,41 @@ test_expect_success 'parallel checkout refills worker queues' '
 	)
 '
 
+test_expect_success 'parallel checkout traces worker load' '
+	set_checkout_config 2 0 &&
+	git init trace-load &&
+	(
+		cd trace-load &&
+		test_write_lines a >a &&
+		test_write_lines b >b &&
+		test_write_lines c >c &&
+		test_write_lines d >d &&
+		git add . &&
+		git commit -m files &&
+		rm a b c d &&
+
+		trace_file="$(pwd)/trace-event" &&
+		GIT_TRACE2_EVENT="$trace_file" git checkout . &&
+		for pair in \
+			"items 2" \
+			"written 2" \
+			"collided 0" \
+			"failed 0" \
+			"bytes 4" \
+			"slowest-item-bytes 2"
+		do
+			set -- $pair &&
+			grep "\"category\":\"pcheckout\",\"key\":\"worker/$1\",\"value\":\"$2\"" \
+				"$trace_file" >"$1" &&
+			test_line_count = 2 "$1" ||
+			return 1
+		done &&
+		grep "\"category\":\"pcheckout\",\"key\":\"worker/slowest-item-us\"" \
+			"$trace_file" >slowest-item-us &&
+		test_line_count = 2 slowest-item-us
+	)
+'
+
 test_expect_success SYMLINKS 'parallel checkout checks for symlinks in leading dirs' '
 	set_checkout_config 2 0 &&
 	git init symlinks &&
