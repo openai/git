@@ -18,9 +18,16 @@
 #include "thread-utils.h"
 #include "trace2.h"
 
+/*
+ * Keep enough work queued to hide the per-item IPC round trip without letting
+ * a slow worker hold an arbitrarily large share of the remaining work.
+ */
+#define PC_WORKER_QUEUE_SIZE 16
+
 struct pc_worker {
 	struct child_process cp;
-	size_t next_item_to_complete, nr_items_to_complete;
+	size_t items_to_complete[PC_WORKER_QUEUE_SIZE];
+	size_t first_item_to_complete, nr_items_to_complete;
 };
 
 struct parallel_checkout {
@@ -447,23 +454,33 @@ static void send_one_item(int fd, struct parallel_checkout_item *pc_item)
 	free(data);
 }
 
-static void send_batch(int fd, size_t start, size_t nr)
+static void send_item(struct pc_worker *worker,
+		      struct parallel_checkout_item *pc_item)
 {
-	size_t i;
-	sigchain_push(SIGPIPE, SIG_IGN);
-	for (i = 0; i < nr; i++)
-		send_one_item(fd, &parallel_checkout.items[start + i]);
-	packet_flush(fd);
-	sigchain_pop(SIGPIPE);
+	send_one_item(worker->cp.in, pc_item);
+
+	if (worker->nr_items_to_complete >= ARRAY_SIZE(worker->items_to_complete))
+		BUG("too many queued items for checkout worker");
+	worker->items_to_complete[
+		(worker->first_item_to_complete + worker->nr_items_to_complete) %
+		ARRAY_SIZE(worker->items_to_complete)] = pc_item->id;
+	worker->nr_items_to_complete++;
+}
+
+static void finish_worker_input(struct pc_worker *worker)
+{
+	packet_flush(worker->cp.in);
+
+	close(worker->cp.in);
+	worker->cp.in = -1;
 }
 
 static struct pc_worker *setup_workers(struct checkout *state, int num_workers)
 {
 	struct pc_worker *workers;
-	int i, workers_with_one_extra_item;
-	size_t base_batch_size, batch_beginning = 0;
+	int i;
 
-	ALLOC_ARRAY(workers, num_workers);
+	CALLOC_ARRAY(workers, num_workers);
 
 	for (i = 0; i < num_workers; i++) {
 		struct child_process *cp = &workers[i].cp;
@@ -478,24 +495,6 @@ static struct pc_worker *setup_workers(struct checkout *state, int num_workers)
 			strvec_pushf(&cp->args, "--prefix=%s", state->base_dir);
 		if (start_command(cp))
 			die("failed to spawn checkout worker");
-	}
-
-	base_batch_size = parallel_checkout.nr / num_workers;
-	workers_with_one_extra_item = parallel_checkout.nr % num_workers;
-
-	for (i = 0; i < num_workers; i++) {
-		struct pc_worker *worker = &workers[i];
-		size_t batch_size = base_batch_size;
-
-		/* distribute the extra work evenly */
-		if (i < workers_with_one_extra_item)
-			batch_size++;
-
-		send_batch(worker->cp.in, batch_beginning, batch_size);
-		worker->next_item_to_complete = batch_beginning;
-		worker->nr_items_to_complete = batch_size;
-
-		batch_beginning += batch_size;
 	}
 
 	return workers;
@@ -564,12 +563,15 @@ static void parse_and_save_result(const char *buffer, int len,
 	}
 
 	if (!worker->nr_items_to_complete)
-		BUG("received result from supposedly finished checkout worker");
-	if (res->id != worker->next_item_to_complete)
+		BUG("received result from supposedly idle checkout worker");
+	if (res->id != worker->items_to_complete[worker->first_item_to_complete])
 		BUG("unexpected item id from checkout worker (got %"PRIuMAX", exp %"PRIuMAX")",
-		    (uintmax_t)res->id, (uintmax_t)worker->next_item_to_complete);
+		    (uintmax_t)res->id,
+		    (uintmax_t)worker->items_to_complete[worker->first_item_to_complete]);
 
-	worker->next_item_to_complete++;
+	worker->first_item_to_complete =
+		(worker->first_item_to_complete + 1) %
+		ARRAY_SIZE(worker->items_to_complete);
 	worker->nr_items_to_complete--;
 
 	pc_item = &parallel_checkout.items[res->id];
@@ -585,12 +587,32 @@ static void gather_results_from_workers(struct pc_worker *workers,
 					int num_workers)
 {
 	int i, active_workers = num_workers;
+	size_t next_item_to_send = 0, queue_slot;
 	struct pollfd *pfds;
 
 	CALLOC_ARRAY(pfds, num_workers);
 	for (i = 0; i < num_workers; i++) {
 		pfds[i].fd = workers[i].cp.out;
 		pfds[i].events = POLLIN;
+	}
+
+	sigchain_push(SIGPIPE, SIG_IGN);
+
+	/*
+	 * Keep a small queue of work in front of each worker to hide IPC
+	 * latency, but refill the queues as results arrive so that a worker
+	 * which finishes early can take work from a slower one.
+	 */
+	for (queue_slot = 0;
+	     queue_slot < PC_WORKER_QUEUE_SIZE &&
+	     next_item_to_send < parallel_checkout.nr;
+	     queue_slot++) {
+		for (i = 0;
+		     i < num_workers &&
+		     next_item_to_send < parallel_checkout.nr;
+		     i++)
+			send_item(&workers[i],
+				  &parallel_checkout.items[next_item_to_send++]);
 	}
 
 	while (active_workers) {
@@ -621,6 +643,11 @@ static void gather_results_from_workers(struct pc_worker *workers,
 				} else {
 					parse_and_save_result(packet_buffer,
 							      len, worker);
+					if (next_item_to_send < parallel_checkout.nr)
+						send_item(worker,
+							  &parallel_checkout.items[next_item_to_send++]);
+					else if (!worker->nr_items_to_complete)
+						finish_worker_input(worker);
 				}
 			} else if (pfd->revents & POLLHUP) {
 				pfd->fd = -1;
@@ -633,6 +660,7 @@ static void gather_results_from_workers(struct pc_worker *workers,
 		}
 	}
 
+	sigchain_pop(SIGPIPE);
 	free(pfds);
 }
 

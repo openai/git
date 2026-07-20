@@ -210,6 +210,24 @@ test_expect_success 'parallel checkout respects --[no]-force' '
 	)
 '
 
+test_expect_success 'parallel checkout refills worker queues' '
+	set_checkout_config 2 0 &&
+	git init refill &&
+	(
+		cd refill &&
+		for i in $(test_seq 1 33)
+		do
+			echo "$i" >"file-$i" || return 1
+		done &&
+		git add . &&
+		git commit -m files &&
+		rm file-* &&
+
+		test_checkout_workers 2 git checkout . &&
+		git diff --exit-code
+	)
+'
+
 test_expect_success SYMLINKS 'parallel checkout checks for symlinks in leading dirs' '
 	set_checkout_config 2 0 &&
 	git init symlinks &&

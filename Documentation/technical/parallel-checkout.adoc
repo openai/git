@@ -104,10 +104,13 @@ sequential order.
 After all entries have passed through the above steps, the main process
 checks if the number of enqueued entries is sufficient to spread among
 the workers. If not, it just writes them sequentially. Otherwise, it
-spawns the workers and distributes the queued entries uniformly in
-continuous chunks. This aims to minimize the chances of two workers
-writing to the same directory simultaneously, which could increase lock
-contention in the kernel.
+spawns the workers and sends entries to them in round-robin order,
+keeping a bounded number of entries queued to each worker. As workers
+report results, the main process refills the queue of whichever worker
+finished an entry. This lets faster workers take more of the remaining
+work, while the bound limits how much work can be stranded behind a slow
+entry and amortizes the per-item IPC round trip. Compared with continuous
+chunks, this trades some path locality for better load balancing.
 
 Then, for each assigned item, each worker:
 
