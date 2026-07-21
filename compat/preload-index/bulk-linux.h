@@ -5,6 +5,8 @@
 
 #include <sys/syscall.h>
 
+#include "strbuf.h"
+
 #define PRELOAD_AT_NO_AUTOMOUNT 0x800
 #define PRELOAD_AT_EMPTY_PATH 0x1000
 #define PRELOAD_AT_SYMLINK_NOFOLLOW 0x100
@@ -55,6 +57,8 @@ struct preload_linux_open_how {
 };
 
 struct preload_bulk_linux_data {
+	struct preload_linux_statx root_statx;
+	struct strbuf mountinfo;
 	uint64_t root_mnt_id;
 	int use_openat2;
 };
@@ -94,6 +98,10 @@ int preload_bulk_linux_enumerate(
 	const struct preload_bulk_dir_identity *parent_identity);
 int preload_bulk_linux_scan_directory(struct preload_bulk_worker *worker,
 				      struct preload_bulk_task *task);
+
+const char *preload_bulk_linux_start(struct preload_bulk_scan *scan);
+const char *preload_bulk_linux_finish(struct preload_bulk_scan *scan);
+void preload_bulk_linux_release(struct preload_bulk_scan *scan);
 
 #endif /* SYS_getdents64 && SYS_statx */
 
