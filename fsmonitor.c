@@ -1302,6 +1302,21 @@ int fsmonitor_pending_token_from_provider(const struct index_state *istate)
 		istate->fsmonitor_pending_token_from_provider;
 }
 
+int fsmonitor_reopen_token(struct index_state *istate)
+{
+	if (!fstat_is_reliable() || istate->split_index ||
+	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC)
+		return 0;
+	if (istate->fsmonitor_last_update_pending)
+		return istate->fsmonitor_pending_token_from_provider;
+	if (!istate->fsmonitor_token_valid || !istate->fsmonitor_last_update)
+		return 0;
+	istate->fsmonitor_last_update_pending =
+		xstrdup(istate->fsmonitor_last_update);
+	istate->fsmonitor_pending_token_from_provider = 1;
+	return 1;
+}
+
 enum fsmonitor_token_result fsmonitor_query_pending_token(
 	struct index_state *istate, int untracked_ready)
 {
