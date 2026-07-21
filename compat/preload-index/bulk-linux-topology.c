@@ -2,10 +2,12 @@
 
 #ifdef __linux__
 
+#include <dirent.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 
 #include "compat/preload-index/bulk-linux.h"
+#include "parse.h"
 #include "preload-index-bulk.h"
 #include "repository.h"
 #include "trace2.h"
@@ -18,6 +20,26 @@
 #endif
 
 #if defined(SYS_getdents64) && defined(SYS_statx)
+
+static void load_test_dirent_type(struct preload_bulk_linux_data *data)
+{
+	const char *path, *value;
+
+	if (!git_env_bool("GIT_TEST_PRELOAD_INDEX_BULK", 0))
+		return;
+	value = getenv("GIT_TEST_PRELOAD_INDEX_BULK_DIRENT_TYPE");
+	if (!value)
+		return;
+	if (skip_prefix(value, "dir:", &path))
+		data->test_dirent_type = DT_DIR;
+	else if (skip_prefix(value, "reg:", &path))
+		data->test_dirent_type = DT_REG;
+	else
+		die("invalid GIT_TEST_PRELOAD_INDEX_BULK_DIRENT_TYPE");
+	if (!*path)
+		die("GIT_TEST_PRELOAD_INDEX_BULK_DIRENT_TYPE needs a path");
+	data->test_dirent_path = xstrdup(path);
+}
 
 static int read_mountinfo(struct strbuf *out)
 {
@@ -42,6 +64,7 @@ const char *preload_bulk_linux_start(struct preload_bulk_scan *scan)
 
 	CALLOC_ARRAY(data, 1);
 	strbuf_init(&data->mountinfo, 0);
+	load_test_dirent_type(data);
 	scan->platform_data = data;
 	scan->root_fd = open(repo_get_work_tree(scan->repo),
 			     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -133,6 +156,7 @@ void preload_bulk_linux_release(struct preload_bulk_scan *scan)
 	if (!data)
 		return;
 	strbuf_release(&data->mountinfo);
+	free(data->test_dirent_path);
 	free(data);
 	scan->platform_data = NULL;
 }

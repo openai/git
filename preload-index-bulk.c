@@ -213,6 +213,9 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 		backend->open_proof_parent;
 	if (istate->preload_untracked && !scan.collect_untracked)
 		untracked_reason = "backend-unsupported";
+	if (backend->max_threads > 0 &&
+	    scan.threads > backend->max_threads)
+		scan.threads = backend->max_threads;
 	if (scan.collect_untracked) {
 		scan.exclude_dir = &exclude_dir;
 #if HAVE_THREADS
