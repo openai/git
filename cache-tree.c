@@ -676,20 +676,34 @@ static struct cache_tree *read_one(const char **buffer, unsigned long *size_p)
 	/*
 	 * Just a heuristic -- we do not add directories that often but
 	 * we do not want to have to extend it immediately when we do,
-	 * hence +2.
+	 * hence +2.  Avoid a separate allocation for the common leaf case.
 	 */
-	it->subtree_alloc = subtree_nr + 2;
-	CALLOC_ARRAY(it->down, it->subtree_alloc);
+	if (subtree_nr) {
+		it->subtree_alloc = subtree_nr + 2;
+		ALLOC_ARRAY(it->down, it->subtree_alloc);
+	}
 	for (i = 0; i < subtree_nr; i++) {
 		/* read each subtree */
 		struct cache_tree *sub;
 		struct cache_tree_sub *subtree;
 		const char *name = buf;
+		int namelen;
 
 		sub = read_one(&buf, &size);
 		if (!sub)
 			goto free_return;
-		subtree = cache_tree_sub(it, name);
+		namelen = strlen(name);
+		if (!it->subtree_nr ||
+		    subtree_name_cmp(it->down[it->subtree_nr - 1]->name,
+				     it->down[it->subtree_nr - 1]->namelen,
+				     name, namelen) < 0) {
+			FLEX_ALLOC_MEM(subtree, name, name, namelen);
+			subtree->namelen = namelen;
+			it->down[it->subtree_nr++] = subtree;
+		} else {
+			/* Be liberal in what we accept from older writers. */
+			subtree = cache_tree_sub(it, name);
+		}
 		subtree->cache_tree = sub;
 	}
 	if (subtree_nr != it->subtree_nr)
