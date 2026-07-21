@@ -1365,6 +1365,7 @@ if host_machine.system() == 'linux'
     'compat/preload-index/bulk-linux-open.c',
     'compat/preload-index/bulk-linux-scan.c',
     'compat/preload-index/bulk-linux-stat.c',
+    'compat/preload-index/bulk-linux-topology.c',
   ]
 elif host_machine.system() == 'windows'
   compat_sources += 'compat/win32/trace2_win32_process_info.c'
