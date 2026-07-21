@@ -1,0 +1,10 @@
+# OpenAI release build settings.
+#
+# The Codex release workflow copies this file to config.mak before
+# building. Keep release-only optimizations here instead of in the
+# upstream Makefile.
+
+ifdef OPENAI_LTO
+CFLAGS_APPEND += -flto=$(OPENAI_LTO)
+LDFLAGS_APPEND += -flto=$(OPENAI_LTO)
+endif
