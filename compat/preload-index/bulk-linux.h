@@ -60,7 +60,9 @@ struct preload_bulk_linux_data {
 };
 
 struct preload_bulk_scan;
+struct preload_bulk_task;
 struct preload_bulk_worker;
+struct preload_bulk_dir_identity;
 
 #if defined(SYS_getdents64) && defined(SYS_statx)
 
@@ -85,6 +87,11 @@ int preload_bulk_linux_open_dir_at(struct preload_bulk_worker *worker,
 				   int parent_fd, const char *name);
 int preload_bulk_linux_open_relative(struct preload_bulk_scan *scan,
 				     const char *path);
+
+int preload_bulk_linux_enumerate(
+	struct preload_bulk_worker *worker,
+	struct preload_bulk_task *task, int fd,
+	const struct preload_bulk_dir_identity *parent_identity);
 
 #endif /* SYS_getdents64 && SYS_statx */
 
