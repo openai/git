@@ -51,6 +51,8 @@ static inline int fsmonitor_stat_can_be_valid(const struct stat *st)
 	return !S_ISREG(st->st_mode) || st->st_nlink <= 1;
 }
 
+void fsmonitor_invalidate_semantics(struct index_state *istate);
+
 /*
  * Check if refresh_fsmonitor has been called at least once.
  * refresh_fsmonitor is idempotent. Returns true if fsmonitor is

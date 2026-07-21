@@ -3,10 +3,13 @@
 
 #include "git-compat-util.h"
 #include "advice.h"
+#include "attr.h"
+#include "attr-fingerprint.h"
 #include "wt-status.h"
 #include "object.h"
 #include "dir.h"
 #include "commit.h"
+#include "clean-status.h"
 #include "diff.h"
 #include "environment.h"
 #include "gettext.h"
@@ -811,6 +814,46 @@ static unsigned int wt_status_untracked_dir_flags(const struct wt_status *s)
 	return DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
 }
 
+static int wt_status_begin_attr_snapshot(struct wt_status *s)
+{
+	int ret;
+	int hook_provider =
+		fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_HOOK;
+
+	if (s->attr_source_snapshot)
+		return 0;
+	if (s->attr_snapshot_failed)
+		return -1;
+	ret = clean_status_capture_attr_snapshot(
+		s->repo->index, &s->attr_source_snapshot);
+	if (ret < 0) {
+		s->attr_snapshot_failed = 1;
+		untracked_cache_invalidate_all(s->repo->index);
+		fsmonitor_invalidate_semantics(s->repo->index);
+		return -1;
+	}
+	if (s->attr_source_snapshot)
+		git_attr_source_snapshot_begin(s->attr_source_snapshot);
+	if ((ret > 0 &&
+	     (!hook_provider ||
+	      (ret & CLEAN_STATUS_ATTR_CONTENT_CHANGED))) ||
+	    (clean_status_fsmonitor_strong_mismatch(s->repo->index) &&
+	     !hook_provider)) {
+		/*
+		 * Hook providers have no closing query with which to adopt
+		 * missing semantic history, so absence alone must preserve
+		 * their established path-reporting contract. Namespace-only
+		 * churn can arise from an index rewrite and is likewise not
+		 * evidence that the hook missed a semantic change. Changed
+		 * attribute contents are current evidence and invalidate
+		 * cached semantics regardless of provider.
+		 */
+		untracked_cache_invalidate_all(s->repo->index);
+		fsmonitor_invalidate_semantics(s->repo->index);
+	}
+	return ret;
+}
+
 void wt_status_start_untracked_cache_preload(struct wt_status *s)
 {
 	struct index_state *istate = s->repo->index;
@@ -820,6 +863,7 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 
 	if (s->untracked_cache_preload)
 		BUG("untracked-cache preload already started");
+	wt_status_begin_attr_snapshot(s);
 	if (s->pathspec.nr ||
 	    s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
 	    s->show_ignored_mode)
@@ -1087,6 +1131,7 @@ void wt_status_collect(struct wt_status *s)
 
 	if (fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED)
 		wt_status_finish_untracked_cache_preload(s);
+	wt_status_begin_attr_snapshot(s);
 	wt_status_close_fsmonitor_token(
 		s, REFRESH_QUIET | REFRESH_UNMERGED,
 		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
@@ -1130,6 +1175,11 @@ void wt_status_collect_free_buffers(struct wt_status *s)
 {
 	untracked_cache_preload_release(s->untracked_cache_preload);
 	s->untracked_cache_preload = NULL;
+	if (s->attr_source_snapshot)
+		git_attr_source_snapshot_end(s->attr_source_snapshot);
+	attr_source_snapshot_free(s->attr_source_snapshot);
+	s->attr_source_snapshot = NULL;
+	s->attr_snapshot_failed = 0;
 	wt_status_state_free_buffers(&s->state);
 }
 
