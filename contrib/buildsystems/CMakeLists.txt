@@ -272,11 +272,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	set(NO_UNIX_SOCKETS 1)
 
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-	add_compile_definitions(PROCFS_EXECUTABLE_PATH="/proc/self/exe" HAVE_DEV_TTY )
+	add_compile_definitions(HAVE_PRELOAD_INDEX_BULK
+		PROCFS_EXECUTABLE_PATH="/proc/self/exe" HAVE_DEV_TTY)
 	list(APPEND compat_SOURCES
 		unix-socket.c
 		unix-stream-server.c
 		compat/linux/procinfo.c
+		compat/preload-index/bulk-linux.c
 		compat/preload-index/bulk-linux-entry.c
 		compat/preload-index/bulk-linux-open.c
 		compat/preload-index/bulk-linux-scan.c
@@ -683,7 +685,8 @@ include_directories(${CMAKE_BINARY_DIR})
 #libgit
 parse_makefile_for_sources(libgit_SOURCES ${CMAKE_SOURCE_DIR}/Makefile "LIB_OBJS")
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR
+		CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	list(APPEND libgit_SOURCES
 		preload-index-bulk-index.c
 		preload-index-bulk-thread.c
