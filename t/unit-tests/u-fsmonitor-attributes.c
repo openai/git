@@ -1,5 +1,7 @@
 #include "unit-test.h"
+#include "fsmonitor.h"
 #include "fsmonitor-ll.h"
+#include "fsmonitor-settings.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 
@@ -69,4 +71,29 @@ void test_fsmonitor_attributes__root_source_invalidates_every_entry(void)
 		cl_assert(istate.cache[i]->ce_flags & CE_CONTENT_CHECK_REQUIRED);
 	}
 	release_index(&istate);
+}
+
+void test_fsmonitor_attributes__disabled_provider_preserves_skipped_stat(void)
+{
+	struct repository repo = { .hash_algo = &hash_algos[GIT_HASH_SHA1] };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+
+	fsm_settings__set_disabled(&repo);
+	CALLOC_ARRAY(istate.cache, 2);
+	istate.cache_alloc = istate.cache_nr = 2;
+	add_entry(&istate, 0, "skipped");
+	add_entry(&istate, 1, "tracked");
+	istate.cache[0]->ce_flags |= CE_SKIP_WORKTREE;
+
+	fsmonitor_invalidate_semantics(&istate);
+
+	cl_assert(!(istate.cache[0]->ce_flags & CE_FSMONITOR_VALID));
+	cl_assert(!(istate.cache[0]->ce_flags & CE_CONTENT_CHECK_REQUIRED));
+	cl_assert(!stat_data_is_zero(istate.cache[0]));
+	cl_assert(!(istate.cache[1]->ce_flags & CE_FSMONITOR_VALID));
+	cl_assert(istate.cache[1]->ce_flags & CE_CONTENT_CHECK_REQUIRED);
+	cl_assert(stat_data_is_zero(istate.cache[1]));
+
+	release_index(&istate);
+	FREE_AND_NULL(repo.settings.fsmonitor);
 }
