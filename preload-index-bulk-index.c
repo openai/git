@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "name-hash.h"
+#include "object.h"
 #include "preload-index-bulk.h"
 #include "read-cache-ll.h"
 
@@ -106,6 +107,12 @@ static int size_change_is_definitive(const struct cache_entry *ce,
 	return ce->ce_stat_data.sd_size &&
 		(match_stat_data(&ce->ce_stat_data, (struct stat *)st) &
 		 DATA_CHANGED);
+}
+
+int preload_bulk_index_entry_is_gitlink(struct preload_bulk_scan *scan,
+					int pos)
+{
+	return pos >= 0 && S_ISGITLINK(scan->istate->cache[pos]->ce_mode);
 }
 
 void preload_bulk_record_tracked(
