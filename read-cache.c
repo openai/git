@@ -205,6 +205,23 @@ void fill_stat_cache_info(struct index_state *istate, struct cache_entry *ce, st
 	}
 }
 
+static struct cache_entry *make_refreshed_cache_entry(
+	struct index_state *istate, const struct cache_entry *ce,
+	struct stat *st, int preserve_valid)
+{
+	struct cache_entry *updated =
+		make_empty_cache_entry(istate, ce_namelen(ce));
+
+	copy_cache_entry(updated, ce);
+	memcpy(updated->name, ce->name, ce->ce_namelen + 1);
+	fill_stat_cache_info(istate, updated, st);
+	/* Do not let assume-unchanged reacquire a caller-cleared CE_VALID. */
+	if (preserve_valid && assume_unchanged &&
+	    !(ce->ce_flags & CE_VALID))
+		updated->ce_flags &= ~CE_VALID;
+	return updated;
+}
+
 static unsigned int st_mode_from_ce(const struct cache_entry *ce)
 {
 	switch (ce->ce_mode & S_IFMT) {
@@ -1458,19 +1475,7 @@ static struct cache_entry *refresh_cache_ent(struct index_state *istate,
 		return NULL;
 	}
 
-	updated = make_empty_cache_entry(istate, ce_namelen(ce));
-	copy_cache_entry(updated, ce);
-	memcpy(updated->name, ce->name, ce->ce_namelen + 1);
-	fill_stat_cache_info(istate, updated, &st);
-	/*
-	 * If ignore_valid is not set, we should leave CE_VALID bit
-	 * alone.  Otherwise, paths marked with --no-assume-unchanged
-	 * (i.e. things to be edited) will reacquire CE_VALID bit
-	 * automatically, which is not really what we want.
-	 */
-	if (!ignore_valid && assume_unchanged &&
-	    !(ce->ce_flags & CE_VALID))
-		updated->ce_flags &= ~CE_VALID;
+	updated = make_refreshed_cache_entry(istate, ce, &st, !ignore_valid);
 
 	/* istate->cache_changed is updated in the caller */
 	return updated;
