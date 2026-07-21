@@ -71,7 +71,8 @@ int fsmonitor_has_pending_token(const struct index_state *istate);
 int fsmonitor_pending_token_from_provider(const struct index_state *istate);
 enum fsmonitor_token_result fsmonitor_query_pending_token(
 	struct index_state *istate, int untracked_ready);
-void fsmonitor_accept_pending_token(struct index_state *istate);
+void fsmonitor_accept_pending_token(struct index_state *istate,
+				    int untracked_ready);
 void fsmonitor_reject_pending_token(struct index_state *istate);
 void fsmonitor_mark_untracked_cache_valid(struct index_state *istate);
 
