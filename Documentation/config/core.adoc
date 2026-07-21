@@ -736,8 +736,9 @@ core.preloadIndexBulk::
 This replaces per-entry filesystem lookups with a physical directory scan,
 but may cost more than normal preload depending on filesystem and cache
 state. Inconclusive scans are discarded before continuing with the normal
-preload. Currently this is supported on APFS and only has an effect when
-`core.preloadIndex` is enabled. Defaults to false.
+preload. Currently this is supported on APFS, ext-family filesystems, and
+XFS, and only has an effect when `core.preloadIndex` is enabled. Defaults
+to false.
 
 core.unsetenvvars::
 	Windows-only: comma-separated list of environment variables'

@@ -105,6 +105,7 @@ int preload_bulk_linux_enumerate(
 	const struct preload_bulk_dir_identity *parent_identity)
 {
 	struct preload_bulk_scan *scan = worker->scan;
+	struct preload_bulk_linux_data *data = scan->platform_data;
 	char *buf = worker->buffer;
 	size_t path_prefix_len;
 
@@ -175,6 +176,9 @@ int preload_bulk_linux_enumerate(
 			pos = preload_bulk_index_position(
 				scan, worker->path.buf, worker->path.len);
 			dtype = de->type;
+			if (data->test_dirent_path &&
+			    !strcmp(data->test_dirent_path, worker->path.buf))
+				dtype = data->test_dirent_type;
 
 			/*
 			 * Exact tracked paths always reach statx. A directory
