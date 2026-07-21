@@ -1361,6 +1361,7 @@ endif
 if host_machine.system() == 'linux'
   compat_sources += [
     'compat/linux/procinfo.c',
+    'compat/preload-index/bulk-linux-open.c',
     'compat/preload-index/bulk-linux-stat.c',
   ]
 elif host_machine.system() == 'windows'
