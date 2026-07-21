@@ -153,6 +153,8 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	unsigned long test_threads;
 	int threads, online, create_threads = 1;
 
+	if (!git_env_bool("GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD", 0))
+		return NULL;
 	if (!uc || !uc->root || uc->use_fsmonitor ||
 	    uc->dir_flags != dir_flags)
 		return NULL;
