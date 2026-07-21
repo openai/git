@@ -190,7 +190,8 @@ struct index_state {
 		 fsmonitor_untracked_valid : 1,
 		 fsmonitor_untracked_extension_seen : 1,
 		 fsmonitor_untracked_extension_invalid : 1,
-		 fsmonitor_pending_token_from_provider : 1;
+		 fsmonitor_pending_token_from_provider : 1,
+		 preload_untracked_complete : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
