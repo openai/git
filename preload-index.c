@@ -327,6 +327,7 @@ static unsigned char *preload_bulk_try(struct index_state *index)
 	}
 	if (result.untracked_complete && index->preload_untracked) {
 		*index->preload_untracked = result.untracked;
+		index->preload_untracked_complete = 1;
 		result.untracked =
 			(struct string_list)STRING_LIST_INIT_DUP;
 	}
@@ -368,6 +369,7 @@ void preload_index(struct index_state *index,
 	int core_preload_index = 1;
 
 	preload_index_bulk_result_clear(index);
+	index->preload_untracked_complete = 0;
 	if (index->preload_untracked)
 		string_list_clear(index->preload_untracked, 0);
 	repo_config_get_bool(index->repo, "core.preloadindex", &core_preload_index);
