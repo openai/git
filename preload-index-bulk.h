@@ -60,6 +60,7 @@ struct preload_bulk_worker {
 
 struct preload_bulk_backend {
 	unsigned collects_untracked : 1;
+	int max_threads;
 	const char *(*start)(struct preload_bulk_scan *scan);
 	const char *(*finish)(struct preload_bulk_scan *scan);
 	void (*release)(struct preload_bulk_scan *scan);
