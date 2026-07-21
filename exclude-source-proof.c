@@ -335,6 +335,12 @@ void exclude_source_capture_record(
 	record_observation(capture, 1, size, &oid);
 }
 
+void exclude_source_capture_error(struct exclude_source_capture *capture)
+{
+	if (capture)
+		capture->proof->invalid = 1;
+}
+
 void exclude_source_capture_release(struct exclude_source_capture *capture)
 {
 	capture_free(capture);

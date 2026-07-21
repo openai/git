@@ -15,6 +15,7 @@
 #include "convert.h"
 #include "dir.h"
 #include "environment.h"
+#include "exclude-source-proof.h"
 #include "gettext.h"
 #include "name-hash.h"
 #include "object-file.h"
@@ -2017,40 +2018,63 @@ static void invalidate_directory(struct untracked_cache *uc,
  */
 static int add_patterns(const char *fname, const char *base, int baselen,
 			struct pattern_list *pl, struct index_state *istate,
-			unsigned flags, struct oid_stat *oid_stat)
+			unsigned flags, struct oid_stat *oid_stat,
+			struct exclude_source_proof *source_proof)
 {
+	struct exclude_source_capture *capture =
+		exclude_source_capture_begin(source_proof, fname,
+					     !!(flags & PATTERN_NOFOLLOW));
 	struct stat st;
 	int r;
 	int fd;
 	size_t size = 0;
 	char *buf;
 
-	if (flags & PATTERN_NOFOLLOW)
+	if (capture)
+		fd = exclude_source_capture_open(capture);
+	else if (flags & PATTERN_NOFOLLOW)
 		fd = open_nofollow(fname, O_RDONLY);
 	else
 		fd = open(fname, O_RDONLY);
 
 	if (fd < 0 || fstat(fd, &st) < 0) {
-		if (fd < 0)
+		if (fd < 0) {
 			warn_on_fopen_errors(fname);
-		else
+			if (capture && exclude_source_capture_absent(capture))
+				exclude_source_capture_record(capture, -1, NULL,
+							      NULL, 0);
+			else
+				exclude_source_capture_error(capture);
+		} else {
+			exclude_source_capture_error(capture);
 			close(fd);
-		if (!istate)
+		}
+		if (!istate) {
+			exclude_source_capture_release(capture);
 			return -1;
+		}
 		r = read_skip_worktree_file_from_index(istate, fname,
 						       &size, &buf,
 						       oid_stat);
+		if (r == 1)
+			exclude_source_capture_error(capture);
+		exclude_source_capture_release(capture);
+		capture = NULL;
 		if (r != 1)
 			return r;
 	} else {
 		size = xsize_t(st.st_size);
 		if (size > PATTERN_MAX_FILE_SIZE) {
+			exclude_source_capture_error(capture);
+			exclude_source_capture_release(capture);
 			warning("ignoring excessively large pattern file: %s",
 				fname);
 			close(fd);
 			return -1;
 		}
 		if (size == 0) {
+			exclude_source_capture_record(capture, fd, &st, NULL, 0);
+			exclude_source_capture_release(capture);
 			if (oid_stat) {
 				fill_stat_data(&oid_stat->stat, &st);
 				oidcpy(&oid_stat->oid, the_hash_algo->empty_blob);
@@ -2061,10 +2085,15 @@ static int add_patterns(const char *fname, const char *base, int baselen,
 		}
 		buf = xmallocz(size);
 		if (read_in_full(fd, buf, size) != size) {
+			exclude_source_capture_error(capture);
+			exclude_source_capture_release(capture);
 			free(buf);
 			close(fd);
 			return -1;
 		}
+		exclude_source_capture_record(capture, fd, &st, buf, size);
+		exclude_source_capture_release(capture);
+		capture = NULL;
 		buf[size++] = '\n';
 		close(fd);
 		if (oid_stat) {
@@ -2137,7 +2166,8 @@ int add_patterns_from_file_to_list(const char *fname, const char *base,
 				   struct index_state *istate,
 				   unsigned flags)
 {
-	return add_patterns(fname, base, baselen, pl, istate, flags, NULL);
+	return add_patterns(fname, base, baselen, pl, istate, flags, NULL,
+			    NULL);
 }
 
 int add_patterns_from_blob_to_list(
@@ -2182,10 +2212,11 @@ struct pattern_list *add_pattern_list(struct dir_struct *dir,
 /*
  * Used to set up core.excludesfile and .git/info/exclude lists.
  */
-static void add_patterns_from_file_1(struct dir_struct *dir, const char *fname,
-				     struct oid_stat *oid_stat)
+static int add_patterns_from_file_1(struct dir_struct *dir, const char *fname,
+				    struct oid_stat *oid_stat, int gentle)
 {
 	struct pattern_list *pl;
+	int ret;
 	/*
 	 * catch setup_standard_excludes() that's called before
 	 * dir->untracked is assigned. That function behaves
@@ -2194,14 +2225,17 @@ static void add_patterns_from_file_1(struct dir_struct *dir, const char *fname,
 	if (!dir->untracked)
 		dir->internal.unmanaged_exclude_files++;
 	pl = add_pattern_list(dir, EXC_FILE, fname);
-	if (add_patterns(fname, "", 0, pl, NULL, 0, oid_stat) < 0)
+	ret = add_patterns(fname, "", 0, pl, NULL, 0, oid_stat,
+			   dir->internal.exclude_source_proof);
+	if (ret < 0 && !gentle)
 		die(_("cannot use %s as an exclude file"), fname);
+	return ret;
 }
 
 void add_patterns_from_file(struct dir_struct *dir, const char *fname)
 {
 	dir->internal.unmanaged_exclude_files++; /* see validate_untracked_cache() */
-	add_patterns_from_file_1(dir, fname, NULL);
+	add_patterns_from_file_1(dir, fname, NULL, 0);
 }
 
 int match_basename(const char *basename, int basenamelen,
@@ -2651,7 +2685,8 @@ static void prep_exclude(struct dir_struct *dir,
 			pl->src = strbuf_detach(&sb, NULL);
 			if (add_patterns(pl->src, pl->src, stk->baselen, pl,
 					 istate, PATTERN_NOFOLLOW,
-					 untracked ? &oid_stat : NULL) < 0 &&
+					 untracked ? &oid_stat : NULL,
+					 dir->internal.exclude_source_proof) < 0 &&
 			    untracked && is_null_oid(&oid_stat.oid)) {
 				struct stat st;
 
@@ -4453,16 +4488,23 @@ void setup_standard_excludes(struct dir_struct *dir)
 	dir->exclude_per_dir = ".gitignore";
 
 	/* core.excludesfile defaulting to $XDG_CONFIG_HOME/git/ignore */
-	if (excludes_file && !access_or_warn(excludes_file, R_OK, 0))
+	if (excludes_file &&
+	    (dir->internal.exclude_source_proof ||
+	     !access_or_warn(excludes_file, R_OK, 0)))
 		add_patterns_from_file_1(dir, excludes_file,
-					 dir->untracked ? &dir->internal.ss_excludes_file : NULL);
+					dir->untracked ?
+					&dir->internal.ss_excludes_file : NULL,
+					!!dir->internal.exclude_source_proof);
 
 	/* per repository user preference */
 	if (startup_info->have_repository) {
 		const char *path = git_path_info_exclude();
-		if (!access_or_warn(path, R_OK, 0))
+		if (dir->internal.exclude_source_proof ||
+		    !access_or_warn(path, R_OK, 0))
 			add_patterns_from_file_1(dir, path,
-						 dir->untracked ? &dir->internal.ss_info_exclude : NULL);
+						dir->untracked ?
+						&dir->internal.ss_info_exclude : NULL,
+						!!dir->internal.exclude_source_proof);
 	}
 }
 
