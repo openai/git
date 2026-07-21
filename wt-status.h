@@ -8,6 +8,7 @@
 
 struct repository;
 struct worktree;
+struct untracked_cache_preload;
 
 enum color_wt_status {
 	WT_STATUS_HEADER = 0,
@@ -145,6 +146,8 @@ struct wt_status {
 	struct string_list untracked;
 	struct string_list ignored;
 	uint32_t untracked_in_ms;
+	struct untracked_cache_preload *untracked_cache_preload;
+	unsigned untracked_cache_preloaded : 1;
 };
 
 size_t wt_status_locate_end(const char *s, size_t len);
@@ -153,6 +156,7 @@ void wt_status_add_cut_line(struct wt_status *s);
 void wt_status_prepare(struct repository *r, struct wt_status *s);
 void wt_status_print(struct wt_status *s);
 void wt_status_collect(struct wt_status *s);
+void wt_status_start_untracked_cache_preload(struct wt_status *s);
 
 /*
  * Collect all changes between the two trees. Changes will be displayed as if

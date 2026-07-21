@@ -803,6 +803,26 @@ static void wt_status_collect_changes_initial(struct wt_status *s)
 	strbuf_release(&base);
 }
 
+static unsigned int wt_status_untracked_dir_flags(const struct wt_status *s)
+{
+	if (s->show_untracked_files == SHOW_ALL_UNTRACKED_FILES)
+		return 0;
+	return DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+}
+
+void wt_status_start_untracked_cache_preload(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	unsigned int dir_flags;
+
+	if (s->untracked_cache_preload)
+		BUG("untracked-cache preload already started");
+
+	dir_flags = wt_status_untracked_dir_flags(s);
+	s->untracked_cache_preload =
+		untracked_cache_preload_start_ordinary(istate, dir_flags);
+}
+
 static void wt_status_collect_untracked(struct wt_status *s)
 {
 	int i;
@@ -814,8 +834,7 @@ static void wt_status_collect_untracked(struct wt_status *s)
 		return;
 
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
-		dir.flags |=
-			DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+		dir.flags |= wt_status_untracked_dir_flags(s);
 	if (s->show_ignored_mode) {
 		dir.flags |= DIR_SHOW_IGNORED_TOO;
 
@@ -826,6 +845,13 @@ static void wt_status_collect_untracked(struct wt_status *s)
 	}
 
 	setup_standard_excludes(&dir);
+	if (s->untracked_cache_preload) {
+		s->untracked_cache_preloaded = untracked_cache_preload_finish(
+			s->untracked_cache_preload, istate, dir.flags);
+		s->untracked_cache_preload = NULL;
+	}
+	dir.internal.untracked_cache_preloaded =
+		s->untracked_cache_preloaded;
 
 	fill_directory(&dir, istate, &s->pathspec);
 
@@ -889,6 +915,8 @@ void wt_status_collect(struct wt_status *s)
 
 void wt_status_collect_free_buffers(struct wt_status *s)
 {
+	untracked_cache_preload_release(s->untracked_cache_preload);
+	s->untracked_cache_preload = NULL;
 	wt_status_state_free_buffers(&s->state);
 }
 

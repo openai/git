@@ -1017,4 +1017,53 @@ test_expect_success 'directory snapshots ignore weak file-stat configuration' '
 	)
 '
 
+test_expect_success 'status preloads cached-directory validation' '
+	test_create_repo auto-preload &&
+	(
+		cd auto-preload &&
+		mkdir -p nested/deep &&
+		echo tracked >nested/tracked &&
+		git add nested/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		echo visible >nested/deep/visible &&
+		git -c core.untrackedCache=false status --porcelain \
+			>.git/expect &&
+		avoid_racy &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=3 \
+		GIT_TRACE2_EVENT="$PWD/.git/normal.trace" \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		if test_have_prereq PTHREADS
+		then
+			expect_threads=3
+		else
+			expect_threads=1
+		fi &&
+		test_grep \
+			"preload_untracked_cache/threads.*value.*$expect_threads" \
+			.git/normal.trace &&
+		test_grep "preload_untracked_cache/valid.*value.*1" \
+			.git/normal.trace &&
+		test_grep "opendir.*value.*0" .git/normal.trace &&
+		echo changed >nested/deep/changed &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain >.git/expect-changed &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=3 \
+		GIT_TRACE2_EVENT="$PWD/.git/changed.trace" \
+			git status --porcelain >.git/actual-changed &&
+		test_cmp .git/expect-changed .git/actual-changed &&
+		test_grep "preload_untracked_cache/valid.*value.*0" \
+			.git/changed.trace &&
+		test_grep "opendir.*value.*[1-9][0-9]*" \
+			.git/changed.trace
+	)
+'
+
 test_done
