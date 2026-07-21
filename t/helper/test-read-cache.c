@@ -345,6 +345,18 @@ static int test_fscf_history(int seed_existing_token)
 		return error("unable to reread test index");
 	if (!test_fscf_history_is_coherent(the_repository->index))
 		return error("FSCF did not survive an index round trip");
+
+	clean_status_invalidate_current_manifest(the_repository->index);
+	if (write_test_index())
+		goto done;
+	discard_index(the_repository->index);
+	if (repo_read_index(the_repository) < 0)
+		return error("unable to reread preserved test index");
+	if (clean_status_has_persistent_fsmonitor_semantic_history(
+		    the_repository->index))
+		return error("generic rewrite retained FSCF epoch bindings");
+	if (!clean_status_has_worktree_manifest_history(the_repository->index))
+		return error("generic rewrite discarded FSCF manifest history");
 	ret = 0;
 
 done:

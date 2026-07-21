@@ -1883,4 +1883,43 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked attribute events reopen semantic history' '
+	test_when_finished "rm -rf tracked-attr-change" &&
+	test_create_repo tracked-attr-change &&
+	(
+		cd tracked-attr-change &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		printf "*.txt text eol=crlf\n" >.gitattributes &&
+		printf "alpha\r\n" >tracked.txt &&
+		git add .gitattributes tracked.txt &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime.actual &&
+		test_must_be_empty .git/prime.actual &&
+		test_grep FSCF .git/index &&
+		test-tool chmtime =-60 tracked.txt &&
+
+		printf "*.txt -text\n" >.gitattributes &&
+		test-tool chmtime +1 tracked.txt &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "^1 \.M .* tracked.txt$" .git/actual &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9]" <.git/status.trace
+	)
+'
+
 test_done
