@@ -1046,6 +1046,37 @@ test_expect_success 'automatic preload observes its directory threshold' '
 			.git/at-threshold.trace
 	)
 '
+
+test_expect_success 'preload verifies cached per-directory excludes' '
+	test_create_repo auto-exclude &&
+	(
+		cd auto-exclude &&
+		test_write_lines hide-a >.gitignore &&
+		test_write_lines tracked >tracked &&
+		git add .gitignore tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		test_write_lines a >hide-a &&
+		test_write_lines b >hide-b &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		avoid_racy &&
+		mtime=$(test-tool chmtime --get .gitignore) &&
+		test_write_lines hide-b >.gitignore &&
+		test-tool chmtime =$mtime .gitignore &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain >.git/expect &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/actual.trace" \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "preload_untracked_cache/valid.*value.*0" \
+			.git/actual.trace
+	)
+'
+
 test_expect_success 'status preloads cached-directory validation' '
 	test_create_repo auto-preload &&
 	(
