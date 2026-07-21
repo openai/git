@@ -1994,23 +1994,104 @@ struct load_index_extensions
 	const char *mmap;
 	size_t mmap_size;
 	unsigned long src_offset;
+	int allow_parallel;
+	int force_parallel;
 };
+
+struct load_index_extension {
+	pthread_t pthread;
+	struct index_state *istate;
+	const char *ext;
+	const char *data;
+	unsigned long size;
+	int result;
+};
+
+#define PARALLEL_INDEX_EXTENSION_THRESHOLD (1024 * 1024)
+
+static void *load_one_index_extension(void *_data)
+{
+	struct load_index_extension *p = _data;
+
+	trace2_thread_start("index-extension");
+	trace2_data_intmax("index", p->istate->repo,
+			   "extension/parallel/tree-untracked", 1);
+	p->result = read_index_extension(p->istate, p->ext, p->data, p->size);
+	trace2_thread_exit();
+	return NULL;
+}
+
+/*
+ * TREE and UNTR are usually the two largest index extensions.  They read the
+ * same immutable mmap but publish to separate index_state fields, so they can
+ * be decoded concurrently.  Keep split indexes on the established serial
+ * path because LINK changes how the completed index is assembled.
+ */
+static int find_parallel_index_extensions(struct load_index_extensions *p,
+					  struct load_index_extension *tree)
+{
+	size_t offset = p->src_offset;
+	size_t end = p->mmap_size - the_hash_algo->rawsz;
+	int tree_nr = 0, untracked_nr = 0, link_nr = 0;
+	uint32_t untracked_size = 0;
+
+	if (!p->allow_parallel)
+		return 0;
+
+	while (offset <= end - 8) {
+		const char *ext = p->mmap + offset;
+		uint32_t size = get_be32(ext + 4);
+
+		if (size > end - offset - 8)
+			return 0;
+
+		switch (CACHE_EXT(ext)) {
+		case CACHE_EXT_TREE:
+			tree_nr++;
+			tree->istate = p->istate;
+			tree->ext = ext;
+			tree->data = ext + 8;
+			tree->size = size;
+			break;
+		case CACHE_EXT_UNTRACKED:
+			untracked_nr++;
+			untracked_size = size;
+			break;
+		case CACHE_EXT_LINK:
+			link_nr++;
+			break;
+		}
+
+		offset += 8 + size;
+	}
+
+	return offset == end && tree_nr == 1 && untracked_nr == 1 && !link_nr &&
+		(p->force_parallel ||
+		 (tree->size >= PARALLEL_INDEX_EXTENSION_THRESHOLD &&
+		  untracked_size >= PARALLEL_INDEX_EXTENSION_THRESHOLD));
+}
 
 static void *load_index_extensions(void *_data)
 {
 	struct load_index_extensions *p = _data;
 	size_t src_offset = p->src_offset;
 	size_t end;
+	struct load_index_extension tree = { 0 };
+	int tree_thread = 0;
 	int extension_error = 0;
 
 	if (p->mmap_size < the_hash_algo->rawsz) {
 		extension_error = 1;
-		goto done;
+		goto join_tree;
 	}
 	end = p->mmap_size - the_hash_algo->rawsz;
 	if (src_offset > end) {
 		extension_error = 1;
-		goto done;
+		goto join_tree;
+	}
+	if (find_parallel_index_extensions(p, &tree) &&
+	    !pthread_create(&tree.pthread, NULL, load_one_index_extension, &tree)) {
+		tree_thread = 1;
 	}
 
 	while (src_offset < end) {
@@ -2021,20 +2102,19 @@ static void *load_index_extensions(void *_data)
 		 * in 4-byte network byte order.
 		 */
 		uint32_t extsize;
+		const char *ext = p->mmap + src_offset;
 
 		if (end - src_offset < 8) {
 			extension_error = 1;
 			break;
 		}
-		extsize = get_be32(p->mmap + src_offset + 4);
+		extsize = get_be32(ext + 4);
 		if (extsize > end - src_offset - 8) {
 			extension_error = 1;
 			break;
 		}
-		if (read_index_extension(p->istate,
-					 p->mmap + src_offset,
-					 p->mmap + src_offset + 8,
-					 extsize) < 0) {
+		if ((!tree_thread || CACHE_EXT(ext) != CACHE_EXT_TREE) &&
+		    read_index_extension(p->istate, ext, ext + 8, extsize) < 0) {
 			extension_error = 1;
 			break;
 		}
@@ -2043,11 +2123,22 @@ static void *load_index_extensions(void *_data)
 	if (src_offset != end)
 		extension_error = 1;
 
-done:
+join_tree:
+	if (tree_thread) {
+		int err = pthread_join(tree.pthread, NULL);
+
+		if (err)
+			die(_("unable to join load_index_extension thread: %s"),
+			    strerror(err));
+		if (tree.result < 0)
+			extension_error = 1;
+	}
+
 	if (extension_error) {
 		munmap((void *)p->mmap, p->mmap_size);
 		die(_("index file corrupt"));
 	}
+
 	return NULL;
 }
 
@@ -2279,6 +2370,8 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	p.istate = istate;
 	p.mmap = mmap;
 	p.mmap_size = mmap_size;
+	p.allow_parallel = 0;
+	p.force_parallel = git_env_bool("GIT_TEST_PARALLEL_INDEX_EXTENSIONS", 0);
 
 	src_offset = sizeof(*hdr);
 
@@ -2300,13 +2393,21 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 		extension_offset = read_eoie_extension(mmap, mmap_size);
 		if (extension_offset) {
 			int err;
+			struct load_index_extension tree = { 0 };
 
 			p.src_offset = extension_offset;
+			/* Keep at least two workers available for cache entries. */
+			p.allow_parallel = nr_threads > 3;
+			if (p.allow_parallel)
+				p.allow_parallel =
+					find_parallel_index_extensions(&p, &tree);
 			err = pthread_create(&p.pthread, NULL, load_index_extensions, &p);
 			if (err)
 				die(_("unable to create load_index_extensions thread: %s"), strerror(err));
 
 			nr_threads--;
+			if (p.allow_parallel)
+				nr_threads--;
 		}
 	}
 
