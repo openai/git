@@ -1369,7 +1369,8 @@ done:
 	return ret;
 }
 
-void fsmonitor_accept_pending_token(struct index_state *istate)
+void fsmonitor_accept_pending_token(struct index_state *istate,
+				    int untracked_ready)
 {
 	if (!fsmonitor_pending_token_from_provider(istate))
 		return;
@@ -1378,13 +1379,24 @@ void fsmonitor_accept_pending_token(struct index_state *istate)
 	istate->fsmonitor_last_update_pending = NULL;
 	istate->fsmonitor_pending_token_from_provider = 0;
 	istate->fsmonitor_token_valid = 1;
-	istate->fsmonitor_untracked_valid = 1;
+	istate->fsmonitor_untracked_valid = !!untracked_ready;
 	if (istate->untracked)
-		istate->untracked->use_fsmonitor = 1;
+		istate->untracked->use_fsmonitor = !!untracked_ready;
 	istate->cache_changed |= FSMONITOR_CHANGED;
 	FREE_AND_NULL(istate->fsmonitor_untracked_token);
-	istate->fsmonitor_untracked_token =
-		xstrdup(istate->fsmonitor_last_update);
+	if (untracked_ready)
+		istate->fsmonitor_untracked_token =
+			xstrdup(istate->fsmonitor_last_update);
+	else {
+		/*
+		 * Keep a query anchored at the accepted tracked token. A
+		 * later in-process status may need to close work done after
+		 * this point before validating its untracked cache.
+		 */
+		istate->fsmonitor_last_update_pending =
+			xstrdup(istate->fsmonitor_last_update);
+		istate->fsmonitor_pending_token_from_provider = 1;
+	}
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "token_closure/accepted", 1);
 }
