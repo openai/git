@@ -5,6 +5,7 @@
 
 struct index_state;
 struct attr_source_snapshot;
+struct clean_status_proof_epoch;
 struct repository;
 struct stat;
 struct strbuf;
@@ -21,6 +22,17 @@ void clean_status_attach_config(struct index_state *istate);
 int clean_status_capture_attr_snapshot(
 	struct index_state *istate,
 	struct attr_source_snapshot **snapshot);
+struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
+	struct index_state *istate,
+	const struct attr_source_snapshot *attrs);
+int clean_status_proof_epoch_start_token_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch);
+int clean_status_proof_epoch_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch);
+void clean_status_release_proof_epoch(
+	struct clean_status_proof_epoch *epoch);
 
 int clean_status_fsmonitor_config_mismatch(const struct index_state *istate);
 int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate);
@@ -40,6 +52,9 @@ void clean_status_begin_fsmonitor_semantic_baseline(
 
 int clean_status_refresh_worktree_manifest(struct index_state *istate);
 int clean_status_manifest_global_fallback(const struct index_state *istate);
+
+void clean_status_mark_fsmonitor_config_valid(
+	struct index_state *istate, const char *closed_token);
 
 void clean_status_record_source_identity(struct index_state *istate,
 					 const struct stat *st);

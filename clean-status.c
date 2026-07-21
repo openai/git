@@ -2,6 +2,7 @@
 #include "attr-fingerprint.h"
 #include "clean-status.h"
 #include "clean-status-internal.h"
+#include "fsmonitor-clean-proof.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "trace2.h"
@@ -167,6 +168,40 @@ int clean_status_manifest_global_fallback(const struct index_state *istate)
 {
 	return istate->clean_status &&
 		istate->clean_status->manifest.global_fallback;
+}
+
+void clean_status_mark_fsmonitor_config_valid(struct index_state *istate,
+					      const char *closed_token)
+{
+	struct clean_status_state *state = istate->clean_status;
+
+	if (!state || !state->current_config_valid)
+		return;
+	if (!closed_token ||
+	    !state->manifest.current_valid || !state->manifest.checked ||
+	    (state->manifest.current_flags &
+	     (FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+	      FSMONITOR_CLEAN_PROOF_FULL_INDEX)) !=
+		    (FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		     FSMONITOR_CLEAN_PROOF_FULL_INDEX)) {
+		state->config_revalidated = 0;
+		FREE_AND_NULL(state->config_revalidated_token);
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "config/manifest-unbound", 1);
+		return;
+	}
+	state->config_mismatch = 0;
+	state->strong_mismatch = 0;
+	state->semantic_baseline_pending = 0;
+	state->manifest.current_flags = FSMONITOR_CLEAN_PROOF_ALL;
+	state->config_revalidated = state->current_semantic_valid &&
+		state->current_attr_valid && state->manifest.current_valid;
+	state->initial_coherent = state->config_revalidated;
+	FREE_AND_NULL(state->config_revalidated_token);
+	if (state->config_revalidated)
+		state->config_revalidated_token = xstrdup(closed_token);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "config/revalidated", 1);
 }
 
 void clean_status_release(struct index_state *istate)

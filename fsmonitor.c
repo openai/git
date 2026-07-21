@@ -944,8 +944,7 @@ static void invalidate_fsmonitor_for_bootstrap(
 	}
 
 	if (physical_history_unavailable) {
-		if (semantic_adoption_needed)
-			clean_status_refresh_worktree_manifest(istate);
+		clean_status_refresh_worktree_manifest(istate);
 		fsmonitor_invalidate_semantics(istate);
 		untracked_cache_invalidate_all(istate);
 		return;

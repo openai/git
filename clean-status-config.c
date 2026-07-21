@@ -2,6 +2,7 @@
 #include "clean-status-config.h"
 #include "config.h"
 #include "hash-framing.h"
+#include "repository.h"
 #include "strbuf.h"
 
 void clean_status_config_init(struct clean_status_config_digest *digest,
@@ -77,4 +78,29 @@ void clean_status_config_final(struct clean_status_config_digest *digest)
 	git_hash_final(digest->hash, &digest->ctx);
 	git_hash_final(digest->semantic_hash, &digest->semantic_ctx);
 	digest->finalized = 1;
+}
+
+static int config_digest_callback(const char *key, const char *value,
+				  const struct config_context *ctx,
+				  void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return 0;
+}
+
+int clean_status_config_read_repository(
+	struct repository *repo,
+	struct clean_status_config_digest *digest)
+{
+	struct config_options opts = { 0 };
+
+	clean_status_config_init(digest, repo->hash_algo);
+	opts.respect_includes = 1;
+	opts.commondir = repo->commondir;
+	opts.git_dir = repo->gitdir;
+	if (config_with_options(config_digest_callback, digest, NULL,
+				repo, &opts) < 0)
+		return -1;
+	clean_status_config_final(digest);
+	return 0;
 }
