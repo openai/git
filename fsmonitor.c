@@ -263,19 +263,29 @@ void prepare_fsmonitor_untracked(struct index_state *istate)
 			  istate->fsmonitor_untracked_token)));
 }
 
-void fill_fsmonitor_bitmap(struct index_state *istate)
+static struct ewah_bitmap *fsmonitor_bitmap_from_index(
+	struct index_state *istate)
 {
+	struct ewah_bitmap *bitmap = ewah_new();
 	unsigned int i, skipped = 0;
-	istate->fsmonitor_dirty = ewah_new();
+
 	for (i = 0; i < istate->cache_nr; i++) {
 		if (istate->cache[i]->ce_flags & CE_REMOVE)
 			skipped++;
 		else if (!(istate->cache[i]->ce_flags & CE_FSMONITOR_VALID))
-			ewah_set(istate->fsmonitor_dirty, i - skipped);
+			ewah_set(bitmap, i - skipped);
 	}
+	return bitmap;
 }
 
-void write_fsmonitor_extension(struct strbuf *sb, struct index_state *istate)
+void fill_fsmonitor_bitmap(struct index_state *istate)
+{
+	istate->fsmonitor_dirty = fsmonitor_bitmap_from_index(istate);
+}
+
+static void serialize_fsmonitor_extension(struct strbuf *sb,
+					  struct index_state *istate,
+					  struct ewah_bitmap *bitmap)
 {
 	uint32_t hdr_version;
 	uint32_t ewah_start;
@@ -283,7 +293,7 @@ void write_fsmonitor_extension(struct strbuf *sb, struct index_state *istate)
 	int fixup = 0;
 
 	if (!istate->split_index)
-		assert_index_minimum(istate, istate->fsmonitor_dirty->bit_size);
+		assert_index_minimum(istate, bitmap->bit_size);
 
 	put_be32(&hdr_version, INDEX_EXTENSION_VERSION2);
 	strbuf_add(sb, &hdr_version, sizeof(uint32_t));
@@ -295,13 +305,27 @@ void write_fsmonitor_extension(struct strbuf *sb, struct index_state *istate)
 	strbuf_add(sb, &ewah_size, sizeof(uint32_t)); /* we'll fix this up later */
 
 	ewah_start = sb->len;
-	ewah_serialize_strbuf(istate->fsmonitor_dirty, sb);
-	ewah_free(istate->fsmonitor_dirty);
-	istate->fsmonitor_dirty = NULL;
+	ewah_serialize_strbuf(bitmap, sb);
 
 	/* fix up size field */
 	put_be32(&ewah_size, sb->len - ewah_start);
 	memcpy(sb->buf + fixup, &ewah_size, sizeof(uint32_t));
+}
+
+void snapshot_fsmonitor_extension(struct strbuf *sb,
+				  struct index_state *istate)
+{
+	struct ewah_bitmap *bitmap = fsmonitor_bitmap_from_index(istate);
+
+	serialize_fsmonitor_extension(sb, istate, bitmap);
+	ewah_free(bitmap);
+}
+
+void write_fsmonitor_extension(struct strbuf *sb, struct index_state *istate)
+{
+	serialize_fsmonitor_extension(sb, istate, istate->fsmonitor_dirty);
+	ewah_free(istate->fsmonitor_dirty);
+	istate->fsmonitor_dirty = NULL;
 
 	trace2_data_string("index", NULL, "extension/fsmn/write/token",
 			   istate->fsmonitor_last_update);
@@ -944,8 +968,7 @@ static void invalidate_fsmonitor_for_bootstrap(
 	}
 
 	if (physical_history_unavailable) {
-		if (semantic_adoption_needed)
-			clean_status_refresh_worktree_manifest(istate);
+		clean_status_refresh_worktree_manifest(istate);
 		fsmonitor_invalidate_semantics(istate);
 		untracked_cache_invalidate_all(istate);
 		return;

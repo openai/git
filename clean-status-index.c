@@ -101,43 +101,105 @@ int clean_status_index_snapshot_still_matches_path(
 				 snapshot->cache_nr, &snapshot->checksum, algo);
 }
 
+static int source_index_matches_snapshot(
+	const struct clean_status_index_snapshot *snapshot,
+	const struct clean_status_state *state,
+	const struct git_hash_algo *algo)
+{
+	struct clean_status_identity identity;
+	struct stat st;
+
+	return state && state->source_index_fd >= 0 &&
+		state->source_index_identity_valid &&
+		!fstat(state->source_index_fd, &st) &&
+		!clean_status_identity_from_stat(&identity, &st) &&
+		clean_status_identity_equal(
+			&identity, &state->source_index_identity) &&
+		clean_status_identity_equal(
+			&snapshot->identity, &state->source_index_identity) &&
+		snapshot_matches(state->source_index_fd, &st,
+				 snapshot->version, snapshot->cache_nr,
+				 &snapshot->checksum, algo);
+}
+
 static int snapshot_matches_index_state(
 	const struct clean_status_index_snapshot *snapshot,
-	const struct index_state *istate)
+	const struct index_state *istate, int allow_process_local_source)
 {
 	const struct clean_status_state *state = istate->clean_status;
 
-	return istate->version == snapshot->version &&
-		istate->cache_nr == snapshot->cache_nr &&
-		oideq(&istate->oid, &snapshot->checksum) &&
-		(!is_null_oid(&snapshot->checksum) ||
-		 (clean_status_identity_is_durable() && state &&
-		  state->source_identity_valid &&
-		  clean_status_identity_equal(&snapshot->identity,
-					      &state->source_identity)));
+	if (istate->version != snapshot->version ||
+	    istate->cache_nr != snapshot->cache_nr ||
+	    !oideq(&istate->oid, &snapshot->checksum))
+		return 0;
+	if (!is_null_oid(&snapshot->checksum))
+		return 1;
+	if (clean_status_identity_is_durable() && state &&
+	    state->source_identity_valid &&
+	    clean_status_identity_equal(&snapshot->identity,
+					&state->source_identity))
+		return 1;
+	return allow_process_local_source &&
+		source_index_matches_snapshot(
+			snapshot, state, istate->repo->hash_algo);
+}
+
+static int snapshot_pin(
+	struct clean_status_index_snapshot *snapshot,
+	struct index_state *istate, int allow_process_local_source)
+{
+	if (snapshot_open(snapshot, istate->repo->index_file,
+			  istate->repo->hash_algo, 1))
+		return -1;
+	if (snapshot_matches_index_state(
+		    snapshot, istate, allow_process_local_source))
+		return 0;
+	clean_status_index_snapshot_release(snapshot);
+	return -1;
 }
 
 int clean_status_index_snapshot_pin(
 	struct clean_status_index_snapshot *snapshot,
 	struct index_state *istate)
 {
-	if (snapshot_open(snapshot, istate->repo->index_file,
-			  istate->repo->hash_algo, 1))
-		return -1;
-	if (snapshot_matches_index_state(snapshot, istate))
-		return 0;
-	clean_status_index_snapshot_release(snapshot);
-	return -1;
+	return snapshot_pin(snapshot, istate, 0);
+}
+
+int clean_status_index_snapshot_pin_proof_epoch(
+	struct clean_status_index_snapshot *snapshot,
+	struct index_state *istate)
+{
+	/*
+	 * A proof epoch is process-local and dies with its index state.  It may
+	 * therefore use the descriptor for the file which populated that state.
+	 * Persisted history and sidecars continue to use the generic pin above.
+	 */
+	return snapshot_pin(snapshot, istate, 1);
+}
+
+static int snapshot_still_matches(
+	const struct clean_status_index_snapshot *snapshot,
+	const struct index_state *istate, int allow_process_local_source)
+{
+	return snapshot_matches_index_state(
+			snapshot, istate, allow_process_local_source) &&
+		clean_status_index_snapshot_still_matches_path(
+			snapshot, istate->repo->index_file,
+			istate->repo->hash_algo);
 }
 
 int clean_status_index_snapshot_still_matches(
 	const struct clean_status_index_snapshot *snapshot,
 	const struct index_state *istate)
 {
-	return snapshot_matches_index_state(snapshot, istate) &&
-		clean_status_index_snapshot_still_matches_path(
-			snapshot, istate->repo->index_file,
-			istate->repo->hash_algo);
+	return snapshot_still_matches(snapshot, istate, 0);
+}
+
+int clean_status_index_snapshot_still_matches_proof_epoch(
+	const struct clean_status_index_snapshot *snapshot,
+	const struct index_state *istate)
+{
+	return snapshot_still_matches(snapshot, istate, 1);
 }
 
 void clean_status_index_snapshot_release(
@@ -209,6 +271,27 @@ int clean_status_index_logical_digest(const struct index_state *istate,
 				      unsigned char *out)
 {
 	return index_logical_digest(istate, 0, out);
+}
+
+int clean_status_index_logical_digest_after_status(
+	const struct index_state *istate, unsigned char *out)
+{
+	const unsigned int acceleration_changes =
+		CE_ENTRY_CHANGED | FSMONITOR_CHANGED | UNTRACKED_CHANGED;
+
+	/*
+	 * CE_UPDATE_IN_BASE has no independent meaning for a full index; status
+	 * uses it as stat-refresh bookkeeping.  Keep that exception confined
+	 * to the main, expanded, acceleration-only status result.  The common
+	 * digest still rejects split/sparse indexes and every other transient
+	 * flag, and hashes every persistent logical field.
+	 */
+	if (!istate->repo ||
+	    !clean_status_external_history_enabled(istate) ||
+	    istate != istate->repo->index ||
+	    (istate->cache_changed & ~acceleration_changes))
+		return -1;
+	return index_logical_digest(istate, CE_UPDATE_IN_BASE, out);
 }
 
 void clean_status_record_source_identity(struct index_state *istate,
