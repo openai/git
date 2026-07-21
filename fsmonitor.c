@@ -905,6 +905,15 @@ static void invalidate_all_fsmonitor_strong(struct index_state *istate)
 		fsmonitor_invalidate_cache_entry(istate->cache[i]);
 }
 
+void fsmonitor_invalidate_semantics(struct index_state *istate)
+{
+	git_attr_invalidate_all();
+	invalidate_all_fsmonitor_strong(istate);
+	istate->cache_changed |= FSMONITOR_CHANGED;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "semantic/strong-invalidation", 1);
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
