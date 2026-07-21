@@ -1359,7 +1359,10 @@ elif host_machine.system() == 'windows'
 endif
 
 if host_machine.system() == 'linux'
-  compat_sources += 'compat/linux/procinfo.c'
+  compat_sources += [
+    'compat/linux/procinfo.c',
+    'compat/preload-index/bulk-linux-stat.c',
+  ]
 elif host_machine.system() == 'windows'
   compat_sources += 'compat/win32/trace2_win32_process_info.c'
 elif host_machine.system() == 'darwin'
