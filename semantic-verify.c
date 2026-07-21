@@ -1,6 +1,8 @@
 #define USE_THE_REPOSITORY_VARIABLE
 
 #include "git-compat-util.h"
+#include "attr.h"
+#include "clean-status.h"
 #include "convert.h"
 #include "fsmonitor.h"
 #include "object.h"
@@ -89,6 +91,7 @@ int semantic_verify_prepare(struct index_state *istate,
 		    (uintmax_t)sizeof(struct semantic_verify_result));
 	CALLOC_ARRAY(proof, 1);
 	proof->istate = istate;
+	proof->epoch_required = options && options->require_proof_epoch;
 	proof->filter_scope_checked = options &&
 		options->validate_filter_scope;
 	proof->cache_nr = istate->cache_nr;
@@ -108,7 +111,7 @@ int semantic_verify_prepare(struct index_state *istate,
 		identity->flags = ce->ce_flags & SEMANTIC_VERIFY_ENTRY_FLAGS;
 	}
 	*proof_out = proof;
-	if (!proof->cache_nr)
+	if (!proof->cache_nr && !proof->epoch_required)
 		return 0;
 	if (istate->sparse_index != INDEX_EXPANDED) {
 		for (size_t i = 0; i < proof->cache_nr; i++) {
@@ -128,11 +131,49 @@ int semantic_verify_prepare(struct index_state *istate,
 		proof->errors = proof->cache_nr;
 		return -1;
 	}
+	if (proof->epoch_required) {
+		proof->epoch = clean_status_capture_proof_epoch(
+			istate, options->attr_snapshot,
+			proof->filter_scope_checked);
+		if (!proof->epoch) {
+			for (size_t i = 0; i < proof->cache_nr; i++) {
+				proof->results[i].kind = SEMANTIC_VERIFY_ERROR;
+				proof->results[i].error = EAGAIN;
+			}
+			proof->errors = proof->cache_nr;
+			return -1;
+		}
+	}
+	if (!proof->cache_nr)
+		return 0;
 
 	/* Initialize conversion config and default attribute state serially. */
 	convert_attrs_prepare(istate);
 	nr_threads = select_thread_count(proof->cache_nr, options);
 	CALLOC_ARRAY(workers, nr_threads);
+	if (proof->epoch_required) {
+		/*
+		 * Load each worker's system, global, root, and info
+		 * attribute frames before closing the proof epoch.
+		 */
+		for (unsigned int i = 0; i < nr_threads; i++) {
+			workers[i].check = convert_attrs_check_alloc();
+			git_check_attr(istate, "", workers[i].check);
+		}
+		if (!clean_status_proof_epoch_prime_matches(
+			    istate, proof->epoch)) {
+			for (unsigned int i = 0; i < nr_threads; i++)
+				attr_check_free(workers[i].check);
+			free(workers);
+			for (size_t i = 0; i < proof->cache_nr; i++) {
+				proof->results[i].kind = SEMANTIC_VERIFY_ERROR;
+				proof->results[i].error = EAGAIN;
+			}
+			proof->errors = proof->cache_nr;
+			git_attr_invalidate_all();
+			return -1;
+		}
+	}
 	trace2_region_enter("semantic_verify", "prepare", istate->repo);
 	trace2_data_intmax("semantic_verify", istate->repo,
 			   "threads", nr_threads);
@@ -208,6 +249,16 @@ int semantic_verify_root_is_stable(const struct semantic_verify_proof *proof)
 	return proof && semantic_verify_root_stable(proof->root);
 }
 
+int semantic_verify_start_token_is_current(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof)
+{
+	return proof && proof->istate == istate &&
+		(!proof->epoch_required ||
+		 clean_status_proof_epoch_start_token_matches(
+			 istate, proof->epoch));
+}
+
 void semantic_verify_get_stats(const struct semantic_verify_proof *proof,
 			       struct semantic_verify_stats *stats)
 {
@@ -248,7 +299,10 @@ int semantic_verify_apply_after_closure(
 	if (!istate || !proof || proof->istate != istate ||
 	    proof->cache_nr != istate->cache_nr ||
 	    proof->namespace_unstable ||
-	    !semantic_verify_root_is_stable(proof))
+	    !semantic_verify_root_is_stable(proof) ||
+	    (proof->epoch_required &&
+	     !clean_status_proof_epoch_content_matches(
+		     istate, proof->epoch)))
 		return -1;
 	if (proof->active_filters) {
 		trace2_data_intmax("semantic_verify", istate->repo,
@@ -349,6 +403,7 @@ void semantic_verify_proof_clear(struct semantic_verify_proof *proof)
 {
 	if (!proof)
 		return;
+	clean_status_release_proof_epoch(proof->epoch);
 	semantic_verify_root_clear(proof->root);
 	for (size_t i = 0; i < proof->cache_nr; i++)
 		free(proof->entry_identities[i].name);
