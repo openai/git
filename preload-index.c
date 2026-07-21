@@ -44,6 +44,15 @@ struct thread_data {
 	int t2_nr_lstat;
 };
 
+static int preload_entry_needs_stat(const struct cache_entry *ce)
+{
+	return !ce_stage(ce) &&
+		!S_ISGITLINK(ce->ce_mode) &&
+		!ce_uptodate(ce) &&
+		!ce_skip_worktree(ce) &&
+		!(ce->ce_flags & CE_FSMONITOR_VALID);
+}
+
 static void *preload_thread(void *_data)
 {
 	int nr, last_nr;
@@ -61,15 +70,7 @@ static void *preload_thread(void *_data)
 		struct cache_entry *ce = *cep++;
 		struct stat st;
 
-		if (ce_stage(ce))
-			continue;
-		if (S_ISGITLINK(ce->ce_mode))
-			continue;
-		if (ce_uptodate(ce))
-			continue;
-		if (ce_skip_worktree(ce))
-			continue;
-		if (ce->ce_flags & CE_FSMONITOR_VALID)
+		if (!preload_entry_needs_stat(ce))
 			continue;
 		if (p->progress && !(nr & 31)) {
 			struct progress_data *pd = p->progress;
