@@ -30,6 +30,7 @@
 
 struct attr_check;
 struct repository;
+struct clean_status_proof_epoch;
 struct cache_entry;
 struct git_hash_algo;
 struct index_state;
@@ -106,6 +107,7 @@ struct semantic_verify_worker {
 	struct index_state *istate;
 	struct semantic_verify_root *root;
 	struct semantic_verify_result *results;
+	struct attr_check *check;
 	size_t start;
 	size_t end;
 	struct semantic_verify_stat_update *updates;
@@ -130,6 +132,7 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker);
 struct semantic_verify_proof {
 	struct index_state *istate;
 	struct semantic_verify_root *root;
+	struct clean_status_proof_epoch *epoch;
 	struct semantic_verify_result *results;
 	struct semantic_verify_entry_identity *entry_identities;
 	struct semantic_verify_stat_update *stat_updates;
@@ -146,6 +149,7 @@ struct semantic_verify_proof {
 	size_t hardlinks;
 	size_t active_filters;
 	unsigned int namespace_unstable;
+	unsigned int epoch_required;
 	unsigned int filter_scope_checked;
 };
 
