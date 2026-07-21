@@ -1893,7 +1893,9 @@ prepare_semantic_untracked_repo () {
 		test_write_lines "*.ignored" >.gitignore &&
 		test_write_lines "*.ignored" >cached/.gitignore &&
 		printf "aaaa\n" >cached/tracked &&
-		git add .gitignore cached/.gitignore cached/tracked &&
+		printf "cccc\n" >cached/hook-tracked &&
+		git add .gitignore cached/.gitignore cached/hook-tracked \
+			cached/tracked &&
 		git commit -m base &&
 		git config core.trustctime false &&
 		git config core.checkStat minimal &&
@@ -1972,6 +1974,94 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! test_trace2_data fsmonitor token_closure/accepted 1 \
 			<.git/status.trace &&
 		test_grep ! FSCF .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,!MINGW,!CYGWIN \
+	'commit closes hook changes without an untracked cache' '
+	test_when_finished "rm -rf commit-hook-closure" &&
+	prepare_semantic_untracked_repo commit-hook-closure &&
+	(
+		cd commit-hook-closure &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		git config core.untrackedCache false &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --no-untracked-cache &&
+		test_grep ! UNTR .git/index &&
+		write_script .git/hooks/pre-commit <<-\EOF &&
+		mtime=$(test-tool chmtime --get cached/hook-tracked) &&
+		printf "dddd\n" >cached/hook-tracked &&
+		test-tool chmtime =$mtime cached/hook-tracked
+		EOF
+		GIT_EDITOR=: \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/hook-tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/commit.trace" \
+			git commit --allow-empty --edit -m adoption &&
+		test_trace2_data status fsmonitor_token/semantic-closed 1 \
+			<.git/commit.trace &&
+		test_trace2_data fsmonitor token_closure/apply_count "[1-9]" \
+			<.git/commit.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/commit.trace >.git/accepted &&
+		test_line_count = 2 .git/accepted &&
+		test_grep FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/status.actual &&
+		test_grep "^1 \.M .* cached/hook-tracked$" \
+			.git/status.actual &&
+		test_grep ! UNTR .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,!MINGW,!CYGWIN \
+	'failed hook closure refreshes the worktree' '
+	test_when_finished "rm -rf commit-hook-fallback" &&
+	prepare_semantic_untracked_repo commit-hook-fallback &&
+	(
+		cd commit-hook-fallback &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		write_script .git/hooks/pre-commit <<-\EOF &&
+		mtime=$(test-tool chmtime --get cached/hook-tracked) &&
+		printf "dddd\n" >cached/hook-tracked &&
+		test-tool chmtime =$mtime cached/hook-tracked
+		EOF
+		GIT_EDITOR=: \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCE \
+		GIT_TRACE2_EVENT="$PWD/.git/commit.trace" \
+			git commit --allow-empty --edit -m adoption &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/commit.trace &&
+		test_trace2_data status count/changed 2 <.git/commit.trace &&
+		test_grep "cached/hook-tracked$" .git/COMMIT_EDITMSG &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/status.actual &&
+		test_grep "cached/hook-tracked$" .git/status.actual
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,!MINGW,!CYGWIN \
+	'post-hook refresh preserves hook index updates' '
+	test_when_finished "rm -rf commit-hook-index" &&
+	prepare_semantic_untracked_repo commit-hook-index &&
+	(
+		cd commit-hook-index &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		write_script .git/hooks/pre-commit <<-\EOF &&
+		printf "hook update\n" >cached/hook-tracked &&
+		oid=$(git hash-object -w cached/hook-tracked) &&
+		git update-index --cacheinfo \
+			100644,$oid,cached/hook-tracked
+		EOF
+		GIT_EDITOR=: \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git commit --allow-empty --edit -m adoption &&
+		printf "hook update\n" >expect &&
+		git show HEAD:cached/hook-tracked >actual &&
+		test_cmp expect actual
 	)
 '
 

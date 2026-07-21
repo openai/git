@@ -168,6 +168,7 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s);
 int wt_status_refresh_index(struct wt_status *s,
 			    unsigned int refresh_flags,
 			    int require_untracked);
+void wt_status_invalidate_refresh(struct wt_status *s);
 
 /*
  * Collect all changes between the two trees. Changes will be displayed as if
