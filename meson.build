@@ -1319,6 +1319,8 @@ if host_machine.system() == 'darwin'
   libgit_c_args += '-DHAVE_PRELOAD_INDEX_BULK'
   libgit_c_args += '-DPRECOMPOSE_UNICODE'
   libgit_c_args += '-DPROTECT_HFS_DEFAULT'
+elif host_machine.system() == 'linux'
+  libgit_c_args += '-DHAVE_PRELOAD_INDEX_BULK'
 endif
 
 # Configure general compatibility wrappers.
@@ -1362,11 +1364,17 @@ endif
 if host_machine.system() == 'linux'
   compat_sources += [
     'compat/linux/procinfo.c',
+    'compat/preload-index/bulk-linux.c',
     'compat/preload-index/bulk-linux-entry.c',
     'compat/preload-index/bulk-linux-open.c',
     'compat/preload-index/bulk-linux-scan.c',
     'compat/preload-index/bulk-linux-stat.c',
     'compat/preload-index/bulk-linux-topology.c',
+  ]
+  libgit_sources += [
+    'preload-index-bulk-index.c',
+    'preload-index-bulk-thread.c',
+    'preload-index-bulk.c',
   ]
 elif host_machine.system() == 'windows'
   compat_sources += 'compat/win32/trace2_win32_process_info.c'
