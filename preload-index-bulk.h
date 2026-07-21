@@ -4,7 +4,11 @@
 #include "git-compat-util.h"
 #include "preload-index.h"
 #include "strbuf.h"
+#include "string-list.h"
 #include "thread-utils.h"
+
+struct dir_struct;
+struct preload_bulk_untracked_root;
 
 struct preload_bulk_dir_identity {
 	struct stat stat;
@@ -34,6 +38,7 @@ struct preload_bulk_queue {
 	size_t open_fds;
 	size_t open_fd_limit;
 	int failed;
+	unsigned untracked_invalid : 1;
 };
 
 struct preload_bulk_scan;
@@ -52,9 +57,12 @@ struct preload_bulk_worker {
 };
 
 struct preload_bulk_backend {
+	unsigned collects_untracked : 1;
 	const char *(*start)(struct preload_bulk_scan *scan);
 	const char *(*finish)(struct preload_bulk_scan *scan);
 	void (*release)(struct preload_bulk_scan *scan);
+	int (*open_proof_parent)(struct preload_bulk_scan *scan,
+				 const char *path);
 	int (*open_dir_at)(struct preload_bulk_worker *worker, int parent_fd,
 			   const char *name);
 	/*
@@ -76,8 +84,13 @@ struct preload_bulk_scan {
 	struct preload_bulk_queue queue;
 	struct preload_bulk_worker *workers;
 	unsigned char *tracked_state;
+	struct dir_struct *exclude_dir;
+	pthread_mutex_t exclude_mutex;
+	struct preload_bulk_untracked_root *untracked_roots;
+	struct string_list untracked;
 	int root_fd;
 	int threads;
+	unsigned collect_untracked : 1;
 	unsigned case_insensitive : 1;
 	unsigned can_skip_unseen_preload : 1;
 };
@@ -89,6 +102,7 @@ struct preload_bulk_run_result {
 	uint64_t changed_dirs;
 	uint64_t malformed;
 	int threads;
+	unsigned untracked_complete : 1;
 };
 
 struct preload_bulk_result {
@@ -96,8 +110,11 @@ struct preload_bulk_result {
 	size_t nr;
 	const char *outcome;
 	const char *reason;
+	const char *untracked_reason;
 	struct preload_bulk_run_result run;
 	unsigned can_skip_unseen_preload : 1;
+	struct string_list untracked;
+	unsigned untracked_complete : 1;
 };
 
 void preload_bulk_schedule_directory(
@@ -120,6 +137,22 @@ void preload_bulk_record_tracked_descendants_fallback(
 int preload_bulk_record_tracked_alias_fallback(
 	struct preload_bulk_worker *worker, const char *path,
 	size_t path_len);
+int preload_bulk_path_is_excluded(struct preload_bulk_worker *worker,
+				  const char *path, int dtype);
+void preload_bulk_invalidate_untracked(
+	struct preload_bulk_worker *worker);
+int preload_bulk_untracked_is_invalid(
+	struct preload_bulk_worker *worker);
+struct preload_bulk_untracked_root *preload_bulk_untracked_root_new(
+	struct preload_bulk_worker *worker, const char *path,
+	size_t path_len);
+int preload_bulk_untracked_root_is_visible(
+	struct preload_bulk_worker *worker,
+	const struct preload_bulk_untracked_root *root);
+void preload_bulk_record_untracked(
+	struct preload_bulk_worker *worker,
+	struct preload_bulk_untracked_root *root,
+	const char *path);
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 			  struct preload_bulk_run_result *result);
 const struct preload_bulk_backend *preload_bulk_platform_backend(void);
