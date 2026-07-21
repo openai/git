@@ -31,6 +31,7 @@ articles = [
   'shallow.adoc',
   'sparse-checkout.adoc',
   'sparse-index.adoc',
+  'status-clean-proof.adoc',
   'trivial-merge.adoc',
   'unambiguous-types.adoc',
   'unit-tests.adoc',
