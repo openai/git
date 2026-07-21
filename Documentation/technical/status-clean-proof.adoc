@@ -1,0 +1,164 @@
+Status clean-proof sidecar
+==========================
+
+The status clean-proof sidecar is an optional cache for one exact clean
+`git status --porcelain=v2` result. It is never a source of repository
+state. A missing, stale, malformed, unsupported, or raced sidecar makes
+status read the index and scan the worktree normally.
+
+Location and scope
+------------------
+
+The sidecar for an index at `<index>` is stored at `<index>.csts`. This
+keeps a proof for one index from being applied to an alternate index.
+Sidecars are currently limited to the main worktree, the builtin file
+system monitor, and an index and worktree root on local APFS file
+systems.
+
+Readers pass `O_NONBLOCK` and do not follow symbolic links when opening
+the sidecar, then accept only regular files no larger than 8192 bytes.
+An open or validation failure falls back to ordinary status. Writers use
+the normal lockfile protocol.
+
+Binary format
+-------------
+
+All integers are stored in network byte order. Hashes use the
+repository's object-format hash algorithm. Version 1 consists of:
+
+* Four-byte magic `CSTS`.
+
+* A 32-bit version number (currently 1).
+
+* 32-bit flags (currently zero).
+
+* Fourteen 64-bit fields describing the source index: device, inode,
+  mode, link count, uid, gid, size, mtime seconds and nanoseconds, ctime
+  seconds and nanoseconds, birth time seconds and nanoseconds, and
+  generation.
+
+* The 32-bit index format version and 32-bit cache-entry count.
+
+* The index checksum and `HEAD` tree object ID.
+
+* Hashes of status-relevant configuration and repository identity. The
+  repository identity covers the worktree and Git directory paths, the
+  worktree root identity, the local APFS identifiers of the held index
+  and worktree root, external-attribute contents, and locale inputs.
+
+* One object ID digesting the unique standard-exclude observations in
+  first-observation order. Each observation contains the source path,
+  symbolic-link lookup policy, presence, and contents. Transient file
+  system identities used to make an observation coherent are not part
+  of the digest.
+
+* A 32-bit provider-token length followed by the token without a
+  terminating NUL. Version 1 accepts only builtin-fsmonitor tokens.
+
+* A hash over all preceding bytes in the sidecar.
+
+Issuance
+--------
+
+Only a literal, top-level `status --porcelain=v2` invocation can issue a
+sidecar. Status first completes the tracked and untracked scan,
+semantic-conversion checks, and provider-token closure. The result must
+be empty and use the bulk scanner's complete standard-exclude result.
+The index must also contain persistent semantic history from an earlier
+scan, so the first scan cannot certify itself.
+
+Status then uses the held attribute snapshot and the scanner-sourced
+standard-exclude digest, pins the named index, and checks its ordinary
+expanded entries, `HEAD`, and the cache tree. External attribute
+sources, effective replacement refs, untracked-cache results, null
+index checksums, and other unsupported repository or index shapes
+prevent issuance.
+
+The sidecar is installed while the index lock remains held and after
+the pinned index is rechecked. Status then rolls back the index lock, so
+issuing a sidecar does not itself rewrite the index. With optional locks
+disabled, status does not issue a sidecar.
+
+Validation and races
+--------------------
+
+For the same literal command, status attempts validation before loading
+the index entries. It checks the bounded sidecar, pins the named index,
+and recreates the configuration, attribute, standard-exclude,
+repository, and `HEAD` inputs. It then queries the builtin file system
+monitor from the recorded token and accepts only an empty delta
+response.
+
+The attribute and exclude snapshots remain held across that query.
+Before returning a clean result, status freshly checks configuration,
+`HEAD`, uncached replacement refs, the attribute contents and namespace,
+the exclude sources, and both the opened and named index identities.
+The sidecar's exclude-source opens pass `O_NONBLOCK` and fail closed
+when the source cannot be opened and validated; standard-exclude
+symbolic links retain their normal lookup behavior.
+
+A hit produces no output and reads only the 12-byte index header and
+the 20- or 32-byte checksum trailer; it does not deserialize cache
+entries, write the index, replace the sidecar, or advance its provider
+token. Any failed check falls through to ordinary status.
+
+Resumable history checkpoints
+-----------------------------
+
+The exact-result sidecar above is deliberately tied to one physical
+index file.  A normal, top-level `git status` has a separate checkpoint
+store for resuming clean-status history after another Git implementation
+has rewritten or re-encoded the index.  The store is consulted only
+after the ordinary index entries have been read.  It cannot answer a
+status command by itself.
+
+For an index at `<index>`, a checkpoint is stored as
+`<index>.csh1.<namespace-hash>`.  The namespace covers the checkpoint
+schema, status configuration, semantic inputs, attribute namespace, and
+the canonical worktree, Git directory, and common directory paths.  It
+does not include a Git executable, build prefix, provider token, or
+physical index generation.  At most eight regular version-1 checkpoint
+files are retained next to an index.  Each file is limited to 16 MiB;
+readers use `O_NONBLOCK`, do not follow symbolic links, and verify an
+outer checksum before parsing any section.  Publication currently
+requires durable index identities on a local APFS file system.
+
+Each checkpoint is self-contained and co-temporal.  It contains:
+
+* a canonical digest of the ordered logical index entries;
+
+* the `FSMN` token and dirty bitmap;
+
+* the serialized untracked cache and its paired `FSUC` token, when an
+  untracked cache exists; and
+
+* the `FSCF` semantic proof bound to the same file-system-monitor token.
+
+The logical index digest includes entry count, path, stage, object ID,
+mode, `CE_VALID`, skip-worktree, and intent-to-add state.  It excludes
+index format, checksum, file identity, cached stat data, and
+`CE_FSMONITOR_VALID`.  Split and collapsed sparse indexes and
+unrecognized transient flags reject matching.  A changed logical digest
+misses, while publication additionally rejects logical changes during
+the command and racy entries.  This lets an index-format-only rewrite
+find the same logical state without preserving proof across commands
+which can change entry membership or persistent flags.
+
+On a valid hit, status installs all checkpoint sections together in a
+scratch index, rechecks the pinned index, and only then replaces the
+in-memory acceleration state.  It queries the builtin file-system
+monitor from the stored token.  A trivial response, provider restart,
+malformed section, token mismatch, namespace mismatch, or index race
+falls back to ordinary validation.
+
+Status publishes a replacement checkpoint only after closing the
+provider token and validating the semantic proof and paired untracked
+cache.  Publication uses the normal index lock followed by a per-slot
+lockfile, and atomically replaces one namespace slot.  When publication
+succeeds, status rolls back the pending acceleration-only index update.
+After an external restore, status also leaves the main index untouched
+if republication fails, so one proof namespace is not copied over
+another implementation's index extensions.  Only literal normal status
+enables this lane; commands capable of logical index changes retain the
+normal index-writing path.  Optional-lock-free commands neither publish
+checkpoints nor use this rollback path.
