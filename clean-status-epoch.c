@@ -129,9 +129,10 @@ int clean_status_proof_epoch_start_token_matches(
 			istate->fsmonitor_last_update_pending);
 }
 
-int clean_status_proof_epoch_matches(
+static int proof_epoch_matches(
 	struct index_state *istate,
-	const struct clean_status_proof_epoch *epoch)
+	const struct clean_status_proof_epoch *epoch,
+	int check_attr_namespace)
 {
 	struct clean_status_state *state;
 	struct attr_fingerprint attrs;
@@ -155,8 +156,9 @@ int clean_status_proof_epoch_matches(
 		goto done;
 	if (attr_fingerprint_repository(istate->repo, &attrs) ||
 	    memcmp(attrs.content_hash, epoch->attr_hash, algo->rawsz) ||
-	    memcmp(attrs.namespace_hash, epoch->attr_namespace_hash,
-		   algo->rawsz) ||
+	    (check_attr_namespace &&
+	     memcmp(attrs.namespace_hash, epoch->attr_namespace_hash,
+		    algo->rawsz)) ||
 	    attrs.sources_present != epoch->attr_sources_present ||
 	    memcmp(state->manifest.current_hash, epoch->manifest_hash,
 		   algo->rawsz) ||
@@ -168,6 +170,33 @@ done:
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "semantic/proof-epoch-matched", matched);
 	return matched;
+}
+
+int clean_status_proof_epoch_prime_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch)
+{
+	int matched =
+		clean_status_proof_epoch_start_token_matches(istate, epoch) &&
+		proof_epoch_matches(istate, epoch, 1);
+
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "semantic/proof-epoch-primed", matched);
+	return matched;
+}
+
+int clean_status_proof_epoch_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch)
+{
+	return proof_epoch_matches(istate, epoch, 1);
+}
+
+int clean_status_proof_epoch_content_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch)
+{
+	return proof_epoch_matches(istate, epoch, 0);
 }
 
 void clean_status_release_proof_epoch(
