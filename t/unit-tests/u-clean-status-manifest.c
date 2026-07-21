@@ -1,5 +1,7 @@
 #include "unit-test.h"
 #include "attr-manifest.h"
+#include "clean-status.h"
+#include "clean-status-internal.h"
 #include "clean-status-manifest.h"
 #include "dir.h"
 #include "fsmonitor-clean-proof.h"
@@ -73,6 +75,51 @@ void test_clean_status_manifest__rejects_invalid_history(void)
 	clean_status_manifest_release(&state);
 	strbuf_release(&manifest);
 }
+
+void test_clean_status_manifest__requires_complete_full_index(void)
+{
+	const char *current_token = "builtin:1:2";
+	const char *closed_token = "builtin:1:3";
+	struct repository repo = { .hash_algo = &hash_algos[GIT_HASH_SHA1] };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct clean_status_state *state = clean_status_get_state(&istate);
+
+	istate.fsmonitor_last_update = xstrdup(current_token);
+	istate.fsmonitor_token_valid = 1;
+	state->current_config_valid = 1;
+	state->current_semantic_valid = 1;
+	state->current_attr_valid = 1;
+	state->config_enforced = 1;
+	state->manifest.current_valid = 1;
+	state->manifest.checked = 1;
+	state->manifest.current_flags =
+		FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE;
+
+	clean_status_mark_fsmonitor_config_valid(&istate, closed_token);
+	cl_assert(!state->config_revalidated);
+	cl_assert(!state->config_revalidated_token);
+	cl_assert(!clean_status_should_write_fsmonitor_config(&istate));
+	cl_assert_equal_i(state->manifest.current_flags,
+			  FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE);
+
+	state->manifest.current_flags |= FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	clean_status_mark_fsmonitor_config_valid(&istate, closed_token);
+	cl_assert(state->config_revalidated);
+	cl_assert_equal_s(state->config_revalidated_token, closed_token);
+	cl_assert(!clean_status_revalidated_token_matches(&istate));
+	cl_assert(!clean_status_should_write_fsmonitor_config(&istate));
+
+	FREE_AND_NULL(istate.fsmonitor_last_update);
+	istate.fsmonitor_last_update = xstrdup(closed_token);
+	cl_assert(clean_status_revalidated_token_matches(&istate));
+	cl_assert(clean_status_should_write_fsmonitor_config(&istate));
+	cl_assert_equal_i(state->manifest.current_flags,
+			  FSMONITOR_CLEAN_PROOF_ALL);
+
+	clean_status_release(&istate);
+	FREE_AND_NULL(istate.fsmonitor_last_update);
+}
+
 #if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
 static char *create_worktree(void)
 {
