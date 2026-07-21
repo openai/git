@@ -42,6 +42,7 @@ void test_clean_status_manifest__loads_and_adopts_valid_history(void)
 	cl_assert(!memcmp(state.current.buf, manifest.buf, manifest.len));
 	clean_status_manifest_invalidate(&state);
 	cl_assert(!state.current_valid);
+	cl_assert(state.current_invalidated);
 	cl_assert_equal_i(state.current_flags, 0);
 	clean_status_manifest_release(&state);
 	strbuf_release(&manifest);
@@ -183,6 +184,7 @@ void test_clean_status_manifest__invalidates_only_changed_scopes(void)
 	}
 	cl_assert_equal_i(clean_status_manifest_refresh(&istate, &state), 1);
 	cl_assert(state.changed);
+	cl_assert(!state.current_invalidated);
 	cl_assert(!(istate.cache[0]->ce_flags & CE_FSMONITOR_VALID));
 	cl_assert(istate.cache[0]->ce_flags & CE_CONTENT_CHECK_REQUIRED);
 	cl_assert(istate.cache[1]->ce_flags & CE_FSMONITOR_VALID);
@@ -195,6 +197,7 @@ void test_clean_status_manifest__invalidates_only_changed_scopes(void)
 	strbuf_reset(&old);
 	strbuf_addbuf(&old, &state.current);
 	clean_status_manifest_invalidate(&state);
+	cl_assert(state.current_invalidated);
 	istate.cache[0]->ce_flags = create_ce_flags(1);
 	cl_assert_equal_i(clean_status_manifest_refresh(&istate, &state), -1);
 	cl_assert(!state.current_valid);
@@ -209,6 +212,7 @@ void test_clean_status_manifest__invalidates_only_changed_scopes(void)
 	}
 	cl_assert_equal_i(clean_status_manifest_refresh(&istate, &state), 1);
 	cl_assert(state.changed);
+	cl_assert(!state.current_invalidated);
 	cl_assert(!(istate.cache[0]->ce_flags & CE_FSMONITOR_VALID));
 	cl_assert(istate.cache[0]->ce_flags & CE_CONTENT_CHECK_REQUIRED);
 	cl_assert(istate.cache[1]->ce_flags & CE_FSMONITOR_VALID);
