@@ -1645,9 +1645,6 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			git status --porcelain=v2 >.git/prime &&
 		test_must_be_empty .git/prime &&
 		test_grep FSUC .git/index &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
-			test-tool read-cache --test-fscf-seed &&
-		test_grep FSUC .git/index &&
 		test_grep FSCF .git/index &&
 
 		touch x &&
@@ -1744,6 +1741,93 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_grep "^1 \.M .* tracked$" .git/actual &&
 		test_trace2_data fsmonitor semantic/strong-invalidation 1 \
 			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'token closure refresh starts inside its proof epoch' '
+	test_when_finished "rm -rf proof-epoch-refresh" &&
+	test_create_repo proof-epoch-refresh &&
+	(
+		cd proof-epoch-refresh &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		# Leave the next refresh with untracked history to bootstrap.
+		git update-index --no-untracked-cache 2>.git/no-uc.err &&
+		test_grep FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			test_must_fail git commit --dry-run --porcelain \
+			>.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		captured=$(test_grep -n \
+			"\"key\":\"semantic/proof-epoch-captured\"" \
+			.git/status.trace | sed -n "1s/:.*//p") &&
+		refreshed=$(test_grep -n \
+			"\"category\":\"index\",\"label\":\"refresh\"" \
+			.git/status.trace | sed -n "\$s/:.*//p") &&
+		test -n "$captured" &&
+		test -n "$refreshed" &&
+		test "$captured" -lt "$refreshed"
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'trivial query closes unbound semantic history' '
+	test_when_finished "rm -rf unbound-trivial" &&
+	test_create_repo unbound-trivial &&
+	(
+		cd unbound-trivial &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			test-tool read-cache --test-fscf-round-trip &&
+		test_grep FSMN .git/index &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TC \
+		GIT_TRACE2_EVENT="$PWD/.git/recovery.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/recovery.out &&
+		test_must_be_empty .git/recovery.out &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/recovery.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9]" <.git/recovery.trace &&
+		test_trace2_data fsmonitor semantic/proof-epoch-captured 1 \
+			<.git/recovery.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/recovery.trace &&
+		! test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/recovery.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/warm.out &&
+		test_must_be_empty .git/warm.out &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/warm.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9]" <.git/warm.trace &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/warm.trace &&
+		! test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/warm.trace
 	)
 '
 
