@@ -35,7 +35,13 @@ struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
 int clean_status_proof_epoch_start_token_matches(
 	struct index_state *istate,
 	const struct clean_status_proof_epoch *epoch);
+int clean_status_proof_epoch_prime_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch);
 int clean_status_proof_epoch_matches(
+	struct index_state *istate,
+	const struct clean_status_proof_epoch *epoch);
+int clean_status_proof_epoch_content_matches(
 	struct index_state *istate,
 	const struct clean_status_proof_epoch *epoch);
 void clean_status_release_proof_epoch(
