@@ -4,14 +4,24 @@
 #include "clean-status-config.h"
 
 struct index_state;
+struct attr_source_snapshot;
 struct repository;
 struct stat;
 struct strbuf;
+
+enum clean_status_attr_change {
+	CLEAN_STATUS_ATTR_CONTENT_CHANGED = 1 << 0,
+	CLEAN_STATUS_ATTR_NAMESPACE_CHANGED = 1 << 1,
+};
 
 void clean_status_set_config_digest(
 	struct repository *repo,
 	const struct clean_status_config_digest *digest);
 void clean_status_attach_config(struct index_state *istate);
+int clean_status_capture_attr_snapshot(
+	struct index_state *istate,
+	struct attr_source_snapshot **snapshot);
+int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate);
 
 void clean_status_record_source_identity(struct index_state *istate,
 					 const struct stat *st);

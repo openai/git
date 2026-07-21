@@ -114,7 +114,7 @@ void test_clean_status_history__adopts_only_coherent_proofs(void)
 
 	state->current_semantic_hash[0] ^= 1;
 	clean_status_prepare_fsmonitor_config(&fixture.istate);
-	cl_assert(state->strong_mismatch);
+	cl_assert(clean_status_fsmonitor_strong_mismatch(&fixture.istate));
 	cl_assert(!state->initial_coherent);
 	fixture_release(&fixture);
 }
