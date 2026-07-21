@@ -7,6 +7,7 @@
 #include "remote.h"
 
 struct repository;
+struct attr_source_snapshot;
 struct worktree;
 struct untracked_cache_preload;
 
@@ -148,7 +149,9 @@ struct wt_status {
 	struct string_list ignored;
 	uint32_t untracked_in_ms;
 	struct untracked_cache_preload *untracked_cache_preload;
+	struct attr_source_snapshot *attr_source_snapshot;
 	unsigned untracked_cache_preloaded : 1;
+	unsigned attr_snapshot_failed : 1;
 };
 
 size_t wt_status_locate_end(const char *s, size_t len);
