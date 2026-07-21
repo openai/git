@@ -67,6 +67,8 @@ int fsmonitor_invalidate_attributes_path(struct index_state *istate,
 /* Close a provider token which was obtained before a required scan. */
 int fsmonitor_has_pending_token(const struct index_state *istate);
 int fsmonitor_pending_token_from_provider(const struct index_state *istate);
+/* Reopen the last accepted IPC token after an in-process operation. */
+int fsmonitor_reopen_token(struct index_state *istate);
 enum fsmonitor_token_result fsmonitor_query_pending_token(
 	struct index_state *istate, int untracked_ready);
 void fsmonitor_accept_pending_token(struct index_state *istate,
