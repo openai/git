@@ -1435,6 +1435,21 @@ static void wt_status_release_attr_snapshot(struct wt_status *s)
 	s->attr_snapshot_failed = 0;
 }
 
+void wt_status_invalidate_refresh(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+
+	wt_status_release_attr_snapshot(s);
+	if (!s->pathspec.nr && !istate->split_index &&
+	    fsmonitor_reopen_token(istate))
+		return;
+	if (fsmonitor_has_pending_token(istate))
+		fsmonitor_reject_pending_token(istate);
+	clean_status_invalidate_current_manifest(istate);
+	untracked_cache_invalidate_all(istate);
+	fsmonitor_invalidate_semantics(istate);
+}
+
 static int has_unmerged(struct wt_status *s)
 {
 	int i;
