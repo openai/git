@@ -1675,13 +1675,14 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 		}
 
 		{
-			int baseline_valid =
-				clean_status_fsmonitor_semantic_baseline_pending(
-					istate) &&
-				(new_entry->ce_flags & CE_FSMONITOR_VALID);
+			int fsmonitor_valid =
+				(new_entry->ce_flags & CE_FSMONITOR_VALID) &&
+				((flags & REFRESH_IN_PROOF_EPOCH) ||
+				 clean_status_fsmonitor_semantic_baseline_pending(
+					 istate));
 
 			replace_index_entry(istate, i, new_entry);
-			if (baseline_valid)
+			if (fsmonitor_valid)
 				mark_fsmonitor_valid(istate,
 						     istate->cache[i]);
 		}
@@ -2038,6 +2039,7 @@ static void post_read_index_from(struct index_state *istate)
 	check_ce_order(istate);
 	tweak_untracked_cache(istate);
 	tweak_split_index(istate);
+	clean_status_restore_external_history(istate);
 	prepare_fsmonitor_untracked(istate);
 	clean_status_prepare_fsmonitor_config(istate);
 	tweak_fsmonitor(istate);
