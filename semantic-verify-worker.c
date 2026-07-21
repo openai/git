@@ -56,9 +56,13 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 {
 	struct semantic_verify_path *path =
 		semantic_verify_path_new(worker->root);
-	struct attr_check *check = convert_attrs_check_alloc();
+	struct attr_check *check = worker->check;
 	void *buffer = xmalloc(SEMANTIC_VERIFY_HASH_BUFFER_SIZE);
 	size_t unstable_from = SIZE_MAX;
+
+	worker->check = NULL;
+	if (!check)
+		check = convert_attrs_check_alloc();
 
 	for (size_t i = worker->start; i < worker->end; i++) {
 		struct cache_entry *ce = worker->istate->cache[i];
