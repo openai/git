@@ -30,6 +30,7 @@ void exclude_source_capture_record(
 	int source_fd,
 	const struct stat *source_stat,
 	const void *buf, size_t size);
+void exclude_source_capture_error(struct exclude_source_capture *capture);
 void exclude_source_capture_release(struct exclude_source_capture *capture);
 int exclude_source_proof_validate(struct exclude_source_proof *proof);
 void exclude_source_proof_release(struct exclude_source_proof *proof);
