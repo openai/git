@@ -60,6 +60,8 @@ struct preload_bulk_linux_data {
 	struct preload_linux_statx root_statx;
 	struct strbuf mountinfo;
 	uint64_t root_mnt_id;
+	char *test_dirent_path;
+	unsigned char test_dirent_type;
 	int use_openat2;
 };
 
