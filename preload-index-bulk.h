@@ -55,8 +55,10 @@ struct preload_bulk_backend {
 };
 
 struct preload_bulk_scan {
+	struct repository *repo;
 	struct index_state *istate;
 	const struct preload_bulk_backend *backend;
+	void *platform_data;
 	struct preload_bulk_queue queue;
 	struct preload_bulk_worker *workers;
 	unsigned char *tracked_state;
