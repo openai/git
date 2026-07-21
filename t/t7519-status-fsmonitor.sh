@@ -69,6 +69,29 @@ test_expect_success 'FSUC parser fails closed' '
 	test-tool read-cache --test-fsuc-parser
 '
 
+test_expect_success !SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'unsupported identity preserves an ordinary provider token' '
+	test_when_finished "rm -rf unsupported-provider-token" &&
+	test_create_repo unsupported-provider-token &&
+	(
+		cd unsupported-provider-token &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep "^fsmonitor last update builtin:test:" \
+			.git/fsmonitor &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'FSCF survives index I/O and generic rewrites' '
 	test_when_finished "rm -rf fscf-round-trip" &&
