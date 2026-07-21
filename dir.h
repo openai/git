@@ -7,6 +7,7 @@
 #include "statinfo.h"
 #include "strbuf.h"
 
+struct exclude_source_proof;
 struct repository;
 
 /**
@@ -364,6 +365,12 @@ struct dir_struct {
 		unsigned visited_paths;
 		unsigned visited_directories;
 		unsigned untracked_cache_preloaded : 1;
+
+		/*
+		 * Optional borrowed proof that covers every exclusion source
+		 * consulted by this traversal.
+		 */
+		struct exclude_source_proof *exclude_source_proof;
 	} internal;
 };
 
