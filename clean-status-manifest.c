@@ -93,6 +93,7 @@ void clean_status_manifest_adopt_disk(
 	state->current_flags = state->disk_flags;
 	state->current_valid = 1;
 	state->checked = 1;
+	state->current_invalidated = 0;
 }
 
 static int invalidate_manifest_path(const struct attr_manifest_entry *entry,
@@ -155,6 +156,7 @@ int clean_status_manifest_refresh(struct index_state *istate,
 	state->current_valid = 1;
 	state->current_flags = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
 		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	state->current_invalidated = 0;
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "semantic/manifest-candidates", stats.candidates);
 	trace2_data_intmax("fsmonitor", istate->repo,
@@ -180,6 +182,8 @@ int clean_status_manifest_refresh(struct index_state *istate,
 void clean_status_manifest_invalidate(
 	struct clean_status_manifest_state *state)
 {
+	if (state->current_valid)
+		state->current_invalidated = 1;
 	state->current_valid = 0;
 	state->current_flags = 0;
 }
