@@ -9,6 +9,7 @@ clar_test_suites = [
   'unit-tests/u-ctype.c',
   'unit-tests/u-dir.c',
   'unit-tests/u-example-decorate.c',
+  'unit-tests/u-exclude-source-proof.c',
   'unit-tests/u-fsmonitor-attributes.c',
   'unit-tests/u-fsmonitor-clean-proof.c',
   'unit-tests/u-fsmonitor-response.c',

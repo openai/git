@@ -377,6 +377,7 @@ libgit_sources = [
   'editor.c',
   'entry.c',
   'environment.c',
+  'exclude-source-proof.c',
   'ewah/bitmap.c',
   'ewah/ewah_bitmap.c',
   'ewah/ewah_io.c',
