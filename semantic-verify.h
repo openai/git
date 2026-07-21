@@ -2,10 +2,13 @@
 #define SEMANTIC_VERIFY_H
 
 struct index_state;
+struct attr_source_snapshot;
 struct semantic_verify_proof;
 
 struct semantic_verify_options {
 	unsigned int nr_threads;
+	const struct attr_source_snapshot *attr_snapshot;
+	unsigned int require_proof_epoch : 1;
 	unsigned int validate_filter_scope : 1;
 };
 
@@ -62,6 +65,9 @@ int semantic_verify_apply_after_closure(
 	struct index_state *istate,
 	const struct semantic_verify_proof *proof);
 int semantic_verify_root_is_stable(
+	const struct semantic_verify_proof *proof);
+int semantic_verify_start_token_is_current(
+	struct index_state *istate,
 	const struct semantic_verify_proof *proof);
 void semantic_verify_proof_clear(struct semantic_verify_proof *proof);
 
