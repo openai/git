@@ -167,4 +167,114 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	test_grep "filter_scope_checked=1" actual
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'immutable attribute sources preserve file parsing' '
+	attrs="$TRASH_DIRECTORY/attribute-parser-file" &&
+	printf "\357\273\277*.dat text\nignored\0junk\n*.txt text\r\n*.bin text\r" \
+		>"$attrs" &&
+	test_create_repo attribute-parser &&
+	git -C attribute-parser config core.attributesFile "$attrs" &&
+	git -C attribute-parser config core.fsmonitor false &&
+	git -C attribute-parser config core.untrackedCache false &&
+	for extension in dat txt bin
+	do
+		printf "alpha\r\n" \
+			>"attribute-parser/tracked.$extension" || return 1
+	done &&
+	git -C attribute-parser add . &&
+	git -C attribute-parser commit -m base &&
+
+	GIT_OPTIONAL_LOCKS=0 GIT_TEST_COLD_BULK_STATUS=0 \
+		git -C attribute-parser status --porcelain=v2 >actual &&
+	test_must_be_empty actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'missing attribute history invalidates cached stats' '
+	attrs="$TRASH_DIRECTORY/external-attributes-file" &&
+	printf "*.txt text eol=crlf\n" >"$attrs" &&
+	test_create_repo external-attributes &&
+	git -C external-attributes config core.attributesFile "$attrs" &&
+	git -C external-attributes config core.fsmonitor false &&
+	git -C external-attributes config core.untrackedCache false &&
+	printf "alpha\r\n" >external-attributes/tracked.txt &&
+	git -C external-attributes add tracked.txt &&
+	git -C external-attributes commit -m base &&
+
+	printf "*.txt -text\n" >"$attrs" &&
+	GIT_OPTIONAL_LOCKS=0 GIT_TEST_COLD_BULK_STATUS=0 \
+		git -C external-attributes status --porcelain=v2 >actual &&
+	test_grep "^1 \.M .* tracked.txt$" actual
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'hook cannot hide an observed external attribute change' '
+	attrs="$TRASH_DIRECTORY/hook-attribute-change.rules" &&
+	marker="$TRASH_DIRECTORY/hook-attribute-change.marker" &&
+	printf "*.txt text eol=crlf\n" >"$attrs" &&
+	test_create_repo hook-attribute-change &&
+	(
+		cd hook-attribute-change &&
+		git config core.attributesFile "$attrs" &&
+		git config core.untrackedCache false &&
+		printf "alpha\r\n" >tracked.txt &&
+		git add tracked.txt &&
+		git commit -m base &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			if test -n "$GIT_TEST_ATTR_FILE"
+			then
+				printf "*.txt -text\n" >"$GIT_TEST_ATTR_FILE"
+				: >"$GIT_TEST_ATTR_MARKER"
+			fi
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+
+		GIT_TEST_ATTR_FILE="$attrs" \
+		GIT_TEST_ATTR_MARKER="$marker" \
+			git status --porcelain=v2 >actual &&
+		test_path_is_file "$marker" &&
+		test_grep "^1 \.M .* tracked.txt$" actual
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'hook missing-history exception preserves reported paths' '
+	attrs="$TRASH_DIRECTORY/hook-missing-history.rules" &&
+	printf "*.txt -text\n" >"$attrs" &&
+	test_create_repo hook-missing-history &&
+	(
+		cd hook-missing-history &&
+		git config core.attributesFile "$attrs" &&
+		git config core.untrackedCache false &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		printf "aaaa\n" >tracked.txt &&
+		git add tracked.txt &&
+		git commit -m base &&
+		test-tool chmtime =-60 tracked.txt &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked.txt) &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		test_grep ! FSCF .git/index &&
+
+		printf "bbbb\n" >tracked.txt &&
+		test-tool chmtime =$mtime tracked.txt &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual
+	)
+'
+
 test_done
