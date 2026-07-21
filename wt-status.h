@@ -140,6 +140,7 @@ struct wt_status {
 	int committable;
 	int workdir_dirty;
 	unsigned untracked_from_token_closure : 1;
+	unsigned bulk_update_index_stat : 1;
 	const char *index_file;
 	FILE *fp;
 	const char *prefix;
