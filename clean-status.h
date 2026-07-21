@@ -52,7 +52,9 @@ void clean_status_begin_fsmonitor_semantic_baseline(
 
 int clean_status_refresh_worktree_manifest(struct index_state *istate);
 int clean_status_manifest_global_fallback(const struct index_state *istate);
-
+int clean_status_worktree_manifest_needs_refresh(
+	const struct index_state *istate);
+void clean_status_invalidate_current_manifest(struct index_state *istate);
 void clean_status_mark_fsmonitor_config_valid(
 	struct index_state *istate, const char *closed_token);
 

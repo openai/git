@@ -147,7 +147,8 @@ int clean_status_fsmonitor_config_mismatch(const struct index_state *istate)
 {
 	return istate->clean_status &&
 		istate->clean_status->current_config_valid &&
-		istate->clean_status->config_mismatch;
+		(istate->clean_status->config_mismatch ||
+		 !istate->clean_status->config_revalidated);
 }
 
 int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate)
@@ -168,6 +169,23 @@ int clean_status_manifest_global_fallback(const struct index_state *istate)
 {
 	return istate->clean_status &&
 		istate->clean_status->manifest.global_fallback;
+}
+
+int clean_status_worktree_manifest_needs_refresh(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->config_enforced &&
+		state->manifest.current_invalidated;
+}
+
+void clean_status_invalidate_current_manifest(struct index_state *istate)
+{
+	if (!istate->clean_status)
+		return;
+	clean_status_manifest_invalidate(&istate->clean_status->manifest);
+	clean_status_invalidate_current_proof(istate);
 }
 
 void clean_status_mark_fsmonitor_config_valid(struct index_state *istate,
