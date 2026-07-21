@@ -492,6 +492,32 @@ int ie_modified(struct index_state *istate,
 	return 0;
 }
 
+int ie_match_stat_with_content_check(struct index_state *istate,
+				     const struct cache_entry *ce,
+				     struct stat *st, unsigned int options)
+{
+	struct cache_entry *current;
+	int changed, pos;
+
+	if (S_ISGITLINK(ce->ce_mode) ||
+	    !(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED))
+		return ie_match_stat(istate, ce, st, options);
+
+	changed = ie_modified(istate, ce, st, options);
+	if (changed)
+		return changed;
+
+	pos = index_name_pos(istate, ce->name, ce_namelen(ce));
+	if (pos < 0 || istate->cache[pos] != ce)
+		return 0;
+
+	current = istate->cache[pos];
+	fill_stat_data(&current->ce_stat_data, st);
+	current->ce_flags |= CE_UPDATE_IN_BASE;
+	istate->cache_changed |= CE_ENTRY_CHANGED;
+	return 0;
+}
+
 static int cache_name_stage_compare(const char *name1, int len1, int stage1,
 				    const char *name2, int len2, int stage2)
 {

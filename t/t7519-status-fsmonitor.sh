@@ -477,4 +477,146 @@ test_expect_success 'status succeeds with sparse index' '
 	)
 '
 
+test_expect_success 'reported events poison weak stat-cache matches' '
+	test_create_repo reported-event &&
+	(
+		cd reported-event &&
+		printf "aaaa\n" >tracked &&
+		printf "clean\n" >clean &&
+		git add tracked clean &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked clean &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0clean\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+
+		GIT_OPTIONAL_LOCKS=0 git diff-index --name-status HEAD \
+			>.git/diff-index &&
+		test_grep "^M.*tracked$" .git/diff-index &&
+		test_grep ! "clean$" .git/diff-index &&
+		git status --porcelain=v2 >.git/status &&
+		test_grep "^1 \.M .* tracked$" .git/status &&
+		test_grep ! " clean$" .git/status
+	)
+'
+
+test_expect_success 'reported path permits apply --index content match' '
+	test_create_repo apply-marker &&
+	(
+		cd apply-marker &&
+		test_commit base tracked &&
+		test_write_lines next >tracked &&
+		git diff >../apply-marker.patch &&
+		git checkout -- tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git apply --index ../apply-marker.patch
+	)
+'
+
+test_expect_success 'reported path permits checkout-index content match' '
+	test_create_repo checkout-marker &&
+	(
+		cd checkout-marker &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git checkout-index tracked
+	)
+'
+
+test_expect_success CASE_INSENSITIVE_FS \
+	'reported path permits case-folded unpack match' '
+	test_create_repo icase-marker &&
+	(
+		cd icase-marker &&
+		test_write_lines same >foo &&
+		git add foo &&
+		git commit -m base &&
+		base=$(git rev-parse HEAD) &&
+		git mv foo intermediate &&
+		git mv intermediate FOO &&
+		git commit -m target &&
+		target=$(git rev-parse HEAD) &&
+		git checkout "$base" &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0foo\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git read-tree -m -u "$target" &&
+		echo FOO >expect &&
+		git ls-files >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'reported unchanged path avoids reset checkout' '
+	test_create_repo reset-marker &&
+	(
+		cd reset-marker &&
+		test_commit base tracked &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked &&
+		git update-index --refresh &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		before=$(test-tool chmtime --get tracked) &&
+		git reset --hard HEAD &&
+		after=$(test-tool chmtime --get tracked) &&
+		test "$before" = "$after"
+	)
+'
+
+test_expect_success 'ordinary zero-stat entries retain diff-index behavior' '
+	test_create_repo ordinary-zero-stat &&
+	(
+		cd ordinary-zero-stat &&
+		echo content >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		oid=$(git rev-parse :tracked) &&
+		git update-index --cacheinfo 100644,$oid,tracked &&
+		git -c core.fsmonitor=false diff-index --name-status HEAD >actual &&
+		test_grep "^M.*tracked$" actual
+	)
+'
+
+test_expect_success 'verified reported paths restore poisoned stat data' '
+	test_create_repo fsmonitor-stat-recovery &&
+	(
+		cd fsmonitor-stat-recovery &&
+		echo content >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		test-tool read-cache \
+			--test-fsmonitor-content-recovery tracked
+	)
+'
+
 test_done
