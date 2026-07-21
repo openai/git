@@ -277,6 +277,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		unix-socket.c
 		unix-stream-server.c
 		compat/linux/procinfo.c
+		compat/preload-index/bulk-linux-entry.c
 		compat/preload-index/bulk-linux-open.c
 		compat/preload-index/bulk-linux-stat.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
