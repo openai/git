@@ -1344,7 +1344,10 @@ if host_machine.system() == 'linux'
 elif host_machine.system() == 'windows'
   compat_sources += 'compat/win32/trace2_win32_process_info.c'
 elif host_machine.system() == 'darwin'
-  compat_sources += 'compat/darwin/procinfo.c'
+  compat_sources += [
+    'compat/darwin/procinfo.c',
+    'compat/preload-index/bulk-darwin-root.c',
+  ]
   libgit_sources += [
     'preload-index-bulk-index.c',
     'preload-index-bulk-thread.c',
