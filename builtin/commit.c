@@ -14,12 +14,14 @@
 #include "lockfile.h"
 #include "cache-tree.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "color.h"
 #include "dir.h"
 #include "editor.h"
 #include "environment.h"
 #include "diff.h"
 #include "commit.h"
+#include "fsmonitor-settings.h"
 #include "add-interactive.h"
 #include "gettext.h"
 #include "revision.h"
@@ -373,7 +375,8 @@ static void refresh_cache_or_die(int refresh_flags)
 }
 
 static const char *prepare_index(const char **argv, const char *prefix,
-				 const struct commit *current_head, int is_status)
+				 const struct commit *current_head, int is_status,
+				 struct wt_status *s)
 {
 	struct string_list partial = STRING_LIST_INIT_DUP;
 	struct pathspec pathspec;
@@ -506,7 +509,14 @@ static const char *prepare_index(const char **argv, const char *prefix,
 	if (!only && !pathspec.nr) {
 		repo_hold_locked_index(the_repository, &index_lock,
 				       LOCK_DIE_ON_ERROR);
-		refresh_cache_or_die(refresh_flags);
+		if (!fstat_is_reliable() ||
+		    the_repository->index->split_index ||
+		    fsm_settings__get_mode(the_repository) !=
+			    FSMONITOR_MODE_IPC)
+			refresh_cache_or_die(refresh_flags);
+		else if (wt_status_refresh_index(
+				 s, refresh_flags | REFRESH_IN_PORCELAIN, 0))
+			die_resolve_conflict("commit");
 		if (the_repository->index->cache_changed
 		    || !cache_tree_fully_valid(the_repository->index->cache_tree))
 			cache_tree_update(the_repository->index, WRITE_TREE_SILENT);
@@ -797,13 +807,29 @@ static int prepare_to_commit(const char *index_file, const char *prefix,
 	int clean_message_contents = (cleanup_mode != COMMIT_MSG_CLEANUP_NONE);
 	int old_display_comment_prefix;
 	int invoked_hook;
+	int hook_index_matches = 0;
+	struct clean_status_index_snapshot hook_index = { .fd = -1 };
 
 	/* This checks and barfs if author is badly specified */
 	determine_author_info(author_ident);
 
-	if (!no_verify && run_commit_hook(use_editor, index_file, &invoked_hook,
-					  "pre-commit", NULL))
-		return 0;
+	if (!no_verify) {
+		int hook_failed = run_commit_hook(
+			use_editor, index_file, &invoked_hook,
+			"pre-commit", NULL);
+
+		if (invoked_hook && fstat_is_reliable())
+			wt_status_invalidate_refresh(s);
+		if (invoked_hook && fstat_is_reliable() &&
+		    commit_style == COMMIT_AS_IS)
+			hook_index_matches =
+				!clean_status_index_snapshot_pin(
+					&hook_index, the_repository->index);
+		if (hook_failed) {
+			clean_status_index_snapshot_release(&hook_index);
+			return 0;
+		}
+	}
 
 	if (squash_message) {
 		/*
@@ -1119,10 +1145,29 @@ static int prepare_to_commit(const char *index_file, const char *prefix,
 			else
 				fputs(_(empty_rebase_pick_advice), stderr);
 		}
+		clean_status_index_snapshot_release(&hook_index);
 		return 0;
 	}
 
 	if (!no_verify && invoked_hook) {
+		struct lock_file refresh_lock = LOCK_INIT;
+
+		/*
+		 * Preserve any strong invalidation recorded while status
+		 * closed the post-hook token. The pinned source prevents this
+		 * write from replacing an index updated by the hook.
+		 */
+		if (hook_index_matches &&
+		    repo_hold_locked_index(the_repository, &refresh_lock, 0) >= 0) {
+			if (clean_status_index_snapshot_still_matches(
+				    &hook_index, the_repository->index))
+				repo_update_index_if_able(
+					the_repository, &refresh_lock);
+			else
+				rollback_lock_file(&refresh_lock);
+		}
+		clean_status_index_snapshot_release(&hook_index);
+
 		/*
 		 * Re-read the index as the pre-commit-commit hook was invoked
 		 * and could have updated it. We must do this before we invoke
@@ -1455,7 +1500,7 @@ static int dry_run_commit(const char **argv, const char *prefix,
 	int committable;
 	const char *index_file;
 
-	index_file = prepare_index(argv, prefix, current_head, 1);
+	index_file = prepare_index(argv, prefix, current_head, 1, s);
 	committable = run_status(stdout, index_file, prefix, 0, s);
 	rollback_index_files();
 
@@ -1871,7 +1916,7 @@ int cmd_commit(int argc,
 
 	if (dry_run)
 		return dry_run_commit(argv, prefix, current_head, &s);
-	index_file = prepare_index(argv, prefix, current_head, 0);
+	index_file = prepare_index(argv, prefix, current_head, 0, &s);
 
 	/* Set up everything for writing the commit object.  This includes
 	   running hooks, writing the trees, and interacting with the user.  */
@@ -1881,6 +1926,7 @@ int cmd_commit(int argc,
 		rollback_index_files();
 		goto cleanup;
 	}
+	wt_status_collect_free_buffers(&s);
 
 	/* Determine parents */
 	reflog_msg = getenv("GIT_REFLOG_ACTION");
@@ -2019,6 +2065,7 @@ int cmd_commit(int argc,
 			    NULL, NULL, NULL, NULL);
 
 cleanup:
+	wt_status_collect_free_buffers(&s);
 	free_commit_extra_headers(extra);
 	commit_list_free(parents);
 	strbuf_release(&author_ident);
