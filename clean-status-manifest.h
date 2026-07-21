@@ -19,6 +19,7 @@ struct clean_status_manifest_state {
 	unsigned checked : 1;
 	unsigned changed : 1;
 	unsigned global_fallback : 1;
+	unsigned current_invalidated : 1;
 };
 
 void clean_status_manifest_init(struct clean_status_manifest_state *state);
