@@ -104,7 +104,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +118,8 @@ jobs:
             file_pattern: Mach-O 64-bit executable arm64
             has_gcm: false
             lto: thin
+            profile_format: LLVM
+            llvm_profdata: xcrun llvm-profdata
             max_tar_bytes: 67108864
           - name: macOS x64
             os: macos-15-intel
@@ -128,6 +130,8 @@ jobs:
             file_pattern: Mach-O 64-bit executable x86_64
             has_gcm: false
             lto: thin
+            profile_format: LLVM
+            llvm_profdata: xcrun llvm-profdata
             max_tar_bytes: 67108864
           # Keep arm64 builds native so release smoke tests can execute them.
           - name: Linux arm64
@@ -139,6 +143,7 @@ jobs:
             file_pattern: ELF 64-bit.*ARM aarch64
             has_gcm: false
             lto: auto
+            profile_format: GCC
             max_tar_bytes: 67108864
           - name: Linux x64
             os: ubuntu-22.04
@@ -149,6 +154,7 @@ jobs:
             file_pattern: ELF 64-bit.*x86-64
             has_gcm: false
             lto: auto
+            profile_format: GCC
             max_tar_bytes: 67108864
           - name: Windows arm64
             os: windows-11-arm
@@ -159,6 +165,8 @@ jobs:
             file_pattern: PE32\+.*ARM64
             has_gcm: true
             lto: thin
+            profile_format: LLVM
+            llvm_profdata: llvm-profdata
             max_tar_bytes: 134217728
             sdk_arch: aarch64
             sdk_flavor: full
@@ -176,6 +184,7 @@ jobs:
             file_pattern: PE32\+.*x86-64
             has_gcm: true
             lto: auto
+            profile_format: GCC
             max_tar_bytes: 134217728
             sdk_arch: x86_64
             sdk_flavor: full
@@ -309,14 +318,18 @@ jobs:
             dependencies.json >"$updated"
           mv "$updated" dependencies.json
 
-      # Dugite cross-compiles several targets. Keep Git's optional Rust
-      # library disabled until its Makefile can direct Cargo at those targets.
+      # Build an instrumented Git, run a representative local workload, then
+      # rebuild with its profile. Keep Git's optional Rust library disabled
+      # until its Makefile can direct Cargo at these targets.
       - name: Build the Dugite Native distribution
         shell: bash
         working-directory: dugite-native
         env:
           NO_RUST: 1
+          OPENAI_LLVM_PROFDATA: ${{ matrix.llvm_profdata }}
           OPENAI_LTO: ${{ matrix.lto }}
+          OPENAI_PROFILE: BUILD
+          OPENAI_PROFILE_FORMAT: ${{ matrix.profile_format }}
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
@@ -342,7 +355,9 @@ jobs:
         working-directory: dugite-native/git
         env:
           MINGW_DIR: ${{ matrix.mingw_dir }}
+          OPENAI_LLVM_PROFDATA: ${{ matrix.llvm_profdata }}
           OPENAI_LTO: ${{ matrix.lto }}
+          OPENAI_PROFILE_FORMAT: ${{ matrix.profile_format }}
         run: |
           set -euo pipefail
 
@@ -357,8 +372,8 @@ jobs:
             SKIP_DASHED_BUILT_INS=YesPlease
           )
           jobs="${NUMBER_OF_PROCESSORS:-2}"
-          make -j"$jobs" "${make_args[@]}" all
-          make "${make_args[@]}" DESTDIR=/tmp/build/git strip install
+          make -j"$jobs" "${make_args[@]}" OPENAI_PROFILE=BUILD all
+          make "${make_args[@]}" OPENAI_PROFILE=USE DESTDIR=/tmp/build/git strip install
 
       - name: Verify distribution layout and provenance
         shell: bash
@@ -369,6 +384,7 @@ jobs:
           FILE_PATTERN: ${{ matrix.file_pattern }}
           HAS_GCM: ${{ matrix.has_gcm }}
           LTO: ${{ matrix.lto }}
+          PROFILE_FORMAT: ${{ matrix.profile_format }}
         run: |
           set -euo pipefail
           if test "$TARGET_PLATFORM" = win32
@@ -397,6 +413,12 @@ jobs:
           grep -E "$FILE_PATTERN" /tmp/git-file-type
           strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
           grep -F -- "-flto=$LTO" dugite-native/git/GIT-CFLAGS
+          if test "$PROFILE_FORMAT" = LLVM
+          then
+            grep -F -- "-fprofile-instr-use=" dugite-native/git/GIT-CFLAGS
+          else
+            grep -F -- "-fprofile-use=" dugite-native/git/GIT-CFLAGS
+          fi
 
       - name: Smoke-test the native distribution
         shell: bash
