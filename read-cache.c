@@ -222,6 +222,13 @@ static struct cache_entry *make_refreshed_cache_entry(
 	return updated;
 }
 
+void refresh_index_entry_stat(struct index_state *istate, int nr,
+			      struct stat *st)
+{
+	replace_index_entry(istate, nr, make_refreshed_cache_entry(
+		istate, istate->cache[nr], st, 1));
+}
+
 static unsigned int st_mode_from_ce(const struct cache_entry *ce)
 {
 	switch (ce->ce_mode & S_IFMT) {
