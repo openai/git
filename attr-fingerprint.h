@@ -32,6 +32,9 @@ int attr_fingerprint_repository(struct repository *repo,
 				struct attr_fingerprint *result);
 int attr_source_snapshot_repository(struct repository *repo,
 				    struct attr_source_snapshot **result);
+int attr_source_snapshot_matches_repository(
+	struct repository *repo,
+	const struct attr_source_snapshot *snapshot);
 const struct attr_fingerprint *attr_source_snapshot_fingerprint(
 	const struct attr_source_snapshot *snapshot);
 int attr_source_snapshot_read(

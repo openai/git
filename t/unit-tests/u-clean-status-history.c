@@ -277,6 +277,28 @@ void test_clean_status_history__advances_only_current_proofs(void)
 	fixture_release(&fixture);
 }
 
+void test_clean_status_history__expires_invalidated_proofs(void)
+{
+	struct history_fixture fixture;
+	struct clean_status_state *state;
+
+	fixture_init(&fixture, &hash_algos[GIT_HASH_SHA1]);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	state = install_current(&fixture);
+	clean_status_prepare_fsmonitor_config(&fixture.istate);
+	cl_assert(state->manifest.current_valid);
+	cl_assert(state->config_revalidated);
+	cl_assert(state->initial_coherent);
+
+	clean_status_invalidate_current_manifest(&fixture.istate);
+	cl_assert(!state->manifest.current_valid);
+	cl_assert(!state->config_revalidated);
+	cl_assert(!state->initial_coherent);
+	cl_assert(clean_status_fsmonitor_config_mismatch(&fixture.istate));
+	fixture_release(&fixture);
+}
+
 void test_clean_status_history__copies_validated_history(void)
 {
 	struct history_fixture fixture;
