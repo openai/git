@@ -65,6 +65,7 @@ ifeq ($(uname_S),Linux)
 	COMPAT_OBJS += compat/linux/procinfo.o
 	COMPAT_OBJS += compat/preload-index/bulk-linux-entry.o
 	COMPAT_OBJS += compat/preload-index/bulk-linux-open.o
+	COMPAT_OBJS += compat/preload-index/bulk-linux-scan.o
 	COMPAT_OBJS += compat/preload-index/bulk-linux-stat.o
 	EXTLIBS += -ldl
 	# centos7/rhel7 provides gcc 4.8.5 and zlib 1.2.7.
