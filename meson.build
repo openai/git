@@ -460,6 +460,7 @@ libgit_sources = [
   'patch-delta.c',
   'patch-ids.c',
   'path.c',
+  'path-namespace.c',
   'path-walk.c',
   'pathspec.c',
   'pkt-line.c',
