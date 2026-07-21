@@ -1353,12 +1353,31 @@ test_expect_success CASE_INSENSITIVE_FS 'fsmonitor file case wrong on disk' '
 	test_grep ! -q "fsmonitor_refresh_callback.*FILE-4-A.*pos" "$PWD/file_case_wrong-try2.log" &&
 	test_grep ! -q "fsmonitor_refresh_callback.*file-4-a.*pos" "$PWD/file_case_wrong-try2.log" &&
 
-	# FSM refresh saw nothing, so it will mark all files as valid,
-	# so they should now have "h" status.
+	# A late directory event can arrive without repeating the file
+	# events checked above. Such an event invalidates its entire cone,
+	# so those entries remain "H" until the next quiet refresh.
 
 	git -C file_case_wrong ls-files -f >"$PWD/file_case_wrong-lsf2.out" &&
-	test_grep -q "h dir1/dir2/dir3/file-3-a" "$PWD/file_case_wrong-lsf2.out" &&
-	test_grep -q "h dir1/dir2/dir4/FILE-4-A" "$PWD/file_case_wrong-lsf2.out" &&
+	if test_grep -E -q \
+		"fsmonitor_refresh_callback .dir1(/dir2(/dir3)?)?/?. .*pos " \
+		"$PWD/file_case_wrong-try2.log" >/dev/null 2>&1 4>/dev/null
+	then
+		expected_3=H
+	else
+		expected_3=h
+	fi &&
+	test_grep -q "$expected_3 dir1/dir2/dir3/file-3-a" \
+		"$PWD/file_case_wrong-lsf2.out" &&
+	if test_grep -E -q \
+		"fsmonitor_refresh_callback .dir1(/dir2(/dir4)?)?/?. .*pos " \
+		"$PWD/file_case_wrong-try2.log" >/dev/null 2>&1 4>/dev/null
+	then
+		expected_4=H
+	else
+		expected_4=h
+	fi &&
+	test_grep -q "$expected_4 dir1/dir2/dir4/FILE-4-A" \
+		"$PWD/file_case_wrong-lsf2.out" &&
 
 
 	# We now have files with clean content, but with case-incorrect
