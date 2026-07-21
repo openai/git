@@ -144,6 +144,7 @@ static inline unsigned create_ce_flags(unsigned stage)
 struct split_index;
 struct clean_status_state;
 struct untracked_cache;
+struct string_list;
 struct progress;
 struct pattern_list;
 
@@ -197,6 +198,8 @@ struct index_state {
 	struct untracked_cache *untracked;
 	unsigned char *preload_bulk_tracked_state;
 	size_t preload_bulk_tracked_nr;
+	/* Borrowed for the duration of preload_index(). */
+	struct string_list *preload_untracked;
 	char *fsmonitor_last_update;
 	char *fsmonitor_last_update_pending;
 	char *fsmonitor_untracked_token;

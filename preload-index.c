@@ -251,6 +251,10 @@ static void preload_bulk_trace_result(
 	if (result->reason)
 		trace2_data_string("index", index->repo,
 				   "preload/bulk_reason", result->reason);
+	if (result->untracked_reason)
+		trace2_data_string("index", index->repo,
+				   "preload/bulk_untracked_reason",
+				   result->untracked_reason);
 	trace2_data_intmax("index", index->repo, "preload/bulk_applied",
 			   applied);
 	trace2_data_intmax("index", index->repo, "preload/bulk_dirs",
@@ -271,6 +275,12 @@ static void preload_bulk_trace_result(
 			   "preload/bulk_content_check", content_check);
 	trace2_data_intmax("index", index->repo,
 			   "preload/bulk_fallback", fallback);
+	trace2_data_intmax("index", index->repo,
+			   "preload/bulk_untracked_complete",
+			   result->untracked_complete);
+	trace2_data_intmax("index", index->repo,
+			   "preload/bulk_untracked_count",
+			   result->untracked.nr);
 }
 
 static unsigned char *preload_bulk_try(struct index_state *index)
@@ -315,6 +325,11 @@ static unsigned char *preload_bulk_try(struct index_state *index)
 		tracked_state = result.tracked_state;
 		result.tracked_state = NULL;
 	}
+	if (result.untracked_complete && index->preload_untracked) {
+		*index->preload_untracked = result.untracked;
+		result.untracked =
+			(struct string_list)STRING_LIST_INIT_DUP;
+	}
 	trace2_region_leave("index", "preload/bulk", index->repo);
 	preload_bulk_result_release(&result);
 	return tracked_state;
@@ -353,6 +368,8 @@ void preload_index(struct index_state *index,
 	int core_preload_index = 1;
 
 	preload_index_bulk_result_clear(index);
+	if (index->preload_untracked)
+		string_list_clear(index->preload_untracked, 0);
 	repo_config_get_bool(index->repo, "core.preloadindex", &core_preload_index);
 
 	if (!core_preload_index)
