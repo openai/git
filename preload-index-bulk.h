@@ -12,6 +12,7 @@ struct preload_bulk_untracked_root;
 
 struct preload_bulk_dir_identity {
 	struct stat stat;
+	uint64_t platform_id;
 	unsigned complete : 1;
 };
 
