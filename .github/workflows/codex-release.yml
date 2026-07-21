@@ -184,8 +184,8 @@ jobs:
       - name: Check out Dugite Native
         uses: actions/checkout@v6
         with:
-          repository: desktop/dugite-native
-          ref: f97e50add48cdcff053a69d95aa343a4a4a258c2
+          repository: dreynaud-oai/dugite-native
+          ref: b6f4473557acb85433fdf9deffe0854a34fd9cc5
           path: dugite-native
           fetch-depth: 0
           persist-credentials: false
