@@ -10,6 +10,17 @@
 #include "strbuf.h"
 #include "wrapper.h"
 
+struct attr_source_snapshot_entry {
+	char *path;
+	char *buf;
+	size_t len;
+};
+
+struct attr_source_snapshot {
+	struct attr_fingerprint fingerprint;
+	struct attr_source_snapshot_entry sources[ATTR_SOURCE_SNAPSHOT_NR];
+};
+
 static int open_attr_source(const char *path)
 {
 #ifdef O_NONBLOCK
@@ -24,7 +35,8 @@ static int open_attr_source(const char *path)
 static int hash_source(struct git_hash_ctx *content_ctx,
 		       struct git_hash_ctx *namespace_ctx,
 		       const struct attr_fingerprint_source *source,
-		       int *present)
+		       int *present,
+		       struct attr_source_snapshot_entry *snapshot)
 {
 	struct path_namespace_snapshot *before = NULL, *after = NULL;
 	struct stat opened_before, opened_after, named;
@@ -84,6 +96,12 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 	path_namespace_hash(namespace_ctx, before);
 	path_namespace_hash_stat(namespace_ctx, &opened_after);
 	hash_length_delimited(content_ctx, buf, size);
+	if (snapshot) {
+		snapshot->path = xstrdup(source->path);
+		snapshot->buf = buf;
+		snapshot->len = size;
+		buf = NULL;
+	}
 	ret = 0;
 done:
 	if (fd >= 0)
@@ -98,11 +116,14 @@ done:
 
 static int fingerprint_sources(
 	const struct attr_fingerprint_source *sources, size_t nr,
-	const struct git_hash_algo *algo, struct attr_fingerprint *result)
+	const struct git_hash_algo *algo, struct attr_fingerprint *result,
+	struct attr_source_snapshot *snapshot)
 {
 	struct git_hash_ctx content_ctx, namespace_ctx;
 	uint32_t count;
 
+	if (snapshot && nr != ARRAY_SIZE(snapshot->sources))
+		BUG("attribute snapshot source count mismatch");
 	memset(result, 0, sizeof(*result));
 	git_hash_init(&content_ctx, algo);
 	git_hash_init(&namespace_ctx, algo);
@@ -116,9 +137,11 @@ static int fingerprint_sources(
 	hash_length_delimited(&namespace_ctx, &count, sizeof(count));
 	for (size_t i = 0; i < nr; i++) {
 		int present;
+		struct attr_source_snapshot_entry *entry =
+			snapshot ? &snapshot->sources[i] : NULL;
 
 		if (hash_source(&content_ctx, &namespace_ctx, &sources[i],
-				&present))
+				&present, entry))
 			return -1;
 		result->sources_present |= present;
 	}
@@ -131,7 +154,7 @@ int attr_fingerprint_sources(
 	const struct attr_fingerprint_source *sources, size_t nr,
 	const struct git_hash_algo *algo, struct attr_fingerprint *result)
 {
-	return fingerprint_sources(sources, nr, algo, result);
+	return fingerprint_sources(sources, nr, algo, result, NULL);
 }
 
 static int repository_sources(struct repository *repo,
@@ -153,7 +176,7 @@ static int repository_sources(struct repository *repo,
 int attr_fingerprint_repository(struct repository *repo,
 				struct attr_fingerprint *result)
 {
-	struct attr_fingerprint_source sources[3];
+	struct attr_fingerprint_source sources[ATTR_SOURCE_SNAPSHOT_NR];
 	char *info_attributes = NULL;
 	int ret;
 
@@ -164,4 +187,64 @@ int attr_fingerprint_repository(struct repository *repo,
 				       repo->hash_algo, result);
 	free(info_attributes);
 	return ret;
+}
+
+int attr_source_snapshot_repository(struct repository *repo,
+				    struct attr_source_snapshot **result)
+{
+	struct attr_fingerprint_source sources[ATTR_SOURCE_SNAPSHOT_NR];
+	struct attr_source_snapshot *snapshot;
+	char *info_attributes = NULL;
+
+	if (!result)
+		BUG("attr_source_snapshot_repository requires an output");
+	*result = NULL;
+	if (repository_sources(repo, sources, &info_attributes))
+		return -1;
+	CALLOC_ARRAY(snapshot, 1);
+	if (fingerprint_sources(sources, ARRAY_SIZE(sources), repo->hash_algo,
+				&snapshot->fingerprint, snapshot)) {
+		attr_source_snapshot_free(snapshot);
+		free(info_attributes);
+		return -1;
+	}
+	free(info_attributes);
+	*result = snapshot;
+	return 0;
+}
+
+const struct attr_fingerprint *attr_source_snapshot_fingerprint(
+	const struct attr_source_snapshot *snapshot)
+{
+	return snapshot ? &snapshot->fingerprint : NULL;
+}
+
+int attr_source_snapshot_read(
+	const struct attr_source_snapshot *snapshot,
+	enum attr_source_snapshot_kind kind,
+	const char **path, const char **buf, size_t *len)
+{
+	const struct attr_source_snapshot_entry *source;
+
+	if (!snapshot || kind >= ATTR_SOURCE_SNAPSHOT_NR ||
+	    !path || !buf || !len)
+		BUG("invalid attribute snapshot read");
+	source = &snapshot->sources[kind];
+	if (!source->buf)
+		return 0;
+	*path = source->path;
+	*buf = source->buf;
+	*len = source->len;
+	return 1;
+}
+
+void attr_source_snapshot_free(struct attr_source_snapshot *snapshot)
+{
+	if (!snapshot)
+		return;
+	for (size_t i = 0; i < ARRAY_SIZE(snapshot->sources); i++) {
+		free(snapshot->sources[i].path);
+		free(snapshot->sources[i].buf);
+	}
+	free(snapshot);
 }

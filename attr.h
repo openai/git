@@ -129,6 +129,7 @@ struct index_state;
  * `git_attr_name()`.
  */
 struct git_attr;
+struct attr_source_snapshot;
 
 /* opaque structures used internally for attribute collection */
 struct all_attrs_item;
@@ -229,6 +230,17 @@ void git_attr_set_direction(enum git_attr_direction new_direction);
 
 /* Discard cached attributes after a provider-wide invalidation. */
 void git_attr_invalidate_all(void);
+
+/*
+ * Read system, global, and info attributes from an immutable snapshot.
+ * begin() and end() must be strictly paired, cannot nest, and the caller must
+ * keep the snapshot alive until end(). Readers may run concurrently while a
+ * snapshot is active, but begin() and end() require that there are no readers.
+ */
+void git_attr_source_snapshot_begin(
+	const struct attr_source_snapshot *snapshot);
+void git_attr_source_snapshot_end(
+	const struct attr_source_snapshot *snapshot);
 
 void attr_start(void);
 
