@@ -1127,6 +1127,7 @@ LIB_OBJS += checkout.o
 LIB_OBJS += chunk-format.o
 LIB_OBJS += clean-status.o
 LIB_OBJS += clean-status-config.o
+LIB_OBJS += clean-status-epoch.o
 LIB_OBJS += clean-status-history.o
 LIB_OBJS += clean-status-identity.o
 LIB_OBJS += clean-status-index.o
