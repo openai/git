@@ -10,6 +10,10 @@
 #define PRELOAD_AT_SYMLINK_NOFOLLOW 0x100
 #define PRELOAD_STATX_BASIC_STATS 0x000007ffU
 #define PRELOAD_STATX_MNT_ID 0x00001000U
+#define PRELOAD_RESOLVE_NO_XDEV 0x01
+#define PRELOAD_RESOLVE_NO_MAGICLINKS 0x02
+#define PRELOAD_RESOLVE_NO_SYMLINKS 0x04
+#define PRELOAD_RESOLVE_BENEATH 0x08
 
 struct preload_linux_statx_timestamp {
 	int64_t tv_sec;
@@ -44,10 +48,18 @@ struct preload_linux_statx {
 	uint64_t spare3[12];
 };
 
-struct preload_bulk_linux_data {
-	uint64_t root_mnt_id;
+struct preload_linux_open_how {
+	uint64_t flags;
+	uint64_t mode;
+	uint64_t resolve;
 };
 
+struct preload_bulk_linux_data {
+	uint64_t root_mnt_id;
+	int use_openat2;
+};
+
+struct preload_bulk_scan;
 struct preload_bulk_worker;
 
 #if defined(SYS_getdents64) && defined(SYS_statx)
@@ -65,6 +77,14 @@ int preload_bulk_linux_entry_stat(struct preload_bulk_worker *worker,
 int preload_bulk_linux_fd_stat(struct preload_bulk_worker *worker, int fd,
 			       struct preload_linux_statx *stx,
 			       struct stat *st);
+
+#ifdef SYS_openat2
+int preload_bulk_linux_openat2_raw(int dirfd, const char *path);
+#endif
+int preload_bulk_linux_open_dir_at(struct preload_bulk_worker *worker,
+				   int parent_fd, const char *name);
+int preload_bulk_linux_open_relative(struct preload_bulk_scan *scan,
+				     const char *path);
 
 #endif /* SYS_getdents64 && SYS_statx */
 
