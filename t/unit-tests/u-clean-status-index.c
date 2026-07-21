@@ -222,6 +222,129 @@ void test_clean_status_index__pins_null_checksum_source_identity(void)
 	assert_pins_null_checksum_source(&hash_algos[GIT_HASH_SHA256]);
 }
 
+static int retain_null_checksum_source(
+	struct index_fixture *fixture, struct repository *repo,
+	struct index_state *istate)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct clean_status_state *state;
+	struct stat source_st;
+	int source_fd;
+
+	repo->hash_algo = algo;
+	repo->index_file = fixture->path;
+	istate->version = 4;
+	istate->cache_nr = 7;
+	oidcpy(&istate->oid, &fixture->checksum);
+	state = clean_status_get_state(istate);
+	source_fd = git_open_cloexec(fixture->path, O_RDONLY);
+	cl_assert(source_fd >= 0);
+#if defined(F_GETFD) && defined(FD_CLOEXEC)
+	cl_assert(fcntl(source_fd, F_GETFD) & FD_CLOEXEC);
+#endif
+	cl_assert_equal_i(fstat(source_fd, &source_st), 0);
+	cl_assert(!clean_status_retain_source_index_fd(
+		istate, source_fd, &source_st));
+	cl_assert_equal_i(fstat(source_fd, &source_st), 0);
+	state->config_enforced = 1;
+	cl_assert(clean_status_retain_source_index_fd(
+		istate, source_fd, &source_st));
+	return source_fd;
+}
+
+void test_clean_status_index__pins_null_checksum_epoch_to_source_fd(void)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct clean_status_index_snapshot snapshot;
+	struct index_fixture fixture;
+	struct repository repo = { 0 };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct stat source_st;
+	int source_fd;
+
+	if (!fstat_is_reliable())
+		return;
+	fixture_init(&fixture, algo);
+	fixture_clear_checksum(&fixture, algo);
+	source_fd = retain_null_checksum_source(&fixture, &repo, &istate);
+
+	/* The held source is an exception only for proof epochs. */
+	cl_assert_equal_i(clean_status_index_snapshot_pin(
+		&snapshot, &istate), -1);
+	cl_assert_equal_i(clean_status_index_snapshot_pin_proof_epoch(
+		&snapshot, &istate), 0);
+	cl_assert(clean_status_index_snapshot_still_matches_proof_epoch(
+		&snapshot, &istate));
+	cl_assert(!clean_status_index_snapshot_still_matches(
+		&snapshot, &istate));
+	clean_status_index_snapshot_release(&snapshot);
+
+	release_index(&istate);
+	errno = 0;
+	cl_assert_equal_i(fstat(source_fd, &source_st), -1);
+	cl_assert_equal_i(errno, EBADF);
+	fixture_release(&fixture);
+}
+
+static void assert_changed_null_checksum_source_is_rejected(int replace)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct clean_status_index_snapshot snapshot;
+	struct index_fixture fixture, replacement;
+	struct repository repo = { 0 };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+#ifndef GIT_WINDOWS_NATIVE
+	char *moved = NULL;
+#endif
+
+	fixture_init(&fixture, algo);
+	fixture_clear_checksum(&fixture, algo);
+	if (replace) {
+		fixture_init(&replacement, algo);
+		fixture_clear_checksum(&replacement, algo);
+	}
+	retain_null_checksum_source(&fixture, &repo, &istate);
+	cl_assert_equal_i(clean_status_index_snapshot_pin_proof_epoch(
+		&snapshot, &istate), 0);
+
+	if (replace) {
+#ifndef GIT_WINDOWS_NATIVE
+		moved = xstrfmt("%s.old", fixture.path);
+		cl_assert_equal_i(rename(fixture.path, moved), 0);
+		cl_assert_equal_i(rename(replacement.path, fixture.path), 0);
+#endif
+	} else {
+		write_at(fixture.fd, "\0", 1, fixture.st.st_size);
+	}
+	cl_assert(!clean_status_index_snapshot_still_matches_proof_epoch(
+		&snapshot, &istate));
+	clean_status_index_snapshot_release(&snapshot);
+	cl_assert_equal_i(clean_status_index_snapshot_pin_proof_epoch(
+		&snapshot, &istate), -1);
+	if (replace) {
+#ifndef GIT_WINDOWS_NATIVE
+		cl_assert_equal_i(rename(fixture.path, replacement.path), 0);
+		cl_assert_equal_i(rename(moved, fixture.path), 0);
+		free(moved);
+#endif
+	}
+
+	release_index(&istate);
+	fixture_release(&fixture);
+	if (replace)
+		fixture_release(&replacement);
+}
+
+void test_clean_status_index__rejects_changed_null_checksum_epoch_source(void)
+{
+	if (!fstat_is_reliable())
+		return;
+	assert_changed_null_checksum_source_is_rejected(0);
+#ifndef GIT_WINDOWS_NATIVE
+	assert_changed_null_checksum_source_is_rejected(1);
+#endif
+}
+
 void test_clean_status_index__pins_named_index_identity(void)
 {
 	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
@@ -401,6 +524,76 @@ void test_clean_status_index__digests_only_persistent_logical_entries(void)
 	ce->ce_flags = CE_UPDATE_IN_BASE;
 	cl_assert_equal_i(clean_status_index_logical_digest(
 		&istate, changed), -1);
+
+	release_index(&istate);
+}
+
+void test_clean_status_index__limits_full_status_bookkeeping_exception(void)
+{
+	struct repository repo = { .hash_algo = &hash_algos[GIT_HASH_SHA1] };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct cache_entry *ce;
+	unsigned char baseline[GIT_MAX_RAWSZ];
+	unsigned char changed[GIT_MAX_RAWSZ];
+	static const char path[] = "tracked";
+
+	CALLOC_ARRAY(istate.cache, 1);
+	istate.cache_alloc = istate.cache_nr = 1;
+	ce = make_empty_cache_entry(&istate, sizeof(path) - 1);
+	ce->ce_mode = S_IFREG | 0644;
+	ce->ce_namelen = sizeof(path) - 1;
+	memcpy(ce->name, path, sizeof(path));
+	memset(ce->oid.hash, 1, repo.hash_algo->rawsz);
+	oid_set_algo(&ce->oid, repo.hash_algo);
+	istate.cache[0] = ce;
+	repo.index = &istate;
+	istate.cache_changed = CE_ENTRY_CHANGED;
+	clean_status_enable_external_history(&repo);
+
+	cl_assert_equal_i(clean_status_index_logical_digest(
+		&istate, baseline), 0);
+	ce->ce_flags = CE_UPDATE_IN_BASE;
+	cl_assert_equal_i(clean_status_index_logical_digest(
+		&istate, changed), -1);
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), 0);
+	cl_assert(!memcmp(baseline, changed, repo.hash_algo->rawsz));
+
+	ce->ce_mode = S_IFREG | 0755;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), 0);
+	cl_assert(memcmp(baseline, changed, repo.hash_algo->rawsz));
+	ce->ce_mode = S_IFREG | 0644;
+	ce->oid.hash[0] = 2;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), 0);
+	cl_assert(memcmp(baseline, changed, repo.hash_algo->rawsz));
+	ce->oid.hash[0] = 1;
+	ce->name[0] = 'T';
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), 0);
+	cl_assert(memcmp(baseline, changed, repo.hash_algo->rawsz));
+	ce->name[0] = 't';
+	ce->ce_flags = CE_UPDATE_IN_BASE | CE_VALID;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), 0);
+	cl_assert(memcmp(baseline, changed, repo.hash_algo->rawsz));
+
+	ce->ce_flags = CE_UPDATE_IN_BASE | CE_CONTENT_CHECK_REQUIRED;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), -1);
+	ce->ce_flags = CE_UPDATE_IN_BASE | CE_WT_REMOVE;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), -1);
+	ce->ce_flags = CE_UPDATE_IN_BASE;
+	istate.cache_changed |= CACHE_TREE_CHANGED;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), -1);
+	istate.cache_changed = CE_ENTRY_CHANGED;
+	repo.index = NULL;
+	cl_assert_equal_i(clean_status_index_logical_digest_after_status(
+		&istate, changed), -1);
+	clean_status_enable_external_history(NULL);
 
 	release_index(&istate);
 }
