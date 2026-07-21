@@ -273,7 +273,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	add_compile_definitions(PROCFS_EXECUTABLE_PATH="/proc/self/exe" HAVE_DEV_TTY )
-	list(APPEND compat_SOURCES unix-socket.c unix-stream-server.c compat/linux/procinfo.c)
+	list(APPEND compat_SOURCES
+		unix-socket.c
+		unix-stream-server.c
+		compat/linux/procinfo.c
+		compat/preload-index/bulk-linux-stat.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 	add_compile_definitions(HAVE_PRELOAD_INDEX_BULK PRECOMPOSE_UNICODE
 		USE_ST_TIMESPEC)
