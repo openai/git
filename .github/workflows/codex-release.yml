@@ -127,8 +127,9 @@ jobs:
             file_pattern: Mach-O 64-bit executable x86_64
             has_gcm: false
             max_tar_bytes: 67108864
+          # Keep arm64 builds native so release smoke tests can execute them.
           - name: Linux arm64
-            os: ubuntu-22.04
+            os: ubuntu-22.04-arm
             target_platform: ubuntu
             asset_platform: ubuntu
             arch: arm64
@@ -243,19 +244,13 @@ jobs:
       - name: Install Linux arm64 build dependencies
         if: matrix.target_platform == 'ubuntu' && matrix.arch == 'arm64'
         run: |
-          sudo sed -i "s/^deb/deb [arch=amd64,i386]/g" /etc/apt/sources.list
-          release="$(lsb_release -s -c)"
-          echo "deb [arch=arm64,armhf] http://azure.ports.ubuntu.com/ ${release} main universe multiverse restricted" | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64,armhf] http://azure.ports.ubuntu.com/ ${release}-updates main universe multiverse restricted" | sudo tee -a /etc/apt/sources.list
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
           sudo apt-get install -y \
             binutils-aarch64-linux-gnu \
             gcc-aarch64-linux-gnu \
-            libcurl4-gnutls-dev:arm64 \
-            libexpat1-dev:arm64 \
-            libssl-dev:arm64 \
-            zlib1g-dev:arm64
+            libcurl4-gnutls-dev \
+            libexpat1-dev \
+            libssl-dev \
+            zlib1g-dev
 
       # Dugite Native currently pins MinGit 2.53. Keep its build script and
       # dependency schema, but match the runtime to the Git series we compile.
@@ -389,7 +384,6 @@ jobs:
           strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
 
       - name: Smoke-test the native distribution
-        if: matrix.arch == 'x64' || matrix.target_platform == 'win32'
         shell: bash
         env:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
