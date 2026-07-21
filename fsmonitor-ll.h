@@ -34,6 +34,8 @@ void prepare_fsmonitor_untracked(struct index_state *istate);
  * before it is split during writing.
  */
 void fill_fsmonitor_bitmap(struct index_state *istate);
+void snapshot_fsmonitor_extension(struct strbuf *sb,
+				  struct index_state *istate);
 
 /*
  * Write the CE_FSMONITOR_VALID state into the fsmonitor index
