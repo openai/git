@@ -244,6 +244,8 @@ int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 		result->malformed += worker->malformed;
 	}
 	result->threads = started_threads;
+	result->untracked_complete =
+		scan->collect_untracked && !scan->queue.untracked_invalid;
 	failed = scan->queue.failed || result->malformed ||
 		result->changed_dirs;
 
