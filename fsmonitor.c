@@ -647,7 +647,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 	if (!strcmp(name, FSMONITOR_PATH_GLOBAL_INVALIDATE)) {
 		unsigned int i;
 
-		clean_status_invalidate_current_proof(istate);
+		clean_status_invalidate_current_manifest(istate);
 		git_attr_invalidate_all();
 		untracked_cache_invalidate_all(istate);
 		for (i = 0; i < istate->cache_nr; i++)
@@ -684,7 +684,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 		}
 	}
 	if (attributes_may_have_changed)
-		clean_status_invalidate_current_proof(istate);
+		clean_status_invalidate_current_manifest(istate);
 
 	if (nr_in_cone)
 		trace_printf_key(&trace_fsmonitor,
@@ -915,14 +915,22 @@ static void invalidate_all_fsmonitor_for_baseline(
 static void invalidate_all_fsmonitor_strong(struct index_state *istate)
 {
 	unsigned int i;
+	int provider_disabled =
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_DISABLED;
 
 	invalidate_all_fsmonitor(istate);
-	for (i = 0; i < istate->cache_nr; i++)
-		fsmonitor_invalidate_cache_entry(istate->cache[i]);
+	for (i = 0; i < istate->cache_nr; i++) {
+		struct cache_entry *ce = istate->cache[i];
+
+		if (provider_disabled && ce_skip_worktree(ce))
+			continue;
+		fsmonitor_invalidate_cache_entry(ce);
+	}
 }
 
 void fsmonitor_invalidate_semantics(struct index_state *istate)
 {
+	clean_status_invalidate_current_proof(istate);
 	git_attr_invalidate_all();
 	invalidate_all_fsmonitor_strong(istate);
 	istate->cache_changed |= FSMONITOR_CHANGED;
@@ -1165,11 +1173,37 @@ apply_results:
 			}
 		}
 
-		if (tracked_requires_bootstrap)
+		/*
+		 * Applying a provider event may expire semantic history after
+		 * the initial bootstrap decision. Keep the new token pending
+		 * until status has rescanned against rebuilt inputs.
+		 */
+		if (fstat_is_reliable() && !istate->split_index &&
+		    fsm_mode == FSMONITOR_MODE_IPC &&
+		    clean_status_fsmonitor_config_mismatch(istate))
+			tracked_requires_bootstrap = 1;
+
+		if (tracked_requires_bootstrap) {
+			/*
+			 * Provider paths can invalidate the manifest or
+			 * semantic inputs after our pre-query snapshot.
+			 * Recheck before choosing the narrow baseline lane.
+			 */
+			semantic_adoption_needed = fstat_is_reliable() &&
+				!istate->split_index &&
+				fsm_mode == FSMONITOR_MODE_IPC &&
+				clean_status_fsmonitor_semantic_adoption_needed(
+					istate);
+			semantic_baseline_needed = fstat_is_reliable() &&
+				!istate->split_index &&
+				fsm_mode == FSMONITOR_MODE_IPC &&
+				clean_status_fsmonitor_semantic_baseline_needed(
+					istate);
 			invalidate_fsmonitor_for_bootstrap(
 				istate, fsm_mode, semantic_adoption_needed,
 				semantic_baseline_needed,
 				!istate->fsmonitor_token_valid);
+		}
 
 		/* Now mark the untracked cache for fsmonitor usage */
 		if (istate->untracked)

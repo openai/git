@@ -820,10 +820,10 @@ static int wt_status_begin_attr_snapshot(struct wt_status *s)
 	int hook_provider =
 		fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_HOOK;
 
-	if (s->attr_source_snapshot)
-		return 0;
 	if (s->attr_snapshot_failed)
 		return -1;
+	if (s->attr_source_snapshot)
+		return 0;
 	ret = clean_status_capture_attr_snapshot(
 		s->repo->index, &s->attr_source_snapshot);
 	if (ret < 0) {
@@ -1021,6 +1021,35 @@ static int fsmonitor_token_requires_rescan(enum fsmonitor_token_result result)
 		result == FSMONITOR_TOKEN_TRIVIAL;
 }
 
+static void wt_status_release_attr_snapshot(struct wt_status *s);
+
+static int wt_status_attr_snapshot_matches(struct wt_status *s)
+{
+	if (s->attr_snapshot_failed)
+		return 0;
+	return !s->attr_source_snapshot ||
+		attr_source_snapshot_matches_repository(
+			s->repo, s->attr_source_snapshot);
+}
+
+static int wt_status_refresh_invalidated_manifest(struct wt_status *s)
+{
+	if (!clean_status_worktree_manifest_needs_refresh(s->repo->index))
+		return 0;
+	return clean_status_refresh_worktree_manifest(s->repo->index) < 0 ?
+		-1 : 0;
+}
+
+static void wt_status_reset_attr_snapshot_if_changed(struct wt_status *s)
+{
+	if (wt_status_attr_snapshot_matches(s))
+		return;
+	wt_status_release_attr_snapshot(s);
+	wt_status_begin_attr_snapshot(s);
+	trace2_data_intmax("status", s->repo,
+			   "semantic/attribute-epoch-rejected", 1);
+}
+
 static void wt_status_refresh_for_token(
 	struct wt_status *s, unsigned int refresh_flags,
 	struct clean_status_proof_epoch **epoch, int *refresh_result)
@@ -1030,9 +1059,10 @@ static void wt_status_refresh_for_token(
 	clean_status_release_proof_epoch(*epoch);
 	*epoch = clean_status_capture_proof_epoch(
 		istate, s->attr_source_snapshot);
-	if (*epoch)
+	if (*epoch) {
 		*refresh_result |= refresh_index(
 			istate, refresh_flags, &s->pathspec, NULL, NULL);
+	}
 }
 
 static int wt_status_close_ordinary_fsmonitor_token(
@@ -1076,8 +1106,10 @@ static int wt_status_close_ordinary_fsmonitor_token(
 		if (result == FSMONITOR_TOKEN_CLEAN) {
 			if (reliable_stat &&
 			    !clean_status_proof_epoch_matches(
-				    istate, scan_epoch))
+				    istate, scan_epoch)) {
+				wt_status_reset_attr_snapshot_if_changed(s);
 				break;
+			}
 			if (closure->untracked_ready) {
 				if (reliable_stat)
 					clean_status_mark_fsmonitor_config_valid(
@@ -1095,6 +1127,9 @@ static int wt_status_close_ordinary_fsmonitor_token(
 			break;
 
 		/* Rescan invalidations returned by the closure query. */
+		wt_status_reset_attr_snapshot_if_changed(s);
+		if (wt_status_refresh_invalidated_manifest(s))
+			break;
 		if (reliable_stat) {
 			wt_status_refresh_for_token(
 				s, closure->refresh_flags, &scan_epoch,
@@ -1129,10 +1164,24 @@ static int wt_status_close_fsmonitor_token(
 	refresh_fsmonitor(istate);
 	if (!fsmonitor_has_pending_token(istate) || s->pathspec.nr ||
 	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC) {
-		if (!refreshed_before_closure)
-			closure.refresh_result = refresh_index(
+		int attr_inputs_match =
+			wt_status_attr_snapshot_matches(s) &&
+			!clean_status_worktree_manifest_needs_refresh(istate);
+
+		if (!refreshed_before_closure && attr_inputs_match)
+			return refresh_index(
 				istate, refresh_flags, &s->pathspec,
 				NULL, NULL);
+		if (refreshed_before_closure && attr_inputs_match)
+			return closure.refresh_result;
+
+		wt_status_reset_attr_snapshot_if_changed(s);
+		if (fsmonitor_has_pending_token(istate))
+			fsmonitor_reject_pending_token(istate);
+		untracked_cache_invalidate_all(istate);
+		fsmonitor_invalidate_semantics(istate);
+		closure.refresh_result |= refresh_index(
+			istate, refresh_flags, &s->pathspec, NULL, NULL);
 		return closure.refresh_result;
 	}
 
@@ -1145,11 +1194,15 @@ static int wt_status_close_fsmonitor_token(
 	    !closure.untracked_ready)
 		BUG("cannot close required untracked scan");
 	trace2_region_enter("status", "fsmonitor_token_closure", s->repo);
+	wt_status_reset_attr_snapshot_if_changed(s);
+	if (wt_status_refresh_invalidated_manifest(s))
+		goto fallback;
 	if (wt_status_close_ordinary_fsmonitor_token(
 		    &closure, refreshed_before_closure))
 		goto accepted;
 
 	/* Keep the last valid token and fall back to complete scans. */
+fallback:
 	wt_status_discard_staged_untracked(&closure);
 	fsmonitor_reject_pending_token(istate);
 	if (fstat_is_reliable()) {
@@ -1170,8 +1223,18 @@ int wt_status_refresh_index(struct wt_status *s,
 			    unsigned int refresh_flags,
 			    int require_untracked)
 {
+	wt_status_begin_attr_snapshot(s);
 	return wt_status_close_fsmonitor_token(
 		s, refresh_flags, require_untracked, 0);
+}
+
+static void wt_status_release_attr_snapshot(struct wt_status *s)
+{
+	if (s->attr_source_snapshot)
+		git_attr_source_snapshot_end(s->attr_source_snapshot);
+	attr_source_snapshot_free(s->attr_source_snapshot);
+	s->attr_source_snapshot = NULL;
+	s->attr_snapshot_failed = 0;
 }
 
 static int has_unmerged(struct wt_status *s)
@@ -1237,11 +1300,7 @@ void wt_status_collect_free_buffers(struct wt_status *s)
 {
 	untracked_cache_preload_release(s->untracked_cache_preload);
 	s->untracked_cache_preload = NULL;
-	if (s->attr_source_snapshot)
-		git_attr_source_snapshot_end(s->attr_source_snapshot);
-	attr_source_snapshot_free(s->attr_source_snapshot);
-	s->attr_source_snapshot = NULL;
-	s->attr_snapshot_failed = 0;
+	wt_status_release_attr_snapshot(s);
 	wt_status_state_free_buffers(&s->state);
 }
 

@@ -213,6 +213,21 @@ int attr_source_snapshot_repository(struct repository *repo,
 	return 0;
 }
 
+int attr_source_snapshot_matches_repository(
+	struct repository *repo,
+	const struct attr_source_snapshot *snapshot)
+{
+	struct attr_fingerprint current;
+
+	return snapshot &&
+		!attr_fingerprint_repository(repo, &current) &&
+		current.sources_present ==
+			snapshot->fingerprint.sources_present &&
+		!memcmp(current.content_hash,
+			snapshot->fingerprint.content_hash,
+			repo->hash_algo->rawsz);
+}
+
 const struct attr_fingerprint *attr_source_snapshot_fingerprint(
 	const struct attr_source_snapshot *snapshot)
 {
