@@ -6,6 +6,7 @@
 
 #include "compat/precompose_utf8.h"
 #include "compat/preload-index/bulk-darwin.h"
+#include "dir.h"
 #include "path-namespace.h"
 #include "preload-index-bulk.h"
 
@@ -329,6 +330,10 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 			size_t remaining;
 			int pos;
 
+			if (scan->collect_untracked &&
+			    preload_bulk_untracked_root_is_visible(
+				    worker, task->untracked_root))
+				return 0;
 			remaining = buf + PRELOAD_INDEX_BULK_BUFFER_SIZE - record;
 			if (decode_entry(record, remaining, &entry))
 				goto malformed;
@@ -344,6 +349,17 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 			strbuf_addstr(&worker->path, path_name);
 			if (path_name != entry.name)
 				free((char *)path_name);
+			if (scan->collect_untracked) {
+				if (!strcmp(task->path, ".") &&
+				    !fspathcmp(worker->path.buf, ".git"))
+					goto next_record;
+				if (strcmp(task->path, ".") &&
+				    !fspathcmp(entry.name, ".git")) {
+					preload_bulk_invalidate_untracked(
+						worker);
+					goto next_record;
+				}
+			}
 
 			pos = preload_bulk_index_position(scan, worker->path.buf,
 						     worker->path.len);
@@ -358,19 +374,50 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 						.st_ctimespec = entry.ctime,
 					},
 				};
+				struct preload_bulk_untracked_root *untracked_root =
+					task->untracked_root;
+				int has_tracked_descendants;
 
 				if (pos >= 0) {
+					if (scan->collect_untracked &&
+					    preload_bulk_index_entry_is_gitlink(
+						    scan, pos))
+						goto next_record;
 					preload_bulk_record_tracked_fallback(
 						worker, pos);
 					goto next_record;
 				}
-				if (!preload_bulk_index_pos_has_tracked_descendants(
-					    scan, worker->path.buf,
-					    worker->path.len, pos)) {
-					preload_bulk_record_tracked_alias_fallback(
-						worker, worker->path.buf,
-						worker->path.len);
+				has_tracked_descendants =
+					preload_bulk_index_pos_has_tracked_descendants(
+						scan, worker->path.buf,
+						worker->path.len, pos);
+				if (!has_tracked_descendants &&
+				    preload_bulk_record_tracked_alias_fallback(
+					    worker, worker->path.buf,
+					    worker->path.len)) {
+					if (scan->collect_untracked)
+						preload_bulk_invalidate_untracked(
+							worker);
 					goto next_record;
+				}
+				if (!has_tracked_descendants) {
+					if (!scan->collect_untracked ||
+					    preload_bulk_untracked_is_invalid(
+						    worker))
+						goto next_record;
+					if (preload_bulk_untracked_root_is_visible(
+						    worker, untracked_root))
+						goto next_record;
+					if (preload_bulk_path_is_excluded(
+						    worker, worker->path.buf,
+						    DT_DIR))
+						goto next_record;
+					if (!untracked_root)
+						untracked_root =
+							preload_bulk_untracked_root_new(
+								worker,
+								worker->path.buf,
+								worker->path.len);
 				}
 				if (((entry.access & S_IFMT) &&
 				     (entry.access & S_IFMT) != S_IFDIR) ||
@@ -382,20 +429,50 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 					preload_bulk_record_tracked_descendants_fallback(
 						worker, worker->path.buf,
 						worker->path.len);
+					if (scan->collect_untracked)
+						preload_bulk_invalidate_untracked(
+							worker);
 					goto next_record;
 				}
 				preload_bulk_schedule_directory(
 					worker, fd, parent_identity,
-					&child_identity, entry.name,
+					&child_identity, untracked_root,
+					entry.name,
 					worker->path.buf,
 					worker->path.len);
 				goto next_record;
 			}
 
 			if (pos < 0) {
-				preload_bulk_record_tracked_alias_fallback(
-					worker, worker->path.buf,
-					worker->path.len);
+				int found_alias =
+					preload_bulk_record_tracked_alias_fallback(
+						worker, worker->path.buf,
+						worker->path.len);
+
+				if (scan->collect_untracked &&
+				    !preload_bulk_untracked_is_invalid(
+					    worker)) {
+					int dtype;
+
+					if (found_alias) {
+						preload_bulk_invalidate_untracked(
+							worker);
+						goto next_record;
+					}
+					if (entry.type == VREG)
+						dtype = DT_REG;
+					else if (entry.type == VLNK)
+						dtype = DT_LNK;
+					else
+						goto next_record;
+					if (!preload_bulk_path_is_excluded(
+						    worker, worker->path.buf,
+						    dtype))
+						preload_bulk_record_untracked(
+							worker,
+							task->untracked_root,
+							worker->path.buf);
+				}
 				goto next_record;
 			}
 			if (entry.dev != data->root_stat.st_dev) {
@@ -457,6 +534,8 @@ static int scan_directory(struct preload_bulk_worker *worker,
 		path_len = strlen(task->path);
 		preload_bulk_record_tracked_descendants_fallback(
 			worker, task->path, path_len);
+		if (scan->collect_untracked)
+			preload_bulk_invalidate_untracked(worker);
 		ret = 0;
 		goto out;
 	}
@@ -471,7 +550,10 @@ static int scan_directory(struct preload_bulk_worker *worker,
 		goto out;
 	}
 	before_identity = directory_identity(&before);
-	if (enumerate_directory(worker, task, fd, &before_identity))
+	if ((!scan->collect_untracked ||
+	     !preload_bulk_untracked_root_is_visible(
+		     worker, task->untracked_root)) &&
+	    enumerate_directory(worker, task, fd, &before_identity))
 		goto out;
 	if (fstat(fd, &after))
 		goto out;
@@ -518,9 +600,11 @@ static const char *finish_scan(struct preload_bulk_scan *scan)
 }
 
 static const struct preload_bulk_backend darwin_backend = {
+	.collects_untracked = 1,
 	.start = start_scan,
 	.finish = finish_scan,
 	.release = preload_bulk_darwin_release,
+	.open_proof_parent = preload_bulk_darwin_open_relative,
 	.open_dir_at = preload_bulk_darwin_open_dir_at,
 	.scan_directory = scan_directory,
 };
