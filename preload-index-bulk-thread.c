@@ -53,6 +53,7 @@ void preload_bulk_schedule_directory(
 	struct preload_bulk_worker *worker, int parent_fd,
 	const struct preload_bulk_dir_identity *parent_identity,
 	const struct preload_bulk_dir_identity *child_identity,
+	struct preload_bulk_untracked_root *untracked_root,
 	const char *name, const char *path, size_t path_len)
 {
 	struct preload_bulk_scan *scan = worker->scan;
@@ -67,6 +68,7 @@ void preload_bulk_schedule_directory(
 		task->child_identity = *child_identity;
 		task->has_child_identity = 1;
 	}
+	task->untracked_root = untracked_root;
 	task->fd = -1;
 	if (reserve_open_fd(&scan->queue)) {
 		task->reserved_fd = 1;
@@ -79,6 +81,8 @@ void preload_bulk_schedule_directory(
 			if (saved_errno == EXDEV) {
 				preload_bulk_record_tracked_descendants_fallback(
 					worker, path, path_len);
+				if (scan->collect_untracked)
+					preload_bulk_invalidate_untracked(worker);
 				free(task);
 				return;
 			}
