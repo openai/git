@@ -280,7 +280,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		compat/preload-index/bulk-linux-entry.c
 		compat/preload-index/bulk-linux-open.c
 		compat/preload-index/bulk-linux-scan.c
-		compat/preload-index/bulk-linux-stat.c)
+		compat/preload-index/bulk-linux-stat.c
+		compat/preload-index/bulk-linux-topology.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 	add_compile_definitions(HAVE_PRELOAD_INDEX_BULK PRECOMPOSE_UNICODE
 		USE_ST_TIMESPEC)
