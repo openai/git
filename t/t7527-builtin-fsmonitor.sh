@@ -1922,4 +1922,89 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked-only status adopts missing semantic history' '
+	test_when_finished "rm -rf tracked-semantic-adoption" &&
+	test_create_repo tracked-semantic-adoption &&
+	(
+		cd tracked-semantic-adoption &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		printf "aaaa\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		test-tool chmtime -60 tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid tracked &&
+		test_grep ! FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual &&
+		test_trace2_data status fsmonitor_token/semantic-closed 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'collapsed sparse index uses ordinary token closure' '
+	test_when_finished "rm -rf sparse-tracked-only" &&
+	test_create_repo sparse-tracked-only &&
+	(
+		cd sparse-tracked-only &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir in outside &&
+		printf "aaaa\n" >in/tracked &&
+		printf "outside\n" >outside/file &&
+		git add . &&
+		git commit -m base &&
+		git sparse-checkout set --cone --sparse-index in &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		test-tool chmtime =-60 in/tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get in/tracked) &&
+		printf "bbbb\n" >in/tracked &&
+		test-tool chmtime =$mtime in/tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid in/tracked &&
+		test_grep ! FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=in/tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/actual &&
+		test_grep "^1 \.M .* in/tracked$" .git/actual &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/apply_count 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index &&
+		git -c core.fsmonitor=false ls-files --sparse \
+			>.git/sparse.after &&
+		test_grep "^outside/$" .git/sparse.after
+	)
+'
+
 test_done
