@@ -1015,45 +1015,104 @@ static void wt_status_publish_staged_untracked(
 	closure->staged_untracked_ready = 0;
 }
 
+static int fsmonitor_token_requires_rescan(enum fsmonitor_token_result result)
+{
+	return result == FSMONITOR_TOKEN_CHANGED ||
+		result == FSMONITOR_TOKEN_TRIVIAL;
+}
+
+static void wt_status_refresh_for_token(
+	struct wt_status *s, unsigned int refresh_flags,
+	struct clean_status_proof_epoch **epoch, int *refresh_result)
+{
+	struct index_state *istate = s->repo->index;
+
+	clean_status_release_proof_epoch(*epoch);
+	*epoch = clean_status_capture_proof_epoch(
+		istate, s->attr_source_snapshot, 0);
+	if (*epoch) {
+		*refresh_result |= refresh_index(
+			istate, refresh_flags | REFRESH_IN_PROOF_EPOCH,
+			&s->pathspec, NULL, NULL);
+	}
+}
+
 static int wt_status_close_ordinary_fsmonitor_token(
 	struct wt_status_token_closure *closure,
 	int refreshed_before_closure)
 {
 	struct wt_status *s = closure->status;
 	struct index_state *istate = s->repo->index;
+	struct clean_status_proof_epoch *scan_epoch = NULL;
+	int reliable_stat = fstat_is_reliable();
 
-	if (!refreshed_before_closure)
-		closure->refresh_result = refresh_index(
+	/*
+	 * A pending token must close a refresh begun after its epoch was
+	 * captured. A refresh performed before entering token closure cannot
+	 * be validated by capturing its inputs afterward.
+	 */
+	if (reliable_stat) {
+		wt_status_refresh_for_token(
+			s, closure->refresh_flags, &scan_epoch,
+			&closure->refresh_result);
+		if (!scan_epoch)
+			return 0;
+	} else if (!refreshed_before_closure) {
+		closure->refresh_result |= refresh_index(
 			istate, closure->refresh_flags, &s->pathspec,
 			NULL, NULL);
+	}
 	if (!closure->untracked_ready && closure->can_prime)
 		closure->untracked_ready = wt_status_stage_untracked(closure);
 
 	while (closure->queries < FSMONITOR_TOKEN_MAX_QUERIES) {
-		enum fsmonitor_token_result result =
-			fsmonitor_query_pending_token(
-				istate, closure->untracked_ready);
+		enum fsmonitor_token_result result;
 
+		if (reliable_stat &&
+		    !clean_status_proof_epoch_start_token_matches(
+			    istate, scan_epoch))
+			break;
 		closure->queries++;
+		result = fsmonitor_query_pending_token(
+			istate, closure->untracked_ready);
 		if (result == FSMONITOR_TOKEN_CLEAN) {
+			if (reliable_stat &&
+			    !clean_status_proof_epoch_matches(
+				    istate, scan_epoch))
+				break;
 			if (closure->untracked_ready) {
+				if (reliable_stat)
+					clean_status_mark_fsmonitor_config_valid(
+						istate,
+						istate->fsmonitor_last_update_pending);
+				clean_status_release_proof_epoch(scan_epoch);
 				fsmonitor_accept_pending_token(istate);
 				return 1;
 			}
 			break;
 		}
-		if (result == FSMONITOR_TOKEN_ERROR ||
-		    result == FSMONITOR_TOKEN_NOT_PENDING)
+		clean_status_release_proof_epoch(scan_epoch);
+		scan_epoch = NULL;
+		if (!fsmonitor_token_requires_rescan(result))
 			break;
 
 		/* Rescan invalidations returned by the closure query. */
-		closure->refresh_result |= refresh_index(
-			istate, closure->refresh_flags, &s->pathspec,
-			NULL, NULL);
+		if (reliable_stat) {
+			wt_status_refresh_for_token(
+				s, closure->refresh_flags, &scan_epoch,
+				&closure->refresh_result);
+			if (!scan_epoch)
+				break;
+		} else {
+			closure->refresh_result |= refresh_index(
+				istate, closure->refresh_flags,
+				&s->pathspec, NULL, NULL);
+		}
 		if (closure->can_prime)
 			closure->untracked_ready =
 				wt_status_stage_untracked(closure);
 	}
+	clean_status_release_proof_epoch(scan_epoch);
 	return 0;
 }
 
@@ -1095,6 +1154,11 @@ static int wt_status_close_fsmonitor_token(
 	/* Keep the last valid token and fall back to complete scans. */
 	wt_status_discard_staged_untracked(&closure);
 	fsmonitor_reject_pending_token(istate);
+	if (fstat_is_reliable()) {
+		if (closure.can_prime)
+			untracked_cache_invalidate_all(istate);
+		fsmonitor_invalidate_semantics(istate);
+	}
 	closure.refresh_result |= refresh_index(
 		istate, refresh_flags, &s->pathspec, NULL, NULL);
 accepted:

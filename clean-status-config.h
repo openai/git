@@ -4,6 +4,7 @@
 #include "hash.h"
 
 struct config_context;
+struct repository;
 
 struct clean_status_config_digest {
 	struct git_hash_ctx ctx;
@@ -22,5 +23,8 @@ void clean_status_config_add(struct clean_status_config_digest *digest,
 			     const char *key, const char *value,
 			     const struct config_context *ctx);
 void clean_status_config_final(struct clean_status_config_digest *digest);
+int clean_status_config_read_repository(
+	struct repository *repo,
+	struct clean_status_config_digest *digest);
 
 #endif /* CLEAN_STATUS_CONFIG_H */
