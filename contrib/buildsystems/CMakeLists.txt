@@ -279,6 +279,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		compat/linux/procinfo.c
 		compat/preload-index/bulk-linux-entry.c
 		compat/preload-index/bulk-linux-open.c
+		compat/preload-index/bulk-linux-scan.c
 		compat/preload-index/bulk-linux-stat.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 	add_compile_definitions(HAVE_PRELOAD_INDEX_BULK PRECOMPOSE_UNICODE
