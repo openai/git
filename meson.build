@@ -1364,6 +1364,7 @@ if host_machine.system() == 'linux'
     'compat/linux/procinfo.c',
     'compat/preload-index/bulk-linux-entry.c',
     'compat/preload-index/bulk-linux-open.c',
+    'compat/preload-index/bulk-linux-scan.c',
     'compat/preload-index/bulk-linux-stat.c',
   ]
 elif host_machine.system() == 'windows'
