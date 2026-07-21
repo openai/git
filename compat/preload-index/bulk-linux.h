@@ -92,6 +92,8 @@ int preload_bulk_linux_enumerate(
 	struct preload_bulk_worker *worker,
 	struct preload_bulk_task *task, int fd,
 	const struct preload_bulk_dir_identity *parent_identity);
+int preload_bulk_linux_scan_directory(struct preload_bulk_worker *worker,
+				      struct preload_bulk_task *task);
 
 #endif /* SYS_getdents64 && SYS_statx */
 
