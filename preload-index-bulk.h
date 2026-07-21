@@ -19,6 +19,7 @@ struct preload_bulk_task {
 	struct preload_bulk_task *next;
 	struct preload_bulk_dir_identity parent_identity;
 	struct preload_bulk_dir_identity child_identity;
+	struct preload_bulk_untracked_root *untracked_root;
 	int fd;
 	unsigned reserved_fd : 1;
 	unsigned has_parent_identity : 1;
@@ -121,12 +122,15 @@ void preload_bulk_schedule_directory(
 	struct preload_bulk_worker *worker, int parent_fd,
 	const struct preload_bulk_dir_identity *parent_identity,
 	const struct preload_bulk_dir_identity *child_identity,
+	struct preload_bulk_untracked_root *untracked_root,
 	const char *name, const char *path, size_t path_len);
 int preload_bulk_index_position(struct preload_bulk_scan *scan,
 				const char *path, size_t path_len);
 int preload_bulk_index_pos_has_tracked_descendants(
 	struct preload_bulk_scan *scan, const char *path, size_t path_len,
 	int pos);
+int preload_bulk_index_entry_is_gitlink(struct preload_bulk_scan *scan,
+					int pos);
 void preload_bulk_record_tracked(
 	struct preload_bulk_worker *worker, int pos, const struct stat *st);
 void preload_bulk_record_tracked_fallback(
