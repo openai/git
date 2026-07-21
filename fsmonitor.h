@@ -9,6 +9,13 @@
 #include "trace.h"
 
 /*
+ * Force the next stat-aware caller to verify this entry's content. Wider
+ * invalidation, such as attributes or untracked-cache state, is the caller's
+ * responsibility.
+ */
+void fsmonitor_invalidate_cache_entry(struct cache_entry *ce);
+
+/*
  * Check if refresh_fsmonitor has been called at least once.
  * refresh_fsmonitor is idempotent. Returns true if fsmonitor is
  * not enabled (since the state will be "fresh" w/ CE_FSMONITOR_VALID unset)

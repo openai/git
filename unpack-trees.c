@@ -2241,7 +2241,8 @@ static int verify_uptodate_1(const struct cache_entry *ce,
 
 	if (!lstat(ce->name, &st)) {
 		int flags = CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE;
-		unsigned changed = ie_match_stat(o->src_index, ce, &st, flags);
+		unsigned changed = ie_match_stat_with_content_check(
+			o->src_index, ce, &st, flags);
 
 		if (submodule_from_ce(ce)) {
 			int r = check_submodule_move_head(ce,
@@ -2407,7 +2408,9 @@ static int icase_exists(struct unpack_trees_options *o, const char *name, int le
 	const struct cache_entry *src;
 
 	src = index_file_exists(o->src_index, name, len, 1);
-	return src && !ie_match_stat(o->src_index, src, st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE);
+	return src && !ie_match_stat_with_content_check(
+		o->src_index, src, st,
+		CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE);
 }
 
 enum absent_checking_type {
@@ -3038,7 +3041,10 @@ int oneway_merge(const struct cache_entry * const *src,
 			!(old->ce_flags & CE_FSMONITOR_VALID)) {
 			struct stat st;
 			if (lstat(old->name, &st) ||
-			    ie_match_stat(o->src_index, old, &st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE))
+			    ie_match_stat_with_content_check(
+				    o->src_index, old, &st,
+				    CE_MATCH_IGNORE_VALID |
+				    CE_MATCH_IGNORE_SKIP_WORKTREE))
 				update |= CE_UPDATE;
 		}
 		if (o->update && S_ISGITLINK(old->ce_mode) &&
