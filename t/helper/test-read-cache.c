@@ -3,15 +3,52 @@
 #include "test-tool.h"
 #include "config.h"
 #include "environment.h"
+#include "fsmonitor.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "setup.h"
+
+static int test_fsmonitor_content_recovery(const char *path)
+{
+	struct index_state *istate;
+	struct cache_entry *ce;
+	struct stat_data empty = { 0 };
+	struct stat st;
+	int pos;
+
+	setup_git_directory(the_repository);
+	repo_config(the_repository, git_default_config, NULL);
+	if (repo_read_index(the_repository) < 0)
+		return error("unable to read test index");
+	istate = the_repository->index;
+	pos = index_name_pos(istate, path, strlen(path));
+	if (pos < 0)
+		return error("path is not indexed: %s", path);
+	ce = istate->cache[pos];
+	if (lstat(path, &st))
+		return error_errno("unable to stat indexed path");
+
+	fsmonitor_invalidate_cache_entry(ce);
+	if (memcmp(&ce->ce_stat_data, &empty, sizeof(empty)))
+		return error("invalidation did not poison cached stat data");
+	if (ie_match_stat_with_content_check(istate, ce, &st, 0))
+		return error("clean content did not match");
+	if (!memcmp(&ce->ce_stat_data, &empty, sizeof(empty)))
+		return error("verified clean entry retained poisoned stat data");
+	if (!(ce->ce_flags & CE_UPDATE_IN_BASE) ||
+	    !(istate->cache_changed & CE_ENTRY_CHANGED))
+		return error("verified stat refresh was not marked for persistence");
+	return 0;
+}
 
 int cmd__read_cache(int argc, const char **argv)
 {
 	int i, cnt = 1;
 	const char *name = NULL;
 
+	if (argc == 3 &&
+	    !strcmp(argv[1], "--test-fsmonitor-content-recovery"))
+		return test_fsmonitor_content_recovery(argv[2]);
 	if (argc > 1 && skip_prefix(argv[1], "--print-and-refresh=", &name)) {
 		argc--;
 		argv++;
