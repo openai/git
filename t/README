@@ -425,6 +425,10 @@ by overriding the minimum number of cache entries required per thread.
 GIT_TEST_PRELOAD_INDEX_BULK=<boolean> overrides the
 `core.preloadIndexBulk` setting.
 
+GIT_TEST_PRELOAD_INDEX_BULK_DIRENT_TYPE=<type>:<path>, when
+GIT_TEST_PRELOAD_INDEX_BULK is enabled, overrides the Linux directory
+entry type for one worktree-relative path. <type> is `dir` or `reg`.
+
 GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_PATH=<path>,
 GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_READY=<path>, and
 GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_RESUME=<path>, when
