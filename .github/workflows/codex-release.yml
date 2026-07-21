@@ -103,6 +103,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable arm64
             has_gcm: false
+            lto: thin
             max_tar_bytes: 67108864
           - name: macOS x64
             os: macos-15-intel
@@ -112,6 +113,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable x86_64
             has_gcm: false
+            lto: thin
             max_tar_bytes: 67108864
           # Keep arm64 builds native so release smoke tests can execute them.
           - name: Linux arm64
@@ -122,6 +124,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*ARM aarch64
             has_gcm: false
+            lto: auto
             max_tar_bytes: 67108864
           - name: Linux x64
             os: ubuntu-22.04
@@ -131,6 +134,7 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*x86-64
             has_gcm: false
+            lto: auto
             max_tar_bytes: 67108864
           - name: Windows arm64
             os: windows-11-arm
@@ -140,6 +144,7 @@ jobs:
             binary: /tmp/build/git/clangarm64/bin/git.exe
             file_pattern: PE32\+.*ARM64
             has_gcm: true
+            lto: thin
             max_tar_bytes: 134217728
             sdk_arch: aarch64
             sdk_flavor: full
@@ -156,6 +161,7 @@ jobs:
             binary: /tmp/build/git/mingw64/bin/git.exe
             file_pattern: PE32\+.*x86-64
             has_gcm: true
+            lto: auto
             max_tar_bytes: 134217728
             sdk_arch: x86_64
             sdk_flavor: full
@@ -195,6 +201,11 @@ jobs:
             -c 'user.name=github-actions[bot]' \
             -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' \
             tag -a "$VERSION" -m "$VERSION"
+
+      - name: Install OpenAI build configuration
+        shell: bash
+        working-directory: dugite-native/git
+        run: cp config.mak.openai config.mak
 
       # Match Dugite Native's compatibility choice for its macOS x64 build.
       - name: Select Xcode 16.4
@@ -291,6 +302,7 @@ jobs:
         working-directory: dugite-native
         env:
           NO_RUST: 1
+          OPENAI_LTO: ${{ matrix.lto }}
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
@@ -316,6 +328,7 @@ jobs:
         working-directory: dugite-native/git
         env:
           MINGW_DIR: ${{ matrix.mingw_dir }}
+          OPENAI_LTO: ${{ matrix.lto }}
         run: |
           set -euo pipefail
 
@@ -341,6 +354,7 @@ jobs:
           GIT_BINARY: ${{ matrix.binary }}
           FILE_PATTERN: ${{ matrix.file_pattern }}
           HAS_GCM: ${{ matrix.has_gcm }}
+          LTO: ${{ matrix.lto }}
         run: |
           set -euo pipefail
           if test "$TARGET_PLATFORM" = win32
@@ -368,6 +382,7 @@ jobs:
           file "$GIT_BINARY" | tee /tmp/git-file-type
           grep -E "$FILE_PATTERN" /tmp/git-file-type
           strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
+          grep -F -- "-flto=$LTO" dugite-native/git/GIT-CFLAGS
 
       - name: Smoke-test the native distribution
         shell: bash
