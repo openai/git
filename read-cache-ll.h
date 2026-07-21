@@ -69,14 +69,18 @@ struct cache_entry {
  */
 #define CE_INTENT_TO_ADD     (1 << 29)
 #define CE_SKIP_WORKTREE     (1 << 30)
-/* CE_EXTENDED2 is for future extension */
-#define CE_EXTENDED2         (1U << 31)
+/*
+ * In-memory only. The cached stat data cannot be trusted, and callers which
+ * normally trust stat differences must verify content. This occupies the
+ * former never-persisted extension slot.
+ */
+#define CE_CONTENT_CHECK_REQUIRED (1U << 31)
 
 #define CE_EXTENDED_FLAGS (CE_INTENT_TO_ADD | CE_SKIP_WORKTREE)
 
 /*
  * Safeguard to avoid saving wrong flags:
- *  - CE_EXTENDED2 won't get saved until its semantic is known
+ *  - CE_CONTENT_CHECK_REQUIRED is transient and must not be saved
  *  - Bits in 0x0000FFFF have been saved in ce_flags already
  *  - Bits in 0x003F0000 are currently in-memory flags
  */
@@ -120,7 +124,9 @@ static inline unsigned create_ce_flags(unsigned stage)
 #define ce_stage(ce) ((CE_STAGEMASK & (ce)->ce_flags) >> CE_STAGESHIFT)
 #define ce_uptodate(ce) ((ce)->ce_flags & CE_UPTODATE)
 #define ce_skip_worktree(ce) ((ce)->ce_flags & CE_SKIP_WORKTREE)
-#define ce_mark_uptodate(ce) ((ce)->ce_flags |= CE_UPTODATE)
+#define ce_mark_uptodate(ce) \
+	((ce)->ce_flags = ((ce)->ce_flags | CE_UPTODATE) & \
+			  ~CE_CONTENT_CHECK_REQUIRED)
 #define ce_intent_to_add(ce) ((ce)->ce_flags & CE_INTENT_TO_ADD)
 
 #define cache_entry_size(len) (offsetof(struct cache_entry,name) + (len) + 1)
@@ -434,6 +440,13 @@ int is_racy_timestamp(const struct index_state *istate,
 int has_racy_timestamp(struct index_state *istate);
 int ie_match_stat(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
 int ie_modified(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
+/*
+ * Unlike ie_match_stat(), verify content for marked non-gitlinks. Ordinary
+ * entries, including unmarked zero-stat entries, retain stat-only matching.
+ */
+int ie_match_stat_with_content_check(struct index_state *,
+				     const struct cache_entry *,
+				     struct stat *, unsigned int);
 
 int match_stat_data_racy(const struct index_state *istate,
 			 const struct stat_data *sd, struct stat *st);
