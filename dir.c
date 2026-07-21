@@ -19,6 +19,7 @@
 #include "name-hash.h"
 #include "object-file.h"
 #include "path.h"
+#include "path-namespace.h"
 #include "refs.h"
 #include "repository.h"
 #include "wildmatch.h"
@@ -77,9 +78,11 @@ struct untracked_cache_preload_task {
 	struct untracked_cache_dir *ucd;
 	char *path;
 	struct stat_data stat_data;
+	struct object_id exclude_oid;
 	unsigned int was_valid : 1;
 	unsigned int stat_checked : 1;
 	unsigned int stat_matches : 1;
+	unsigned int exclude_matches : 1;
 	unsigned int update_stat_data : 1;
 };
 
@@ -99,6 +102,7 @@ struct untracked_cache_preload {
 	struct untracked_cache_preload_task *tasks;
 	struct untracked_cache_preload_data *data;
 	struct cache_time index_timestamp;
+	char *exclude_per_dir;
 	size_t nr;
 	int threads;
 	unsigned int dir_flags;
@@ -107,6 +111,10 @@ struct untracked_cache_preload {
 
 #define UNTRACKED_CACHE_MAX_OVERLAP_THREADS 6
 #define UNTRACKED_CACHE_PRELOAD_COST 1000
+#define UNTRACKED_CACHE_MAX_EXCLUDE_SIZE (1024 * 1024)
+
+static void invalidate_gitignore(struct untracked_cache *uc,
+				 struct untracked_cache_dir *dir);
 
 static int match_untracked_dir_stat_racy(const struct cache_time *timestamp,
 					 const struct stat_data *sd,
@@ -127,6 +135,7 @@ static void collect_untracked_cache_preload_tasks(
 	(*tasks)[*nr].ucd = ucd;
 	(*tasks)[*nr].path = xstrdup(path->len ? path->buf : ".");
 	(*tasks)[*nr].stat_data = ucd->stat_data;
+	oidcpy(&(*tasks)[*nr].exclude_oid, &ucd->exclude_oid);
 	(*tasks)[*nr].was_valid = ucd->valid;
 	(*nr)++;
 
@@ -168,6 +177,63 @@ static int untracked_cache_auto_preload_worthwhile(
 		UNTRACKED_CACHE_AUTO_PRELOAD_MIN_DIRS;
 }
 
+static int exclude_path_matches_fd(const char *path,
+				   const struct stat *expected)
+{
+	struct stat st;
+	int fd = open_nofollow(path, O_RDONLY);
+	int ret = fd >= 0 && !fstat(fd, &st) && S_ISREG(st.st_mode) &&
+		path_namespace_stat_equal(expected, &st);
+
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+static int cached_exclude_file_matches(
+	const struct git_hash_algo *algo,
+	const char *path, const struct object_id *cached_oid)
+{
+	struct object_id raw_oid, normalized_oid;
+	struct stat st, st_after;
+	char *buf;
+	size_t size;
+	int fd, ret = 0;
+
+	fd = open_nofollow(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+	    st.st_size > UNTRACKED_CACHE_MAX_EXCLUDE_SIZE)
+		goto out_close;
+
+	size = xsize_t(st.st_size);
+	buf = xmallocz(size + 1);
+	if (read_in_full(fd, buf, size) != size)
+		goto out;
+	/* Prove both the opened file and its pathname stayed unchanged. */
+	if (fstat(fd, &st_after) ||
+	    !path_namespace_stat_equal(&st, &st_after) ||
+	    !exclude_path_matches_fd(path, &st_after))
+		goto out;
+
+	/* add_patterns() may record either the blob or its LF-normalized form. */
+	hash_object_file(algo, buf, size, OBJ_BLOB, &raw_oid);
+	if (oideq(&raw_oid, cached_oid)) {
+		ret = 1;
+		goto out;
+	}
+	buf[size] = '\n';
+	hash_object_file(algo, buf, size + 1, OBJ_BLOB,
+			 &normalized_oid);
+	ret = oideq(&normalized_oid, cached_oid);
+out:
+	free(buf);
+out_close:
+	close(fd);
+	return ret;
+}
+
 static struct untracked_cache_preload *untracked_cache_preload_start_1(
 	struct index_state *istate, unsigned int dir_flags, int automatic)
 {
@@ -187,6 +253,7 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 	preload->uc = uc;
 	preload->root = uc->root;
 	preload->index_timestamp = istate->timestamp;
+	preload->exclude_per_dir = xstrdup_or_null(uc->exclude_per_dir);
 	preload->dir_flags = dir_flags;
 	collect_untracked_cache_preload_tasks(
 		uc->root, &path, &preload->tasks, &preload->nr, &alloc);
@@ -260,6 +327,7 @@ static void *preload_untracked_cache_thread(void *_data)
 
 	for (i = data->offset; i < data->offset + data->nr; i++) {
 		struct untracked_cache_preload_task *task = &preload->tasks[i];
+		struct strbuf exclude_path = STRBUF_INIT;
 		struct stat st;
 
 		if (!task->was_valid)
@@ -273,10 +341,26 @@ static void *preload_untracked_cache_thread(void *_data)
 		if (!match_untracked_dir_stat_racy(
 				&preload->index_timestamp, &task->stat_data, &st)) {
 			task->stat_matches = 1;
+		} else {
+			fill_stat_data(&task->stat_data, &st);
+			task->update_stat_data = 1;
 			continue;
 		}
-		fill_stat_data(&task->stat_data, &st);
-		task->update_stat_data = 1;
+		if (is_null_oid(&task->exclude_oid)) {
+			task->exclude_matches = 1;
+			continue;
+		}
+		if (!preload->exclude_per_dir)
+			continue;
+		if (strcmp(task->path, "."))
+			strbuf_addstr(&exclude_path, task->path);
+		if (exclude_path.len)
+			strbuf_addch(&exclude_path, '/');
+		strbuf_addstr(&exclude_path, preload->exclude_per_dir);
+		task->exclude_matches = cached_exclude_file_matches(
+			preload->repo->hash_algo, exclude_path.buf,
+			&task->exclude_oid);
+		strbuf_release(&exclude_path);
 	}
 	return NULL;
 }
@@ -314,6 +398,7 @@ static void untracked_cache_preload_free(
 	for (i = 0; i < preload->nr; i++)
 		free(preload->tasks[i].path);
 	free(preload->tasks);
+	free(preload->exclude_per_dir);
 	free(preload);
 }
 
@@ -340,6 +425,7 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 
 		ucd->stat_checked = 0;
 		ucd->stat_matches = 0;
+		ucd->exclude_matches = 0;
 		/* Invalidation performed after the snapshot always wins. */
 		if (!task->was_valid || !ucd->valid) {
 			valid = 0;
@@ -347,10 +433,14 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 		}
 		ucd->stat_checked = task->stat_checked;
 		ucd->stat_matches = task->stat_matches;
-		if (!task->stat_checked || !task->stat_matches)
+		ucd->exclude_matches = task->exclude_matches;
+		if (!task->stat_checked || !task->stat_matches ||
+		    !task->exclude_matches)
 			valid = 0;
 		if (task->update_stat_data)
 			ucd->stat_data = task->stat_data;
+		if (task->stat_matches && !task->exclude_matches)
+			invalidate_gitignore(uc, ucd);
 	}
 	trace2_data_intmax("dir", istate->repo,
 			   "preload_untracked_cache/valid", valid);
@@ -2873,7 +2963,8 @@ static int valid_cached_dir(struct dir_struct *dir,
 	if (!(dir->untracked->use_fsmonitor && untracked->valid)) {
 		if (dir->internal.untracked_cache_preloaded &&
 		    untracked->stat_checked) {
-			if (!untracked->valid || !untracked->stat_matches)
+			if (!untracked->valid || !untracked->stat_matches ||
+			    !untracked->exclude_matches)
 				return 0;
 		} else {
 			if (lstat(path->len ? path->buf : ".", &st)) {

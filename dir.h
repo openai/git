@@ -185,6 +185,7 @@ struct untracked_cache_dir {
 	/* transient results from directory-stat preloading */
 	unsigned int stat_checked : 1;
 	unsigned int stat_matches : 1;
+	unsigned int exclude_matches : 1;
 	/* null object ID means this directory does not have .gitignore */
 	struct object_id exclude_oid;
 	char name[FLEX_ARRAY];
