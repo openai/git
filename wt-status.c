@@ -946,6 +946,10 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 		return;
 	}
 
+	if (s->show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
+	    !istate->untracked &&
+	    istate->sparse_index == INDEX_EXPANDED)
+		istate->preload_untracked = &s->untracked;
 	/* Restore verified stats before cached excludes inspect them. */
 	if (fstat_is_reliable() && !istate->split_index &&
 	    fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_IPC &&
@@ -995,6 +999,10 @@ static int wt_status_collect_untracked_1(
 	struct index_state *istate = s->repo->index;
 
 	if (!s->show_untracked_files)
+		return 0;
+	if (s->untracked_from_preload &&
+	    !istate->untracked &&
+	    !s->show_ignored_mode)
 		return 0;
 
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
@@ -1474,13 +1482,22 @@ int wt_status_refresh_index(struct wt_status *s,
 			    unsigned int refresh_flags,
 			    int require_untracked)
 {
+	struct index_state *istate = s->repo->index;
 	struct semantic_verify_proof *proof;
+	int ret;
 
 	wt_status_begin_attr_snapshot(s);
-	refresh_fsmonitor(s->repo->index);
+	refresh_fsmonitor(istate);
 	proof = wt_status_prepare_semantic_verify(s);
-	return wt_status_close_fsmonitor_token(
+	ret = wt_status_close_fsmonitor_token(
 		s, proof, refresh_flags, require_untracked, 0);
+	if (istate->preload_untracked == &s->untracked) {
+		s->untracked_from_preload =
+			istate->preload_untracked_complete;
+		istate->preload_untracked = NULL;
+		istate->preload_untracked_complete = 0;
+	}
+	return ret;
 }
 
 static void wt_status_release_attr_snapshot(struct wt_status *s)

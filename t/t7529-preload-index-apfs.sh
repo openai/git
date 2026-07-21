@@ -74,6 +74,23 @@ compare_status () {
 	test_cmp expect actual
 }
 
+compare_fallback_status () {
+	repo=$1 &&
+	fallback_trace=$TRASH_DIRECTORY/$2 &&
+	shift 2 &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -C "$repo" -c core.preloadIndex=false \
+		status --porcelain=v2 "$@" >expect &&
+	rm -f "$fallback_trace" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TEST_PRELOAD_INDEX=1 \
+	GIT_TEST_PRELOAD_INDEX_BULK=1 \
+	GIT_TRACE2_EVENT="$fallback_trace" \
+		git -C "$repo" status --porcelain=v2 "$@" >actual &&
+	test_cmp expect actual &&
+	test_grep "\"category\":\"read_directory\"" "$fallback_trace"
+}
+
 configured_bulk_status () {
 	repo=$1 &&
 	output=$2 &&
@@ -182,11 +199,23 @@ finish_raced_status () {
 	test_trace2_data index preload/bulk_applied 0 <"$race_trace"
 }
 
+finish_raced_untracked_status () {
+	printf "resume\n" >&9 &&
+	exec 9>&- &&
+	wait "$status_pid" &&
+	status_pid= &&
+	ordinary_status "$1" expect &&
+	test_cmp expect actual &&
+	test_trace2_data index preload/bulk_applied "$2" <"$race_trace"
+}
+
 test_expect_success 'clean entries are published without lstat' '
 	setup_repo clean &&
 	bulk_status clean actual clean.trace &&
 	test_must_be_empty actual &&
 	check_data clean.trace preload/bulk_applied 8 &&
+	check_data clean.trace preload/bulk_untracked_complete 1 &&
+	check_data clean.trace preload/bulk_untracked_count 0 &&
 	check_lstat_data clean.trace 0
 '
 
@@ -256,6 +285,229 @@ test_expect_success CASE_INSENSITIVE_FS \
 	}
 '
 
+test_expect_success 'visible paths are returned by the bulk walk' '
+	setup_repo visible-output &&
+	test_write_lines "*.ignored" >visible-output/.gitignore &&
+	git -C visible-output add .gitignore &&
+	git -C visible-output commit -m ignore &&
+	test_write_lines root >visible-output/root-untracked &&
+	test_write_lines nested >visible-output/nested/untracked &&
+	mkdir -p visible-output/collapsed/deep \
+		visible-output/ignored-only/deep \
+		visible-output/empty &&
+	test_write_lines collapsed >visible-output/collapsed/deep/file &&
+	test_write_lines ignored >visible-output/ignored-only/deep/file.ignored &&
+	compare_status visible-output visible-output.trace &&
+	test_grep "^? root-untracked$" actual &&
+	test_grep "^? nested/untracked$" actual &&
+	test_grep "^? collapsed/$" actual &&
+	test_grep ! "ignored-only" actual &&
+	test_grep ! "empty" actual &&
+	check_data visible-output.trace preload/bulk_untracked_complete 1 &&
+	check_data visible-output.trace preload/bulk_untracked_count 3 &&
+	test_grep ! "\"category\":\"read_directory\"" \
+		visible-output.trace
+'
+
+test_expect_success PIPE 'special files are ignored' '
+	setup_repo special-file &&
+	mkfifo special-file/fifo &&
+	compare_status special-file special-file.trace &&
+	test_must_be_empty actual &&
+	check_data special-file.trace preload/bulk_untracked_complete 1 &&
+	check_data special-file.trace preload/bulk_untracked_count 0
+'
+
+test_expect_success 'activation guards retain ordinary traversal' '
+	setup_repo activation-guards &&
+	test_write_lines "*.ignored" >activation-guards/.gitignore &&
+	git -C activation-guards add .gitignore &&
+	git -C activation-guards commit -m ignore &&
+	test_write_lines visible >activation-guards/visible &&
+	test_write_lines ignored >activation-guards/file.ignored &&
+	compare_fallback_status activation-guards all.trace \
+		--untracked-files=all &&
+	compare_fallback_status activation-guards ignored.trace \
+		--ignored &&
+	compare_fallback_status activation-guards pathspec.trace \
+		-- nested &&
+	git -C activation-guards update-index --untracked-cache &&
+	compare_fallback_status activation-guards untracked-cache.trace
+'
+
+test_expect_success CASE_INSENSITIVE_FS 'case aliases fall back' '
+	setup_repo untracked-case-alias &&
+	mv untracked-case-alias/root untracked-case-alias/ROOT &&
+	compare_status untracked-case-alias untracked-case-alias.trace &&
+	check_data untracked-case-alias.trace preload/bulk_untracked_complete 0 &&
+	check_data untracked-case-alias.trace preload/bulk_untracked_count 0
+'
+
+test_expect_success 'nested repositories fall back' '
+	setup_repo nested-repo &&
+	test_write_lines "embedded/**" >nested-repo/.gitignore &&
+	git -C nested-repo add .gitignore &&
+	git -C nested-repo commit -m ignore &&
+	mkdir nested-repo/embedded &&
+	git -C nested-repo/embedded init &&
+	test_write_lines ignored >nested-repo/embedded/file &&
+	compare_status nested-repo nested-repo.trace &&
+	test_grep "^? embedded/$" actual &&
+	check_data nested-repo.trace preload/bulk_untracked_complete 0
+'
+
+test_expect_success 'tracked submodules retain collected paths' '
+	git init submodule-child &&
+	git -C submodule-child commit --allow-empty -m base &&
+	setup_repo submodule-parent &&
+	git -C submodule-parent -c protocol.file.allow=always \
+		submodule add ../submodule-child embedded &&
+	git -C submodule-parent commit -m submodule &&
+	git -C submodule-parent update-index --refresh &&
+	test_write_lines visible >submodule-parent/visible &&
+	compare_status submodule-parent submodule-parent.trace &&
+	test_grep "^? visible$" actual &&
+	check_data submodule-parent.trace preload/bulk_untracked_complete 1
+'
+
+test_expect_success 'exclude changes discard collected paths' '
+	setup_repo exclude-race &&
+	exclude=$TRASH_DIRECTORY/exclude-race.patterns &&
+	test_write_lines visible >"$exclude" &&
+	git -C exclude-race config core.excludesFile "$exclude" &&
+	test_write_lines visible >exclude-race/visible &&
+	test_when_finished cleanup_race &&
+	start_raced_status exclude-race "" &&
+	>"$exclude" &&
+	finish_raced_untracked_status exclude-race 8 &&
+	test_grep "^? visible$" actual &&
+	check_data exclude-race.trace preload/bulk_untracked_complete 0 &&
+	check_data exclude-race.trace preload/bulk_untracked_reason exclude-race
+'
+
+test_expect_success 'info exclude changes discard collected paths' '
+	setup_repo info-exclude &&
+	test_write_lines visible >info-exclude/.git/info/exclude &&
+	test_write_lines visible >info-exclude/visible &&
+	test_when_finished cleanup_race &&
+	start_raced_status info-exclude "" &&
+	>info-exclude/.git/info/exclude &&
+	finish_raced_untracked_status info-exclude 8 &&
+	test_grep "^? visible$" actual &&
+	check_data info-exclude.trace preload/bulk_untracked_complete 0 &&
+	check_data info-exclude.trace \
+		preload/bulk_untracked_reason exclude-race
+'
+
+test_expect_success 'new exclusion source discards collected paths' '
+	setup_repo absent-exclude &&
+	exclude_dir=$TRASH_DIRECTORY/absent-exclude-config &&
+	exclude=$exclude_dir/ignore &&
+	rm -rf "$exclude_dir" &&
+	git -C absent-exclude config core.excludesFile "$exclude" &&
+	test_write_lines visible >absent-exclude/visible &&
+	test_when_finished cleanup_race &&
+	test_when_finished "rm -rf \"$exclude_dir\"" &&
+	start_raced_status absent-exclude "" &&
+	mkdir "$exclude_dir" &&
+	test_write_lines visible >"$exclude" &&
+	finish_raced_untracked_status absent-exclude 8 &&
+	test_must_be_empty actual &&
+	check_data absent-exclude.trace preload/bulk_untracked_complete 0 &&
+	check_data absent-exclude.trace \
+		preload/bulk_untracked_reason exclude-race
+'
+
+test_expect_success 'separate-git-dir excludes are proven' '
+	setup_repo separate-info &&
+	mv separate-info/.git separate-info.git &&
+	printf "gitdir: ../separate-info.git\n" >separate-info/.git &&
+	test_write_lines visible >separate-info.git/info/exclude &&
+	test_write_lines visible >separate-info/visible &&
+	compare_status separate-info separate-info.trace &&
+	test_must_be_empty actual &&
+	check_data separate-info.trace preload/bulk_untracked_complete 1
+'
+
+test_expect_success 'nested per-directory excludes are closed both ways' '
+	test_when_finished cleanup_race &&
+	for direction in visible-to-ignored ignored-to-visible
+	do
+		repo=per-dir-$direction &&
+		setup_repo "$repo" &&
+		git -C "$repo" config core.trustctime false &&
+		case "$direction" in
+		visible-to-ignored)
+			initial=nomatch &&
+			updated=visible
+			;;
+		ignored-to-visible)
+			initial=visible &&
+			updated=nomatch
+			;;
+		esac &&
+		test_write_lines "$initial" >"$repo/nested/.gitignore" &&
+		git -C "$repo" add nested/.gitignore &&
+		git -C "$repo" commit -m ignore &&
+		git -C "$repo" update-index --assume-unchanged \
+			nested/.gitignore &&
+		test_write_lines visible >"$repo/nested/visible" &&
+		mtime=$(test-tool chmtime --get \
+			"$repo/nested/.gitignore") &&
+		start_raced_status "$repo" "" &&
+		test_write_lines "$updated" >"$repo/nested/.gitignore" &&
+		test-tool chmtime "=$mtime" "$repo/nested/.gitignore" &&
+		finish_raced_untracked_status "$repo" 8 &&
+		check_data "$repo.trace" \
+			preload/bulk_untracked_complete 0 &&
+		check_data "$repo.trace" \
+			preload/bulk_untracked_reason exclude-race &&
+		case "$direction" in
+		visible-to-ignored)
+			test_must_be_empty actual
+			;;
+		ignored-to-visible)
+			test_grep "^? nested/visible$" actual
+			;;
+		esac ||
+		return 1
+	done
+'
+
+test_expect_success 'multiply-linked per-directory excludes are proven' '
+	setup_repo linked-exclude &&
+	test_write_lines visible >linked-exclude/.gitignore &&
+	git -C linked-exclude add .gitignore &&
+	git -C linked-exclude commit -m ignore &&
+	test_write_lines visible >linked-exclude/visible &&
+	ln linked-exclude/.gitignore linked-exclude-alias &&
+	test_when_finished "rm -f linked-exclude-alias" &&
+	compare_status linked-exclude linked-exclude.trace &&
+	test_must_be_empty actual &&
+	check_data linked-exclude.trace preload/bulk_untracked_complete 1 &&
+	check_data linked-exclude.trace preload/bulk_applied 8 &&
+	check_data linked-exclude.trace preload/bulk_untracked_count 0
+'
+
+test_expect_success 'multiply-linked exclude changes discard paths' '
+	setup_repo linked-exclude-race &&
+	test_write_lines visible >linked-exclude-race/.gitignore &&
+	git -C linked-exclude-race add .gitignore &&
+	git -C linked-exclude-race commit -m ignore &&
+	test_write_lines visible >linked-exclude-race/visible &&
+	ln linked-exclude-race/.gitignore linked-exclude-race-alias &&
+	test_when_finished "rm -f linked-exclude-race-alias" &&
+	test_when_finished cleanup_race &&
+	start_raced_status linked-exclude-race "" &&
+	test_write_lines nomatch >linked-exclude-race-alias &&
+	finish_raced_untracked_status linked-exclude-race 8 &&
+	test_grep "^? visible$" actual &&
+	check_data linked-exclude-race.trace \
+		preload/bulk_untracked_complete 0 &&
+	check_data linked-exclude-race.trace \
+		preload/bulk_untracked_reason exclude-race
+'
+
 test_expect_success ULIMIT_FILE_DESCRIPTORS \
 	'bulk preload reopens directories under a low descriptor limit' '
 	git init low-fd &&
@@ -311,6 +563,18 @@ test_expect_success SYMLINKS \
 	ln -s nested/deep/peer worktree-states/link &&
 	compare_status worktree-states worktree-states.trace &&
 	test_file_not_empty actual
+'
+
+test_expect_success 'tracked-file replacement directories are pruned' '
+	setup_repo replacement-dir &&
+	rm replacement-dir/root &&
+	mkdir -p replacement-dir/root/deep/embedded &&
+	test_write_lines hidden >replacement-dir/root/deep/untracked &&
+	git -C replacement-dir/root/deep/embedded init &&
+	compare_status replacement-dir replacement-dir.trace &&
+	test_line_count = 1 actual &&
+	check_data replacement-dir.trace preload/bulk_fallback 1 &&
+	check_data replacement-dir.trace preload/bulk_untracked_complete 1
 '
 
 test_expect_success 'staged and unmerged entries agree' '
