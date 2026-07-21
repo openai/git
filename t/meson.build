@@ -960,6 +960,7 @@ integration_tests = [
   't7528-signed-commit-ssh.sh',
   't7529-preload-index-apfs.sh',
   't7531-semantic-verify.sh',
+  't7532-preload-index-linux.sh',
   't7600-merge.sh',
   't7601-merge-pull-config.sh',
   't7602-merge-octopus-many.sh',
