@@ -729,6 +729,20 @@ static struct cache_entry *create_alias_ce(struct index_state *istate,
 	return new_entry;
 }
 
+static int same_persistent_add_entry(const struct cache_entry *a,
+				     const struct cache_entry *b)
+{
+	const unsigned int flags =
+		CE_STAGEMASK | CE_VALID | CE_EXTENDED_FLAGS;
+
+	return a && b &&
+		ce_namelen(a) == ce_namelen(b) &&
+		!memcmp(a->name, b->name, ce_namelen(a)) &&
+		a->ce_mode == b->ce_mode &&
+		oideq(&a->oid, &b->oid) &&
+		((a->ce_flags ^ b->ce_flags) & flags) == 0;
+}
+
 void set_object_name_for_intent_to_add_entry(struct cache_entry *ce)
 {
 	struct object_id oid;
@@ -739,7 +753,8 @@ void set_object_name_for_intent_to_add_entry(struct cache_entry *ce)
 
 int add_to_index(struct index_state *istate, const char *path, struct stat *st, int flags)
 {
-	int namelen, was_same;
+	int namelen, was_same, logical_same;
+	int cache_nr = istate->cache_nr;
 	mode_t st_mode = st->st_mode;
 	struct cache_entry *ce, *alias = NULL;
 	unsigned ce_option = CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE|CE_MATCH_RACY_IS_DIRTY;
@@ -824,12 +839,22 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 		    !ce_stage(alias) &&
 		    oideq(&alias->oid, &ce->oid) &&
 		    ce->ce_mode == alias->ce_mode);
+	logical_same = same_persistent_add_entry(alias, ce);
+
+	if (!pretend && (flags & ADD_CACHE_TRACK_CLEAN_HISTORY) &&
+	    !logical_same)
+		clean_status_invalidate_current_proof(istate);
 
 	if (pretend)
 		discard_cache_entry(ce);
-	else if (add_index_entry(istate, ce, add_option)) {
-		discard_cache_entry(ce);
-		return error(_("unable to add '%s' to index"), path);
+	else {
+		if (add_index_entry(istate, ce, add_option)) {
+			discard_cache_entry(ce);
+			return error(_("unable to add '%s' to index"), path);
+		}
+		if ((flags & ADD_CACHE_TRACK_CLEAN_HISTORY) &&
+		    cache_nr != istate->cache_nr)
+			clean_status_invalidate_current_proof(istate);
 	}
 	if (verbose && !was_same)
 		printf("add '%s'\n", path);
@@ -2840,6 +2865,7 @@ enum write_extensions {
 	WRITE_RESOLVE_UNDO_EXTENSION =    1<<2,
 	WRITE_UNTRACKED_CACHE_EXTENSION = 1<<3,
 	WRITE_FSMONITOR_EXTENSION =       1<<4,
+	WRITE_FSCF_EXTENSION =            1<<5,
 };
 #define WRITE_ALL_EXTENSIONS ((enum write_extensions)-1)
 
@@ -3100,6 +3126,19 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 		write_fsmonitor_untracked_extension(&sb, istate);
 		err = write_index_ext_header(f, eoie_c,
 					     CACHE_EXT_FSMONITOR_UNTRACKED,
+					     sb.len) < 0;
+		hashwrite(f, sb.buf, sb.len);
+		if (err) {
+			ret = -1;
+			goto out;
+		}
+	}
+	if (write_extensions & WRITE_FSCF_EXTENSION &&
+	    clean_status_should_write_fsmonitor_config(istate)) {
+		strbuf_reset(&sb);
+		clean_status_write_fsmonitor_config(&sb, istate);
+		err = write_index_ext_header(f, eoie_c,
+					     CACHE_EXT_FSMONITOR_CONFIG,
 					     sb.len) < 0;
 		hashwrite(f, sb.buf, sb.len);
 		if (err) {
@@ -4064,8 +4103,12 @@ static void update_callback(struct diff_queue_struct *q,
 		case DIFF_STATUS_DELETED:
 			if (data->flags & ADD_CACHE_IGNORE_REMOVAL)
 				break;
-			if (!(data->flags & ADD_CACHE_PRETEND))
+			if (!(data->flags & ADD_CACHE_PRETEND)) {
+				if (data->flags & ADD_CACHE_TRACK_CLEAN_HISTORY)
+					clean_status_invalidate_current_proof(
+						data->index);
 				remove_file_from_index(data->index, path);
+			}
 			if (data->flags & (ADD_CACHE_PRETEND|ADD_CACHE_VERBOSE))
 				printf(_("remove '%s'\n"), path);
 			break;

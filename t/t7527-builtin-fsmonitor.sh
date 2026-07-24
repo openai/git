@@ -3,6 +3,7 @@
 test_description='built-in file system watcher'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-semantic-verify.sh
 
 if ! test_have_prereq FSMONITOR_DAEMON
 then
@@ -1621,5 +1622,3 @@ test_expect_success MACOS 'worktree binding rejects same-gitdir aliases' '
 		binding-daemon.trace &&
 	git -C binding-a fsmonitor--daemon stop
 '
-
-test_done
