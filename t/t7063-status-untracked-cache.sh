@@ -1077,6 +1077,40 @@ test_expect_success 'preload verifies cached per-directory excludes' '
 	)
 '
 
+test_expect_success 'recursive preload checks descendant directory mtimes' '
+	test_create_repo recursive-preload &&
+	(
+		cd recursive-preload &&
+		mkdir -p a/b &&
+		echo tracked >a/b/tracked &&
+		git add a/b/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		avoid_racy &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/pruned.trace" \
+			git status --porcelain >.git/pruned &&
+		test_must_be_empty .git/pruned &&
+		test_grep \
+			"directories-visited.*value.*0" \
+			.git/pruned.trace &&
+		avoid_racy &&
+		echo untracked >a/b/new-untracked &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain >.git/expect &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual
+	)
+'
+
 test_expect_success 'recursive preload rescans a vanished collapsed witness' '
 	test_create_repo collapsed-witness &&
 	(
