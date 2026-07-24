@@ -1,6 +1,7 @@
 #include "unit-test.h"
 
 #include "path-namespace.h"
+#include "tempfile.h"
 
 #define ASSERT_STAT_FIELD_MATTERS(base, changed, field) do { \
 	(changed) = (base); \
@@ -66,4 +67,51 @@ void test_path_namespace__stat_fields(void)
 	ASSERT_STAT_FIELD_MATTERS(st, changed, st_birthtimespec.tv_nsec);
 	ASSERT_STAT_FIELD_MATTERS(st, changed, st_gen);
 #endif
+}
+
+static int source_fd = -1;
+
+static int reopen_source(int dirfd UNUSED, const char *path, int flags UNUSED)
+{
+	if (strcmp(path, "source")) {
+		errno = ENOENT;
+		return -1;
+	}
+	return dup(source_fd);
+}
+
+void test_path_namespace__reopen_component(void)
+{
+	struct tempfile *first = mks_tempfile_t("path-namespace-one-XXXXXX");
+	struct tempfile *second = mks_tempfile_t("path-namespace-two-XXXXXX");
+	struct stat expected;
+
+	cl_assert(first != NULL);
+	cl_assert(second != NULL);
+	cl_must_pass(fstat(get_tempfile_fd(first), &expected));
+
+	source_fd = get_tempfile_fd(first);
+	if (!fstat_is_reliable()) {
+		cl_assert(path_namespace_reopen_component(
+				  -1, "source", O_RDONLY,
+				  reopen_source, &expected) < 0);
+		cl_assert_equal_i(errno, EAGAIN);
+		goto invalid_component;
+	}
+	cl_must_pass(path_namespace_reopen_component(
+		-1, "source", O_RDONLY, reopen_source, &expected));
+
+	source_fd = get_tempfile_fd(second);
+	cl_assert(path_namespace_reopen_component(
+			  -1, "source", O_RDONLY, reopen_source, &expected) < 0);
+	cl_assert_equal_i(errno, EAGAIN);
+
+invalid_component:
+	cl_assert(path_namespace_reopen_component(
+			  -1, "../source", O_RDONLY, reopen_source, &expected) < 0);
+	cl_assert_equal_i(errno, EINVAL);
+
+	source_fd = -1;
+	cl_must_pass(delete_tempfile(&first));
+	cl_must_pass(delete_tempfile(&second));
 }
