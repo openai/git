@@ -1633,7 +1633,17 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 			continue;
 		}
 
-		replace_index_entry(istate, i, new_entry);
+		{
+			int baseline_valid =
+				clean_status_fsmonitor_semantic_baseline_pending(
+					istate) &&
+				(new_entry->ce_flags & CE_FSMONITOR_VALID);
+
+			replace_index_entry(istate, i, new_entry);
+			if (baseline_valid)
+				mark_fsmonitor_valid(istate,
+						     istate->cache[i]);
+		}
 	}
 	trace2_data_intmax("index", NULL, "refresh/sum_lstat", t2_sum_lstat);
 	trace2_data_intmax("index", NULL, "refresh/sum_scan", t2_sum_scan);

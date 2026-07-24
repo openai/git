@@ -27,6 +27,7 @@ static void fixture_init(struct history_fixture *fixture,
 
 	memset(fixture, 0, sizeof(*fixture));
 	fixture->repo.hash_algo = algo;
+	repo_config_values_init(&fixture->repo.config_values_private_);
 	index_state_init(&fixture->istate, &fixture->repo);
 	fixture->manifest = (struct strbuf)STRBUF_INIT;
 	fixture->encoded = (struct strbuf)STRBUF_INIT;
@@ -54,6 +55,7 @@ static void fixture_release(struct history_fixture *fixture)
 {
 	clean_status_release(&fixture->istate);
 	free(fixture->istate.fsmonitor_last_update);
+	repo_config_values_clear(&fixture->repo.config_values_private_);
 	strbuf_release(&fixture->encoded);
 	strbuf_release(&fixture->manifest);
 }
@@ -72,6 +74,7 @@ static struct clean_status_state *install_current(
 	state->current_semantic_valid = 1;
 	state->current_attr_valid = 1;
 	state->config_enforced = 1;
+	FREE_AND_NULL(fixture->istate.fsmonitor_last_update);
 	fixture->istate.fsmonitor_last_update = xstrdup("builtin:1:2");
 	fixture->istate.fsmonitor_token_valid = 1;
 	return state;
@@ -117,6 +120,81 @@ void test_clean_status_history__adopts_only_coherent_proofs(void)
 	cl_assert(clean_status_fsmonitor_strong_mismatch(&fixture.istate));
 	cl_assert(!state->initial_coherent);
 	fixture_release(&fixture);
+}
+
+void test_clean_status_history__distinguishes_available_history(void)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct history_fixture fixture;
+	struct clean_status_state *state;
+	struct strbuf manifest_only = STRBUF_INIT;
+
+	fixture_init(&fixture, algo);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	cl_assert(clean_status_has_persistent_fsmonitor_semantic_history(
+		&fixture.istate));
+	cl_assert(clean_status_has_worktree_manifest_history(&fixture.istate));
+	state = install_current(&fixture);
+	cl_assert(!clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(!clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	state->strong_mismatch = 1;
+	cl_assert(clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(!clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	fixture_release(&fixture);
+
+	fixture_init(&fixture, algo);
+	cl_assert_equal_i(fsmonitor_clean_proof_copy_without_bindings(
+		&manifest_only, fixture.encoded.buf, fixture.encoded.len,
+		algo), 0);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, manifest_only.buf, manifest_only.len);
+	cl_assert(!clean_status_has_persistent_fsmonitor_semantic_history(
+		&fixture.istate));
+	cl_assert(clean_status_has_worktree_manifest_history(&fixture.istate));
+	install_current(&fixture);
+	cl_assert(!clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(!clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	fixture_release(&fixture);
+
+	fixture_init(&fixture, algo);
+	state = install_current(&fixture);
+	fixture.istate.fsmonitor_token_valid = 1;
+	FREE_AND_NULL(fixture.istate.fsmonitor_last_update);
+	fixture.istate.fsmonitor_last_update = xstrdup("builtin:test:1");
+	cl_assert(clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	clean_status_begin_fsmonitor_semantic_baseline(&fixture.istate);
+	cl_assert(!clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	state->semantic_baseline_pending = 0;
+	state->disk_config_seen = 1;
+	cl_assert(clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(!clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	state->disk_config_seen = 0;
+	fixture.repo.config_values_private_.trust_ctime = 0;
+	cl_assert(clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(!clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	fixture.repo.config_values_private_.trust_ctime = 1;
+	state->strong_mismatch = 1;
+	cl_assert(clean_status_fsmonitor_semantic_adoption_needed(
+		&fixture.istate));
+	cl_assert(!clean_status_fsmonitor_semantic_baseline_needed(
+		&fixture.istate));
+	fixture_release(&fixture);
+	strbuf_release(&manifest_only);
 }
 
 void test_clean_status_history__preserves_unbound_manifests(void)

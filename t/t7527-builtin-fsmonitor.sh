@@ -1684,4 +1684,67 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'missing semantic history seeds a forward baseline' '
+	test_when_finished \
+		"stop_daemon_delete_repo missing-semantic-baseline" &&
+	test_create_repo missing-semantic-baseline &&
+	(
+		cd missing-semantic-baseline &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid tracked &&
+		test_grep ! FSCF .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep FSCF .git/index &&
+		test_trace2_data fsmonitor semantic/adoption-baseline 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'missing semantic history with weak stat identity forces content verification' '
+	test_when_finished \
+		"stop_daemon_delete_repo missing-semantic-history" &&
+	test_create_repo missing-semantic-history &&
+	(
+		cd missing-semantic-history &&
+		printf "aaaa\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+		git config core.fsmonitor true &&
+		git update-index --fsmonitor &&
+		git update-index --fsmonitor-valid tracked &&
+		test_grep FSMN .git/index &&
+		test_grep ! FSCF .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_line_count = 1 .git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual &&
+		test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace
+	)
+'
+
 test_done

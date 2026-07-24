@@ -111,6 +111,91 @@ void clean_status_prepare_fsmonitor_config(struct index_state *istate)
 			   "semantic/initial-mismatch", state->strong_mismatch);
 }
 
+int clean_status_has_persistent_fsmonitor_semantic_history(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->disk_config_valid &&
+		!state->disk_config_invalid && state->disk_semantic_valid &&
+		state->disk_attr_valid && state->manifest.disk_valid &&
+		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+			FSMONITOR_CLEAN_PROOF_ALL &&
+		state->disk_config_raw.len;
+}
+
+int clean_status_has_worktree_manifest_history(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+
+	return state && state->disk_config_valid &&
+		!state->disk_config_invalid && state->manifest.disk_valid &&
+		(state->manifest.disk_flags & required) == required;
+}
+
+int clean_status_fsmonitor_semantic_adoption_needed(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	int missing_history;
+
+	if (!state || !state->current_config_valid || !state->config_enforced)
+		return 0;
+	if (state->semantic_baseline_pending)
+		return 0;
+	missing_history =
+		!clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		!clean_status_has_worktree_manifest_history(istate);
+	/*
+	 * Keep missing history on the proof path until fsmonitor explicitly
+	 * chooses the narrow forward-baseline lane for a valid legacy token.
+	 */
+	return state->strong_mismatch || missing_history;
+}
+
+int clean_status_fsmonitor_semantic_baseline_needed(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	const struct repo_config_values *cfg;
+
+	if (!state || !state->current_config_valid || !state->config_enforced ||
+	    state->strong_mismatch || state->disk_config_seen ||
+	    !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_last_update ||
+	    !*istate->fsmonitor_last_update)
+		return 0;
+	/*
+	 * This helper is exercised by isolated index-state unit fixtures,
+	 * which are not the_repository. The config values are already
+	 * initialized with the repository and need no lazy parsing here.
+	 */
+	cfg = &istate->repo->config_values_private_;
+	if (!cfg->trust_ctime || !cfg->check_stat)
+		return 0;
+	return !clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		!clean_status_has_worktree_manifest_history(istate);
+}
+
+int clean_status_fsmonitor_semantic_baseline_pending(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->semantic_baseline_pending;
+}
+
+void clean_status_begin_fsmonitor_semantic_baseline(
+	struct index_state *istate)
+{
+	struct clean_status_state *state = clean_status_get_state(istate);
+
+	state->semantic_baseline_pending = 1;
+}
+
 static int current_proof_is_writable(const struct index_state *istate)
 {
 	const struct clean_status_state *state = istate->clean_status;
