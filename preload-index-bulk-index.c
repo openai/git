@@ -86,6 +86,28 @@ static int tracked_entry_is_eligible(const struct cache_entry *ce)
 		(S_ISREG(ce->ce_mode) || S_ISLNK(ce->ce_mode));
 }
 
+/*
+ * Match ie_modified(): a nonzero cached size mismatch is a conclusive
+ * content change. Zero sizes and the historical Windows symlink sentinel
+ * still require an ordinary content check. Recompute the stat-data match
+ * because CE_MATCH_RACY_IS_DIRTY may make ie_match_stat() report a data
+ * change without a size mismatch.
+ */
+static int size_change_is_definitive(const struct cache_entry *ce,
+				     const struct stat *st,
+				     unsigned int changed)
+{
+	if (changed & (MODE_CHANGED | TYPE_CHANGED))
+		return 0;
+#ifdef GIT_WINDOWS_NATIVE
+	if (S_ISLNK(st->st_mode) && ce->ce_stat_data.sd_size == MAX_PATH)
+		return 0;
+#endif
+	return ce->ce_stat_data.sd_size &&
+		(match_stat_data(&ce->ce_stat_data, (struct stat *)st) &
+		 DATA_CHANGED);
+}
+
 void preload_bulk_record_tracked(
 	struct preload_bulk_worker *worker, int pos, const struct stat *st)
 {
@@ -99,8 +121,12 @@ void preload_bulk_record_tracked(
 	changed = ie_match_stat(
 		scan->istate, ce, (struct stat *)st,
 		CE_MATCH_RACY_IS_DIRTY | CE_MATCH_IGNORE_FSMONITOR);
-	state = changed ? PRELOAD_BULK_TRACKED_CONTENT_CHECK :
-			  PRELOAD_BULK_TRACKED_CLEAN;
+	if (!changed)
+		state = PRELOAD_BULK_TRACKED_CLEAN;
+	else if (size_change_is_definitive(ce, st, changed))
+		state = PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED;
+	else
+		state = PRELOAD_BULK_TRACKED_CONTENT_CHECK;
 	record_tracked_state(worker, pos, state);
 }
 
