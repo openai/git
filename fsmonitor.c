@@ -815,6 +815,23 @@ static enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	return result->outcome;
 }
 
+static int apply_fsmonitor_paths(struct index_state *istate,
+				 const struct strbuf *paths)
+{
+	const char *p = paths->buf;
+	const char *end = paths->buf + paths->len;
+	int count = 0;
+
+	while (p < end) {
+		size_t len = strlen(p);
+
+		fsmonitor_refresh_callback(istate, (char *)p);
+		count++;
+		p += len + 1;
+	}
+	return count;
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
@@ -974,17 +991,21 @@ apply_results:
 		 */
 		int count = 0;
 
-		buf = query_result.buf;
-		for (i = bol; i < query_result.len; i++) {
-			if (buf[i] != '\0')
-				continue;
-			fsmonitor_refresh_callback(istate, buf + bol);
-			bol = i + 1;
-			count++;
-		}
-		if (bol < query_result.len) {
-			fsmonitor_refresh_callback(istate, buf + bol);
-			count++;
+		if (fsm_mode == FSMONITOR_MODE_IPC) {
+			count = apply_fsmonitor_paths(istate, &query_result);
+		} else {
+			buf = query_result.buf;
+			for (i = bol; i < query_result.len; i++) {
+				if (buf[i] != '\0')
+					continue;
+				fsmonitor_refresh_callback(istate, buf + bol);
+				bol = i + 1;
+				count++;
+			}
+			if (bol < query_result.len) {
+				fsmonitor_refresh_callback(istate, buf + bol);
+				count++;
+			}
 		}
 
 		/* Now mark the untracked cache for fsmonitor usage */
