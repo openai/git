@@ -1175,6 +1175,12 @@ static int add_patterns(const char *fname, const char *base, int baselen,
 			return r;
 	} else {
 		size = xsize_t(st.st_size);
+		if (size > PATTERN_MAX_FILE_SIZE) {
+			warning("ignoring excessively large pattern file: %s",
+				fname);
+			close(fd);
+			return -1;
+		}
 		if (size == 0) {
 			if (oid_stat) {
 				fill_stat_data(&oid_stat->stat, &st);

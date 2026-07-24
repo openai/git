@@ -959,7 +959,7 @@ test_expect_success EXPENSIVE 'large exclude file ignored in tree' '
 	test_when_finished "rm .gitignore" &&
 	find . -name .gitignore -exec rm "{}" ";" &&
 	dd if=/dev/zero of=.gitignore bs=101M count=1 &&
-	git ls-files -o --exclude-standard 2>err &&
+	GIT_ALLOC_LIMIT=1m git ls-files -o --exclude-standard 2>err &&
 	echo "warning: ignoring excessively large pattern file: .gitignore" >expect &&
 	test_cmp expect err
 '
