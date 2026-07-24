@@ -345,6 +345,8 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 			if (path_name != entry.name)
 				free((char *)path_name);
 
+			pos = preload_bulk_index_position(scan, worker->path.buf,
+						     worker->path.len);
 			if (entry.type == VDIR) {
 				struct preload_bulk_dir_identity child_identity = {
 					.stat = {
@@ -357,10 +359,19 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 					},
 				};
 
-				if (!preload_bulk_index_has_tracked_descendants(
-					    scan, worker->path.buf,
-					    worker->path.len))
+				if (pos >= 0) {
+					preload_bulk_record_tracked_fallback(
+						worker, pos);
 					goto next_record;
+				}
+				if (!preload_bulk_index_pos_has_tracked_descendants(
+					    scan, worker->path.buf,
+					    worker->path.len, pos)) {
+					preload_bulk_record_tracked_alias_fallback(
+						worker, worker->path.buf,
+						worker->path.len);
+					goto next_record;
+				}
 				if (((entry.access & S_IFMT) &&
 				     (entry.access & S_IFMT) != S_IFDIR) ||
 				    (entry.access & ~(S_IFMT | 07777)))
@@ -368,6 +379,9 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 				if (entry.dev != data->root_stat.st_dev ||
 				    entry.mountstatus ||
 				    (entry.flags & SF_FIRMLINK)) {
+					preload_bulk_record_tracked_descendants_fallback(
+						worker, worker->path.buf,
+						worker->path.len);
 					goto next_record;
 				}
 				preload_bulk_schedule_directory(
@@ -378,17 +392,27 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 				goto next_record;
 			}
 
-			pos = preload_bulk_index_position(scan, worker->path.buf,
-						     worker->path.len);
-			if (pos < 0)
-				goto next_record;
-			if (entry.dev != data->root_stat.st_dev) {
+			if (pos < 0) {
+				preload_bulk_record_tracked_alias_fallback(
+					worker, worker->path.buf,
+					worker->path.len);
 				goto next_record;
 			}
-			if (entry.type != VREG && entry.type != VLNK)
+			if (entry.dev != data->root_stat.st_dev) {
+				preload_bulk_record_tracked_fallback(
+					worker, pos);
 				goto next_record;
-			if (entry.linkcount != 1)
+			}
+			if (entry.type != VREG && entry.type != VLNK) {
+				preload_bulk_record_tracked_fallback(
+					worker, pos);
 				goto next_record;
+			}
+			if (entry.linkcount != 1) {
+				preload_bulk_record_tracked_fallback(
+					worker, pos);
+				goto next_record;
+			}
 			if (fill_file_stat(&st, entry.dev, entry.fileid,
 					   entry.type, entry.mtime, entry.ctime,
 					   entry.uid, entry.gid, entry.access,
@@ -417,6 +441,7 @@ static int scan_directory(struct preload_bulk_worker *worker,
 	struct preload_bulk_scan *scan = worker->scan;
 	struct preload_bulk_dir_identity before_identity;
 	struct stat before, after;
+	size_t path_len;
 	int fd = task->fd;
 	int ret = -1;
 
@@ -429,6 +454,9 @@ static int scan_directory(struct preload_bulk_worker *worker,
 	if (preload_bulk_darwin_fd_on_root_mount(scan, fd, &before)) {
 		if (errno != EXDEV)
 			goto out;
+		path_len = strlen(task->path);
+		preload_bulk_record_tracked_descendants_fallback(
+			worker, task->path, path_len);
 		ret = 0;
 		goto out;
 	}
