@@ -312,7 +312,8 @@ static void preload_fsmonitor_excludes_from_index(
 			goto next;
 		ce = preload->istate->cache[pos];
 		if (!S_ISREG(ce->ce_mode) ||
-		    !(ce->ce_flags & CE_FSMONITOR_VALID) ||
+		    (!(ce->ce_flags & CE_FSMONITOR_VALID) &&
+		     fstat_is_reliable()) ||
 		    ce_skip_worktree(ce) ||
 		    (ce->ce_flags & CE_REMOVE) ||
 		    ce_intent_to_add(ce))
