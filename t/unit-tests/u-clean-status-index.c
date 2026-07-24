@@ -3,6 +3,7 @@
 #include "clean-status-index.h"
 #include "clean-status-internal.h"
 #include "dir.h"
+#include "object.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "strbuf.h"
@@ -330,4 +331,52 @@ void test_clean_status_index__binds_the_parsed_source(void)
 	strbuf_release(&replacement);
 	strbuf_release(&path);
 	free(worktree);
+}
+
+void test_clean_status_index__recognizes_certifiable_entries(void)
+{
+	struct repository repo = { .hash_algo = &hash_algos[GIT_HASH_SHA1] };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct cache_entry *ce;
+	static const char path[] = "tracked";
+
+	CALLOC_ARRAY(istate.cache, 1);
+	istate.cache_alloc = istate.cache_nr = 1;
+	memset(istate.oid.hash, 1, repo.hash_algo->rawsz);
+	oid_set_algo(&istate.oid, repo.hash_algo);
+	ce = make_empty_cache_entry(&istate, sizeof(path) - 1);
+	ce->ce_mode = S_IFREG | 0644;
+	ce->ce_namelen = sizeof(path) - 1;
+	memcpy(ce->name, path, sizeof(path));
+	istate.cache[0] = ce;
+
+	ce->ce_flags = CE_FSMONITOR_VALID;
+	cl_assert(clean_status_index_is_certifiable(&istate));
+	ce->ce_flags |= CE_UPTODATE | CE_HASHED;
+	cl_assert(clean_status_index_is_certifiable(&istate));
+
+	oidclr(&istate.oid, repo.hash_algo);
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	cl_assert(clean_status_index_entries_are_certifiable(&istate));
+	memset(istate.oid.hash, 1, repo.hash_algo->rawsz);
+
+	ce->ce_flags = 0;
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID | CE_VALID;
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID | CE_UPDATE_IN_BASE;
+	cl_assert(clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID | create_ce_flags(1);
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID | CE_INTENT_TO_ADD;
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID | CE_SKIP_WORKTREE;
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID | CE_WT_REMOVE;
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+	ce->ce_flags = CE_FSMONITOR_VALID;
+	ce->ce_mode = S_IFGITLINK;
+	cl_assert(!clean_status_index_is_certifiable(&istate));
+
+	release_index(&istate);
 }
