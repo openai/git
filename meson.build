@@ -1297,6 +1297,7 @@ endif
 
 if host_machine.system() == 'darwin'
   compat_sources += 'compat/precompose_utf8.c'
+  libgit_c_args += '-DHAVE_PRELOAD_INDEX_BULK'
   libgit_c_args += '-DPRECOMPOSE_UNICODE'
   libgit_c_args += '-DPROTECT_HFS_DEFAULT'
 endif
@@ -1344,7 +1345,16 @@ if host_machine.system() == 'linux'
 elif host_machine.system() == 'windows'
   compat_sources += 'compat/win32/trace2_win32_process_info.c'
 elif host_machine.system() == 'darwin'
-  compat_sources += 'compat/darwin/procinfo.c'
+  compat_sources += [
+    'compat/darwin/procinfo.c',
+    'compat/preload-index/bulk-darwin.c',
+    'compat/preload-index/bulk-darwin-root.c',
+  ]
+  libgit_sources += [
+    'preload-index-bulk-index.c',
+    'preload-index-bulk-thread.c',
+    'preload-index-bulk.c',
+  ]
 else
   compat_sources += 'compat/stub/procinfo.c'
 endif
