@@ -197,8 +197,10 @@ test_expect_success 'definitive size changes are not restated' '
 	test_file_not_empty actual &&
 	check_data dirty.trace preload/bulk_applied 7 &&
 	check_data dirty.trace preload/bulk_definitive_modified 1 &&
+	test_trace2_data status preload/direct_modified 1 \
+		<"$TRASH_DIRECTORY/dirty.trace" &&
 	check_lstat_data dirty.trace 0 &&
-	check_data dirty.trace refresh/sum_lstat 1
+	check_data dirty.trace refresh/sum_lstat 0
 '
 
 test_expect_success 'missing entries bypass speculative lstat' '
@@ -209,8 +211,20 @@ test_expect_success 'missing entries bypass speculative lstat' '
 	test_line_count = 5 actual &&
 	check_data missing.trace preload/bulk_applied 3 &&
 	check_data missing.trace preload/bulk_definitive_deleted 5 &&
+	test_trace2_data status preload/direct_deleted 5 \
+		<"$TRASH_DIRECTORY/missing.trace" &&
 	check_lstat_data missing.trace 0 &&
-	check_data missing.trace refresh/sum_lstat 5
+	check_data missing.trace refresh/sum_lstat 0
+'
+
+test_expect_success 'metadata-only mismatches are checked by diff' '
+	setup_repo metadata &&
+	test-tool chmtime +60 metadata/root &&
+	compare_status metadata metadata.trace &&
+	test_must_be_empty actual &&
+	check_data metadata.trace preload/bulk_content_check 1 &&
+	check_lstat_data metadata.trace 0 &&
+	check_data metadata.trace refresh/sum_lstat 0
 '
 
 test_expect_success PIPE \
