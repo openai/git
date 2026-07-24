@@ -64,6 +64,9 @@ int semantic_verify_root_is_stable(
 int semantic_verify_start_token_is_current(
 	struct index_state *istate,
 	const struct semantic_verify_proof *proof);
+int semantic_verify_proof_is_current(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof);
 void semantic_verify_proof_clear(struct semantic_verify_proof *proof);
 
 /* Introspection used by the semantic verifier test helper. */

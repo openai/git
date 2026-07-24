@@ -250,6 +250,19 @@ int semantic_verify_start_token_is_current(
 			 istate, proof->epoch));
 }
 
+int semantic_verify_proof_is_current(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof)
+{
+	return istate && proof && proof->istate == istate &&
+		proof->cache_nr == istate->cache_nr &&
+		!proof->namespace_unstable &&
+		semantic_verify_root_is_stable(proof) &&
+		(!proof->epoch_required ||
+		 clean_status_proof_epoch_content_matches(
+			 istate, proof->epoch));
+}
+
 void semantic_verify_get_stats(const struct semantic_verify_proof *proof,
 			       struct semantic_verify_stats *stats)
 {
@@ -285,13 +298,7 @@ int semantic_verify_apply_after_closure(
 	int poisoned = 0;
 	size_t validated_updates = 0;
 
-	if (!istate || !proof || proof->istate != istate ||
-	    proof->cache_nr != istate->cache_nr ||
-	    proof->namespace_unstable ||
-	    !semantic_verify_root_is_stable(proof) ||
-	    (proof->epoch_required &&
-	     !clean_status_proof_epoch_content_matches(
-		     istate, proof->epoch)))
+	if (!semantic_verify_proof_is_current(istate, proof))
 		return -1;
 
 	for (size_t i = 0; i < proof->cache_nr; i++) {
