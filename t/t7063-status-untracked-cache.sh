@@ -1077,6 +1077,37 @@ test_expect_success 'preload verifies cached per-directory excludes' '
 	)
 '
 
+test_expect_success 'recursive preload rescans a vanished collapsed witness' '
+	test_create_repo collapsed-witness &&
+	(
+		cd collapsed-witness &&
+		test_write_lines "*.ignored" >.gitignore &&
+		git add .gitignore &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		for i in 00 01
+		do
+			mkdir -p "scratch/d$i" &&
+			test_write_lines "$i" >"scratch/d$i/file" || return 1
+		done &&
+		echo "?? scratch/" >.git/expect &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		test-tool dump-untracked-cache >.git/cache &&
+		witness=$(sed -n \
+			"s#^/scratch/\\(d[0-9][0-9]*\\)/ .*#\\1#p" \
+			.git/cache | sed -n 1p) &&
+		test -n "$witness" &&
+		avoid_racy &&
+		rm "scratch/$witness/file" &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual
+	)
+'
+
 test_expect_success 'status preloads cached-directory validation' '
 	test_create_repo auto-preload &&
 	(
