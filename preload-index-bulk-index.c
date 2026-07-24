@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "name-hash.h"
 #include "preload-index-bulk.h"
 #include "read-cache-ll.h"
 
@@ -14,17 +15,23 @@ int preload_bulk_index_position(struct preload_bulk_scan *scan,
 	return index_name_pos_sparse(scan->istate, path, path_len);
 }
 
-int preload_bulk_index_has_tracked_descendants(struct preload_bulk_scan *scan,
-					       const char *path,
-					       size_t path_len)
+static int first_tracked_descendant(struct index_state *istate,
+				    const char *path, size_t path_len,
+				    int pos)
 {
-	int pos;
+	while ((unsigned int)pos < istate->cache_nr) {
+		const struct cache_entry *ce = istate->cache[pos];
 
-	if (path_len > INT_MAX)
-		return 0;
-	pos = index_name_pos_sparse(scan->istate, path, path_len);
-	return preload_bulk_index_pos_has_tracked_descendants(
-		scan, path, path_len, pos);
+		if (ce_namelen(ce) <= path_len ||
+		    memcmp(ce->name, path, path_len))
+			return -1;
+		if (ce->name[path_len] == '/')
+			return pos;
+		if ((unsigned char)ce->name[path_len] > '/')
+			return -1;
+		pos++;
+	}
+	return -1;
 }
 
 int preload_bulk_index_pos_has_tracked_descendants(
@@ -32,27 +39,11 @@ int preload_bulk_index_pos_has_tracked_descendants(
 	int pos)
 {
 	struct index_state *istate = scan->istate;
-	const struct cache_entry *ce;
 
 	if (pos >= 0)
 		return 0;
 	pos = -pos - 1;
-	while ((unsigned int)pos < istate->cache_nr) {
-		ce = istate->cache[pos];
-		if (ce_namelen(ce) < path_len ||
-		    memcmp(ce->name, path, path_len))
-			return 0;
-		if (ce_namelen(ce) == path_len) {
-			pos++;
-			continue;
-		}
-		if (ce->name[path_len] == '/')
-			return 1;
-		if ((unsigned char)ce->name[path_len] > '/')
-			return 0;
-		pos++;
-	}
-	return 0;
+	return first_tracked_descendant(istate, path, path_len, pos) >= 0;
 }
 
 static int record_tracked_state(struct preload_bulk_worker *worker, int pos,
@@ -111,4 +102,62 @@ void preload_bulk_record_tracked(
 	state = changed ? PRELOAD_BULK_TRACKED_CONTENT_CHECK :
 			  PRELOAD_BULK_TRACKED_CLEAN;
 	record_tracked_state(worker, pos, state);
+}
+
+void preload_bulk_record_tracked_fallback(
+	struct preload_bulk_worker *worker, int pos)
+{
+	if (!tracked_entry_is_eligible(worker->scan->istate->cache[pos]))
+		return;
+	record_tracked_state(worker, pos,
+			     PRELOAD_BULK_TRACKED_FALLBACK);
+}
+
+void preload_bulk_record_tracked_descendants_fallback(
+	struct preload_bulk_worker *worker, const char *path,
+	size_t path_len)
+{
+	struct index_state *istate = worker->scan->istate;
+	int pos = preload_bulk_index_position(worker->scan, path, path_len);
+
+	if (pos < 0)
+		pos = -pos - 1;
+	else
+		pos++;
+	while ((pos = first_tracked_descendant(istate, path, path_len, pos)) >= 0) {
+		preload_bulk_record_tracked_fallback(worker, pos);
+		pos++;
+	}
+}
+
+int preload_bulk_record_tracked_alias_fallback(
+	struct preload_bulk_worker *worker, const char *path,
+	size_t path_len)
+{
+	struct preload_bulk_scan *scan = worker->scan;
+	struct index_state *istate = scan->istate;
+	struct cache_entry *ce;
+	struct strbuf canonical = STRBUF_INIT;
+	int found = 0;
+	int pos;
+
+	if (!scan->case_insensitive || path_len > INT_MAX)
+		return 0;
+	if (index_dir_find(istate, path, path_len, &canonical)) {
+		found = 1;
+		preload_bulk_record_tracked_descendants_fallback(
+			worker, canonical.buf, canonical.len);
+		goto out;
+	}
+	ce = index_file_exists(istate, path, path_len, 1);
+	if (!ce)
+		goto out;
+	found = 1;
+	pos = index_name_pos_sparse(istate, ce->name, ce_namelen(ce));
+	if (pos >= 0)
+		preload_bulk_record_tracked_fallback(worker, pos);
+
+out:
+	strbuf_release(&canonical);
+	return found;
 }
