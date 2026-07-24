@@ -3,6 +3,7 @@
 test_description='git status with file system watcher'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-semantic-verify.sh
 
 # Note, after "git reset --hard HEAD" no extensions exist other than 'TREE'
 # "git update-index --fsmonitor" can be used to get the extension written
@@ -66,6 +67,18 @@ test_expect_success 'FSMN parser fails closed' '
 
 test_expect_success 'FSUC parser fails closed' '
 	test-tool read-cache --test-fsuc-parser
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'FSCF survives index I/O and generic rewrites' '
+	test_when_finished "rm -rf fscf-round-trip" &&
+	test_create_repo fscf-round-trip &&
+	(
+		cd fscf-round-trip &&
+		test_commit base tracked &&
+		test-tool read-cache --test-fscf-round-trip &&
+		test_grep FSCF .git/index
+	)
 '
 
 test_expect_success 'hook parser ignores empty path records' '
