@@ -14,6 +14,7 @@
 #include "hex.h"
 #include "object-name.h"
 #include "path.h"
+#include "preload-index.h"
 #include "revision.h"
 #include "diffcore.h"
 #include "quote.h"
@@ -458,6 +459,19 @@ static char short_submodule_status(struct wt_status_change_data *d)
 	return d->worktree_status;
 }
 
+static struct wt_status_change_data *wt_status_get_change(
+	struct wt_status *s, const char *path)
+{
+	struct string_list_item *it = string_list_insert(&s->change, path);
+	struct wt_status_change_data *d = it->util;
+
+	if (!d) {
+		CALLOC_ARRAY(d, 1);
+		it->util = d;
+	}
+	return d;
+}
+
 static void wt_status_collect_changed_cb(struct diff_queue_struct *q,
 					 struct diff_options *options UNUSED,
 					 void *data)
@@ -470,16 +484,10 @@ static void wt_status_collect_changed_cb(struct diff_queue_struct *q,
 	s->workdir_dirty = 1;
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p;
-		struct string_list_item *it;
 		struct wt_status_change_data *d;
 
 		p = q->queue[i];
-		it = string_list_insert(&s->change, p->two->path);
-		d = it->util;
-		if (!d) {
-			CALLOC_ARRAY(d, 1);
-			it->util = d;
-		}
+		d = wt_status_get_change(s, p->two->path);
 		if (!d->worktree_status)
 			d->worktree_status = p->status;
 		if (S_ISGITLINK(p->two->mode)) {
@@ -525,6 +533,64 @@ static void wt_status_collect_changed_cb(struct diff_queue_struct *q,
 	}
 }
 
+static struct cache_entry **wt_status_collect_preload_changes(
+	struct wt_status *s, size_t *direct_nr)
+{
+	struct index_state *istate = s->repo->index;
+	struct cache_entry **direct = NULL;
+	size_t direct_alloc = 0;
+	uint64_t modified = 0, deleted = 0;
+
+	*direct_nr = 0;
+	if (istate->preload_bulk_tracked_nr != istate->cache_nr)
+		goto clear;
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		struct cache_entry *ce = istate->cache[i];
+		struct wt_status_change_data *d;
+		unsigned char state =
+			istate->preload_bulk_tracked_state[i];
+		int status;
+
+		if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED) {
+			status = DIFF_STATUS_MODIFIED;
+			modified++;
+		} else if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED) {
+			status = DIFF_STATUS_DELETED;
+			deleted++;
+		} else {
+			continue;
+		}
+
+		d = wt_status_get_change(s, ce->name);
+		if (!d->worktree_status)
+			d->worktree_status = status;
+		d->mode_index = ce->ce_mode;
+		d->mode_worktree = status == DIFF_STATUS_MODIFIED ?
+			ce->ce_mode : 0;
+		oidcpy(&d->oid_index, &ce->oid);
+		ce_mark_uptodate(ce);
+		ALLOC_GROW(direct, *direct_nr + 1, direct_alloc);
+		direct[(*direct_nr)++] = ce;
+		s->workdir_dirty = 1;
+	}
+	trace2_data_intmax("status", s->repo, "preload/direct_modified",
+			   modified);
+	trace2_data_intmax("status", s->repo, "preload/direct_deleted",
+			   deleted);
+
+clear:
+	preload_index_bulk_result_clear(istate);
+	return direct;
+}
+
+static void wt_status_release_preload_changes(
+	struct cache_entry **direct, size_t direct_nr)
+{
+	for (size_t i = 0; i < direct_nr; i++)
+		direct[i]->ce_flags &= ~CE_UPTODATE;
+	free(direct);
+}
+
 static int unmerged_mask(struct index_state *istate, const char *path)
 {
 	int pos, mask;
@@ -554,16 +620,10 @@ static void wt_status_collect_updated_cb(struct diff_queue_struct *q,
 
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p;
-		struct string_list_item *it;
 		struct wt_status_change_data *d;
 
 		p = q->queue[i];
-		it = string_list_insert(&s->change, p->two->path);
-		d = it->util;
-		if (!d) {
-			CALLOC_ARRAY(d, 1);
-			it->util = d;
-		}
+		d = wt_status_get_change(s, p->two->path);
 		if (!d->index_status)
 			d->index_status = p->status;
 		switch (p->status) {
@@ -639,8 +699,11 @@ void wt_status_collect_changes_trees(struct wt_status *s,
 
 static void wt_status_collect_changes_worktree(struct wt_status *s)
 {
+	struct cache_entry **direct;
+	size_t direct_nr;
 	struct rev_info rev;
 
+	direct = wt_status_collect_preload_changes(s, &direct_nr);
 	repo_init_revisions(s->repo, &rev, NULL);
 	setup_revisions(0, NULL, &rev, NULL);
 	rev.diffopt.output_format |= DIFF_FORMAT_CALLBACK;
@@ -661,6 +724,7 @@ static void wt_status_collect_changes_worktree(struct wt_status *s)
 	rev.diffopt.rename_score = s->rename_score >= 0 ? s->rename_score : rev.diffopt.rename_score;
 	copy_pathspec(&rev.prune_data, &s->pathspec);
 	run_diff_files(&rev, 0);
+	wt_status_release_preload_changes(direct, direct_nr);
 	release_revisions(&rev);
 }
 
@@ -850,6 +914,7 @@ static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
 	if (!index_invalidated)
 		return;
 
+	preload_index_bulk_result_clear(istate);
 	trace2_data_intmax("status", s->repo,
 			   "fsmonitor/exclude-index-invalidated",
 			   index_invalidated);
