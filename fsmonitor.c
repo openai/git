@@ -209,6 +209,39 @@ void fsmonitor_invalidate_cache_entry(struct cache_entry *ce)
 static size_t handle_path_with_trailing_slash(
 	struct index_state *istate, const char *name, int pos);
 
+int fsmonitor_invalidate_attributes_path(struct index_state *istate,
+					 const char *name)
+{
+	size_t len = strlen(name), base, attr_len = strlen(GITATTRIBUTES_FILE);
+	size_t invalidated = 0;
+	unsigned int i;
+
+	while (len && is_dir_sep(name[len - 1]))
+		len--;
+	base = len;
+	while (base && !is_dir_sep(name[base - 1]))
+		base--;
+	if (len - base != attr_len ||
+	    fspathncmp(name + base, GITATTRIBUTES_FILE, attr_len))
+		return 0;
+
+	git_attr_invalidate_all();
+	for (i = 0; i < istate->cache_nr; i++) {
+		struct cache_entry *ce = istate->cache[i];
+
+		if (base && (ce->ce_namelen < base ||
+			     fspathncmp(ce->name, name, base)))
+			continue;
+		fsmonitor_invalidate_cache_entry(ce);
+		invalidated++;
+	}
+	if (invalidated)
+		istate->cache_changed |= FSMONITOR_CHANGED;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "semantic/attributes-scope", base);
+	return invalidated > 0;
+}
+
 /*
  * Use the name-hash to do a case-insensitive cache-entry lookup with
  * the pathname and invalidate the cache-entry.
@@ -457,6 +490,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 		return;
 	}
 	pos = index_name_pos(istate, name, len);
+	fsmonitor_invalidate_attributes_path(istate, name);
 
 	if (name[len - 1] == '/')
 		nr_in_cone = handle_path_with_trailing_slash(istate, name, pos);
