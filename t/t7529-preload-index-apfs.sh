@@ -190,6 +190,58 @@ test_expect_success 'clean entries are published without lstat' '
 	check_lstat_data clean.trace 0
 '
 
+test_expect_success 'known mismatches are not restated during preload' '
+	setup_repo dirty &&
+	test_write_lines changed-content >dirty/root &&
+	compare_status dirty dirty.trace &&
+	test_file_not_empty actual &&
+	check_data dirty.trace preload/bulk_applied 7 &&
+	check_data dirty.trace preload/bulk_content_check 1 &&
+	check_lstat_data dirty.trace 0 &&
+	check_data dirty.trace refresh/sum_lstat 1
+'
+
+test_expect_success 'missing entries bypass speculative lstat' '
+	setup_repo missing &&
+	rm missing/root &&
+	rm -rf missing/nested &&
+	compare_status missing missing.trace &&
+	test_line_count = 5 actual &&
+	check_data missing.trace preload/bulk_applied 3 &&
+	check_data missing.trace preload/bulk_definitive_deleted 5 &&
+	check_lstat_data missing.trace 0 &&
+	check_data missing.trace refresh/sum_lstat 5
+'
+
+test_expect_success PIPE \
+	'tracked directories and unsupported vnodes fall back' '
+	setup_repo tracked-types &&
+	rm tracked-types/root tracked-types/root-peer &&
+	mkdir tracked-types/root &&
+	mkfifo tracked-types/root-peer &&
+	compare_status tracked-types tracked-types.trace &&
+	test_line_count = 2 actual &&
+	check_data tracked-types.trace preload/bulk_applied 6 &&
+	check_data tracked-types.trace preload/bulk_fallback 2 &&
+	check_lstat_data tracked-types.trace 2 &&
+	check_data tracked-types.trace refresh/sum_lstat 2
+'
+
+test_expect_success CASE_INSENSITIVE_FS \
+	'case aliases retain parallel preload' '
+	setup_repo case-alias &&
+	mv case-alias/root case-alias/ROOT &&
+	mv case-alias/nested case-alias/NESTED &&
+	compare_status case-alias case-alias.trace &&
+	test_must_be_empty actual &&
+	check_data case-alias.trace preload/bulk_applied 3 &&
+	check_lstat_data case-alias.trace 5 &&
+	{
+		test_have_prereq !PTHREADS ||
+		check_data case-alias.trace refresh/sum_lstat 0
+	}
+'
+
 test_expect_success ULIMIT_FILE_DESCRIPTORS \
 	'bulk preload reopens directories under a low descriptor limit' '
 	git init low-fd &&
@@ -300,7 +352,7 @@ test_expect_success UTF8_NFD_TO_NFC \
 test_expect_success 'multiply-linked entries are left to lstat' '
 	setup_repo hardlink &&
 	# Mutate through a name outside the watched worktree, then restore
-	# mtime. The bulk scan must reject the multiply-linked entry.
+	# mtime. The bulk scan must leave the multiply-linked entry to lstat.
 	ln hardlink/root hardlink-alias &&
 	test-tool chmtime -120 hardlink/root &&
 	git -C hardlink update-index --refresh &&
@@ -311,7 +363,9 @@ test_expect_success 'multiply-linked entries are left to lstat' '
 	compare_status hardlink hardlink.trace &&
 	test_file_not_empty actual &&
 	check_data hardlink.trace preload/bulk_applied 7 &&
-	check_lstat_data hardlink.trace 1
+	check_data hardlink.trace preload/bulk_fallback 1 &&
+	check_lstat_data hardlink.trace 1 &&
+	check_data hardlink.trace refresh/sum_lstat 1
 '
 
 test_expect_success PIPE 'queued child replacement discards observations' '
