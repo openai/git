@@ -68,6 +68,26 @@ test_expect_success 'FSUC parser fails closed' '
 	test-tool read-cache --test-fsuc-parser
 '
 
+test_expect_success 'hook parser ignores empty path records' '
+	test_when_finished "rm -rf empty-hook-record" &&
+	test_create_repo empty-hook-record &&
+	(
+		cd empty-hook-record &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+			printf "\0"
+			printf "tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		echo changed >tracked &&
+		git status --porcelain --untracked-files=no >actual &&
+		echo " M tracked" >expect &&
+		test_cmp expect actual
+	)
+'
+
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
 test_expect_success 'incompatible bare repo' '
 	test_when_finished "rm -rf ./bare-clone actual expect" &&
