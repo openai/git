@@ -4,6 +4,8 @@
 #include "hash.h"
 #include "strbuf.h"
 
+struct index_state;
+
 struct clean_status_manifest_state {
 	struct strbuf disk;
 	struct strbuf current;
@@ -11,9 +13,12 @@ struct clean_status_manifest_state {
 	unsigned char current_hash[GIT_MAX_RAWSZ];
 	uint32_t disk_flags;
 	uint32_t current_flags;
+	uint32_t scan_count;
 	unsigned disk_valid : 1;
 	unsigned current_valid : 1;
 	unsigned checked : 1;
+	unsigned changed : 1;
+	unsigned global_fallback : 1;
 };
 
 void clean_status_manifest_init(struct clean_status_manifest_state *state);
@@ -23,6 +28,8 @@ int clean_status_manifest_load(struct clean_status_manifest_state *state,
 			       const struct git_hash_algo *algo);
 void clean_status_manifest_adopt_disk(
 	struct clean_status_manifest_state *state);
+int clean_status_manifest_refresh(struct index_state *istate,
+				  struct clean_status_manifest_state *state);
 void clean_status_manifest_invalidate(
 	struct clean_status_manifest_state *state);
 

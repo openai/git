@@ -96,6 +96,7 @@ void clean_status_invalidate_current_proof(struct index_state *istate)
 	istate->clean_status->config_revalidated = 0;
 	istate->clean_status->initial_coherent = 0;
 	istate->clean_status->filter_scope_valid = 0;
+	istate->clean_status->semantic_baseline_pending = 0;
 }
 
 int clean_status_capture_attr_snapshot(
@@ -152,11 +153,31 @@ int clean_status_capture_attr_snapshot(
 	return changed;
 }
 
+int clean_status_fsmonitor_config_mismatch(const struct index_state *istate)
+{
+	return istate->clean_status &&
+		istate->clean_status->current_config_valid &&
+		istate->clean_status->config_mismatch;
+}
+
 int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate)
 {
 	return istate->clean_status &&
 		istate->clean_status->current_config_valid &&
 		istate->clean_status->strong_mismatch;
+}
+
+int clean_status_refresh_worktree_manifest(struct index_state *istate)
+{
+	struct clean_status_state *state = clean_status_get_state(istate);
+
+	return clean_status_manifest_refresh(istate, &state->manifest);
+}
+
+int clean_status_manifest_global_fallback(const struct index_state *istate)
+{
+	return istate->clean_status &&
+		istate->clean_status->manifest.global_fallback;
 }
 
 void clean_status_release(struct index_state *istate)
