@@ -190,13 +190,13 @@ test_expect_success 'clean entries are published without lstat' '
 	check_lstat_data clean.trace 0
 '
 
-test_expect_success 'known mismatches are not restated during preload' '
+test_expect_success 'definitive size changes are not restated' '
 	setup_repo dirty &&
 	test_write_lines changed-content >dirty/root &&
 	compare_status dirty dirty.trace &&
 	test_file_not_empty actual &&
 	check_data dirty.trace preload/bulk_applied 7 &&
-	check_data dirty.trace preload/bulk_content_check 1 &&
+	check_data dirty.trace preload/bulk_definitive_modified 1 &&
 	check_lstat_data dirty.trace 0 &&
 	check_data dirty.trace refresh/sum_lstat 1
 '
