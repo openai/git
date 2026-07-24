@@ -42,9 +42,15 @@ static int fsmonitor__start_timeout_sec = 60;
 #define FSMONITOR__ANNOUNCE_STARTUP "fsmonitor.announcestartup"
 static int fsmonitor__announce_startup = 0;
 
+struct fsmonitor_config_data {
+	unsigned int ignore_start_timeout : 1;
+};
+
 static int fsmonitor_config(const char *var, const char *value,
 			    const struct config_context *ctx, void *cb)
 {
+	struct fsmonitor_config_data *data = cb;
+
 	if (!strcmp(var, FSMONITOR__IPC_THREADS)) {
 		int i = git_config_int(var, value, ctx->kvi);
 		if (i < 1)
@@ -55,7 +61,12 @@ static int fsmonitor_config(const char *var, const char *value,
 	}
 
 	if (!strcmp(var, FSMONITOR__START_TIMEOUT)) {
-		int i = git_config_int(var, value, ctx->kvi);
+		int i;
+
+		/* The run process does not consume this client-only setting. */
+		if (data && data->ignore_start_timeout)
+			return 0;
+		i = git_config_int(var, value, ctx->kvi);
 		if (i < 0)
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__START_TIMEOUT, i);
@@ -73,7 +84,7 @@ static int fsmonitor_config(const char *var, const char *value,
 		return 0;
 	}
 
-	return git_default_config(var, value, ctx, cb);
+	return git_default_config(var, value, ctx, NULL);
 }
 
 /*
@@ -1570,6 +1581,9 @@ int cmd_fsmonitor__daemon(int argc,
 			  const char *prefix,
 			  struct repository *repo UNUSED)
 {
+	struct fsmonitor_config_data config_data = {
+		.ignore_start_timeout = argc > 1 && !strcmp(argv[1], "run"),
+	};
 	const char *subcmd;
 	enum fsmonitor_reason reason;
 	int detach_console = 0;
@@ -1586,7 +1600,7 @@ int cmd_fsmonitor__daemon(int argc,
 		OPT_END()
 	};
 
-	repo_config(the_repository, fsmonitor_config, NULL);
+	repo_config(the_repository, fsmonitor_config, &config_data);
 
 	argc = parse_options(argc, argv, prefix, options,
 			     builtin_fsmonitor__daemon_usage, 0);
