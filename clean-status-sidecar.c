@@ -19,6 +19,7 @@
 #include "wrapper.h"
 
 #define CLEAN_STATUS_SIDECAR_MAGIC "CSTS"
+#define CLEAN_STATUS_SIDECAR_MAX_SIZE 8192
 #define CLEAN_STATUS_FILESYSTEM_ID_SIZE 16
 
 struct clean_status_filesystem_id {
@@ -161,6 +162,49 @@ static int open_nofollow_nonblocking(const char *path, int flags)
 	errno = ENOSYS;
 	return -1;
 #endif
+}
+
+int clean_status_sidecar_load(
+	const char *index_path, const struct git_hash_algo *algo,
+	struct clean_status_sidecar_record *record)
+{
+	struct stat st;
+	char extra;
+	char *path = sidecar_path(index_path);
+	int fd = -1, ret = -1;
+	size_t size;
+
+	memset(&record->sidecar, 0, sizeof(record->sidecar));
+	strbuf_reset(&record->storage);
+	fd = open_nofollow_nonblocking(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_size < 0 || st.st_size > CLEAN_STATUS_SIDECAR_MAX_SIZE)
+		goto done;
+	size = xsize_t(st.st_size);
+	strbuf_grow(&record->storage, size);
+	strbuf_setlen(&record->storage, size);
+	if ((size_t)read_in_full(fd, record->storage.buf, size) != size ||
+	    read(fd, &extra, 1) != 0 ||
+	    clean_status_sidecar_parse(&record->sidecar,
+				       record->storage.buf,
+				       record->storage.len, algo))
+		goto done;
+	ret = 0;
+
+done:
+	if (ret)
+		strbuf_reset(&record->storage);
+	if (fd >= 0)
+		close(fd);
+	free(path);
+	return ret;
+}
+
+void clean_status_sidecar_record_release(
+	struct clean_status_sidecar_record *record)
+{
+	strbuf_release(&record->storage);
+	memset(&record->sidecar, 0, sizeof(record->sidecar));
 }
 
 static int local_apfs_id(int fd MAYBE_UNUSED,
