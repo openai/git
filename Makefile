@@ -1578,6 +1578,7 @@ CLAR_TEST_SUITES += u-clean-status-identity
 CLAR_TEST_SUITES += u-clean-status-index
 CLAR_TEST_SUITES += u-clean-status-manifest
 CLAR_TEST_SUITES += u-clean-status-sidecar
+CLAR_TEST_SUITES += u-clean-status-store
 CLAR_TEST_SUITES += u-ctype
 CLAR_TEST_SUITES += u-dir
 CLAR_TEST_SUITES += u-example-decorate
