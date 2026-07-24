@@ -797,10 +797,9 @@ static int delete_merged_branches(const struct strvec *upstreams,
 	struct strbuf key = STRBUF_INIT;
 	struct hashmap_iter iter;
 	struct strmap_entry *entry;
-	size_t i;
 	int ret = 0;
 
-	for (i = 0; i < upstreams->nr; i++)
+	for (size_t i = 0; i < upstreams->nr; i++)
 		if (ref_filter_forked_add(&filter, upstreams->v[i]) < 0)
 			die(_("'%s' is not a valid branch or pattern"),
 			    upstreams->v[i]);
@@ -809,7 +808,7 @@ static int delete_merged_branches(const struct strvec *upstreams,
 	filter.name_patterns = argv;
 	filter_refs(&candidates, &filter, filter.kind);
 
-	for (i = 0; i < (size_t)candidates.nr; i++) {
+	for (size_t i = 0; i < (size_t)candidates.nr; i++) {
 		const char *branch_refname = candidates.items[i]->refname;
 		const char *branch_name;
 		struct branch *branch;
