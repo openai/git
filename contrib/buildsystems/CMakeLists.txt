@@ -278,6 +278,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 	add_compile_definitions(USE_ST_TIMESPEC)
 	list(APPEND compat_SOURCES
 		compat/darwin/procinfo.c
+		compat/preload-index/bulk-darwin.c
 		compat/preload-index/bulk-darwin-root.c)
 endif()
 

@@ -1346,6 +1346,7 @@ elif host_machine.system() == 'windows'
 elif host_machine.system() == 'darwin'
   compat_sources += [
     'compat/darwin/procinfo.c',
+    'compat/preload-index/bulk-darwin.c',
     'compat/preload-index/bulk-darwin-root.c',
   ]
   libgit_sources += [
