@@ -5,6 +5,13 @@ struct index_state;
 struct pathspec;
 struct repository;
 
+enum preload_bulk_tracked_state {
+	PRELOAD_BULK_TRACKED_UNSEEN = 0,
+	PRELOAD_BULK_TRACKED_CLEAN,
+	PRELOAD_BULK_TRACKED_CONTENT_CHECK,
+	PRELOAD_BULK_TRACKED_FALLBACK,
+};
+
 void preload_index(struct index_state *index,
 		   const struct pathspec *pathspec,
 		   unsigned int refresh_flags);
