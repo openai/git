@@ -657,6 +657,75 @@ test_expect_success 'provider global marker invalidates every tracked entry' '
 	)
 '
 
+test_expect_success \
+	'directory attribute invalidation requires an indexed cone' '
+	test_create_repo directory-attributes &&
+	(
+		cd directory-attributes &&
+		mkdir tracked-dir &&
+		test_commit base tracked-dir/tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			if test -f .git/report-cone
+			then
+				printf "cone-token\0tracked-dir/\0"
+			elif test -f .git/report-unmatched
+			then
+				printf "unmatched-token\0untracked/\0"
+			else
+				printf "base-token\0"
+			fi
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+
+		> .git/report-cone &&
+		GIT_TRACE2_EVENT="$PWD/.git/cone.trace" \
+		GIT_TRACE_FSMONITOR="$PWD/.git/cone.fsm" \
+			git status --porcelain=v2 >.git/cone.actual &&
+		test_must_be_empty .git/cone.actual &&
+		test_grep "fsmonitor_refresh_callback.*tracked-dir/" \
+			.git/cone.fsm &&
+		test_trace2_data fsmonitor semantic/attributes-cone 1 \
+			<.git/cone.trace &&
+
+		rm .git/report-cone &&
+		> .git/report-unmatched &&
+		GIT_TRACE2_EVENT="$PWD/.git/unmatched.trace" \
+		GIT_TRACE_FSMONITOR="$PWD/.git/unmatched.fsm" \
+			git status --porcelain=v2 >.git/unmatched.actual &&
+		test_must_be_empty .git/unmatched.actual &&
+		test_grep "fsmonitor_refresh_callback.*untracked/" \
+			.git/unmatched.fsm &&
+		test_grep ! \
+			"\"category\":\"fsmonitor\",\"key\":\"semantic/attributes-cone\"" \
+			.git/unmatched.trace
+	)
+'
+
+test_expect_success 'directory events invalidate cached attributes' '
+	test_create_repo directory-attribute-cache &&
+	(
+		cd directory-attribute-cache &&
+		mkdir tracked-dir &&
+		test_write_lines "tracked marker=old" \
+			>tracked-dir/.gitattributes &&
+		test_write_lines tracked >tracked-dir/tracked &&
+		git add tracked-dir &&
+		git commit -m base &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "new-token\0tracked-dir/\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		test-tool read-cache \
+			--test-fsmonitor-directory-attributes
+	)
+'
+
 test_expect_success HARDLINKS,!MINGW,!CYGWIN \
 	'multiply-linked files stay fsmonitor-invalid' '
 	test_when_finished "rm -f hardlink-alias" &&
