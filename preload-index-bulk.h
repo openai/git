@@ -3,6 +3,7 @@
 
 #include "git-compat-util.h"
 #include "preload-index.h"
+#include "strbuf.h"
 #include "thread-utils.h"
 
 struct preload_bulk_dir_identity {
@@ -40,6 +41,13 @@ struct preload_bulk_scan;
 struct preload_bulk_worker {
 	struct preload_bulk_scan *scan;
 	pthread_t thread;
+	void *buffer;
+	struct strbuf path;
+	uint64_t dirs;
+	uint64_t entries;
+	uint64_t bulk_calls;
+	uint64_t changed_dirs;
+	uint64_t malformed;
 	unsigned started : 1;
 };
 
@@ -67,6 +75,11 @@ struct preload_bulk_scan {
 };
 
 struct preload_bulk_run_result {
+	uint64_t dirs;
+	uint64_t entries;
+	uint64_t bulk_calls;
+	uint64_t changed_dirs;
+	uint64_t malformed;
 	int threads;
 };
 
@@ -77,6 +90,9 @@ void preload_bulk_schedule_directory(
 	const char *name, const char *path, size_t path_len);
 int preload_bulk_index_position(struct preload_bulk_scan *scan,
 				const char *path, size_t path_len);
+int preload_bulk_index_has_tracked_descendants(struct preload_bulk_scan *scan,
+					       const char *path,
+					       size_t path_len);
 int preload_bulk_index_pos_has_tracked_descendants(
 	struct preload_bulk_scan *scan, const char *path, size_t path_len,
 	int pos);
@@ -84,5 +100,6 @@ void preload_bulk_record_tracked(
 	struct preload_bulk_worker *worker, int pos, const struct stat *st);
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 			  struct preload_bulk_run_result *result);
+const struct preload_bulk_backend *preload_bulk_platform_backend(void);
 
 #endif /* PRELOAD_INDEX_BULK_H */
