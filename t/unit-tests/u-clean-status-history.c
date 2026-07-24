@@ -1,0 +1,120 @@
+#include "unit-test.h"
+#include "attr-manifest.h"
+#include "clean-status.h"
+#include "clean-status-internal.h"
+#include "fsmonitor-clean-proof.h"
+#include "read-cache-ll.h"
+#include "repository.h"
+#include "strbuf.h"
+
+struct history_fixture {
+	struct repository repo;
+	struct index_state istate;
+	struct strbuf manifest;
+	struct strbuf encoded;
+	unsigned char config_hash[GIT_MAX_RAWSZ];
+	unsigned char semantic_hash[GIT_MAX_RAWSZ];
+	unsigned char attr_hash[GIT_MAX_RAWSZ];
+};
+
+static void fixture_init(struct history_fixture *fixture,
+			 const struct git_hash_algo *algo)
+{
+	static const unsigned char token[] = "builtin:1:2";
+	struct attr_manifest_writer writer;
+	struct fsmonitor_clean_proof proof;
+	unsigned char hash[GIT_MAX_RAWSZ];
+
+	memset(fixture, 0, sizeof(*fixture));
+	fixture->repo.hash_algo = algo;
+	index_state_init(&fixture->istate, &fixture->repo);
+	fixture->manifest = (struct strbuf)STRBUF_INIT;
+	fixture->encoded = (struct strbuf)STRBUF_INIT;
+	memset(hash, 1, algo->rawsz);
+	memset(fixture->config_hash, 2, algo->rawsz);
+	memset(fixture->semantic_hash, 3, algo->rawsz);
+	memset(fixture->attr_hash, 4, algo->rawsz);
+	attr_manifest_writer_init(&writer, &fixture->manifest, algo);
+	cl_assert_equal_i(attr_manifest_writer_add(
+		&writer, ".gitattributes", ATTR_MANIFEST_INDEX, hash), 0);
+	memset(&proof, 0, sizeof(proof));
+	proof.flags = FSMONITOR_CLEAN_PROOF_ALL;
+	proof.token = token;
+	proof.token_len = sizeof(token) - 1;
+	proof.config_hash = fixture->config_hash;
+	proof.semantic_hash = fixture->semantic_hash;
+	proof.attr_hash = fixture->attr_hash;
+	proof.attr_manifest = (const unsigned char *)fixture->manifest.buf;
+	proof.attr_manifest_len = fixture->manifest.len;
+	cl_assert_equal_i(fsmonitor_clean_proof_write(
+		&fixture->encoded, &proof, algo), 0);
+}
+
+static void fixture_release(struct history_fixture *fixture)
+{
+	clean_status_release(&fixture->istate);
+	free(fixture->istate.fsmonitor_last_update);
+	strbuf_release(&fixture->encoded);
+	strbuf_release(&fixture->manifest);
+}
+
+static struct clean_status_state *install_current(
+	struct history_fixture *fixture)
+{
+	struct clean_status_state *state =
+		clean_status_get_state(&fixture->istate);
+	const struct git_hash_algo *algo = fixture->repo.hash_algo;
+
+	memcpy(state->current_config_hash, fixture->config_hash, algo->rawsz);
+	memcpy(state->current_semantic_hash, fixture->semantic_hash, algo->rawsz);
+	memcpy(state->current_attr_hash, fixture->attr_hash, algo->rawsz);
+	state->current_config_valid = 1;
+	state->current_semantic_valid = 1;
+	state->current_attr_valid = 1;
+	state->config_enforced = 1;
+	fixture->istate.fsmonitor_last_update = xstrdup("builtin:1:2");
+	fixture->istate.fsmonitor_token_valid = 1;
+	return state;
+}
+
+void test_clean_status_history__reads_valid_history_once(void)
+{
+	struct history_fixture fixture;
+	struct clean_status_state *state;
+
+	fixture_init(&fixture, &hash_algos[GIT_HASH_SHA1]);
+	cl_assert_equal_i(clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len), 0);
+	state = fixture.istate.clean_status;
+	cl_assert(state->disk_config_valid);
+	cl_assert(state->manifest.disk_valid);
+	cl_assert_equal_s(state->disk_config_token, "builtin:1:2");
+
+	cl_assert_equal_i(clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len), 0);
+	cl_assert(state->disk_config_invalid);
+	cl_assert(!state->disk_config_valid);
+	cl_assert(!state->manifest.disk_valid);
+	fixture_release(&fixture);
+}
+
+void test_clean_status_history__adopts_only_coherent_proofs(void)
+{
+	struct history_fixture fixture;
+	struct clean_status_state *state;
+
+	fixture_init(&fixture, &hash_algos[GIT_HASH_SHA256]);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	state = install_current(&fixture);
+	clean_status_prepare_fsmonitor_config(&fixture.istate);
+	cl_assert(state->initial_coherent);
+	cl_assert(state->manifest.current_valid);
+	cl_assert_equal_i(state->manifest.current.len, fixture.manifest.len);
+
+	state->current_semantic_hash[0] ^= 1;
+	clean_status_prepare_fsmonitor_config(&fixture.istate);
+	cl_assert(state->strong_mismatch);
+	cl_assert(!state->initial_coherent);
+	fixture_release(&fixture);
+}
