@@ -1445,4 +1445,22 @@ test_expect_success MACOS 'implicit daemon rediscovers a linked worktree' '
 	)
 '
 
+test_expect_success MACOS 'implicit startup treats a bad timeout as best effort' '
+	test_create_repo reexec-timeout &&
+	(
+		cd reexec-timeout &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config fsmonitor.starttimeout nonsense &&
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		git config --unset fsmonitor.starttimeout &&
+		git fsmonitor--daemon stop &&
+		git config fsmonitor.starttimeout nonsense &&
+		test_must_fail git fsmonitor--daemon start 2>.git/err &&
+		test_grep "bad numeric config value" .git/err
+	)
+'
+
 test_done
