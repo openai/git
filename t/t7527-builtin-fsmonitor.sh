@@ -3,6 +3,7 @@
 test_description='built-in file system watcher'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-semantic-verify.sh
 
 if ! test_have_prereq FSMONITOR_DAEMON
 then
@@ -1620,6 +1621,67 @@ test_expect_success MACOS 'worktree binding rejects same-gitdir aliases' '
 	test_grep "\"key\":\"query/worktree-mismatch\",\"value\":\"1\"" \
 		binding-daemon.trace &&
 	git -C binding-a fsmonitor--daemon stop
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'ordinary deltas advance only attribute-stable proofs' '
+	test_when_finished "rm -rf token-carry" &&
+	test_create_repo token-carry &&
+	(
+		cd token-carry &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines "*.txt text" >.gitattributes &&
+		git add .gitattributes &&
+		git commit -m attributes &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/initial &&
+		test_must_be_empty .git/initial &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSUC .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			test-tool read-cache --test-fscf-seed &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+
+		touch x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/created.trace" \
+			git status --porcelain=v2 >.git/created &&
+		test_grep "^? x$" .git/created &&
+		test_trace2_data fsmonitor config/token-advanced 1 \
+			<.git/created.trace &&
+
+		rm x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/deleted.trace" \
+			git status --porcelain=v2 >.git/deleted &&
+		test_must_be_empty .git/deleted &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/deleted.trace &&
+		test_trace2_data fsmonitor config/token-advanced 1 \
+			<.git/deleted.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes &&
+		test_must_be_empty .git/attributes &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/attributes.trace &&
+		test_trace2_data fsmonitor apply_count 1 \
+			<.git/attributes.trace &&
+		! test_trace2_data fsmonitor config/token-advanced 1 \
+			<.git/attributes.trace
+	)
 '
 
 test_done

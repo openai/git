@@ -2,13 +2,19 @@
 
 #include "test-tool.h"
 #include "attr.h"
+#include "attr-fingerprint.h"
+#include "attr-manifest.h"
+#include "clean-status.h"
+#include "clean-status-internal.h"
 #include "config.h"
 #include "dir.h"
 #include "environment.h"
 #include "ewah/ewok.h"
 #include "ewah/ewok_rlw.h"
 #include "fsmonitor.h"
+#include "fsmonitor-clean-proof.h"
 #include "fsmonitor-ll.h"
+#include "lockfile.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "setup.h"
@@ -237,6 +243,116 @@ static int test_fsmn_parser(void)
 	return 0;
 }
 
+static int write_test_index(void)
+{
+	struct lock_file index_lock = LOCK_INIT;
+
+	repo_hold_locked_index(the_repository, &index_lock, LOCK_DIE_ON_ERROR);
+	if (write_locked_index(the_repository->index, &index_lock, COMMIT_LOCK))
+		return error("unable to write test index");
+	return 0;
+}
+
+static int test_fscf_history_is_coherent(const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->disk_config_valid &&
+		!state->disk_config_invalid && state->disk_semantic_valid &&
+		state->disk_attr_valid && state->manifest.disk_valid &&
+		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+			FSMONITOR_CLEAN_PROOF_ALL &&
+		state->disk_config_raw.len && state->initial_coherent;
+}
+
+static int test_fscf_config(const char *key, const char *value,
+			    const struct config_context *ctx, void *cb)
+{
+	struct clean_status_config_digest *config = cb;
+
+	clean_status_config_add(config, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
+static int test_fscf_history(int seed_existing_token)
+{
+	struct clean_status_config_digest config;
+	struct attr_fingerprint attrs;
+	struct attr_manifest_writer writer;
+	struct strbuf manifest = STRBUF_INIT;
+	struct strbuf encoded = STRBUF_INIT;
+	unsigned char index_hash[GIT_MAX_RAWSZ] = { 0 };
+	const char *token;
+	struct fsmonitor_clean_proof proof = {
+		.flags = FSMONITOR_CLEAN_PROOF_ALL,
+	};
+	const struct git_hash_algo *algo;
+	int ret = 1;
+
+	setup_git_directory(the_repository);
+	algo = the_repository->hash_algo;
+	clean_status_config_init(&config, algo);
+	repo_config(the_repository, test_fscf_config, &config);
+	clean_status_config_final(&config);
+	clean_status_set_config_digest(the_repository, &config);
+	if (repo_read_index(the_repository) < 0)
+		return error("unable to read test index");
+	if (seed_existing_token) {
+		if (!the_repository->index->fsmonitor_token_valid ||
+		    !the_repository->index->fsmonitor_last_update)
+			return error("existing fsmonitor token was not valid");
+		the_repository->index->fsmonitor_has_run_once = 1;
+		token = the_repository->index->fsmonitor_last_update;
+	} else {
+		token = "fscf-test-token";
+	}
+	if (attr_fingerprint_repository(the_repository, &attrs))
+		return error("unable to fingerprint attribute sources");
+
+	attr_manifest_writer_init(&writer, &manifest, algo);
+	if (attr_manifest_writer_add(&writer, ".gitattributes",
+				     ATTR_MANIFEST_INDEX, index_hash))
+		return error("unable to write test attribute manifest");
+	proof.config_hash = config.hash;
+	proof.semantic_hash = config.semantic_hash;
+	proof.attr_hash = attrs.content_hash;
+	proof.token = (const unsigned char *)token;
+	proof.token_len = strlen(token);
+	proof.attr_manifest = (const unsigned char *)manifest.buf;
+	proof.attr_manifest_len = manifest.len;
+	if (fsmonitor_clean_proof_write(&encoded, &proof, algo))
+		return error("unable to write test clean proof");
+
+	if (!seed_existing_token) {
+		FREE_AND_NULL(the_repository->index->fsmonitor_last_update);
+		the_repository->index->fsmonitor_last_update = xstrdup(token);
+		the_repository->index->fsmonitor_token_valid = 1;
+	}
+	clean_status_read_fsmonitor_config(the_repository->index,
+					   encoded.buf, encoded.len);
+	clean_status_prepare_fsmonitor_config(the_repository->index);
+	if (!test_fscf_history_is_coherent(the_repository->index))
+		return error("test clean proof was not coherent");
+	if (write_test_index())
+		goto done;
+	if (seed_existing_token) {
+		ret = 0;
+		goto done;
+	}
+
+	discard_index(the_repository->index);
+	if (repo_read_index(the_repository) < 0)
+		return error("unable to reread test index");
+	if (!test_fscf_history_is_coherent(the_repository->index))
+		return error("FSCF did not survive an index round trip");
+	ret = 0;
+
+done:
+	strbuf_release(&encoded);
+	strbuf_release(&manifest);
+	return ret;
+}
+
 static int test_fsmonitor_directory_attributes(void)
 {
 	struct attr_check *check;
@@ -288,6 +404,10 @@ int cmd__read_cache(int argc, const char **argv)
 		return test_fsuc_parser();
 	if (argc == 2 && !strcmp(argv[1], "--test-fsmn-parser"))
 		return test_fsmn_parser();
+	if (argc == 2 && !strcmp(argv[1], "--test-fscf-round-trip"))
+		return test_fscf_history(0);
+	if (argc == 2 && !strcmp(argv[1], "--test-fscf-seed"))
+		return test_fscf_history(1);
 	if (argc == 2 &&
 	    !strcmp(argv[1], "--test-fsmonitor-directory-attributes"))
 		return test_fsmonitor_directory_attributes();

@@ -2840,6 +2840,7 @@ enum write_extensions {
 	WRITE_RESOLVE_UNDO_EXTENSION =    1<<2,
 	WRITE_UNTRACKED_CACHE_EXTENSION = 1<<3,
 	WRITE_FSMONITOR_EXTENSION =       1<<4,
+	WRITE_FSCF_EXTENSION =            1<<5,
 };
 #define WRITE_ALL_EXTENSIONS ((enum write_extensions)-1)
 
@@ -3100,6 +3101,19 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 		write_fsmonitor_untracked_extension(&sb, istate);
 		err = write_index_ext_header(f, eoie_c,
 					     CACHE_EXT_FSMONITOR_UNTRACKED,
+					     sb.len) < 0;
+		hashwrite(f, sb.buf, sb.len);
+		if (err) {
+			ret = -1;
+			goto out;
+		}
+	}
+	if (write_extensions & WRITE_FSCF_EXTENSION &&
+	    clean_status_should_write_fsmonitor_config(istate)) {
+		strbuf_reset(&sb);
+		clean_status_write_fsmonitor_config(&sb, istate);
+		err = write_index_ext_header(f, eoie_c,
+					     CACHE_EXT_FSMONITOR_CONFIG,
 					     sb.len) < 0;
 		hashwrite(f, sb.buf, sb.len);
 		if (err) {
