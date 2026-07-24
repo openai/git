@@ -1384,6 +1384,7 @@ LIB_OBJS += ws.o
 ifdef PRELOAD_INDEX_BULK_BACKEND
 PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-index.o
 PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-thread.o
+PRELOAD_INDEX_BULK_OBJS += compat/preload-index/bulk-$(PRELOAD_INDEX_BULK_BACKEND).o
 PRELOAD_INDEX_BULK_OBJS += $(PRELOAD_INDEX_BULK_PLATFORM_OBJS)
 endif
 LIB_OBJS += $(PRELOAD_INDEX_BULK_OBJS)
@@ -1558,6 +1559,7 @@ CLAR_TEST_SUITES += u-oidmap
 CLAR_TEST_SUITES += u-oidtree
 CLAR_TEST_SUITES += u-path-namespace
 CLAR_TEST_SUITES += u-prio-queue
+CLAR_TEST_SUITES += u-preload-index-bulk-darwin
 CLAR_TEST_SUITES += u-reftable-basics
 CLAR_TEST_SUITES += u-reftable-block
 CLAR_TEST_SUITES += u-reftable-merged
