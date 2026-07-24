@@ -14,8 +14,11 @@ static int configured_semantic_explicit;
 
 struct clean_status_state *clean_status_get_state(struct index_state *istate)
 {
-	if (!istate->clean_status)
+	if (!istate->clean_status) {
 		CALLOC_ARRAY(istate->clean_status, 1);
+		clean_status_manifest_init(&istate->clean_status->manifest);
+		strbuf_init(&istate->clean_status->disk_config_raw, 0);
+	}
 	return istate->clean_status;
 }
 
@@ -78,5 +81,9 @@ void clean_status_release(struct index_state *istate)
 {
 	if (!istate->clean_status)
 		return;
+	clean_status_manifest_release(&istate->clean_status->manifest);
+	strbuf_release(&istate->clean_status->disk_config_raw);
+	free(istate->clean_status->disk_config_token);
+	free(istate->clean_status->config_revalidated_token);
 	FREE_AND_NULL(istate->clean_status);
 }
