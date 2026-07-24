@@ -78,6 +78,8 @@ struct preload_bulk_scan {
 	unsigned char *tracked_state;
 	int root_fd;
 	int threads;
+	unsigned case_insensitive : 1;
+	unsigned can_skip_unseen_preload : 1;
 };
 
 struct preload_bulk_run_result {
@@ -95,6 +97,7 @@ struct preload_bulk_result {
 	const char *outcome;
 	const char *reason;
 	struct preload_bulk_run_result run;
+	unsigned can_skip_unseen_preload : 1;
 };
 
 void preload_bulk_schedule_directory(
@@ -104,14 +107,19 @@ void preload_bulk_schedule_directory(
 	const char *name, const char *path, size_t path_len);
 int preload_bulk_index_position(struct preload_bulk_scan *scan,
 				const char *path, size_t path_len);
-int preload_bulk_index_has_tracked_descendants(struct preload_bulk_scan *scan,
-					       const char *path,
-					       size_t path_len);
 int preload_bulk_index_pos_has_tracked_descendants(
 	struct preload_bulk_scan *scan, const char *path, size_t path_len,
 	int pos);
 void preload_bulk_record_tracked(
 	struct preload_bulk_worker *worker, int pos, const struct stat *st);
+void preload_bulk_record_tracked_fallback(
+	struct preload_bulk_worker *worker, int pos);
+void preload_bulk_record_tracked_descendants_fallback(
+	struct preload_bulk_worker *worker, const char *path,
+	size_t path_len);
+int preload_bulk_record_tracked_alias_fallback(
+	struct preload_bulk_worker *worker, const char *path,
+	size_t path_len);
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 			  struct preload_bulk_run_result *result);
 const struct preload_bulk_backend *preload_bulk_platform_backend(void);
