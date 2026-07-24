@@ -335,6 +335,7 @@ libgit_sources = [
   'chunk-format.c',
   'clean-status.c',
   'clean-status-config.c',
+  'clean-status-identity.c',
   'clean-status-manifest.c',
   'color.c',
   'column.c',
