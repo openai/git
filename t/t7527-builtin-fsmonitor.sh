@@ -1389,4 +1389,33 @@ test_expect_success CASE_INSENSITIVE_FS 'fsmonitor file case wrong on disk' '
 	test_grep -q " M dir1/dir2/dir4/FILE-4-A" "$PWD/file_case_wrong-try3.out"
 '
 
+test_expect_success MACOS 'implicit daemon rediscovers a linked worktree' '
+	test_when_finished "
+		git -C reexec-linked-wt fsmonitor--daemon stop 2>/dev/null || :
+		git -C reexec-linked-main worktree remove --force \
+			../reexec-linked-wt 2>/dev/null || :
+	" &&
+	test_create_repo reexec-linked-main &&
+	(
+		cd reexec-linked-main &&
+		test_commit base tracked &&
+		git worktree add ../reexec-linked-wt &&
+		git -C ../reexec-linked-wt config core.untrackedCache true &&
+		git -C ../reexec-linked-wt config core.fsmonitor true &&
+		linked_worktree=$(test-tool path-utils real_path \
+			../reexec-linked-wt) &&
+		GIT_TRACE2_EVENT="$PWD/../reexec-linked.trace" \
+			git -C ../reexec-linked-wt status --porcelain=v2 \
+			>../reexec-linked.actual &&
+		test_must_be_empty ../reexec-linked.actual &&
+		test_subcommand git fsmonitor--daemon start \
+			<../reexec-linked.trace &&
+		test_grep \
+			"\"child_class\":\"fsmonitor\",\"cd\":\"$linked_worktree\"" \
+			../reexec-linked.trace &&
+		git -C ../reexec-linked-wt fsmonitor--daemon stop &&
+		git worktree remove ../reexec-linked-wt
+	)
+'
+
 test_done
