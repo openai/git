@@ -413,6 +413,9 @@ include shared.mak
 # `compat/fsmonitor/fsm-health-<name>.c` files
 # that implement the `fsm_listen__*()` and `fsm_health__*()` routines.
 #
+# If a platform supports bulk worktree scans during index preload, set
+# PRELOAD_INDEX_BULK_BACKEND to the name of its backend.
+#
 # If your platform has OS-specific ways to tell if a repo is incompatible with
 # fsmonitor (whether the hook or IPC daemon version), set FSMONITOR_OS_SETTINGS
 # to the "<name>" of the corresponding `compat/fsmonitor/fsm-settings-<name>.c`
@@ -1378,6 +1381,11 @@ LIB_OBJS += worktree.o
 LIB_OBJS += wrapper.o
 LIB_OBJS += write-or-die.o
 LIB_OBJS += ws.o
+ifdef PRELOAD_INDEX_BULK_BACKEND
+PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-thread.o
+PRELOAD_INDEX_BULK_OBJS += $(PRELOAD_INDEX_BULK_PLATFORM_OBJS)
+endif
+LIB_OBJS += $(PRELOAD_INDEX_BULK_OBJS)
 LIB_OBJS += wt-status.o
 LIB_OBJS += xdiff-interface.o
 LIB_OBJS += xdiff/xdiffi.o
