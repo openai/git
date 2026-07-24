@@ -12,6 +12,10 @@ struct preload_bulk_darwin_data {
 	fsid_t root_fsid;
 };
 
+/*
+ * Exposed so that tests can validate kernel-supplied records directly.
+ */
+int preload_bulk_darwin_decode_record(const char *record, size_t len);
 int preload_bulk_darwin_fd_on_root_mount(struct preload_bulk_scan *scan,
 					 int fd, struct stat *st_out);
 const char *preload_bulk_darwin_open_root(struct preload_bulk_scan *scan);
