@@ -198,6 +198,37 @@ void test_exclude_source_proof__rejects_conflicting_observations(void)
 	free(parent);
 }
 
+void test_exclude_source_proof__digest_deduplicates_and_ignores_identity(void)
+{
+	struct exclude_source_proof *first_proof =
+		exclude_source_proof_create(&istate, NULL, open_parent);
+	struct exclude_source_proof *second_proof;
+	struct object_id first, second;
+	char *parent = make_path("parent");
+	char *source = make_path("parent/source");
+
+	cl_must_pass(mkdir(parent, 0700));
+	write_file_buf(source, "content", 7);
+	record_file(first_proof, source);
+	cl_must_pass(exclude_source_proof_digest(
+		first_proof, repo.hash_algo, &first));
+
+	cl_must_pass(unlink(source));
+	write_file_buf(source, "content", 7);
+	second_proof =
+		exclude_source_proof_create(&istate, NULL, open_parent);
+	record_file(second_proof, source);
+	record_file(second_proof, source);
+	cl_must_pass(exclude_source_proof_digest(
+		second_proof, repo.hash_algo, &second));
+	cl_assert(oideq(&first, &second));
+
+	exclude_source_proof_release(second_proof);
+	exclude_source_proof_release(first_proof);
+	free(source);
+	free(parent);
+}
+
 void test_exclude_source_proof__rejects_open_failure(void)
 {
 	struct exclude_source_proof *proof = new_proof();
@@ -391,6 +422,7 @@ SKIP_TEST(test_exclude_source_proof__rejects_different_content_replacement)
 SKIP_TEST(test_exclude_source_proof__accepts_repeated_observation)
 SKIP_TEST(test_exclude_source_proof__rejects_missing_source_buffer)
 SKIP_TEST(test_exclude_source_proof__rejects_conflicting_observations)
+SKIP_TEST(test_exclude_source_proof__digest_deduplicates_and_ignores_identity)
 SKIP_TEST(test_exclude_source_proof__rejects_open_failure)
 SKIP_TEST(test_exclude_source_proof__fails_closed_without_parent_opener)
 SKIP_TEST(test_exclude_source_proof__honors_nofollow)
