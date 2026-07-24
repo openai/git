@@ -23,7 +23,25 @@ int clean_status_filter_scope_needs_validation(
 int clean_status_capture_attr_snapshot(
 	struct index_state *istate,
 	struct attr_source_snapshot **snapshot);
+
+int clean_status_fsmonitor_config_mismatch(const struct index_state *istate);
 int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate);
+
+int clean_status_has_persistent_fsmonitor_semantic_history(
+	const struct index_state *istate);
+int clean_status_has_worktree_manifest_history(
+	const struct index_state *istate);
+int clean_status_fsmonitor_semantic_adoption_needed(
+	const struct index_state *istate);
+int clean_status_fsmonitor_semantic_baseline_needed(
+	const struct index_state *istate);
+int clean_status_fsmonitor_semantic_baseline_pending(
+	const struct index_state *istate);
+void clean_status_begin_fsmonitor_semantic_baseline(
+	struct index_state *istate);
+
+int clean_status_refresh_worktree_manifest(struct index_state *istate);
+int clean_status_manifest_global_fallback(const struct index_state *istate);
 void clean_status_record_source_identity(struct index_state *istate,
 					 const struct stat *st);
 int clean_status_verify_null_index(const struct index_state *istate,

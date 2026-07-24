@@ -896,6 +896,22 @@ static void invalidate_all_fsmonitor(struct index_state *istate)
 		istate->cache_changed |= FSMONITOR_CHANGED;
 }
 
+/*
+ * A forward baseline still needs one ordinary stat refresh before its
+ * provider token can certify the index. Clear only process-local
+ * uptodate state so that refresh_index() performs those stats without
+ * escalating to content checks.
+ */
+static void invalidate_all_fsmonitor_for_baseline(
+	struct index_state *istate)
+{
+	unsigned int i;
+
+	invalidate_all_fsmonitor(istate);
+	for (i = 0; i < istate->cache_nr; i++)
+		istate->cache[i]->ce_flags &= ~CE_UPTODATE;
+}
+
 static void invalidate_all_fsmonitor_strong(struct index_state *istate)
 {
 	unsigned int i;
@@ -914,6 +930,45 @@ void fsmonitor_invalidate_semantics(struct index_state *istate)
 			   "semantic/strong-invalidation", 1);
 }
 
+static void invalidate_fsmonitor_for_bootstrap(
+	struct index_state *istate, enum fsmonitor_mode mode,
+	int semantic_adoption_needed, int semantic_baseline_needed,
+	int physical_history_unavailable)
+{
+	int manifest_refresh_failed;
+
+	if (!fstat_is_reliable() || mode != FSMONITOR_MODE_IPC ||
+	    istate->split_index) {
+		invalidate_all_fsmonitor(istate);
+		return;
+	}
+
+	if (physical_history_unavailable) {
+		if (semantic_adoption_needed)
+			clean_status_refresh_worktree_manifest(istate);
+		fsmonitor_invalidate_semantics(istate);
+		untracked_cache_invalidate_all(istate);
+		return;
+	}
+
+	manifest_refresh_failed =
+		clean_status_refresh_worktree_manifest(istate) < 0;
+	if (manifest_refresh_failed ||
+	    clean_status_manifest_global_fallback(istate) ||
+	    (semantic_adoption_needed && !semantic_baseline_needed)) {
+		fsmonitor_invalidate_semantics(istate);
+	} else {
+		if (semantic_baseline_needed) {
+			clean_status_begin_fsmonitor_semantic_baseline(istate);
+			invalidate_all_fsmonitor_for_baseline(istate);
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "semantic/adoption-baseline", 1);
+		} else {
+			invalidate_all_fsmonitor(istate);
+		}
+	}
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
@@ -927,6 +982,8 @@ void refresh_fsmonitor(struct index_state *istate)
 	int is_trivial = 0;
 	int tracked_requires_bootstrap;
 	int untracked_requires_bootstrap;
+	int semantic_adoption_needed;
+	int semantic_baseline_needed;
 	struct repository *r = istate->repo;
 	enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(r);
 	enum fsmonitor_reason reason = fsm_settings__get_reason(r);
@@ -943,6 +1000,14 @@ void refresh_fsmonitor(struct index_state *istate)
 		return;
 
 	istate->fsmonitor_has_run_once = 1;
+	semantic_adoption_needed = fstat_is_reliable() &&
+		!istate->split_index &&
+		fsm_mode == FSMONITOR_MODE_IPC &&
+		clean_status_fsmonitor_semantic_adoption_needed(istate);
+	semantic_baseline_needed = fstat_is_reliable() &&
+		!istate->split_index &&
+		fsm_mode == FSMONITOR_MODE_IPC &&
+		clean_status_fsmonitor_semantic_baseline_needed(istate);
 
 	trace_printf_key(&trace_fsmonitor, "refresh fsmonitor");
 
@@ -1068,7 +1133,10 @@ apply_results:
 	trace2_region_enter("fsmonitor", "apply_results", istate->repo);
 
 	tracked_requires_bootstrap = !query_success || is_trivial ||
-		!istate->fsmonitor_token_valid;
+		!istate->fsmonitor_token_valid ||
+		(fstat_is_reliable() && !istate->split_index &&
+		 fsm_mode == FSMONITOR_MODE_IPC &&
+		 clean_status_fsmonitor_config_mismatch(istate));
 	untracked_requires_bootstrap = !istate->fsmonitor_untracked_valid;
 
 	if (query_success && !is_trivial) {
@@ -1099,7 +1167,10 @@ apply_results:
 		}
 
 		if (tracked_requires_bootstrap)
-			invalidate_all_fsmonitor(istate);
+			invalidate_fsmonitor_for_bootstrap(
+				istate, fsm_mode, semantic_adoption_needed,
+				semantic_baseline_needed,
+				!istate->fsmonitor_token_valid);
 
 		/* Now mark the untracked cache for fsmonitor usage */
 		if (istate->untracked)
@@ -1122,7 +1193,9 @@ apply_results:
 		 * we've actually changed entries, so keep track if we
 		 * actually changed entries or not.
 		 */
-		invalidate_all_fsmonitor(istate);
+		invalidate_fsmonitor_for_bootstrap(
+			istate, fsm_mode, semantic_adoption_needed,
+			semantic_baseline_needed, 1);
 	}
 	trace2_region_leave("fsmonitor", "apply_results", istate->repo);
 
