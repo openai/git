@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "name-hash.h"
 #include "parse.h"
 #include "preload-index-bulk.h"
 #include "read-cache-ll.h"
@@ -56,6 +57,18 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 	result->reason = "backend-unavailable";
 	if (!backend_available(backend))
 		return -1;
+	if (istate->sparse_index == INDEX_EXPANDED) {
+		/*
+		 * Workers may need case-folding lookups for names returned by
+		 * the filesystem. Build the lazy hash before they start.
+		 *
+		 * A collapsed sparse index cannot expand itself concurrently
+		 * from the worker threads. Leave its unseen entries to the
+		 * existing preload path, which expands them on the main thread.
+		 */
+		scan.case_insensitive = prepare_index_casefolding(istate);
+		scan.can_skip_unseen_preload = 1;
+	}
 
 	if (git_env_bool("GIT_TEST_PRELOAD_INDEX_BULK", 0)) {
 		scan.test_barrier_path = getenv(
@@ -101,6 +114,8 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 	if (clean) {
 		result->tracked_state = scan.tracked_state;
 		result->nr = istate->cache_nr;
+		result->can_skip_unseen_preload =
+			scan.can_skip_unseen_preload;
 		scan.tracked_state = NULL;
 	}
 
