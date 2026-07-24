@@ -319,7 +319,25 @@ static unsigned char *preload_bulk_try(struct index_state *index)
 	preload_bulk_result_release(&result);
 	return tracked_state;
 }
+
+static void preload_bulk_finish_state(struct index_state *index,
+				      unsigned char **state,
+				      unsigned int refresh_flags)
+{
+	if ((refresh_flags & REFRESH_DEFER_BULK_DIRTY) && *state) {
+		index->preload_bulk_tracked_state = *state;
+		index->preload_bulk_tracked_nr = index->cache_nr;
+		*state = NULL;
+	}
+	FREE_AND_NULL(*state);
+}
 #endif
+
+void preload_index_bulk_result_clear(struct index_state *index)
+{
+	FREE_AND_NULL(index->preload_bulk_tracked_state);
+	index->preload_bulk_tracked_nr = 0;
+}
 
 void preload_index(struct index_state *index,
 		   const struct pathspec *pathspec,
@@ -334,6 +352,7 @@ void preload_index(struct index_state *index,
 	int t2_sum_lstat = 0;
 	int core_preload_index = 1;
 
+	preload_index_bulk_result_clear(index);
 	repo_config_get_bool(index->repo, "core.preloadindex", &core_preload_index);
 
 	if (!core_preload_index)
@@ -345,7 +364,7 @@ void preload_index(struct index_state *index,
 #endif
 	if (!HAVE_THREADS) {
 #ifdef HAVE_PRELOAD_INDEX_BULK
-		free(bulk_state);
+		preload_bulk_finish_state(index, &bulk_state, refresh_flags);
 #endif
 		return;
 	}
@@ -355,7 +374,7 @@ void preload_index(struct index_state *index,
 		threads = 2;
 	if (threads < 2) {
 #ifdef HAVE_PRELOAD_INDEX_BULK
-		free(bulk_state);
+		preload_bulk_finish_state(index, &bulk_state, refresh_flags);
 #endif
 		return;
 	}
@@ -405,7 +424,7 @@ void preload_index(struct index_state *index,
 	}
 	stop_progress(&pd.progress);
 #ifdef HAVE_PRELOAD_INDEX_BULK
-	free(bulk_state);
+	preload_bulk_finish_state(index, &bulk_state, refresh_flags);
 #endif
 
 	if (pathspec) {
