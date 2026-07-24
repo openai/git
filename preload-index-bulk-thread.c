@@ -176,6 +176,15 @@ static void *preload_bulk_worker_main(void *data)
 	return NULL;
 }
 
+static void release_workers(struct preload_bulk_scan *scan)
+{
+	for (int i = 0; i < scan->threads; i++) {
+		free(scan->workers[i].buffer);
+		strbuf_release(&scan->workers[i].path);
+	}
+	FREE_AND_NULL(scan->workers);
+}
+
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 			  struct preload_bulk_run_result *result)
 {
@@ -188,8 +197,10 @@ int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 	if (queue_init(&scan->queue))
 		return -1;
 	CALLOC_ARRAY(scan->workers, scan->threads);
-	for (int i = 0; i < scan->threads; i++)
+	for (int i = 0; i < scan->threads; i++) {
 		scan->workers[i].scan = scan;
+		strbuf_init(&scan->workers[i].path, 0);
+	}
 
 	FLEX_ALLOC_STR(root_task, path, ".");
 	if (!reserve_open_fd(&scan->queue))
@@ -199,8 +210,7 @@ int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 	if (root_task->fd < 0) {
 		release_open_fd(&scan->queue);
 		free(root_task);
-		free(scan->workers);
-		scan->workers = NULL;
+		release_workers(scan);
 		queue_release(&scan->queue);
 		return -1;
 	}
@@ -222,11 +232,20 @@ int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 		    pthread_join(scan->workers[i].thread, NULL))
 			BUG("unable to join bulk preload worker");
 
-	result->threads = started_threads;
-	failed = scan->queue.failed;
+	for (int i = 0; i < scan->threads; i++) {
+		struct preload_bulk_worker *worker = &scan->workers[i];
 
-	free(scan->workers);
-	scan->workers = NULL;
+		result->dirs += worker->dirs;
+		result->entries += worker->entries;
+		result->bulk_calls += worker->bulk_calls;
+		result->changed_dirs += worker->changed_dirs;
+		result->malformed += worker->malformed;
+	}
+	result->threads = started_threads;
+	failed = scan->queue.failed || result->malformed ||
+		result->changed_dirs;
+
+	release_workers(scan);
 	queue_release(&scan->queue);
 	return failed ? -1 : 0;
 }
