@@ -14,6 +14,19 @@ int preload_bulk_index_position(struct preload_bulk_scan *scan,
 	return index_name_pos_sparse(scan->istate, path, path_len);
 }
 
+int preload_bulk_index_has_tracked_descendants(struct preload_bulk_scan *scan,
+					       const char *path,
+					       size_t path_len)
+{
+	int pos;
+
+	if (path_len > INT_MAX)
+		return 0;
+	pos = index_name_pos_sparse(scan->istate, path, path_len);
+	return preload_bulk_index_pos_has_tracked_descendants(
+		scan, path, path_len, pos);
+}
+
 int preload_bulk_index_pos_has_tracked_descendants(
 	struct preload_bulk_scan *scan, const char *path, size_t path_len,
 	int pos)
