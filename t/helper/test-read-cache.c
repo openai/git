@@ -1,9 +1,11 @@
 #define USE_THE_REPOSITORY_VARIABLE
 
 #include "test-tool.h"
+#include "attr.h"
 #include "config.h"
 #include "environment.h"
 #include "fsmonitor.h"
+#include "fsmonitor-ll.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "setup.h"
@@ -41,6 +43,45 @@ static int test_fsmonitor_content_recovery(const char *path)
 	return 0;
 }
 
+static int test_fsmonitor_directory_attributes(void)
+{
+	struct attr_check *check;
+	int ret = 1;
+
+	setup_git_directory(the_repository);
+	repo_config(the_repository, git_default_config, NULL);
+	if (repo_read_index(the_repository) < 0)
+		return error("unable to read test index");
+
+	check = attr_check_initl("marker", NULL);
+	git_check_attr(the_repository->index, "tracked-dir/tracked", check);
+	if (!check->items[0].value ||
+	    strcmp(check->items[0].value, "old")) {
+		error("initial attribute value was not cached");
+		goto done;
+	}
+
+	write_file("tracked-dir/.gitattributes", "tracked marker=new\n");
+	/*
+	 * repo_read_index() consumed the normal refresh. Re-arm it after
+	 * caching the pre-event attribute value.
+	 */
+	the_repository->index->fsmonitor_has_run_once = 0;
+	refresh_fsmonitor(the_repository->index);
+	git_check_attr(the_repository->index, "tracked-dir/tracked", check);
+	if (!check->items[0].value ||
+	    strcmp(check->items[0].value, "new")) {
+		error("directory event did not invalidate cached attributes");
+		goto done;
+	}
+	ret = 0;
+
+done:
+	attr_check_free(check);
+	discard_index(the_repository->index);
+	return ret;
+}
+
 int cmd__read_cache(int argc, const char **argv)
 {
 	int i, cnt = 1;
@@ -49,6 +90,10 @@ int cmd__read_cache(int argc, const char **argv)
 	if (argc == 3 &&
 	    !strcmp(argv[1], "--test-fsmonitor-content-recovery"))
 		return test_fsmonitor_content_recovery(argv[2]);
+	if (argc == 2 &&
+	    !strcmp(argv[1], "--test-fsmonitor-directory-attributes"))
+		return test_fsmonitor_directory_attributes();
+
 	if (argc > 1 && skip_prefix(argv[1], "--print-and-refresh=", &name)) {
 		argc--;
 		argv++;
