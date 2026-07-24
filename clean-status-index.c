@@ -2,6 +2,7 @@
 #include "clean-status.h"
 #include "clean-status-index.h"
 #include "clean-status-internal.h"
+#include "object.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "wrapper.h"
@@ -144,6 +145,30 @@ void clean_status_index_snapshot_release(
 	if (snapshot->fd >= 0)
 		close(snapshot->fd);
 	snapshot->fd = -1;
+}
+
+int clean_status_index_entries_are_certifiable(
+	const struct index_state *istate)
+{
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *ce = istate->cache[i];
+
+		if (S_ISGITLINK(ce->ce_mode) || ce_stage(ce) ||
+		    ce_intent_to_add(ce) || ce_skip_worktree(ce) ||
+		    (ce->ce_flags & CE_VALID) ||
+		    !(ce->ce_flags & CE_FSMONITOR_VALID) ||
+		    (ce->ce_flags & ~(CE_UPTODATE | CE_HASHED |
+				     CE_FSMONITOR_VALID |
+				     CE_UPDATE_IN_BASE)))
+			return 0;
+	}
+	return 1;
+}
+
+int clean_status_index_is_certifiable(const struct index_state *istate)
+{
+	return !is_null_oid(&istate->oid) &&
+		clean_status_index_entries_are_certifiable(istate);
 }
 
 void clean_status_record_source_identity(struct index_state *istate,
