@@ -464,6 +464,16 @@ static size_t handle_path_with_trailing_slash(
 		nr_in_cone++;
 	}
 
+	if (nr_in_cone) {
+		/*
+		 * A matched directory event may stand in for a nested
+		 * attribute-file change.
+		 */
+		git_attr_invalidate_all();
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "semantic/attributes-cone", nr_in_cone);
+	}
+
 	return nr_in_cone;
 }
 
