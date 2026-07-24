@@ -1382,6 +1382,7 @@ LIB_OBJS += wrapper.o
 LIB_OBJS += write-or-die.o
 LIB_OBJS += ws.o
 ifdef PRELOAD_INDEX_BULK_BACKEND
+PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-index.o
 PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-thread.o
 PRELOAD_INDEX_BULK_OBJS += $(PRELOAD_INDEX_BULK_PLATFORM_OBJS)
 endif
