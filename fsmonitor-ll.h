@@ -47,6 +47,8 @@ void tweak_fsmonitor(struct index_state *istate);
  */
 void refresh_fsmonitor(struct index_state *istate);
 
+int fsmonitor_invalidate_attributes_path(struct index_state *istate,
+					 const char *name);
 /*
  * Does the received result contain the "trivial" response?
  */
