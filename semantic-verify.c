@@ -259,6 +259,19 @@ int semantic_verify_start_token_is_current(
 			 istate, proof->epoch));
 }
 
+int semantic_verify_proof_is_current(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof)
+{
+	return istate && proof && proof->istate == istate &&
+		proof->cache_nr == istate->cache_nr &&
+		!proof->namespace_unstable &&
+		semantic_verify_root_is_stable(proof) &&
+		(!proof->epoch_required ||
+		 clean_status_proof_epoch_content_matches(
+			 istate, proof->epoch));
+}
+
 void semantic_verify_get_stats(const struct semantic_verify_proof *proof,
 			       struct semantic_verify_stats *stats)
 {
@@ -296,13 +309,7 @@ int semantic_verify_apply_after_closure(
 	int poisoned = 0;
 	size_t validated_updates = 0;
 
-	if (!istate || !proof || proof->istate != istate ||
-	    proof->cache_nr != istate->cache_nr ||
-	    proof->namespace_unstable ||
-	    !semantic_verify_root_is_stable(proof) ||
-	    (proof->epoch_required &&
-	     !clean_status_proof_epoch_content_matches(
-		     istate, proof->epoch)))
+	if (!semantic_verify_proof_is_current(istate, proof))
 		return -1;
 	if (proof->active_filters) {
 		trace2_data_intmax("semantic_verify", istate->repo,
@@ -397,6 +404,19 @@ int semantic_verify_apply_after_closure(
 	trace2_data_intmax("semantic_verify", istate->repo,
 			   "poisoned-for-tail", poisoned);
 	return applied;
+}
+
+int semantic_verify_accept_filter_scope(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof)
+{
+	if (!proof || !proof->filter_scope_checked)
+		return 0;
+	if (!proof->epoch_required || proof->active_filters ||
+	    !semantic_verify_proof_is_current(istate, proof))
+		return -1;
+	clean_status_mark_filter_scope_valid(istate);
+	return 1;
 }
 
 void semantic_verify_proof_clear(struct semantic_verify_proof *proof)
