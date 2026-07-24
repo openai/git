@@ -7,6 +7,7 @@ clar_test_suites = [
   'unit-tests/u-clean-status-index.c',
   'unit-tests/u-clean-status-manifest.c',
   'unit-tests/u-clean-status-sidecar.c',
+  'unit-tests/u-clean-status-store.c',
   'unit-tests/u-ctype.c',
   'unit-tests/u-dir.c',
   'unit-tests/u-example-decorate.c',

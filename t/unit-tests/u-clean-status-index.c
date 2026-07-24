@@ -135,6 +135,8 @@ static void assert_rejects_null_checksum(const struct git_hash_algo *algo)
 	istate.cache_nr = 7;
 	fixture_clear_checksum(&fixture, algo);
 	oidcpy(&istate.oid, &fixture.checksum);
+	cl_assert_equal_i(clean_status_index_snapshot_open(
+		&snapshot, fixture.path, algo), -1);
 	cl_assert_equal_i(clean_status_index_snapshot_pin(
 		&snapshot, &istate), -1);
 	fixture_release(&fixture);

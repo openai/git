@@ -14,6 +14,12 @@ struct clean_status_index_snapshot {
 	int fd;
 };
 
+int clean_status_index_snapshot_open(
+	struct clean_status_index_snapshot *snapshot, const char *path,
+	const struct git_hash_algo *algo);
+int clean_status_index_snapshot_still_matches_path(
+	const struct clean_status_index_snapshot *snapshot, const char *path,
+	const struct git_hash_algo *algo);
 int clean_status_index_snapshot_pin(
 	struct clean_status_index_snapshot *snapshot,
 	struct index_state *istate);
