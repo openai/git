@@ -3,11 +3,11 @@
 
 #include "clean-status-identity.h"
 #include "hash.h"
+#include "strbuf.h"
 
 struct clean_status_index_snapshot;
 struct attr_source_snapshot;
 struct repository;
-struct strbuf;
 struct stat;
 
 #define CLEAN_STATUS_SIDECAR_VERSION 1
@@ -29,12 +29,26 @@ struct clean_status_sidecar {
 	size_t token_len;
 };
 
+struct clean_status_sidecar_record {
+	struct clean_status_sidecar sidecar;
+	struct strbuf storage;
+};
+
+#define CLEAN_STATUS_SIDECAR_RECORD_INIT { \
+	.storage = STRBUF_INIT, \
+}
+
 int clean_status_sidecar_parse(struct clean_status_sidecar *sidecar,
 			       const void *data, size_t len,
 			       const struct git_hash_algo *algo);
 int clean_status_sidecar_write(struct strbuf *out,
 			       const struct clean_status_sidecar *sidecar,
 			       const struct git_hash_algo *algo);
+int clean_status_sidecar_load(
+	const char *index_path, const struct git_hash_algo *algo,
+	struct clean_status_sidecar_record *record);
+void clean_status_sidecar_record_release(
+	struct clean_status_sidecar_record *record);
 int clean_status_sidecar_pin_source(
 	const char *index_path, const struct clean_status_sidecar *sidecar,
 	const struct git_hash_algo *algo,
