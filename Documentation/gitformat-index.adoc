@@ -379,6 +379,36 @@ The remaining data of each directory block is grouped by type:
   - A NUL-terminated string containing the opaque file system monitor
     token associated with the untracked-cache data.
 
+== File System Monitor semantic proof
+
+  The file system monitor semantic proof records the configuration and
+  attribute inputs for a completed worktree-content verification. Its
+  signature is { 'F', 'S', 'C', 'F' }.
+
+  The extension consists of:
+
+  - 32-bit version number (currently 1).
+
+  - 32-bit magic number identifying version 1 records (`FSC1`).
+
+  - 32-bit flags. The low four bits respectively indicate a complete
+    attribute manifest, a provider-token binding, a stat-data binding, and
+    coverage of the full index. All other bits must be zero.
+
+  - 32-bit length of the provider token.
+
+  - 32-bit length of the attribute manifest.
+
+  - The provider token, without a terminating NUL.
+
+  - Three hashes, using the index hash algorithm, over the relevant Git
+    configuration, semantic-conversion configuration, and attribute state.
+
+  - The attribute manifest described by its length above.
+
+  - A hash over all preceding bytes in this extension, using the index hash
+    algorithm.
+
 == End of Index Entry
 
   The End of Index Entry (EOIE) is used to locate the end of the variable

@@ -17,6 +17,11 @@ void clean_status_record_source_identity(struct index_state *istate,
 					 const struct stat *st);
 int clean_status_verify_null_index(const struct index_state *istate,
 				   const struct stat *st);
+
+int clean_status_read_fsmonitor_config(struct index_state *istate,
+				       const void *data, unsigned long size);
+void clean_status_prepare_fsmonitor_config(struct index_state *istate);
+
 void clean_status_release(struct index_state *istate);
 
 #endif /* CLEAN_STATUS_H */
