@@ -36,6 +36,7 @@ struct clean_status_state {
 	unsigned disk_attr_valid : 1;
 	unsigned disk_config_seen : 1;
 	unsigned disk_config_invalid : 1;
+	unsigned semantic_baseline_pending : 1;
 };
 
 struct clean_status_state *clean_status_get_state(struct index_state *istate);
