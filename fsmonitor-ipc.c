@@ -1,6 +1,8 @@
 #define USE_THE_REPOSITORY_VARIABLE
 
 #include "git-compat-util.h"
+#include "abspath.h"
+#include "environment.h"
 #include "gettext.h"
 #include "simple-ipc.h"
 #include "fsmonitor-ipc.h"
@@ -45,6 +47,17 @@ int fsmonitor_ipc__send_command(const char *command UNUSED,
 
 #else
 
+static void prepare_spawn_env(struct strvec *env)
+{
+	/* Let the child rediscover this repository from the worktree. */
+	strvec_push(env, GIT_DIR_ENVIRONMENT);
+	strvec_push(env, GIT_WORK_TREE_ENVIRONMENT);
+	strvec_push(env, GIT_COMMON_DIR_ENVIRONMENT);
+	strvec_push(env, GIT_PREFIX_ENVIRONMENT);
+	strvec_push(env, GIT_IMPLICIT_WORK_TREE_ENVIRONMENT);
+	strvec_push(env, INDEX_ENVIRONMENT);
+}
+
 int fsmonitor_ipc__is_supported(void)
 {
 	return 1;
@@ -58,7 +71,18 @@ enum ipc_active_state fsmonitor_ipc__get_state(void)
 static int spawn_daemon(void)
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
+	struct strbuf canonical_worktree = STRBUF_INIT;
+	const char *worktree = repo_get_work_tree(the_repository);
+	int ret = -1;
 
+	if (!worktree ||
+	    !strbuf_realpath(&canonical_worktree, worktree, 0)) {
+		error(_("cannot start fsmonitor daemon without a work tree"));
+		goto done;
+	}
+
+	prepare_spawn_env(&cmd.env);
+	cmd.dir = canonical_worktree.buf;
 	cmd.git_cmd = 1;
 	cmd.no_stdin = 1;
 	cmd.no_stdout = 1;
@@ -67,7 +91,10 @@ static int spawn_daemon(void)
 	cmd.trace2_child_class = "fsmonitor";
 	strvec_pushl(&cmd.args, "fsmonitor--daemon", "start", NULL);
 
-	return run_command(&cmd);
+	ret = run_command(&cmd);
+done:
+	strbuf_release(&canonical_worktree);
+	return ret;
 }
 
 int fsmonitor_ipc__send_query(const char *since_token,
