@@ -619,6 +619,14 @@ static void lazy_init_name_hash(struct index_state *istate)
 	trace_performance_leave("initialize name hash");
 }
 
+int prepare_index_casefolding(struct index_state *istate)
+{
+	if (!repo_ignore_case(istate->repo))
+		return 0;
+	lazy_init_name_hash(istate);
+	return 1;
+}
+
 /*
  * A test routine for t/helper/ sources.
  *
