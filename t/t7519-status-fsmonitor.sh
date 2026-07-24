@@ -594,7 +594,8 @@ prepare_builtin_closure_repo () {
 	)
 }
 
-test_expect_success UNTRACKED_CACHE 'builtin clean closure publishes its proof' '
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin clean closure publishes its proof' '
 	test_when_finished "rm -rf builtin-closure-clean" &&
 	prepare_builtin_closure_repo builtin-closure-clean untracked &&
 	(
@@ -616,7 +617,8 @@ test_expect_success UNTRACKED_CACHE 'builtin clean closure publishes its proof' 
 	)
 '
 
-test_expect_success 'builtin changed closure rescans before acceptance' '
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin changed closure rescans before acceptance' '
 	test_when_finished "rm -rf builtin-closure-changed" &&
 	prepare_builtin_closure_repo builtin-closure-changed &&
 	(
@@ -638,7 +640,8 @@ test_expect_success 'builtin changed closure rescans before acceptance' '
 	)
 '
 
-test_expect_success 'builtin initial trivial response anchors a closure' '
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin initial trivial response anchors a closure' '
 	test_when_finished "rm -rf builtin-initial-trivial" &&
 	prepare_builtin_closure_repo builtin-initial-trivial &&
 	(
@@ -661,7 +664,8 @@ test_expect_success 'builtin initial trivial response anchors a closure' '
 	)
 '
 
-test_expect_success 'builtin trivial closure can rescan and accept' '
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin trivial closure can rescan and accept' '
 	test_when_finished "rm -rf builtin-closure-trivial" &&
 	prepare_builtin_closure_repo builtin-closure-trivial &&
 	(
@@ -681,7 +685,8 @@ test_expect_success 'builtin trivial closure can rescan and accept' '
 	)
 '
 
-test_expect_success 'builtin closure rejects three intervening changes' '
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin closure rejects three intervening changes' '
 	test_when_finished "rm -rf builtin-closure-exhausted" &&
 	prepare_builtin_closure_repo builtin-closure-exhausted &&
 	(
@@ -704,14 +709,15 @@ test_expect_success 'builtin closure rejects three intervening changes' '
 	)
 '
 
-test_expect_success 'builtin closure query errors fall back completely' '
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin closure query errors fall back completely' '
 	test_when_finished "rm -rf builtin-closure-error" &&
 	prepare_builtin_closure_repo builtin-closure-error untracked &&
 	(
 		cd builtin-closure-error &&
 		sane_unset GIT_TEST_SPLIT_INDEX &&
 		test_write_lines visible >visible &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CE \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCE \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status --porcelain=v2 >.git/actual &&
 		test_grep "^? visible$" .git/actual &&
@@ -1416,6 +1422,61 @@ test_expect_success HARDLINKS,!MINGW,!CYGWIN \
 		echo changed >>../hardlink-alias &&
 		git status --porcelain=v2 >.git/actual &&
 		test_grep "^1 \.M .* tracked$" .git/actual
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'second closing-query change reprimes untracked cache' '
+	test_when_finished "rm -rf second-query-changed" &&
+	test_create_repo second-query-changed &&
+	(
+		cd second-query-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines "*.ignored" >.gitignore &&
+		test_write_lines "*.ignored" >cached/.gitignore &&
+		printf "aaaa\n" >cached/tracked &&
+		test_write_lines ignored >cached/junk.ignored &&
+		git add .gitignore cached/.gitignore cached/tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/prime &&
+		test_must_be_empty .git/prime &&
+		test-tool chmtime =-60 cached/tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get cached/tracked) &&
+		printf "bbbb\n" >cached/tracked &&
+		test-tool chmtime =$mtime cached/tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid cached/tracked &&
+		test_grep ! FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_line_count = 1 .git/actual &&
+		test_grep "^1 \.M .* cached/tracked$" .git/actual &&
+		test_trace2_data status fsmonitor_token/semantic-closed 1 \
+			<.git/status.trace &&
+		test_trace2_data status \
+			fsmonitor_token/untracked-after-semantic 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/apply_count 1 \
+			<.git/status.trace &&
+		test_trace2_data status \
+			fsmonitor_token/untracked-after-retry 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index
 	)
 '
 
