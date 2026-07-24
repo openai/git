@@ -89,6 +89,7 @@ static void *preload_thread(void *_data)
 			continue;
 #ifdef HAVE_PRELOAD_INDEX_BULK
 		if (state == PRELOAD_BULK_TRACKED_CONTENT_CHECK ||
+		    state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED ||
 		    state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED)
 			continue;
 #endif
@@ -185,6 +186,7 @@ static size_t preload_bulk_apply_result(
 			result->tracked_state[i] = state;
 		}
 		if ((state == PRELOAD_BULK_TRACKED_CONTENT_CHECK ||
+		     state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED ||
 		     state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED) &&
 		    preload_entry_needs_stat(ce))
 			*has_deferred = 1;
@@ -223,10 +225,14 @@ static void preload_bulk_trace_result(
 	const struct preload_bulk_result *result,
 	size_t applied)
 {
-	uint64_t content_check = 0, definitive_deleted = 0, fallback = 0;
+	uint64_t content_check = 0, definitive_modified = 0;
+	uint64_t definitive_deleted = 0, fallback = 0;
 
 	for (size_t i = 0; i < result->nr; i++) {
 		switch (result->tracked_state[i]) {
+		case PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED:
+			definitive_modified++;
+			break;
 		case PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED:
 			definitive_deleted++;
 			break;
@@ -255,6 +261,9 @@ static void preload_bulk_trace_result(
 			   result->run.bulk_calls);
 	trace2_data_intmax("index", index->repo, "preload/bulk_workers",
 			   result->run.threads);
+	trace2_data_intmax("index", index->repo,
+			   "preload/bulk_definitive_modified",
+			   definitive_modified);
 	trace2_data_intmax("index", index->repo,
 			   "preload/bulk_definitive_deleted",
 			   definitive_deleted);
