@@ -384,7 +384,8 @@ test_expect_success 'update-index implicitly starts daemon' '
 
 	# Confirm that the trace2 log contains a record of the
 	# daemon starting.
-	test_subcommand git fsmonitor--daemon start <.git/trace_implicit_1
+	test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+		.git/trace_implicit_1
 '
 
 test_expect_success 'status implicitly starts daemon' '
@@ -400,7 +401,8 @@ test_expect_success 'status implicitly starts daemon' '
 
 	# Confirm that the trace2 log contains a record of the
 	# daemon starting.
-	test_subcommand git fsmonitor--daemon start <.git/trace_implicit_2
+	test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+		.git/trace_implicit_2
 '
 
 edit_files () {
@@ -978,7 +980,8 @@ test_expect_success "submodule absorbgitdirs implicitly starts daemon" '
 
 	# Confirm that the trace2 log contains a record of the
 	# daemon starting.
-	test_subcommand git fsmonitor--daemon start <super-sub.trace
+	test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+		super-sub.trace
 '
 
 start_git_in_background () {
@@ -1389,6 +1392,30 @@ test_expect_success CASE_INSENSITIVE_FS 'fsmonitor file case wrong on disk' '
 	test_grep -q " M dir1/dir2/dir4/FILE-4-A" "$PWD/file_case_wrong-try3.out"
 '
 
+test_expect_success MACOS 'implicit daemon reuses the invoking Git executable' '
+	test_create_repo same-executable-spawn &&
+	mkdir fake-exec-path &&
+	write_script fake-exec-path/git <<-EOF &&
+	echo invoked >"$TRASH_DIRECTORY/fake-git-used"
+	exit 1
+	EOF
+	(
+		cd same-executable-spawn &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_EXEC_PATH="$TRASH_DIRECTORY/fake-exec-path" \
+		GIT_TRACE2_EVENT="$PWD/.git/spawn.trace" \
+			"$GIT_BUILD_DIR/git" status --porcelain=v2 \
+			>.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_path_is_missing "$TRASH_DIRECTORY/fake-git-used" &&
+		test_grep -F "\"argv\":[\"$GIT_BUILD_DIR/git\",\"fsmonitor--daemon\",\"run\",\"--detach\"]" \
+			.git/spawn.trace &&
+		git fsmonitor--daemon stop
+	)
+'
+
 test_expect_success MACOS 'implicit daemon rediscovers a linked worktree' '
 	test_when_finished "
 		git -C reexec-linked-wt fsmonitor--daemon stop 2>/dev/null || :
@@ -1408,8 +1435,8 @@ test_expect_success MACOS 'implicit daemon rediscovers a linked worktree' '
 			git -C ../reexec-linked-wt status --porcelain=v2 \
 			>../reexec-linked.actual &&
 		test_must_be_empty ../reexec-linked.actual &&
-		test_subcommand git fsmonitor--daemon start \
-			<../reexec-linked.trace &&
+		test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+			../reexec-linked.trace &&
 		test_grep \
 			"\"child_class\":\"fsmonitor\",\"cd\":\"$linked_worktree\"" \
 			../reexec-linked.trace &&
