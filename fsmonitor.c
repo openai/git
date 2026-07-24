@@ -998,9 +998,11 @@ apply_results:
 			for (i = bol; i < query_result.len; i++) {
 				if (buf[i] != '\0')
 					continue;
-				fsmonitor_refresh_callback(istate, buf + bol);
+				if (i > bol) {
+					fsmonitor_refresh_callback(istate, buf + bol);
+					count++;
+				}
 				bol = i + 1;
-				count++;
 			}
 			if (bol < query_result.len) {
 				fsmonitor_refresh_callback(istate, buf + bol);
