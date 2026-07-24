@@ -67,6 +67,25 @@ void clean_status_attach_config(struct index_state *istate)
 	}
 }
 
+int clean_status_revalidated_token_matches(const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->config_revalidated &&
+		state->config_revalidated_token &&
+		istate->fsmonitor_last_update &&
+		!strcmp(state->config_revalidated_token,
+			istate->fsmonitor_last_update);
+}
+
+void clean_status_invalidate_current_proof(struct index_state *istate)
+{
+	if (!istate->clean_status)
+		return;
+	istate->clean_status->config_revalidated = 0;
+	istate->clean_status->initial_coherent = 0;
+}
+
 void clean_status_release(struct index_state *istate)
 {
 	if (!istate->clean_status)

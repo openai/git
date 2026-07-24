@@ -118,3 +118,84 @@ void test_clean_status_history__adopts_only_coherent_proofs(void)
 	cl_assert(!state->initial_coherent);
 	fixture_release(&fixture);
 }
+
+void test_clean_status_history__preserves_unbound_manifests(void)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct history_fixture fixture;
+	struct clean_status_state *state;
+	struct fsmonitor_clean_proof parsed;
+	struct strbuf rewritten = STRBUF_INIT;
+
+	fixture_init(&fixture, algo);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	state = install_current(&fixture);
+	clean_status_prepare_fsmonitor_config(&fixture.istate);
+	cl_assert(clean_status_should_write_fsmonitor_config(&fixture.istate));
+	clean_status_write_fsmonitor_config(&rewritten, &fixture.istate);
+	cl_assert_equal_i(fsmonitor_clean_proof_parse(
+		&parsed, rewritten.buf, rewritten.len, algo), 0);
+	cl_assert_equal_i(parsed.flags, FSMONITOR_CLEAN_PROOF_ALL);
+
+	FREE_AND_NULL(fixture.istate.fsmonitor_last_update);
+	fixture.istate.fsmonitor_last_update = xstrdup("builtin:1:3");
+	clean_status_write_fsmonitor_config(&rewritten, &fixture.istate);
+	cl_assert_equal_i(fsmonitor_clean_proof_parse(
+		&parsed, rewritten.buf, rewritten.len, algo), 0);
+	cl_assert_equal_i(parsed.flags,
+		FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX);
+
+	FREE_AND_NULL(fixture.istate.fsmonitor_last_update);
+	fixture.istate.fsmonitor_last_update = xstrdup("builtin:1:2");
+	state->current_config_valid = 0;
+	clean_status_write_fsmonitor_config(&rewritten, &fixture.istate);
+	cl_assert_equal_i(fsmonitor_clean_proof_parse(
+		&parsed, rewritten.buf, rewritten.len, algo), 0);
+	cl_assert_equal_i(parsed.flags,
+		FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX);
+	strbuf_release(&rewritten);
+	fixture_release(&fixture);
+}
+
+void test_clean_status_history__advances_only_current_proofs(void)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct history_fixture fixture;
+	struct clean_status_state *state;
+	struct fsmonitor_clean_proof parsed;
+	struct strbuf rewritten = STRBUF_INIT;
+
+	fixture_init(&fixture, algo);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	state = install_current(&fixture);
+	clean_status_prepare_fsmonitor_config(&fixture.istate);
+
+	clean_status_advance_fsmonitor_config_token(
+		&fixture.istate, "builtin:1:3");
+	cl_assert_equal_s(state->config_revalidated_token, "builtin:1:3");
+	FREE_AND_NULL(fixture.istate.fsmonitor_last_update);
+	fixture.istate.fsmonitor_last_update = xstrdup("builtin:1:3");
+	cl_assert(clean_status_should_write_fsmonitor_config(&fixture.istate));
+
+	clean_status_invalidate_current_proof(&fixture.istate);
+	cl_assert(!state->config_revalidated);
+	cl_assert(!state->initial_coherent);
+	clean_status_advance_fsmonitor_config_token(
+		&fixture.istate, "builtin:1:4");
+	cl_assert_equal_s(state->config_revalidated_token, "builtin:1:3");
+	FREE_AND_NULL(fixture.istate.fsmonitor_last_update);
+	fixture.istate.fsmonitor_last_update = xstrdup("builtin:1:4");
+	clean_status_write_fsmonitor_config(&rewritten, &fixture.istate);
+	cl_assert_equal_i(fsmonitor_clean_proof_parse(
+		&parsed, rewritten.buf, rewritten.len, algo), 0);
+	cl_assert_equal_i(parsed.flags,
+		FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX);
+
+	strbuf_release(&rewritten);
+	fixture_release(&fixture);
+}
