@@ -115,6 +115,8 @@ struct untracked_cache_preload {
 
 static void invalidate_gitignore(struct untracked_cache *uc,
 				 struct untracked_cache_dir *dir);
+static void invalidate_directory(struct untracked_cache *uc,
+				 struct untracked_cache_dir *dir);
 
 static int match_untracked_dir_stat_racy(const struct cache_time *timestamp,
 					 const struct stat_data *sd,
@@ -365,6 +367,53 @@ static void *preload_untracked_cache_thread(void *_data)
 	return NULL;
 }
 
+static int untracked_cache_has_collapsed_child(
+	const struct untracked_cache_dir *parent,
+	const struct untracked_cache_dir *child)
+{
+	size_t i, len = strlen(child->name);
+
+	for (i = 0; i < parent->untracked_nr; i++) {
+		const char *name = parent->untracked[i];
+
+		if (strlen(name) == len + 1 && name[len] == '/' &&
+		    !strncmp(name, child->name, len))
+			return 1;
+	}
+	return 0;
+}
+
+static int compute_untracked_cache_valid_recursive(
+	struct untracked_cache *uc,
+	struct untracked_cache_dir *ucd,
+	int invalidate_ancestors)
+{
+	size_t i;
+	int local_valid = ucd->valid && ucd->stat_checked &&
+		ucd->stat_matches && ucd->exclude_matches;
+	int valid = local_valid;
+	int invalidate_self = !local_valid;
+
+	for (i = 0; i < ucd->dirs_nr; i++) {
+		int child_valid = compute_untracked_cache_valid_recursive(
+			uc, ucd->dirs[i], invalidate_ancestors);
+
+		if (!child_valid) {
+			valid = 0;
+			if (untracked_cache_has_collapsed_child(ucd, ucd->dirs[i]))
+				invalidate_self = 1;
+		}
+	}
+	if (invalidate_self && invalidate_ancestors) {
+		if (!local_valid && ucd->valid && ucd->stat_checked &&
+		    ucd->stat_matches && !ucd->exclude_matches)
+			invalidate_gitignore(uc, ucd);
+		else
+			invalidate_directory(uc, ucd);
+	}
+	return valid;
+}
+
 static void untracked_cache_preload_join(
 	struct untracked_cache_preload *preload)
 {
@@ -409,7 +458,6 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 	struct untracked_cache *uc;
 	size_t i;
 	int applied = 0;
-	int valid = 1;
 
 	if (!preload)
 		return 0;
@@ -427,23 +475,19 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 		ucd->stat_matches = 0;
 		ucd->exclude_matches = 0;
 		/* Invalidation performed after the snapshot always wins. */
-		if (!task->was_valid || !ucd->valid) {
-			valid = 0;
+		if (!task->was_valid || !ucd->valid)
 			continue;
-		}
 		ucd->stat_checked = task->stat_checked;
 		ucd->stat_matches = task->stat_matches;
 		ucd->exclude_matches = task->exclude_matches;
-		if (!task->stat_checked || !task->stat_matches ||
-		    !task->exclude_matches)
-			valid = 0;
 		if (task->update_stat_data)
 			ucd->stat_data = task->stat_data;
-		if (task->stat_matches && !task->exclude_matches)
-			invalidate_gitignore(uc, ucd);
 	}
 	trace2_data_intmax("dir", istate->repo,
-			   "preload_untracked_cache/valid", valid);
+			   "preload_untracked_cache/valid",
+		compute_untracked_cache_valid_recursive(
+			uc, preload->root,
+			dir_flags & DIR_SHOW_OTHER_DIRECTORIES));
 	applied = 1;
 done:
 	trace2_data_intmax("dir", istate->repo,
@@ -3063,6 +3107,28 @@ static int read_cached_dir(struct cached_dir *cdir)
 	return -1;
 }
 
+static void remove_collapsed_untracked_child(
+	struct untracked_cache *uc,
+	struct untracked_cache_dir *parent,
+	const struct untracked_cache_dir *child)
+{
+	size_t i, len = strlen(child->name);
+
+	for (i = 0; i < parent->untracked_nr; i++) {
+		char *name = parent->untracked[i];
+
+		if (strlen(name) != len + 1 || name[len] != '/' ||
+		    strncmp(name, child->name, len))
+			continue;
+		free(name);
+		MOVE_ARRAY(parent->untracked + i, parent->untracked + i + 1,
+			   parent->untracked_nr - i - 1);
+		parent->untracked_nr--;
+		uc->dir_invalidated++;
+		return;
+	}
+}
+
 static void close_cached_dir(struct cached_dir *cdir)
 {
 	if (cdir->fdir)
@@ -3157,6 +3223,23 @@ static enum path_treatment read_directory_recursive(struct dir_struct *dir,
 		/* check how the file or directory should be treated */
 		state = treat_path(dir, untracked, &cdir, istate, &path,
 				   baselen, pathspec);
+		if (!cdir.d_name && cdir.ucd && cdir.ucd->check_only &&
+		    state < path_untracked && untracked &&
+		    untracked_cache_has_collapsed_child(untracked, cdir.ucd) &&
+		    (dir->flags & DIR_SHOW_OTHER_DIRECTORIES)) {
+			/*
+			 * A collapsed directory retains one descendant as its
+			 * untracked witness.  Rescan before dropping a stale witness;
+			 * an unvisited sibling may still make the directory untracked.
+			 */
+			invalidate_directory(dir->untracked, cdir.ucd);
+			state = read_directory_recursive(
+				dir, istate, path.buf, path.len, cdir.ucd,
+				1, 0, pathspec);
+			if (state < path_untracked)
+				remove_collapsed_untracked_child(
+					dir->untracked, untracked, cdir.ucd);
+		}
 		dir->internal.visited_paths++;
 
 		if (state > dir_state)
