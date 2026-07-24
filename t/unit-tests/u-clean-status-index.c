@@ -229,6 +229,8 @@ void test_clean_status_index__pins_named_index_identity(void)
 	struct index_fixture fixture;
 	struct repository repo = { 0 };
 	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct index_state parsed = INDEX_STATE_INIT(&repo);
+	unsigned char replacement_hash[GIT_MAX_RAWSZ];
 #ifndef GIT_WINDOWS_NATIVE
 	char *moved;
 	int replacement;
@@ -245,6 +247,18 @@ void test_clean_status_index__pins_named_index_identity(void)
 		&snapshot, &istate), 0);
 	cl_assert(clean_status_index_snapshot_still_matches(
 		&snapshot, &istate));
+
+	/*
+	 * Model an A-to-B-to-A replacement while a consumer parses B.
+	 * Matching the restored named path is insufficient unless the parsed
+	 * state is also bound to the pinned A contents.
+	 */
+	memset(replacement_hash, 2, algo->rawsz);
+	parsed.version = 4;
+	parsed.cache_nr = 7;
+	oidread(&parsed.oid, replacement_hash, algo);
+	cl_assert(!clean_status_index_snapshot_still_matches(
+		&snapshot, &parsed));
 
 	istate.cache_nr++;
 	cl_assert(!clean_status_index_snapshot_still_matches(
