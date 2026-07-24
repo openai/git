@@ -3,6 +3,7 @@
 
 #include "git-compat-util.h"
 #include "attr.h"
+#include "clean-status.h"
 #include "config.h"
 #include "dir.h"
 #include "environment.h"
@@ -636,6 +637,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 {
 	int len = strlen(name);
 	int pos;
+	int attributes_may_have_changed;
 	size_t nr_in_cone;
 
 	trace_printf_key(&trace_fsmonitor,
@@ -645,6 +647,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 	if (!strcmp(name, FSMONITOR_PATH_GLOBAL_INVALIDATE)) {
 		unsigned int i;
 
+		clean_status_invalidate_current_proof(istate);
 		git_attr_invalidate_all();
 		untracked_cache_invalidate_all(istate);
 		for (i = 0; i < istate->cache_nr; i++)
@@ -655,12 +658,15 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 		return;
 	}
 	pos = index_name_pos(istate, name, len);
-	fsmonitor_invalidate_attributes_path(istate, name);
+	attributes_may_have_changed =
+		fsmonitor_invalidate_attributes_path(istate, name);
 
 	if (name[len - 1] == '/')
 		nr_in_cone = handle_path_with_trailing_slash(istate, name, pos);
 	else
 		nr_in_cone = handle_path_without_trailing_slash(istate, name, pos);
+	if (pos < 0 && nr_in_cone)
+		attributes_may_have_changed = 1;
 
 	/*
 	 * If we did not find an exact match for this pathname or any
@@ -670,10 +676,15 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 	 */
 	if (!nr_in_cone && repo_ignore_case(the_repository)) {
 		nr_in_cone = handle_using_name_hash_icase(istate, name);
-		if (!nr_in_cone)
+		if (!nr_in_cone) {
 			nr_in_cone = handle_using_dir_name_hash_icase(
 				istate, name);
+			if (nr_in_cone)
+				attributes_may_have_changed = 1;
+		}
 	}
+	if (attributes_may_have_changed)
+		clean_status_invalidate_current_proof(istate);
 
 	if (nr_in_cone)
 		trace_printf_key(&trace_fsmonitor,
@@ -1137,6 +1148,14 @@ apply_results:
 			(fsm_mode == FSMONITOR_MODE_IPC || !is_trivial);
 		istate->fsmonitor_untracked_valid = 0;
 	} else {
+		/*
+		 * The applied delta carries an existing proof forward:
+		 * tracked paths are now invalid in FSMN, while semantic
+		 * events have already expired the proof itself.
+		 */
+		if (fsm_mode == FSMONITOR_MODE_IPC)
+			clean_status_advance_fsmonitor_config_token(
+				istate, last_update_token.buf);
 		FREE_AND_NULL(istate->fsmonitor_last_update);
 		istate->fsmonitor_last_update =
 			strbuf_detach(&last_update_token, NULL);
