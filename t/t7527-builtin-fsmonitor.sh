@@ -1747,4 +1747,56 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'sparse index rebuilds semantic history without expansion' '
+	test_when_finished "rm -rf sparse-semantic" &&
+	test_create_repo sparse-semantic &&
+	(
+		cd sparse-semantic &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir in outside &&
+		printf "aaaa\n" >in/tracked &&
+		printf "outside\n" >outside/file &&
+		git add . &&
+		git commit -m base &&
+		git sparse-checkout set --cone --sparse-index in &&
+		git ls-files --sparse >.git/sparse.before &&
+		test_grep "^outside/$" .git/sparse.before &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		test-tool chmtime =-60 in/tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get in/tracked) &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/prime.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/prime.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9]" <.git/prime.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/prime.trace &&
+		test_grep FSMN .git/index &&
+		git -c core.fsmonitor=false ls-files --sparse \
+			>.git/sparse.after-prime &&
+		test_grep "^outside/$" .git/sparse.after-prime &&
+		printf "bbbb\n" >in/tracked &&
+		test-tool chmtime =$mtime in/tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=in/tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/change.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* in/tracked$" .git/actual &&
+		test_trace2_data fsmonitor apply_count 1 \
+			<.git/change.trace &&
+		test_grep FSMN .git/index &&
+		git -c core.fsmonitor=false ls-files --sparse \
+			>.git/sparse.after-change &&
+		test_grep "^outside/$" .git/sparse.after-change
+	)
+'
+
 test_done
