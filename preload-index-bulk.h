@@ -1,0 +1,76 @@
+#ifndef PRELOAD_INDEX_BULK_H
+#define PRELOAD_INDEX_BULK_H
+
+#include "git-compat-util.h"
+#include "thread-utils.h"
+
+struct preload_bulk_dir_identity {
+	struct stat stat;
+	unsigned complete : 1;
+};
+
+struct preload_bulk_task {
+	struct preload_bulk_task *next;
+	struct preload_bulk_dir_identity parent_identity;
+	struct preload_bulk_dir_identity child_identity;
+	int fd;
+	unsigned reserved_fd : 1;
+	unsigned has_parent_identity : 1;
+	unsigned has_child_identity : 1;
+	char path[FLEX_ARRAY];
+};
+
+struct preload_bulk_queue {
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	struct preload_bulk_task *head;
+	/*
+	 * pending includes queued and in-flight tasks. open_fds counts only
+	 * descriptor reservations held by tasks.
+	 */
+	size_t pending;
+	size_t open_fds;
+	size_t open_fd_limit;
+	int failed;
+};
+
+struct preload_bulk_scan;
+
+struct preload_bulk_worker {
+	struct preload_bulk_scan *scan;
+	pthread_t thread;
+	unsigned started : 1;
+};
+
+struct preload_bulk_backend {
+	int (*open_dir_at)(struct preload_bulk_worker *worker, int parent_fd,
+			   const char *name);
+	/*
+	 * Consume task->fd when it is non-negative, and close it before
+	 * returning.
+	 */
+	int (*scan_directory)(struct preload_bulk_worker *worker,
+			      struct preload_bulk_task *task);
+};
+
+struct preload_bulk_scan {
+	const struct preload_bulk_backend *backend;
+	struct preload_bulk_queue queue;
+	struct preload_bulk_worker *workers;
+	int root_fd;
+	int threads;
+};
+
+struct preload_bulk_run_result {
+	int threads;
+};
+
+void preload_bulk_schedule_directory(
+	struct preload_bulk_worker *worker, int parent_fd,
+	const struct preload_bulk_dir_identity *parent_identity,
+	const struct preload_bulk_dir_identity *child_identity,
+	const char *name, const char *path, size_t path_len);
+int preload_bulk_run_scan(struct preload_bulk_scan *scan,
+			  struct preload_bulk_run_result *result);
+
+#endif /* PRELOAD_INDEX_BULK_H */
