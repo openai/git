@@ -64,9 +64,15 @@ int semantic_verify_prepare(struct index_state *istate,
 int semantic_verify_apply_after_closure(
 	struct index_state *istate,
 	const struct semantic_verify_proof *proof);
+int semantic_verify_accept_filter_scope(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof);
 int semantic_verify_root_is_stable(
 	const struct semantic_verify_proof *proof);
 int semantic_verify_start_token_is_current(
+	struct index_state *istate,
+	const struct semantic_verify_proof *proof);
+int semantic_verify_proof_is_current(
 	struct index_state *istate,
 	const struct semantic_verify_proof *proof);
 void semantic_verify_proof_clear(struct semantic_verify_proof *proof);
