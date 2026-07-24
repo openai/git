@@ -414,7 +414,7 @@ int remove_file_from_index_with_flags(struct index_state *, const char *, int);
 #define ADD_CACHE_IGNORE_ERRORS	4
 #define ADD_CACHE_IGNORE_REMOVAL 8
 #define ADD_CACHE_INTENT 16
-
+#define ADD_CACHE_TRACK_CLEAN_HISTORY 32
 /*
  * These two are used to add the contents of the file at path
  * to the index, marking the working tree up-to-date by storing
