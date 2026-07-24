@@ -667,6 +667,7 @@ parse_makefile_for_sources(libgit_SOURCES ${CMAKE_SOURCE_DIR}/Makefile "LIB_OBJS
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 	list(APPEND libgit_SOURCES
+		preload-index-bulk-index.c
 		preload-index-bulk-thread.c)
 endif()
 

@@ -2,6 +2,7 @@
 #define PRELOAD_INDEX_BULK_H
 
 #include "git-compat-util.h"
+#include "preload-index.h"
 #include "thread-utils.h"
 
 struct preload_bulk_dir_identity {
@@ -54,9 +55,11 @@ struct preload_bulk_backend {
 };
 
 struct preload_bulk_scan {
+	struct index_state *istate;
 	const struct preload_bulk_backend *backend;
 	struct preload_bulk_queue queue;
 	struct preload_bulk_worker *workers;
+	unsigned char *tracked_state;
 	int root_fd;
 	int threads;
 };
@@ -70,6 +73,13 @@ void preload_bulk_schedule_directory(
 	const struct preload_bulk_dir_identity *parent_identity,
 	const struct preload_bulk_dir_identity *child_identity,
 	const char *name, const char *path, size_t path_len);
+int preload_bulk_index_position(struct preload_bulk_scan *scan,
+				const char *path, size_t path_len);
+int preload_bulk_index_pos_has_tracked_descendants(
+	struct preload_bulk_scan *scan, const char *path, size_t path_len,
+	int pos);
+void preload_bulk_record_tracked(
+	struct preload_bulk_worker *worker, int pos, const struct stat *st);
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 			  struct preload_bulk_run_result *result);
 
