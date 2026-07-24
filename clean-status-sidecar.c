@@ -1,10 +1,23 @@
 #include "git-compat-util.h"
+
+#ifdef __APPLE__
+#include <sys/mount.h>
+#endif
+
+#include "clean-status-index.h"
 #include "clean-status-sidecar.h"
 #include "fsmonitor-clean-proof.h"
 #include "hash-framing.h"
+#include "lockfile.h"
 #include "strbuf.h"
+#include "wrapper.h"
 
 #define CLEAN_STATUS_SIDECAR_MAGIC "CSTS"
+#define CLEAN_STATUS_FILESYSTEM_ID_SIZE 16
+
+struct clean_status_filesystem_id {
+	unsigned char value[CLEAN_STATUS_FILESYSTEM_ID_SIZE];
+};
 
 static int checksum_valid(const void *data, size_t len,
 			  const struct git_hash_algo *algo)
@@ -125,4 +138,95 @@ int clean_status_sidecar_write(struct strbuf *out,
 	strbuf_add(out, sidecar->token, sidecar->token_len);
 	hash_append_checksum(out, algo);
 	return 0;
+}
+
+static char *sidecar_path(const char *index_path)
+{
+	return xstrfmt("%s.csts", index_path);
+}
+
+static int local_apfs_id(int fd MAYBE_UNUSED,
+			 struct clean_status_filesystem_id *id)
+{
+#ifdef __APPLE__
+	struct statfs fs;
+#endif
+
+	memset(id, 0, sizeof(*id));
+#ifdef __APPLE__
+	if (fstatfs(fd, &fs) || !(fs.f_flags & MNT_LOCAL) ||
+	    strcmp(fs.f_fstypename, "apfs") ||
+	    sizeof(fs.f_fsid) > sizeof(id->value))
+		return -1;
+	memcpy(id->value, &fs.f_fsid, sizeof(fs.f_fsid));
+	return 0;
+#else
+	return -1;
+#endif
+}
+
+static int sidecar_matches_snapshot(
+	const char *index_path, const struct clean_status_sidecar *sidecar,
+	const struct clean_status_index_snapshot *snapshot,
+	const struct git_hash_algo *algo)
+{
+	struct clean_status_filesystem_id fsid;
+
+	return clean_status_identity_is_durable() &&
+		snapshot && snapshot->fd >= 0 &&
+		!local_apfs_id(snapshot->fd, &fsid) &&
+		clean_status_identity_equal(&snapshot->identity,
+					    &sidecar->identity) &&
+		snapshot->version == sidecar->proof.index_version &&
+		snapshot->cache_nr == sidecar->proof.cache_nr &&
+		oideq(&snapshot->checksum,
+		      &sidecar->proof.index_checksum) &&
+		clean_status_index_snapshot_still_matches_path(
+			snapshot, index_path, algo);
+}
+
+int clean_status_sidecar_pin_source(
+	const char *index_path, const struct clean_status_sidecar *sidecar,
+	const struct git_hash_algo *algo,
+	struct clean_status_index_snapshot *snapshot)
+{
+	if (clean_status_index_snapshot_open(snapshot, index_path, algo))
+		return -1;
+	if (sidecar_matches_snapshot(
+		    index_path, sidecar, snapshot, algo))
+		return 0;
+	clean_status_index_snapshot_release(snapshot);
+	return -1;
+}
+
+int clean_status_sidecar_install(
+	const char *index_path, const struct clean_status_sidecar *sidecar,
+	const struct clean_status_index_snapshot *snapshot,
+	const struct git_hash_algo *algo)
+{
+	struct strbuf encoded = STRBUF_INIT;
+	struct lock_file lock = LOCK_INIT;
+	char *path = sidecar_path(index_path);
+	int sidecar_fd = -1, ret = -1;
+
+	if (!sidecar_matches_snapshot(
+		    index_path, sidecar, snapshot, algo) ||
+	    clean_status_sidecar_write(&encoded, sidecar, algo))
+		goto done;
+	sidecar_fd = hold_lock_file_for_update(&lock, path, 0);
+	if (sidecar_fd < 0 ||
+	    (size_t)write_in_full(sidecar_fd, encoded.buf, encoded.len) !=
+		    encoded.len ||
+	    !sidecar_matches_snapshot(
+		    index_path, sidecar, snapshot, algo) ||
+	    commit_lock_file(&lock))
+		goto done;
+	ret = 0;
+
+done:
+	if (ret)
+		rollback_lock_file(&lock);
+	free(path);
+	strbuf_release(&encoded);
+	return ret;
 }
