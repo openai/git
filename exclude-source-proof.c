@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "exclude-source-proof.h"
+#include "hash-framing.h"
 #include "object-file.h"
 #include "path-namespace.h"
 #include "read-cache-ll.h"
@@ -8,9 +9,9 @@
 #include "trace2.h"
 
 /*
- * Each entry describes one path/policy observation. Filesystem identities
- * are used only to make capture and validation coherent; the durable
- * observation is the source's existence and bytes.
+ * Each entry describes one path/policy observation for replay or a stable
+ * digest. Filesystem identities make capture and validation coherent; the
+ * durable observation is the source's existence and bytes.
  */
 struct exclude_source_proof_entry {
 	char *path;
@@ -413,6 +414,45 @@ int exclude_source_proof_validate(struct exclude_source_proof *proof)
 				   "proof_valid", valid);
 	}
 	return valid;
+}
+
+int exclude_source_proof_digest(
+	struct exclude_source_proof *proof,
+	const struct git_hash_algo *algo,
+	struct object_id *oid)
+{
+	static const char domain[] = "git-exclude-source-proof-digest-v1";
+	const struct git_hash_algo *source_algo;
+	struct git_hash_ctx ctx;
+	unsigned char count[sizeof(uint64_t)];
+	unsigned char format[sizeof(uint32_t)];
+
+	if (!proof || !algo || !oid ||
+	    !exclude_source_proof_validate(proof))
+		return -1;
+	source_algo = proof->istate->repo->hash_algo;
+	git_hash_init(&ctx, algo);
+	hash_length_delimited(&ctx, domain, sizeof(domain) - 1);
+	put_be32(format, source_algo->format_id);
+	hash_length_delimited(&ctx, format, sizeof(format));
+	put_be64(count, proof->nr);
+	hash_length_delimited(&ctx, count, sizeof(count));
+	for (size_t i = 0; i < proof->nr; i++) {
+		const struct exclude_source_proof_entry *entry =
+			&proof->entries[i];
+		unsigned char policy[] = {
+			entry->nofollow,
+			entry->exists,
+		};
+
+		hash_length_delimited(&ctx, entry->path,
+				      strlen(entry->path));
+		hash_length_delimited(&ctx, policy, sizeof(policy));
+		hash_length_delimited(&ctx, entry->oid.hash,
+				      entry->exists ? source_algo->rawsz : 0);
+	}
+	git_hash_final_oid(oid, &ctx);
+	return 0;
 }
 
 void exclude_source_proof_release(struct exclude_source_proof *proof)
