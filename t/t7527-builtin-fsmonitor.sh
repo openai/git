@@ -1883,6 +1883,98 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+prepare_semantic_untracked_repo () {
+	r=$1 &&
+	test_create_repo "$r" &&
+	(
+		cd "$r" &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines "*.ignored" >.gitignore &&
+		test_write_lines "*.ignored" >cached/.gitignore &&
+		printf "aaaa\n" >cached/tracked &&
+		git add .gitignore cached/.gitignore cached/tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		test_write_lines ignored >cached/junk.ignored &&
+		git status --porcelain=v2 >.git/prime.actual &&
+		test_must_be_empty .git/prime.actual &&
+		test_grep UNTR .git/index &&
+		test-tool chmtime =-60 cached/tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get cached/tracked) &&
+		printf "bbbb\n" >cached/tracked &&
+		test-tool chmtime =$mtime cached/tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid cached/tracked &&
+		test_grep FSMN .git/index &&
+		test_grep ! FSCF .git/index
+	)
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'semantic adoption closes the untracked scan' '
+	test_when_finished "rm -rf semantic-untracked" &&
+	prepare_semantic_untracked_repo semantic-untracked &&
+	(
+		cd semantic-untracked &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_line_count = 1 .git/actual &&
+		test_grep "^1 \.M .* cached/tracked$" .git/actual &&
+		test_trace2_data status fsmonitor_token/untracked-deferred 1 \
+			<.git/status.trace &&
+		test_trace2_data status fsmonitor_token/semantic-closed 1 \
+			<.git/status.trace &&
+		test_trace2_data status \
+			fsmonitor_token/untracked-after-semantic 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/apply_count \
+			"[0-9][0-9]*" <.git/status.trace >.git/apply-count &&
+		test_line_count = 2 .git/apply-count &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'failed untracked closure discards semantic adoption' '
+	test_when_finished "rm -rf failed-semantic-untracked" &&
+	prepare_semantic_untracked_repo failed-semantic-untracked &&
+	(
+		cd failed-semantic-untracked &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_DISABLE_UNTRACKED_CACHE=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_line_count = 1 .git/actual &&
+		test_grep "^1 \.M .* cached/tracked$" .git/actual &&
+		test_trace2_data status fsmonitor_token/semantic-closed 1 \
+			<.git/status.trace &&
+		test_trace2_data status \
+			fsmonitor_token/untracked-after-semantic 0 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace >.git/strong-invalidations &&
+		test_line_count = 2 .git/strong-invalidations &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep ! FSCF .git/index
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'tracked attribute events reopen semantic history' '
 	test_when_finished "rm -rf tracked-attr-change" &&
