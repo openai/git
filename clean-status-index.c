@@ -73,7 +73,14 @@ fail:
 	return -1;
 }
 
-static int clean_status_index_snapshot_still_matches_path(
+int clean_status_index_snapshot_open(
+	struct clean_status_index_snapshot *snapshot, const char *path,
+	const struct git_hash_algo *algo)
+{
+	return snapshot_open(snapshot, path, algo, 0);
+}
+
+int clean_status_index_snapshot_still_matches_path(
 	const struct clean_status_index_snapshot *snapshot, const char *path,
 	const struct git_hash_algo *algo)
 {
