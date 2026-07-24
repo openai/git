@@ -411,6 +411,7 @@ static int compute_untracked_cache_valid_recursive(
 		else
 			invalidate_directory(uc, ucd);
 	}
+	ucd->valid_recursive = valid;
 	return valid;
 }
 
@@ -474,6 +475,7 @@ int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
 		ucd->stat_checked = 0;
 		ucd->stat_matches = 0;
 		ucd->exclude_matches = 0;
+		ucd->valid_recursive = 0;
 		/* Invalidation performed after the snapshot always wins. */
 		if (!task->was_valid || !ucd->valid)
 			continue;
@@ -1567,6 +1569,8 @@ static void do_invalidate_gitignore(struct untracked_cache_dir *dir)
 {
 	int i;
 	dir->valid = 0;
+	dir->valid_recursive = 0;
+	dir->has_untracked = 0;
 	for (size_t i = 0; i < dir->untracked_nr; i++)
 		free(dir->untracked[i]);
 	dir->untracked_nr = 0;
@@ -1596,6 +1600,7 @@ static void invalidate_directory(struct untracked_cache *uc,
 		uc->dir_invalidated++;
 
 	dir->valid = 0;
+	dir->valid_recursive = 0;
 	for (size_t i = 0; i < dir->untracked_nr; i++)
 		free(dir->untracked[i]);
 	dir->untracked_nr = 0;
@@ -2987,6 +2992,7 @@ static void add_untracked(struct untracked_cache_dir *dir, const char *name)
 	ALLOC_GROW(dir->untracked, dir->untracked_nr + 1,
 		   dir->untracked_alloc);
 	dir->untracked[dir->untracked_nr++] = xstrdup(name);
+	dir->has_untracked = 1;
 }
 
 static int valid_cached_dir(struct dir_struct *dir,
@@ -3131,6 +3137,8 @@ static void remove_collapsed_untracked_child(
 
 static void close_cached_dir(struct cached_dir *cdir)
 {
+	int i;
+
 	if (cdir->fdir)
 		closedir(cdir->fdir);
 	/*
@@ -3140,6 +3148,12 @@ static void close_cached_dir(struct cached_dir *cdir)
 	if (cdir->untracked) {
 		cdir->untracked->valid = 1;
 		cdir->untracked->recurse = 1;
+		cdir->untracked->has_untracked = !!cdir->untracked->untracked_nr;
+		for (i = 0; !cdir->untracked->has_untracked &&
+			     i < cdir->untracked->dirs_nr; i++)
+			cdir->untracked->has_untracked =
+				cdir->untracked->dirs[i]->recurse &&
+				cdir->untracked->dirs[i]->has_untracked;
 	}
 }
 
@@ -3211,6 +3225,14 @@ static enum path_treatment read_directory_recursive(struct dir_struct *dir,
 	struct strbuf path = STRBUF_INIT;
 
 	strbuf_add(&path, base, baselen);
+	if (untracked && dir->internal.untracked_cache_preloaded &&
+	    untracked->valid && untracked->valid_recursive &&
+	    untracked->check_only == !!check_only &&
+	    !untracked->has_untracked &&
+	    (dir->flags & DIR_SHOW_OTHER_DIRECTORIES)) {
+		untracked->recurse = 1;
+		goto out;
+	}
 
 	if (open_cached_dir(&cdir, dir, untracked, istate, &path, check_only))
 		goto out;
@@ -4344,7 +4366,11 @@ static int read_one_dir(struct untracked_cache_dir **untracked_,
 	for (i = 0; i < untracked->dirs_nr; i++) {
 		if (read_one_dir(untracked->dirs + i, rd) < 0)
 			return -1;
+		if (untracked->dirs[i]->has_untracked)
+			untracked->has_untracked = 1;
 	}
+	if (untracked->untracked_nr)
+		untracked->has_untracked = 1;
 	return 0;
 }
 
@@ -4486,6 +4512,7 @@ static void invalidate_one_directory(struct untracked_cache *uc,
 {
 	uc->dir_invalidated++;
 	ucd->valid = 0;
+	ucd->valid_recursive = 0;
 	for (size_t i = 0; i < ucd->untracked_nr; i++)
 		free(ucd->untracked[i]);
 	ucd->untracked_nr = 0;
