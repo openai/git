@@ -45,6 +45,9 @@ struct thread_data {
 	struct index_state *index;
 	struct pathspec pathspec;
 	struct progress_data *progress;
+#ifdef HAVE_PRELOAD_INDEX_BULK
+	const unsigned char *bulk_state;
+#endif
 	int offset, nr;
 	int t2_nr_lstat;
 };
@@ -65,6 +68,9 @@ static void *preload_thread(void *_data)
 	struct index_state *index = p->index;
 	struct cache_entry **cep = index->cache + p->offset;
 	struct cache_def cache = CACHE_DEF_INIT;
+#ifdef HAVE_PRELOAD_INDEX_BULK
+	const unsigned char *bulk_state = p->bulk_state;
+#endif
 
 	nr = p->nr;
 	if (nr + p->offset > index->cache_nr)
@@ -74,9 +80,18 @@ static void *preload_thread(void *_data)
 	do {
 		struct cache_entry *ce = *cep++;
 		struct stat st;
+#ifdef HAVE_PRELOAD_INDEX_BULK
+		unsigned char state = bulk_state ?
+			*bulk_state++ : PRELOAD_BULK_TRACKED_UNSEEN;
+#endif
 
 		if (!preload_entry_needs_stat(ce))
 			continue;
+#ifdef HAVE_PRELOAD_INDEX_BULK
+		if (state == PRELOAD_BULK_TRACKED_CONTENT_CHECK ||
+		    state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED)
+			continue;
+#endif
 		if (p->progress && !(nr & 31)) {
 			struct progress_data *pd = p->progress;
 
@@ -143,9 +158,10 @@ static size_t preload_bulk_useful_candidates(struct index_state *index)
 	return useful;
 }
 
-static size_t preload_bulk_publish_clean(
+static size_t preload_bulk_apply_result(
 	struct index_state *index,
-	const struct preload_bulk_result *result)
+	struct preload_bulk_result *result,
+	int *has_deferred)
 {
 	size_t applied = 0;
 
@@ -153,12 +169,27 @@ static size_t preload_bulk_publish_clean(
 		BUG("bulk preload result does not match the index");
 
 	for (size_t i = 0; i < result->nr; i++) {
-		struct cache_entry *ce;
+		struct cache_entry *ce = index->cache[i];
 		unsigned char state = result->tracked_state[i];
 
+		/*
+		 * A complete scan which did not observe a useful entry proves
+		 * that the entry is absent. Avoid repeating the same lookup in
+		 * speculative preload. A status consumer may use this result
+		 * directly; other callers retain the authoritative refresh.
+		 */
+		if (result->can_skip_unseen_preload &&
+		    state == PRELOAD_BULK_TRACKED_UNSEEN &&
+		    preload_bulk_entry_is_useful(ce)) {
+			state = PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED;
+			result->tracked_state[i] = state;
+		}
+		if ((state == PRELOAD_BULK_TRACKED_CONTENT_CHECK ||
+		     state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED) &&
+		    preload_entry_needs_stat(ce))
+			*has_deferred = 1;
 		if (state != PRELOAD_BULK_TRACKED_CLEAN)
 			continue;
-		ce = index->cache[i];
 		if (!preload_bulk_entry_is_useful(ce))
 			continue;
 		ce_mark_uptodate(ce);
@@ -192,6 +223,23 @@ static void preload_bulk_trace_result(
 	const struct preload_bulk_result *result,
 	size_t applied)
 {
+	uint64_t content_check = 0, definitive_deleted = 0, fallback = 0;
+
+	for (size_t i = 0; i < result->nr; i++) {
+		switch (result->tracked_state[i]) {
+		case PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED:
+			definitive_deleted++;
+			break;
+		case PRELOAD_BULK_TRACKED_CONTENT_CHECK:
+			content_check++;
+			break;
+		case PRELOAD_BULK_TRACKED_FALLBACK:
+			fallback++;
+			break;
+		default:
+			break;
+		}
+	}
 	trace2_data_string("index", index->repo, "preload/bulk_result",
 			   result->outcome);
 	if (result->reason)
@@ -207,13 +255,22 @@ static void preload_bulk_trace_result(
 			   result->run.bulk_calls);
 	trace2_data_intmax("index", index->repo, "preload/bulk_workers",
 			   result->run.threads);
+	trace2_data_intmax("index", index->repo,
+			   "preload/bulk_definitive_deleted",
+			   definitive_deleted);
+	trace2_data_intmax("index", index->repo,
+			   "preload/bulk_content_check", content_check);
+	trace2_data_intmax("index", index->repo,
+			   "preload/bulk_fallback", fallback);
 }
 
-static void preload_bulk_try(struct index_state *index)
+static unsigned char *preload_bulk_try(struct index_state *index)
 {
 	struct preload_bulk_result result = { 0 };
+	unsigned char *tracked_state = NULL;
 	size_t useful;
 	size_t applied = 0;
+	int has_deferred = 0;
 	int enabled = 0;
 	int control, threads;
 
@@ -230,21 +287,28 @@ static void preload_bulk_try(struct index_state *index)
 	if (!enabled ||
 	    fsm_settings__get_mode(index->repo) != FSMONITOR_MODE_DISABLED ||
 	    !preload_bulk_available())
-		return;
+		return NULL;
 	useful = preload_bulk_useful_candidates(index);
 	trace2_data_intmax("index", index->repo, "preload/bulk_useful",
 			   useful);
 	trace2_data_intmax("index", index->repo, "preload/bulk_cache_nr",
 			   index->cache_nr);
 	if (!useful)
-		return;
+		return NULL;
 	threads = preload_bulk_threads(useful);
 	trace2_region_enter("index", "preload/bulk", index->repo);
-	if (!preload_bulk_collect(index, threads, &result))
-		applied = preload_bulk_publish_clean(index, &result);
+	if (!preload_bulk_collect(index, threads, &result)) {
+		applied = preload_bulk_apply_result(index, &result,
+						    &has_deferred);
+	}
 	preload_bulk_trace_result(index, &result, applied);
+	if (has_deferred) {
+		tracked_state = result.tracked_state;
+		result.tracked_state = NULL;
+	}
 	trace2_region_leave("index", "preload/bulk", index->repo);
 	preload_bulk_result_release(&result);
+	return tracked_state;
 }
 #endif
 
@@ -255,6 +319,9 @@ void preload_index(struct index_state *index,
 	int threads, i, work, offset;
 	struct thread_data data[MAX_PARALLEL];
 	struct progress_data pd;
+#ifdef HAVE_PRELOAD_INDEX_BULK
+	unsigned char *bulk_state = NULL;
+#endif
 	int t2_sum_lstat = 0;
 	int core_preload_index = 1;
 
@@ -265,16 +332,24 @@ void preload_index(struct index_state *index,
 
 #ifdef HAVE_PRELOAD_INDEX_BULK
 	if (!pathspec || !pathspec->nr)
-		preload_bulk_try(index);
+		bulk_state = preload_bulk_try(index);
 #endif
-	if (!HAVE_THREADS)
+	if (!HAVE_THREADS) {
+#ifdef HAVE_PRELOAD_INDEX_BULK
+		free(bulk_state);
+#endif
 		return;
+	}
 
 	threads = index->cache_nr / THREAD_COST;
 	if ((index->cache_nr > 1) && (threads < 2) && git_env_bool("GIT_TEST_PRELOAD_INDEX", 0))
 		threads = 2;
-	if (threads < 2)
+	if (threads < 2) {
+#ifdef HAVE_PRELOAD_INDEX_BULK
+		free(bulk_state);
+#endif
 		return;
+	}
 
 	trace2_region_enter("index", "preload", NULL);
 
@@ -298,6 +373,9 @@ void preload_index(struct index_state *index,
 		int err;
 
 		p->index = index;
+#ifdef HAVE_PRELOAD_INDEX_BULK
+		p->bulk_state = bulk_state ? bulk_state + offset : NULL;
+#endif
 		if (pathspec)
 			copy_pathspec(&p->pathspec, pathspec);
 		p->offset = offset;
@@ -317,6 +395,9 @@ void preload_index(struct index_state *index,
 		t2_sum_lstat += p->t2_nr_lstat;
 	}
 	stop_progress(&pd.progress);
+#ifdef HAVE_PRELOAD_INDEX_BULK
+	free(bulk_state);
+#endif
 
 	if (pathspec) {
 		/* earlier we made deep copies for each thread to work with */
