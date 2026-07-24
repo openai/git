@@ -12,7 +12,9 @@
 
 struct exclude_source_capture;
 struct exclude_source_proof;
+struct git_hash_algo;
 struct index_state;
+struct object_id;
 struct stat;
 
 typedef int (*exclude_source_open_parent_fn)(void *data, const char *path);
@@ -33,6 +35,14 @@ void exclude_source_capture_record(
 void exclude_source_capture_error(struct exclude_source_capture *capture);
 void exclude_source_capture_release(struct exclude_source_capture *capture);
 int exclude_source_proof_validate(struct exclude_source_proof *proof);
+/*
+ * Hash unique observations in first-observation order. The caller must
+ * capture them in a deterministic order when comparing across processes.
+ */
+int exclude_source_proof_digest(
+	struct exclude_source_proof *proof,
+	const struct git_hash_algo *algo,
+	struct object_id *oid);
 void exclude_source_proof_release(struct exclude_source_proof *proof);
 
 #endif /* EXCLUDE_SOURCE_PROOF_H */
