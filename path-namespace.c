@@ -45,3 +45,45 @@ int path_namespace_stat_equal(const struct stat *a, const struct stat *b)
 	path_stat_identity_init(&second, b);
 	return path_stat_identity_equal(&first, &second);
 }
+
+int path_namespace_reopen_component(
+	int parent_fd, const char *component, int flags,
+	path_namespace_open_fn open_fn, const struct stat *expected)
+{
+	struct stat reopened;
+	int fd, saved_errno;
+
+	if (!open_fn || !component || !*component ||
+	    !strcmp(component, ".") || !strcmp(component, "..")) {
+		errno = EINVAL;
+		return -1;
+	}
+	for (const char *p = component; *p; p++) {
+		if (is_dir_sep(*p)) {
+			errno = EINVAL;
+			return -1;
+		}
+	}
+	if (!fstat_is_reliable()) {
+		errno = EAGAIN;
+		return -1;
+	}
+
+	fd = open_fn(parent_fd, component, flags);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &reopened)) {
+		saved_errno = errno;
+		goto error;
+	}
+	if (!path_namespace_stat_equal(expected, &reopened)) {
+		saved_errno = EAGAIN;
+		goto error;
+	}
+	return close(fd);
+
+error:
+	close(fd);
+	errno = saved_errno;
+	return -1;
+}
