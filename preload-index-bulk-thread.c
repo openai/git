@@ -77,6 +77,8 @@ void preload_bulk_schedule_directory(
 			task->reserved_fd = 0;
 			release_open_fd(&scan->queue);
 			if (saved_errno == EXDEV) {
+				preload_bulk_record_tracked_descendants_fallback(
+					worker, path, path_len);
 				free(task);
 				return;
 			}
