@@ -10,6 +10,8 @@ int index_dir_find(struct index_state *istate, const char *name, int namelen,
 
 #define index_dir_exists(i, n, l) index_dir_find((i), (n), (l), NULL)
 
+/* Prepare the name and directory hashes for concurrent case-folded lookups. */
+int prepare_index_casefolding(struct index_state *istate);
 void adjust_dirname_case(struct index_state *istate, char *name);
 struct cache_entry *index_file_exists(struct index_state *istate, const char *name, int namelen, int igncase);
 
