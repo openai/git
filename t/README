@@ -422,6 +422,18 @@ overridden by the --no-path-walk command-line argument.
 GIT_TEST_PRELOAD_INDEX=<boolean> exercises the preload-index code path
 by overriding the minimum number of cache entries required per thread.
 
+GIT_TEST_PRELOAD_INDEX_BULK=<boolean> overrides the
+`core.preloadIndexBulk` setting.
+
+GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_PATH=<path>,
+GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_READY=<path>, and
+GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_RESUME=<path>, when
+GIT_TEST_PRELOAD_INDEX_BULK is enabled, pause a bulk preload before
+scanning the named directory. An empty directory path pauses after the
+complete walk. Git writes `ready` to the ready path, then waits until it
+can read from the resume path. Tests which set one barrier variable must
+set all three.
+
 GIT_TEST_INDEX_THREADS=<n> enables exercising the multi-threaded loading
 of the index for the whole test suite by bypassing the default number of
 cache entries and thread minimums. Setting this to 1 will make the
