@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "attr-manifest.h"
+#include "clean-status-index.h"
 #include "clean-status-manifest.h"
 #include "dir.h"
 #include "fsmonitor-clean-proof.h"
@@ -7,6 +8,7 @@
 #include "hash-framing.h"
 #include "read-cache-ll.h"
 #include "repository.h"
+#include "sparse-index.h"
 #include "trace2.h"
 #include "worktree-attr-manifest.h"
 
@@ -20,10 +22,33 @@ static int build_manifest(struct index_state *istate,
 			  unsigned char *manifest_hash,
 			  struct worktree_attr_manifest_stats *stats)
 {
-	if (istate->sparse_index != INDEX_EXPANDED)
+	struct clean_status_index_snapshot snapshot;
+	struct index_state scratch = INDEX_STATE_INIT(istate->repo);
+	int ret = -1;
+
+	if (istate->sparse_index == INDEX_EXPANDED)
+		return worktree_attr_manifest_build(
+			istate, manifest, manifest_hash, stats);
+	if (clean_status_index_snapshot_pin(&snapshot, istate))
 		return -1;
-	return worktree_attr_manifest_build(
-		istate, manifest, manifest_hash, stats);
+	scratch.fsmonitor_has_run_once = 1;
+	if (read_index_from(&scratch, istate->repo->index_file,
+			    istate->repo->gitdir) < 0 ||
+	    !clean_status_index_snapshot_still_matches(&snapshot, &scratch))
+		goto done;
+	ensure_full_index(&scratch);
+	ret = worktree_attr_manifest_build(
+		&scratch, manifest, manifest_hash, stats);
+	if (ret ||
+	    !clean_status_index_snapshot_still_matches(&snapshot, istate)) {
+		strbuf_reset(manifest);
+		ret = -1;
+	}
+
+done:
+	release_index(&scratch);
+	clean_status_index_snapshot_release(&snapshot);
+	return ret;
 }
 
 void clean_status_manifest_init(struct clean_status_manifest_state *state)
