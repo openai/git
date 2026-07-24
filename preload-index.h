@@ -20,5 +20,6 @@ void preload_index(struct index_state *index,
 int repo_read_index_preload(struct repository *,
 			    const struct pathspec *pathspec,
 			    unsigned refresh_flags);
+void preload_index_bulk_result_clear(struct index_state *index);
 
 #endif /* PRELOAD_INDEX_H */
