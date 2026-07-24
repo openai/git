@@ -82,6 +82,122 @@ static struct strbuf sidecar_path(struct store_fixture *fixture)
 	return path;
 }
 
+#ifdef O_NONBLOCK
+static void write_fixture_sidecar(struct store_fixture *fixture,
+				  const struct git_hash_algo *algo)
+{
+	struct strbuf encoded = STRBUF_INIT;
+	struct strbuf path = sidecar_path(fixture);
+
+	cl_assert_equal_i(clean_status_sidecar_write(
+		&encoded, &fixture->sidecar, algo), 0);
+	write_file_buf(path.buf, encoded.buf, encoded.len);
+	strbuf_release(&path);
+	strbuf_release(&encoded);
+}
+
+static void assert_loads_sidecar(const struct git_hash_algo *algo)
+{
+	struct clean_status_sidecar_record record =
+		CLEAN_STATUS_SIDECAR_RECORD_INIT;
+	struct store_fixture fixture;
+
+	fixture_init(&fixture, algo);
+	write_fixture_sidecar(&fixture, algo);
+	cl_assert_equal_i(clean_status_sidecar_load(
+		fixture.index_path.buf, algo, &record), 0);
+	cl_assert(clean_status_identity_equal(
+		&record.sidecar.identity, &fixture.sidecar.identity));
+	cl_assert_equal_i(record.sidecar.proof.index_version,
+			  fixture.sidecar.proof.index_version);
+	cl_assert_equal_i(record.sidecar.proof.cache_nr,
+			  fixture.sidecar.proof.cache_nr);
+	cl_assert(oideq(&record.sidecar.proof.index_checksum,
+			&fixture.sidecar.proof.index_checksum));
+	cl_assert(oideq(&record.sidecar.proof.head_tree,
+			&fixture.sidecar.proof.head_tree));
+	cl_assert(!memcmp(record.sidecar.proof.config_hash,
+			  fixture.sidecar.proof.config_hash, algo->rawsz));
+	cl_assert(!memcmp(record.sidecar.proof.repo_hash,
+			  fixture.sidecar.proof.repo_hash, algo->rawsz));
+	cl_assert(oideq(&record.sidecar.proof.exclude_source_digest,
+			&fixture.sidecar.proof.exclude_source_digest));
+	cl_assert_equal_i(record.sidecar.token_len, fixture.sidecar.token_len);
+	cl_assert(!memcmp(record.sidecar.token, fixture.sidecar.token,
+			  record.sidecar.token_len));
+	cl_assert(record.sidecar.token >=
+		  (const unsigned char *)record.storage.buf);
+	cl_assert(record.sidecar.token + record.sidecar.token_len <=
+		  (const unsigned char *)record.storage.buf +
+			  record.storage.len);
+
+	clean_status_sidecar_record_release(&record);
+	fixture_release(&fixture);
+}
+#endif
+
+void test_clean_status_store__loads_owned_sidecars_in_both_object_formats(void)
+{
+#ifdef O_NONBLOCK
+	assert_loads_sidecar(&hash_algos[GIT_HASH_SHA1]);
+	assert_loads_sidecar(&hash_algos[GIT_HASH_SHA256]);
+#else
+	cl_skip();
+#endif
+}
+
+void test_clean_status_store__rejects_nonregular_sidecars(void)
+{
+#if defined(O_NONBLOCK) && !defined(GIT_WINDOWS_NATIVE)
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct clean_status_sidecar_record record =
+		CLEAN_STATUS_SIDECAR_RECORD_INIT;
+	struct store_fixture fixture;
+	struct strbuf path, target = STRBUF_INIT;
+
+	fixture_init(&fixture, algo);
+	path = sidecar_path(&fixture);
+	strbuf_addf(&target, "%s/target", fixture.directory);
+	write_file(target.buf, "target");
+	cl_assert_equal_i(symlink(target.buf, path.buf), 0);
+	cl_assert_equal_i(clean_status_sidecar_load(
+		fixture.index_path.buf, algo, &record), -1);
+	cl_assert_equal_i(unlink(path.buf), 0);
+	cl_assert_equal_i(mkfifo(path.buf, 0600), 0);
+	cl_assert_equal_i(clean_status_sidecar_load(
+		fixture.index_path.buf, algo, &record), -1);
+
+	clean_status_sidecar_record_release(&record);
+	strbuf_release(&target);
+	strbuf_release(&path);
+	fixture_release(&fixture);
+#else
+	cl_skip();
+#endif
+}
+
+void test_clean_status_store__rejects_oversized_sidecars(void)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct clean_status_sidecar_record record =
+		CLEAN_STATUS_SIDECAR_RECORD_INIT;
+	struct store_fixture fixture;
+	struct strbuf oversized = STRBUF_INIT;
+	struct strbuf path;
+
+	fixture_init(&fixture, algo);
+	path = sidecar_path(&fixture);
+	strbuf_addchars(&oversized, 'x', 8193);
+	write_file_buf(path.buf, oversized.buf, oversized.len);
+	cl_assert_equal_i(clean_status_sidecar_load(
+		fixture.index_path.buf, algo, &record), -1);
+
+	clean_status_sidecar_record_release(&record);
+	strbuf_release(&oversized);
+	strbuf_release(&path);
+	fixture_release(&fixture);
+}
+
 static void require_local_apfs(const char *path MAYBE_UNUSED)
 {
 #ifdef __APPLE__
