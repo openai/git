@@ -3,6 +3,7 @@
 test_description='built-in file system watcher'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-semantic-verify.sh
 
 if ! test_have_prereq FSMONITOR_DAEMON
 then
