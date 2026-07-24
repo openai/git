@@ -2,6 +2,7 @@ clar_test_suites = [
   'unit-tests/u-attr-fingerprint.c',
   'unit-tests/u-attr-manifest.c',
   'unit-tests/u-clean-status-config.c',
+  'unit-tests/u-clean-status-identity.c',
   'unit-tests/u-clean-status-manifest.c',
   'unit-tests/u-ctype.c',
   'unit-tests/u-dir.c',
