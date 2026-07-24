@@ -27,6 +27,14 @@
 
 static const char *system_prefix(void);
 
+/*
+ * Absolute path to the current executable, when it can be determined. Keep
+ * this separately from executable_dirname because some callers need to
+ * re-execute this exact Git rather than resolve "git" through PATH.
+ */
+static const char *executable_path;
+static int executable_is_dispatcher;
+
 #ifdef RUNTIME_PREFIX
 
 /**
@@ -257,7 +265,8 @@ void git_resolve_executable_dir(const char *argv0)
 		return;
 	}
 
-	resolved = strbuf_detach(&buf, NULL);
+	executable_path = strbuf_detach(&buf, NULL);
+	resolved = xstrdup(executable_path);
 	slash = find_last_dir_sep(resolved);
 	if (slash)
 		resolved[slash - resolved] = '\0';
@@ -278,14 +287,41 @@ static const char *system_prefix(void)
 }
 
 /*
- * This is called during initialization, but No work needs to be done here when
- * runtime prefix is not being used.
+ * A non-runtime-prefix build does not need the executable directory for path
+ * discovery, but an explicit argv[0] is still useful for exact re-execution.
  */
-void git_resolve_executable_dir(const char *argv0 UNUSED)
+void git_resolve_executable_dir(const char *argv0)
 {
+	struct strbuf buf = STRBUF_INIT;
+
+	/* A bare argv[0] would require a PATH lookup and is not authoritative. */
+	if (!argv0 || !*argv0 || !find_last_dir_sep(argv0))
+		return;
+	strbuf_add_absolute_path(&buf, argv0);
+	if (strbuf_normalize_path(&buf)) {
+		trace_printf("trace: could not normalize executable path: %s\n",
+			     buf.buf);
+		strbuf_release(&buf);
+		return;
+	}
+	executable_path = strbuf_detach(&buf, NULL);
+	trace2_cmd_path(executable_path);
 }
 
 #endif /* RUNTIME_PREFIX */
+
+const char *git_executable_path(void)
+{
+	/* Helpers have an exact path too, but cannot dispatch Git builtins. */
+	if (!executable_path || !executable_is_dispatcher)
+		return NULL;
+	return executable_path;
+}
+
+void git_mark_executable_as_dispatcher(void)
+{
+	executable_is_dispatcher = 1;
+}
 
 char *system_path(const char *path)
 {

@@ -2,8 +2,11 @@
 
 #include "git-compat-util.h"
 #include "abspath.h"
+#include "config.h"
 #include "environment.h"
+#include "exec-cmd.h"
 #include "gettext.h"
+#include "parse.h"
 #include "simple-ipc.h"
 #include "fsmonitor-ipc.h"
 #include "repository.h"
@@ -68,10 +71,44 @@ enum ipc_active_state fsmonitor_ipc__get_state(void)
 	return ipc_get_active_state(fsmonitor_ipc__get_path(the_repository));
 }
 
+#define FSMONITOR_START_TIMEOUT_KEY "fsmonitor.starttimeout"
+#define FSMONITOR_START_TIMEOUT_DEFAULT 60
+
+static unsigned int get_start_timeout(void)
+{
+	const char *value;
+	int timeout;
+
+	if (!repo_config_get_value(the_repository,
+				   FSMONITOR_START_TIMEOUT_KEY, &value) &&
+	    value && git_parse_int(value, &timeout) && timeout >= 0)
+		return timeout;
+	return FSMONITOR_START_TIMEOUT_DEFAULT;
+}
+
+static int spawn_wait_cb(const struct child_process *cmd UNUSED,
+			 void *cb_data UNUSED)
+{
+	switch (fsmonitor_ipc__get_state()) {
+	case IPC_STATE__LISTENING:
+		return 0;
+	case IPC_STATE__NOT_LISTENING:
+	case IPC_STATE__PATH_NOT_FOUND:
+		return 1;
+	default:
+	case IPC_STATE__INVALID_PATH:
+	case IPC_STATE__OTHER_ERROR:
+		return -1;
+	}
+}
+
 static int spawn_daemon(void)
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	struct strbuf canonical_worktree = STRBUF_INIT;
+	enum start_bg_result result;
+	unsigned int timeout = get_start_timeout();
+	const char *git = git_executable_path();
 	const char *worktree = repo_get_work_tree(the_repository);
 	int ret = -1;
 
@@ -83,15 +120,21 @@ static int spawn_daemon(void)
 
 	prepare_spawn_env(&cmd.env);
 	cmd.dir = canonical_worktree.buf;
-	cmd.git_cmd = 1;
+	if (git)
+		strvec_push(&cmd.args, git);
+	else
+		cmd.git_cmd = 1;
 	cmd.no_stdin = 1;
 	cmd.no_stdout = 1;
 	cmd.no_stderr = 1;
 	cmd.close_fd_above_stderr = 1;
 	cmd.trace2_child_class = "fsmonitor";
-	strvec_pushl(&cmd.args, "fsmonitor--daemon", "start", NULL);
+	strvec_pushl(&cmd.args, "fsmonitor--daemon", "run", "--detach", NULL);
 
-	ret = run_command(&cmd);
+	result = start_bg_command(&cmd, spawn_wait_cb, NULL, timeout);
+	if (result == SBGR_READY ||
+	    fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
+		ret = 0;
 done:
 	strbuf_release(&canonical_worktree);
 	return ret;
