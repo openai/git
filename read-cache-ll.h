@@ -142,6 +142,7 @@ static inline unsigned create_ce_flags(unsigned stage)
 #define FSMONITOR_CHANGED	(1 << 8)
 
 struct split_index;
+struct clean_status_state;
 struct untracked_cache;
 struct progress;
 struct pattern_list;
@@ -202,6 +203,7 @@ struct index_state {
 	struct progress *progress;
 	struct repository *repo;
 	struct pattern_list *sparse_checkout_patterns;
+	struct clean_status_state *clean_status;
 };
 
 /**
