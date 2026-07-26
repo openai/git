@@ -1017,6 +1017,35 @@ test_expect_success 'directory snapshots ignore weak file-stat configuration' '
 	)
 '
 
+test_expect_success 'automatic preload observes its directory threshold' '
+	test_create_repo auto-preload-threshold &&
+	(
+		cd auto-preload-threshold &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		sane_unset GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD &&
+		for i in $(test_seq 1 1998)
+		do
+			mkdir "d$i" &&
+			>"d$i/file" || return 1
+		done &&
+		git status --porcelain >/dev/null &&
+		GIT_TRACE2_EVENT="$PWD/.git/below-threshold.trace" \
+			git status --porcelain >/dev/null &&
+		test_grep ! "preload_untracked_cache/automatic" \
+			.git/below-threshold.trace &&
+
+		mkdir d1999 &&
+		>d1999/file &&
+		git status --porcelain >/dev/null &&
+		GIT_TRACE2_EVENT="$PWD/.git/at-threshold.trace" \
+			git status --porcelain >/dev/null &&
+		test_grep \
+			"preload_untracked_cache/automatic.*value.*1" \
+			.git/at-threshold.trace
+	)
+'
 test_expect_success 'status preloads cached-directory validation' '
 	test_create_repo auto-preload &&
 	(
@@ -1062,7 +1091,23 @@ test_expect_success 'status preloads cached-directory validation' '
 		test_grep "preload_untracked_cache/valid.*value.*0" \
 			.git/changed.trace &&
 		test_grep "opendir.*value.*[1-9][0-9]*" \
-			.git/changed.trace
+			.git/changed.trace &&
+
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain -- nested >.git/expect-pathspec &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/pathspec.trace" \
+			git status --porcelain -- nested >.git/actual-pathspec &&
+		test_cmp .git/expect-pathspec .git/actual-pathspec &&
+		test_grep ! 'preload_untracked_cache/threads' \
+			.git/pathspec.trace &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain -uall >.git/expect-uall &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/uall.trace" \
+			git status --porcelain -uall >.git/actual-uall &&
+		test_cmp .git/expect-uall .git/actual-uall &&
+		test_grep ! 'preload_untracked_cache/threads' .git/uall.trace
 	)
 '
 
