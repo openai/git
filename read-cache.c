@@ -16,6 +16,7 @@
 #include "tempfile.h"
 #include "lockfile.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "refs.h"
 #include "dir.h"
 #include "object-file.h"
@@ -2241,6 +2242,7 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	int nr_threads, cpus;
 	struct index_entry_offset_table *ieot = NULL;
 
+	clean_status_attach_config(istate);
 	if (istate->initialized)
 		return istate->cache_nr;
 
@@ -2473,6 +2475,7 @@ void release_index(struct index_state *istate)
 	free(istate->fsmonitor_last_update);
 	free(istate->fsmonitor_last_update_pending);
 	free(istate->fsmonitor_untracked_token);
+	clean_status_release(istate);
 	free(istate->cache);
 	discard_split_index(istate);
 	free_untracked_cache(istate->untracked);
