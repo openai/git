@@ -13,6 +13,7 @@
 #include "config.h"
 #include "lockfile.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "color.h"
 #include "dir.h"
 #include "editor.h"
@@ -205,11 +206,34 @@ static void determine_whence(struct wt_status *s)
 		s->whence = whence;
 }
 
-static void status_init_config(struct wt_status *s, config_fn_t fn)
+struct status_config_callback_data {
+	struct wt_status *status;
+	config_fn_t fn;
+	struct clean_status_config_digest *clean_digest;
+};
+
+static int status_config_callback(const char *key, const char *value,
+				  const struct config_context *ctx, void *cb)
 {
+	struct status_config_callback_data *data = cb;
+
+	clean_status_config_add(data->clean_digest, key, value, ctx);
+	return data->fn(key, value, ctx, data->status);
+}
+
+static void status_init_config_with_clean_digest(
+	struct wt_status *s, config_fn_t fn,
+	struct clean_status_config_digest *clean_digest)
+{
+	struct status_config_callback_data data = {
+		.status = s,
+		.fn = fn,
+		.clean_digest = clean_digest,
+	};
+
 	wt_status_prepare(the_repository, s);
 	init_diff_ui_defaults();
-	repo_config(the_repository, fn, s);
+	repo_config(the_repository, status_config_callback, &data);
 	determine_whence(s);
 	s->hints = advice_enabled(ADVICE_STATUS_HINTS); /* must come after repo_config() */
 }
@@ -1542,6 +1566,7 @@ struct repository *repo UNUSED)
 	static int no_renames = -1;
 	static const char *rename_score_arg = (const char *)-1;
 	static struct wt_status s;
+	struct clean_status_config_digest clean_digest;
 	unsigned int progress_flag = 0;
 	int fd;
 	struct object_id oid;
@@ -1605,7 +1630,11 @@ struct repository *repo UNUSED)
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
 
-	status_init_config(&s, git_status_config);
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	status_init_config_with_clean_digest(
+		&s, git_status_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
+	clean_status_set_config_digest(the_repository, &clean_digest);
 	argc = parse_options(argc, argv, prefix,
 			     builtin_status_options,
 			     builtin_status_usage, 0);
@@ -1703,6 +1732,7 @@ int cmd_commit(int argc,
 	       struct repository *repo UNUSED)
 {
 	static struct wt_status s;
+	struct clean_status_config_digest clean_digest;
 	static const char *cleanup_arg = NULL;
 	static struct option builtin_commit_options[] = {
 		OPT__QUIET(&quiet, N_("suppress summary after successful commit")),
@@ -1807,7 +1837,11 @@ int cmd_commit(int argc,
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
 
-	status_init_config(&s, git_commit_config);
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	status_init_config_with_clean_digest(
+		&s, git_commit_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
+	clean_status_set_config_digest(the_repository, &clean_digest);
 	s.commit_template = 1;
 	status_format = STATUS_FORMAT_NONE; /* Ignore status.short */
 	s.colopts = 0;
