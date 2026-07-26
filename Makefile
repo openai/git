@@ -1125,6 +1125,7 @@ LIB_OBJS += cbtree.o
 LIB_OBJS += chdir-notify.o
 LIB_OBJS += checkout.o
 LIB_OBJS += chunk-format.o
+LIB_OBJS += clean-status.o
 LIB_OBJS += clean-status-config.o
 LIB_OBJS += clean-status-manifest.o
 LIB_OBJS += color.o

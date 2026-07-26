@@ -2,8 +2,11 @@
 #include "abspath.h"
 #include "attr-fingerprint.h"
 #include "attr.h"
+#include "environment.h"
 #include "hash-framing.h"
+#include "path.h"
 #include "path-namespace.h"
+#include "repository.h"
 #include "strbuf.h"
 #include "wrapper.h"
 
@@ -129,4 +132,36 @@ int attr_fingerprint_sources(
 	const struct git_hash_algo *algo, struct attr_fingerprint *result)
 {
 	return fingerprint_sources(sources, nr, algo, result);
+}
+
+static int repository_sources(struct repository *repo,
+			      struct attr_fingerprint_source *sources,
+			      char **info_attributes)
+{
+	if (getenv(GIT_ATTR_SOURCE_ENVIRONMENT))
+		return -1;
+	sources[0].path = git_attr_system_file();
+	sources[0].enabled = git_attr_system_is_enabled();
+	sources[1].path = git_attr_global_file();
+	sources[1].enabled = 1;
+	*info_attributes = repo_git_path(repo, INFOATTRIBUTES_FILE);
+	sources[2].path = *info_attributes;
+	sources[2].enabled = 1;
+	return 0;
+}
+
+int attr_fingerprint_repository(struct repository *repo,
+				struct attr_fingerprint *result)
+{
+	struct attr_fingerprint_source sources[3];
+	char *info_attributes = NULL;
+	int ret;
+
+	memset(result, 0, sizeof(*result));
+	if (repository_sources(repo, sources, &info_attributes))
+		return -1;
+	ret = attr_fingerprint_sources(sources, ARRAY_SIZE(sources),
+				       repo->hash_algo, result);
+	free(info_attributes);
+	return ret;
 }
