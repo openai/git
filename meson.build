@@ -333,6 +333,7 @@ libgit_sources = [
   'chdir-notify.c',
   'checkout.c',
   'chunk-format.c',
+  'clean-status.c',
   'clean-status-config.c',
   'clean-status-manifest.c',
   'color.c',
