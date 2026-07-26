@@ -817,6 +817,11 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 
 	if (s->untracked_cache_preload)
 		BUG("untracked-cache preload already started");
+	if (fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED ||
+	    s->pathspec.nr ||
+	    s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
+	    s->show_ignored_mode)
+		return;
 
 	dir_flags = wt_status_untracked_dir_flags(s);
 	s->untracked_cache_preload =

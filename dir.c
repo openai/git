@@ -143,8 +143,33 @@ static void collect_untracked_cache_preload_tasks(
 	}
 }
 
-struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
-	struct index_state *istate, unsigned int dir_flags)
+static size_t count_untracked_cache_dirs_bounded(
+	const struct untracked_cache_dir *ucd,
+	size_t limit)
+{
+	size_t i, nr = 1;
+
+	for (i = 0; i < ucd->dirs_nr && nr < limit; i++)
+		nr += count_untracked_cache_dirs_bounded(ucd->dirs[i], limit - nr);
+	return nr;
+}
+
+#define UNTRACKED_CACHE_AUTO_PRELOAD_MIN_DIRS 2000
+
+static int untracked_cache_auto_preload_worthwhile(
+	const struct untracked_cache *uc)
+{
+	if (!uc || !uc->root || uc->use_fsmonitor || !uc->root->valid)
+		return 0;
+	if (git_env_bool("GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD", 0))
+		return 1;
+	return count_untracked_cache_dirs_bounded(
+		uc->root, UNTRACKED_CACHE_AUTO_PRELOAD_MIN_DIRS) >=
+		UNTRACKED_CACHE_AUTO_PRELOAD_MIN_DIRS;
+}
+
+static struct untracked_cache_preload *untracked_cache_preload_start_1(
+	struct index_state *istate, unsigned int dir_flags, int automatic)
 {
 	struct untracked_cache *uc = istate->untracked;
 	struct untracked_cache_preload *preload;
@@ -153,8 +178,6 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	unsigned long test_threads;
 	int threads, online, create_threads = 1;
 
-	if (!git_env_bool("GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD", 0))
-		return NULL;
 	if (!uc || !uc->root || uc->use_fsmonitor ||
 	    uc->dir_flags != dir_flags)
 		return NULL;
@@ -188,6 +211,8 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	preload->started_at = getnanotime();
 	trace2_data_intmax("dir", istate->repo,
 			   "preload_untracked_cache/threads", threads);
+	trace2_data_intmax("dir", istate->repo,
+			   "preload_untracked_cache/automatic", automatic);
 	CALLOC_ARRAY(preload->data, threads);
 	work = DIV_ROUND_UP(preload->nr, threads);
 	for (i = 0; i < threads; i++) {
@@ -214,6 +239,17 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 		data->started = 1;
 	}
 	return preload;
+}
+
+struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
+	struct index_state *istate, unsigned int dir_flags)
+{
+	struct untracked_cache *uc = istate->untracked;
+
+	if (!uc || uc->dir_flags != dir_flags ||
+	    !untracked_cache_auto_preload_worthwhile(uc))
+		return NULL;
+	return untracked_cache_preload_start_1(istate, dir_flags, 1);
 }
 
 static void *preload_untracked_cache_thread(void *_data)
