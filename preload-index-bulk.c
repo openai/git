@@ -249,7 +249,7 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 	if (!start_error) {
 		if (scan.collect_untracked) {
 			exclude_proof = exclude_source_proof_create(
-				istate, &scan, open_exclude_parent);
+				istate, &scan, open_exclude_parent, 0);
 			exclude_dir.internal.exclude_source_proof =
 				exclude_proof;
 			setup_standard_excludes(&exclude_dir);
