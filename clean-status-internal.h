@@ -40,7 +40,5 @@ struct clean_status_state {
 };
 
 struct clean_status_state *clean_status_get_state(struct index_state *istate);
-int clean_status_revalidated_token_matches(
-	const struct index_state *istate);
 
 #endif /* CLEAN_STATUS_INTERNAL_H */
