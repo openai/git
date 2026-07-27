@@ -1137,6 +1137,7 @@ LIB_OBJS += clean-status-identity.o
 LIB_OBJS += clean-status-index.o
 LIB_OBJS += clean-status-manifest.o
 LIB_OBJS += clean-status-sidecar.o
+LIB_OBJS += clean-status-fast.o
 LIB_OBJS += clean-status-sidecar-issue.o
 LIB_OBJS += color.o
 LIB_OBJS += column.o

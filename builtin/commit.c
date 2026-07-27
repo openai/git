@@ -1617,6 +1617,7 @@ struct repository *repo UNUSED)
 	int default_status_command = argc == 1 && (!prefix || !*prefix);
 	int exact_clean_command = argc == 2 &&
 		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
+	int exact_clean_query;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1703,6 +1704,17 @@ struct repository *repo UNUSED)
 		default_status_command && !s.pathspec.nr;
 	if (s.allow_clean_status_shortcuts)
 		clean_status_enable_external_history(the_repository);
+	exact_clean_query = exact_clean_command &&
+		status_format == STATUS_FORMAT_PORCELAIN_V2 &&
+		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
+		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
+		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES;
+	s.certify_clean_status = exact_clean_query;
+	if (exact_clean_query &&
+	    clean_status_try_sidecar(the_repository, &clean_digest)) {
+		wt_status_collect_free_buffers(&s);
+		return 0;
+	}
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2)
