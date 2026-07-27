@@ -815,7 +815,7 @@ malformed:
 	return FSMONITOR_QUERY_ERROR;
 }
 
-static enum fsmonitor_query_outcome query_builtin_fsmonitor(
+enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	const char *since_token, struct fsmonitor_query_result *result)
 {
 	const char *test_sequence =
