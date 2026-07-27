@@ -19,9 +19,13 @@ struct stat;
 
 typedef int (*exclude_source_open_parent_fn)(void *data, const char *path);
 
+enum exclude_source_proof_flags {
+	EXCLUDE_SOURCE_PROOF_NONBLOCKING = (1 << 0),
+};
+
 struct exclude_source_proof *exclude_source_proof_create(
 	struct index_state *istate, void *open_data,
-	exclude_source_open_parent_fn open_parent);
+	exclude_source_open_parent_fn open_parent, unsigned flags);
 struct exclude_source_capture *exclude_source_capture_begin(
 	struct exclude_source_proof *proof, const char *path,
 	int nofollow);
