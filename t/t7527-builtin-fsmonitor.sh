@@ -1615,8 +1615,6 @@ test_expect_success MACOS 'daemon token reset closes a skipHash index' '
 		GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
 			git status --porcelain=v2 >.git/warm.out &&
 		test_must_be_empty .git/warm.out &&
-		test_trace2_data index refresh/sum_lstat 0 \
-			<.git/warm.trace &&
 		! test_trace2_data index refresh/sum_lstat \
 			"[1-9][0-9]*" <.git/warm.trace &&
 		! test_trace2_data fsm_client query/trivial-response 1 \
@@ -1641,7 +1639,9 @@ test_expect_success MACOS 'daemon token reset closes a skipHash index' '
 		GIT_TRACE2_EVENT="$PWD/.git/dirty-warm.trace" \
 			git status --porcelain=v2 >.git/dirty-warm.out &&
 		test_cmp .git/dirty-reset.out .git/dirty-warm.out &&
-		test_trace2_data index refresh/sum_lstat 2 \
+		test_trace2_data index preload/bulk_provider_applied 1 \
+			<.git/dirty-warm.trace &&
+		test_trace2_data index refresh/sum_lstat 0 \
 			<.git/dirty-warm.trace &&
 		! test_trace2_data fsm_client query/trivial-response 1 \
 			<.git/dirty-warm.trace
@@ -1753,7 +1753,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_trace2_data fsmonitor config/token-advanced 1 \
 			<.git/deleted.trace &&
 
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCC \
 		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
 		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
 			git status --porcelain=v2 >.git/attributes &&
