@@ -49,6 +49,8 @@ void clean_status_release_proof_epoch(
 
 int clean_status_fsmonitor_config_mismatch(const struct index_state *istate);
 int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate);
+int clean_status_revalidated_token_matches(
+	const struct index_state *istate);
 
 int clean_status_has_persistent_fsmonitor_semantic_history(
 	const struct index_state *istate);
@@ -84,6 +86,9 @@ int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
 	struct lock_file *index_lock);
+int clean_status_try_sidecar(
+	struct repository *repo,
+	const struct clean_status_config_digest *config);
 
 int clean_status_read_fsmonitor_config(struct index_state *istate,
 				       const void *data, unsigned long size);

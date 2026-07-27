@@ -37,6 +37,8 @@ struct fsmonitor_query_result {
 void fsmonitor_query_result_release(struct fsmonitor_query_result *result);
 enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 	const struct strbuf *raw, struct fsmonitor_query_result *result);
+enum fsmonitor_query_outcome query_builtin_fsmonitor(
+	const char *since_token, struct fsmonitor_query_result *result);
 
 /*
  * A pathname monitor cannot prove that every name for a multiply-linked

@@ -12,6 +12,7 @@
 #include "dir.h"
 #include "commit.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "diff.h"
 #include "environment.h"
 #include "exclude-source-proof.h"
@@ -716,6 +717,11 @@ static void wt_status_collect_changes_worktree(struct wt_status *s)
 	size_t direct_nr;
 	struct rev_info rev;
 
+	if (s->tracked_from_fsmonitor) {
+		preload_index_bulk_result_consume(s->repo->index);
+		return;
+	}
+
 	direct = wt_status_collect_preload_changes(s, &direct_nr);
 	repo_init_revisions(s->repo, &rev, NULL);
 	setup_revisions(0, NULL, &rev, NULL);
@@ -1137,6 +1143,7 @@ static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
 	if (!index_invalidated)
 		return;
 
+	s->tracked_from_fsmonitor = 0;
 	preload_index_bulk_result_clear(istate);
 	trace2_data_intmax("status", s->repo,
 			   "fsmonitor/exclude-index-invalidated",
@@ -1620,6 +1627,26 @@ wt_status_close_semantic_fsmonitor_token(
 	return WT_STATUS_TOKEN_CLOSURE_ACCEPTED;
 }
 
+static int wt_status_tracked_fsmonitor_state_is_current(
+	struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+
+	return s->allow_clean_status_shortcuts &&
+		!s->certify_clean_status && !s->pathspec.nr &&
+		!getenv(INDEX_ENVIRONMENT) && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_IPC &&
+		is_fsmonitor_refreshed(istate) &&
+		!fsmonitor_has_pending_token(istate) &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_last_update &&
+		*istate->fsmonitor_last_update &&
+		clean_status_revalidated_token_matches(istate) &&
+		!clean_status_manifest_global_fallback(istate) &&
+		!clean_status_worktree_manifest_needs_refresh(istate);
+}
+
 static int wt_status_close_fsmonitor_token(
 	struct wt_status *s, struct semantic_verify_proof *proof,
 	unsigned int refresh_flags, int require_untracked,
@@ -1644,6 +1671,20 @@ static int wt_status_close_fsmonitor_token(
 
 		wt_status_discard_semantic_verify(
 			s, &proof, "provider-unavailable");
+		if (!refreshed_before_closure && attr_inputs_match &&
+		    wt_status_tracked_fsmonitor_state_is_current(s) &&
+		    clean_status_index_entries_are_certifiable(istate)) {
+			s->tracked_from_fsmonitor = 1;
+			trace2_data_intmax(
+				"status", s->repo,
+				"fsmonitor/tracked-clean", 1);
+			return 0;
+		}
+		if (refreshed_before_closure && attr_inputs_match &&
+		    s->tracked_from_fsmonitor &&
+		    wt_status_tracked_fsmonitor_state_is_current(s))
+			return closure.refresh_result;
+		s->tracked_from_fsmonitor = 0;
 		if (!refreshed_before_closure && attr_inputs_match)
 			return refresh_index(
 				istate, refresh_flags, &s->pathspec,
@@ -1661,6 +1702,7 @@ static int wt_status_close_fsmonitor_token(
 		return closure.refresh_result;
 	}
 
+	s->tracked_from_fsmonitor = 0;
 	closure.can_prime = require_untracked &&
 		istate->untracked &&
 		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
@@ -1750,6 +1792,7 @@ void wt_status_invalidate_refresh(struct wt_status *s)
 {
 	struct index_state *istate = s->repo->index;
 
+	s->tracked_from_fsmonitor = 0;
 	if (s->untracked_from_token_closure) {
 		string_list_clear(&s->untracked, 0);
 		string_list_clear(&s->ignored, 0);
