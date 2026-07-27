@@ -29,7 +29,7 @@ static int open_parent(void *data UNUSED, const char *path)
 static struct exclude_source_proof *new_proof(void)
 {
 	return exclude_source_proof_create(
-		&istate, NULL, open_parent);
+		&istate, NULL, open_parent, 0);
 }
 
 static char *make_path(const char *name)
@@ -201,7 +201,7 @@ void test_exclude_source_proof__rejects_conflicting_observations(void)
 void test_exclude_source_proof__digest_deduplicates_and_ignores_identity(void)
 {
 	struct exclude_source_proof *first_proof =
-		exclude_source_proof_create(&istate, NULL, open_parent);
+		exclude_source_proof_create(&istate, NULL, open_parent, 0);
 	struct exclude_source_proof *second_proof;
 	struct object_id first, second;
 	char *parent = make_path("parent");
@@ -216,7 +216,7 @@ void test_exclude_source_proof__digest_deduplicates_and_ignores_identity(void)
 	cl_must_pass(unlink(source));
 	write_file_buf(source, "content", 7);
 	second_proof =
-		exclude_source_proof_create(&istate, NULL, open_parent);
+		exclude_source_proof_create(&istate, NULL, open_parent, 0);
 	record_file(second_proof, source);
 	record_file(second_proof, source);
 	cl_must_pass(exclude_source_proof_digest(
@@ -249,7 +249,7 @@ void test_exclude_source_proof__rejects_open_failure(void)
 void test_exclude_source_proof__fails_closed_without_parent_opener(void)
 {
 	struct exclude_source_proof *proof =
-		exclude_source_proof_create(&istate, NULL, NULL);
+		exclude_source_proof_create(&istate, NULL, NULL, 0);
 
 	cl_assert(!exclude_source_capture_begin(proof, "/dev/null", 0));
 	cl_assert(!exclude_source_proof_validate(proof));
@@ -410,6 +410,25 @@ void test_exclude_source_proof__rejects_nonempty_fifo_replacement(void)
 	free(parent);
 }
 
+void test_exclude_source_proof__captures_fifo_without_blocking(void)
+{
+	struct exclude_source_proof *proof =
+		exclude_source_proof_create(
+			&istate, NULL, open_parent,
+			EXCLUDE_SOURCE_PROOF_NONBLOCKING);
+	char *parent = make_path("parent");
+	char *source = make_path("parent/source");
+
+	cl_must_pass(mkdir(parent, 0700));
+	cl_must_pass(mkfifo(source, 0600));
+	record_file(proof, source);
+	cl_assert(exclude_source_proof_validate(proof));
+
+	exclude_source_proof_release(proof);
+	free(source);
+	free(parent);
+}
+
 #else
 
 #define EMPTY_TEST(name) void name(void) {}
@@ -432,5 +451,6 @@ SKIP_TEST(test_exclude_source_proof__reresolves_absent_source_parent)
 SKIP_TEST(test_exclude_source_proof__accepts_dev_null)
 SKIP_TEST(test_exclude_source_proof__accepts_empty_fifo_replacement)
 SKIP_TEST(test_exclude_source_proof__rejects_nonempty_fifo_replacement)
+SKIP_TEST(test_exclude_source_proof__captures_fifo_without_blocking)
 
 #endif
