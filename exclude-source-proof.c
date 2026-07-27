@@ -29,6 +29,7 @@ struct exclude_source_proof {
 	struct strintmap entries_by_path[2];
 	size_t nr;
 	size_t alloc;
+	unsigned nonblocking : 1;
 	unsigned invalid : 1;
 };
 
@@ -187,7 +188,7 @@ static struct exclude_source_capture *capture_begin(
 
 struct exclude_source_proof *exclude_source_proof_create(
 	struct index_state *istate, void *open_data,
-	exclude_source_open_parent_fn open_parent)
+	exclude_source_open_parent_fn open_parent, unsigned flags)
 {
 	struct exclude_source_proof *proof;
 
@@ -195,13 +196,16 @@ struct exclude_source_proof *exclude_source_proof_create(
 	proof->istate = istate;
 	proof->open_data = open_data;
 	proof->open_parent = open_parent;
+	proof->nonblocking =
+		!!(flags & EXCLUDE_SOURCE_PROOF_NONBLOCKING);
 	strintmap_init_with_options(&proof->entries_by_path[0], -1,
 				    NULL, 0);
 	strintmap_init_with_options(&proof->entries_by_path[1], -1,
 				    NULL, 0);
 	if (!EXCLUDE_SOURCE_PROOF_HAS_ANCHORED_OPEN ||
 	    !istate || !istate->repo || !istate->repo->hash_algo ||
-	    !open_parent)
+	    !open_parent ||
+	    (flags & ~EXCLUDE_SOURCE_PROOF_NONBLOCKING))
 		proof->invalid = 1;
 	return proof;
 }
@@ -220,7 +224,8 @@ int exclude_source_capture_open(struct exclude_source_capture *capture)
 		return -1;
 	}
 	return open_source_at(capture->parent_fd, capture->relative,
-			      capture->nofollow, 0);
+			      capture->nofollow,
+			      capture->proof->nonblocking);
 }
 
 int exclude_source_capture_absent(struct exclude_source_capture *capture)
