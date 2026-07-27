@@ -982,7 +982,8 @@ static void wt_status_prepare_exclude_proof(
 		s->certify_exclude_context = context;
 		s->certify_exclude_proof = exclude_source_proof_create(
 			s->repo->index, context,
-			wt_status_open_exclude_parent);
+			wt_status_open_exclude_parent,
+			EXCLUDE_SOURCE_PROOF_NONBLOCKING);
 	}
 	dir->internal.exclude_source_proof =
 		s->certify_exclude_proof;
