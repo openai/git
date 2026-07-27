@@ -594,6 +594,76 @@ prepare_builtin_closure_repo () {
 	)
 }
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'bare status reuses a current tracked fsmonitor proof' '
+	test_when_finished "rm -rf builtin-tracked-clean" &&
+	prepare_builtin_closure_repo builtin-tracked-clean &&
+	(
+		cd builtin-tracked-clean &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status >.git/clean &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/clean &&
+		test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/clean.trace &&
+		test_trace2_data status index/cache-tree-match 1 \
+			<.git/clean.trace &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/exact.trace" \
+			git status --porcelain=v2 >.git/exact &&
+		test_must_be_empty .git/exact &&
+		! test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/exact.trace &&
+		test_grep \
+			"\"category\":\"index\",\"label\":\"refresh\"" \
+			.git/exact.trace &&
+
+		test_write_lines changed >tracked &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/dirty.trace" \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		! test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/dirty.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git checkout -- tracked &&
+		test_write_lines staged >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git write-tree >.git/staged-tree &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/staged-prime &&
+		test_grep "^M  tracked$" .git/staged-prime &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/staged.trace" \
+			git status >.git/staged &&
+		test_grep "Changes to be committed:" .git/staged &&
+		test_grep "modified:.*tracked" .git/staged &&
+		test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/staged.trace &&
+		! test_trace2_data status index/cache-tree-match 1 \
+			<.git/staged.trace
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'builtin closure initializes a new untracked cache' '
 	test_when_finished "rm -rf builtin-closure-new-uc" &&
