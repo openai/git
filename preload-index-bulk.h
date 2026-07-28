@@ -2,6 +2,7 @@
 #define PRELOAD_INDEX_BULK_H
 
 #include "git-compat-util.h"
+#include "hash.h"
 #include "preload-index.h"
 #include "statinfo.h"
 #include "strbuf.h"
@@ -137,6 +138,9 @@ struct preload_bulk_result {
 	unsigned can_skip_unseen_preload : 1;
 	struct string_list untracked;
 	unsigned untracked_complete : 1;
+	unsigned standard_excludes_digest_valid : 1;
+	struct object_id standard_excludes_digest;
+	struct stat scanned_worktree;
 };
 
 struct preload_bulk_stat_update {
