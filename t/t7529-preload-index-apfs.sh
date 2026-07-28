@@ -127,6 +127,61 @@ test_expect_success 'bulk preload waits for fsmonitor provider closure' '
 	test_grep ! "\"key\":\"preload/bulk_result\"" fsmonitor.trace
 '
 
+cleanup_race () {
+	exec 9>&-
+	if test -n "$status_pid"
+	then
+		kill "$status_pid" 2>/dev/null || :
+		wait "$status_pid" 2>/dev/null || :
+	fi
+	status_pid= &&
+	rm -f "$ready" "$resume"
+}
+
+wait_for_ready () {
+	for i in $(test_seq 1 1000)
+	do
+		test "$(cat "$ready" 2>/dev/null)" = ready && return 0
+		kill -0 "$status_pid" 2>/dev/null || return 1
+		sleep 0.01
+	done
+	return 1
+}
+
+start_raced_status () {
+	repo=$1 &&
+	barrier=$2 &&
+	ready=$TRASH_DIRECTORY/$repo.ready &&
+	resume=$TRASH_DIRECTORY/$repo.resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_PATH="$barrier" \
+		GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_READY="$ready" \
+		GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			git -C "$repo" status --porcelain=v2 >actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_ready
+}
+
+finish_raced_status () {
+	printf "resume\n" >&9 &&
+	exec 9>&- &&
+	wait "$status_pid" &&
+	status_pid= &&
+	ordinary_status "$1" expect &&
+	test_cmp expect actual &&
+	test_trace2_data index preload/bulk_applied 0 <"$race_trace"
+}
+
 test_expect_success 'clean entries are published without lstat' '
 	setup_repo clean &&
 	bulk_status clean actual clean.trace &&
@@ -257,6 +312,30 @@ test_expect_success 'multiply-linked entries are left to lstat' '
 	test_file_not_empty actual &&
 	check_data hardlink.trace preload/bulk_applied 7 &&
 	check_lstat_data hardlink.trace 1
+'
+
+test_expect_success PIPE 'queued child replacement discards observations' '
+	setup_repo child-race &&
+	test_when_finished cleanup_race &&
+	start_raced_status child-race nested/deep &&
+	mv child-race/nested/deep child-race/nested/deep-away &&
+	mkdir child-race/nested/deep &&
+	test_write_lines dirty >child-race/nested/deep/tracked &&
+	test_write_lines deep-peer >child-race/nested/deep/peer &&
+	finish_raced_status child-race &&
+	test_file_not_empty actual
+'
+
+test_expect_success PIPE,SYMLINKS \
+	'worktree root replacement discards observations' '
+	setup_repo root-race &&
+	test_when_finished cleanup_race &&
+	start_raced_status root-race "" &&
+	mv root-race root-race-away &&
+	ln -s root-race-away root-race &&
+	test_write_lines dirty >root-race-away/root &&
+	finish_raced_status root-race &&
+	test_file_not_empty actual
 '
 
 test_done

@@ -424,6 +424,8 @@ static int scan_directory(struct preload_bulk_worker *worker,
 		fd = preload_bulk_darwin_open_relative(scan, task->path);
 	if (fd < 0)
 		goto out;
+	if (preload_bulk_test_barrier(scan, task->path))
+		goto out;
 	if (preload_bulk_darwin_fd_on_root_mount(scan, fd, &before)) {
 		if (errno != EXDEV)
 			goto out;
