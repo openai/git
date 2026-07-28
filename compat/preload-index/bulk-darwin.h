@@ -12,6 +12,7 @@ struct preload_bulk_darwin_data {
 	fsid_t root_fsid;
 };
 
+int preload_bulk_darwin_supports_nofollow_any(void);
 /*
  * Exposed so that tests can validate kernel-supplied records directly.
  */
