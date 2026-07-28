@@ -4,12 +4,18 @@
 #include <sys/mount.h>
 #endif
 
+#include "abspath.h"
+#include "attr-fingerprint.h"
 #include "clean-status-index.h"
 #include "clean-status-sidecar.h"
 #include "fsmonitor-clean-proof.h"
 #include "hash-framing.h"
 #include "lockfile.h"
+#include "path.h"
+#include "repository.h"
+#include "replace-object.h"
 #include "strbuf.h"
+#include "worktree.h"
 #include "wrapper.h"
 
 #define CLEAN_STATUS_SIDECAR_MAGIC "CSTS"
@@ -145,6 +151,18 @@ static char *sidecar_path(const char *index_path)
 	return xstrfmt("%s.csts", index_path);
 }
 
+static int open_nofollow_nonblocking(const char *path, int flags)
+{
+#ifdef O_NONBLOCK
+	return open_nofollow(path, flags | O_NONBLOCK);
+#else
+	(void)path;
+	(void)flags;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+
 static int local_apfs_id(int fd MAYBE_UNUSED,
 			 struct clean_status_filesystem_id *id)
 {
@@ -228,5 +246,107 @@ done:
 		rollback_lock_file(&lock);
 	free(path);
 	strbuf_release(&encoded);
+	return ret;
+}
+
+static int current_worktree_is_main(struct repository *repo)
+{
+	struct worktree *worktree = get_current_worktree(repo);
+	int ret = worktree && is_main_worktree(worktree);
+
+	free_worktree(worktree);
+	return ret;
+}
+
+static int worktree_root_identity(
+	const struct stat *st, uint64_t *identity MAYBE_UNUSED)
+{
+	if (!S_ISDIR(st->st_mode))
+		return -1;
+#ifdef __APPLE__
+	identity[0] = st->st_dev;
+	identity[1] = st->st_ino;
+	identity[2] = st->st_birthtimespec.tv_sec;
+	identity[3] = st->st_birthtimespec.tv_nsec;
+	identity[4] = st->st_gen;
+	return 0;
+#else
+	return -1;
+#endif
+}
+
+int clean_status_repository_fingerprint(
+	struct repository *repo,
+	const struct attr_source_snapshot *attrs,
+	const struct clean_status_index_snapshot *index,
+	const struct stat *scanned_worktree,
+	unsigned char *out)
+{
+	static const char domain[] = "git-clean-status-repository-v1";
+	const struct attr_fingerprint *attr_fingerprint =
+		attr_source_snapshot_fingerprint(attrs);
+	struct clean_status_filesystem_id index_fsid, worktree_fsid;
+	struct git_hash_ctx ctx;
+	struct stat st;
+	char *worktree = NULL, *gitdir = NULL, *commondir = NULL;
+	uint64_t root_identity[5];
+	uint64_t scanned_root_identity[5];
+	uint64_t value;
+	int worktree_fd = -1, ret = -1;
+
+	if (!attr_fingerprint || attr_fingerprint->sources_present ||
+	    !index || index->fd < 0 || !scanned_worktree ||
+	    is_bare_repository(repo) ||
+	    !repo_get_work_tree(repo) ||
+	    !current_worktree_is_main(repo) ||
+	    repo_has_replace_refs_uncached(repo))
+		goto done;
+
+	worktree = real_pathdup(repo_get_work_tree(repo), 0);
+	gitdir = real_pathdup(repo_get_git_dir(repo), 0);
+	commondir = real_pathdup(repo_get_common_dir(repo), 0);
+	if (!worktree || !gitdir || !commondir)
+		goto done;
+	worktree_fd = open_nofollow_nonblocking(
+		worktree, O_RDONLY | O_CLOEXEC);
+	if (worktree_fd < 0 ||
+	    local_apfs_id(worktree_fd, &worktree_fsid) ||
+	    local_apfs_id(index->fd, &index_fsid) ||
+	    fstat(worktree_fd, &st) ||
+	    worktree_root_identity(&st, root_identity) ||
+	    worktree_root_identity(
+		    scanned_worktree, scanned_root_identity) ||
+	    memcmp(root_identity, scanned_root_identity,
+		   sizeof(root_identity)))
+		goto done;
+
+	git_hash_init(&ctx, repo->hash_algo);
+	hash_length_delimited(&ctx, domain, sizeof(domain) - 1);
+	hash_length_delimited(&ctx, worktree, strlen(worktree));
+	hash_length_delimited(&ctx, gitdir, strlen(gitdir));
+	hash_length_delimited(&ctx, commondir, strlen(commondir));
+	for (size_t i = 0; i < ARRAY_SIZE(root_identity); i++) {
+		put_be64(&value, root_identity[i]);
+		hash_length_delimited(&ctx, &value, sizeof(value));
+	}
+	hash_length_delimited(&ctx, worktree_fsid.value,
+			      sizeof(worktree_fsid.value));
+	hash_length_delimited(&ctx, index_fsid.value,
+			      sizeof(index_fsid.value));
+	hash_length_delimited(&ctx, attr_fingerprint->content_hash,
+			      repo->hash_algo->rawsz);
+	hash_optional_cstring(&ctx, setlocale(LC_CTYPE, NULL));
+	hash_optional_cstring(&ctx, getenv("LC_ALL"));
+	hash_optional_cstring(&ctx, getenv("LC_CTYPE"));
+	hash_optional_cstring(&ctx, getenv("LANG"));
+	git_hash_final(out, &ctx);
+	ret = 0;
+
+done:
+	if (worktree_fd >= 0)
+		close(worktree_fd);
+	free(worktree);
+	free(gitdir);
+	free(commondir);
 	return ret;
 }
