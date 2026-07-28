@@ -12,6 +12,9 @@
 #include "gettext.h"
 #include "parse.h"
 #include "preload-index.h"
+#ifdef HAVE_PRELOAD_INDEX_BULK
+#include "preload-index-bulk.h"
+#endif
 #include "progress.h"
 #include "read-cache.h"
 #include "thread-utils.h"
@@ -28,6 +31,8 @@
  */
 #define MAX_PARALLEL (20)
 #define THREAD_COST (500)
+#define BULK_MAX_PARALLEL (32)
+#define BULK_ENTRIES_PER_THREAD (5000)
 
 struct progress_data {
 	unsigned long n;
@@ -104,6 +109,144 @@ static void *preload_thread(void *_data)
 	return NULL;
 }
 
+#ifdef HAVE_PRELOAD_INDEX_BULK
+static int stat_data_is_zero(const struct stat_data *sd)
+{
+	return !sd->sd_ctime.sec &&
+		!sd->sd_ctime.nsec &&
+		!sd->sd_mtime.sec &&
+		!sd->sd_mtime.nsec &&
+		!sd->sd_dev &&
+		!sd->sd_ino &&
+		!sd->sd_uid &&
+		!sd->sd_gid &&
+		!sd->sd_size;
+}
+
+static int preload_bulk_entry_is_useful(const struct cache_entry *ce)
+{
+	return preload_entry_needs_stat(ce) &&
+		!ce_intent_to_add(ce) &&
+		!(ce->ce_flags & (CE_VALID | CE_REMOVE)) &&
+		(S_ISREG(ce->ce_mode) || S_ISLNK(ce->ce_mode)) &&
+		!stat_data_is_zero(&ce->ce_stat_data);
+}
+
+static size_t preload_bulk_useful_candidates(struct index_state *index)
+{
+	size_t useful = 0;
+
+	for (size_t i = 0; i < index->cache_nr; i++)
+		if (preload_bulk_entry_is_useful(index->cache[i]))
+			useful++;
+	return useful;
+}
+
+static size_t preload_bulk_publish_clean(
+	struct index_state *index,
+	const struct preload_bulk_result *result)
+{
+	size_t applied = 0;
+
+	if (result->nr != index->cache_nr)
+		BUG("bulk preload result does not match the index");
+
+	for (size_t i = 0; i < result->nr; i++) {
+		struct cache_entry *ce;
+		unsigned char state = result->tracked_state[i];
+
+		if (state != PRELOAD_BULK_TRACKED_CLEAN)
+			continue;
+		ce = index->cache[i];
+		if (!preload_bulk_entry_is_useful(ce))
+			continue;
+		ce_mark_uptodate(ce);
+		mark_fsmonitor_valid(index, ce);
+		applied++;
+	}
+	return applied;
+}
+
+static int preload_bulk_threads(size_t useful)
+{
+	int cpus = online_cpus();
+	int threads = DIV_ROUND_UP(useful, BULK_ENTRIES_PER_THREAD);
+
+	if (threads < 1)
+		threads = 1;
+	if (cpus > 0) {
+		int cpu_limit = cpus > BULK_MAX_PARALLEL / 2 ?
+			BULK_MAX_PARALLEL : cpus * 2;
+
+		if (threads > cpu_limit)
+			threads = cpu_limit;
+	}
+	if (threads > BULK_MAX_PARALLEL)
+		threads = BULK_MAX_PARALLEL;
+	return threads;
+}
+
+static void preload_bulk_trace_result(
+	struct index_state *index,
+	const struct preload_bulk_result *result,
+	size_t applied)
+{
+	trace2_data_string("index", index->repo, "preload/bulk_result",
+			   result->outcome);
+	if (result->reason)
+		trace2_data_string("index", index->repo,
+				   "preload/bulk_reason", result->reason);
+	trace2_data_intmax("index", index->repo, "preload/bulk_applied",
+			   applied);
+	trace2_data_intmax("index", index->repo, "preload/bulk_dirs",
+			   result->run.dirs);
+	trace2_data_intmax("index", index->repo, "preload/bulk_entries",
+			   result->run.entries);
+	trace2_data_intmax("index", index->repo, "preload/bulk_calls",
+			   result->run.bulk_calls);
+	trace2_data_intmax("index", index->repo, "preload/bulk_workers",
+			   result->run.threads);
+}
+
+static void preload_bulk_try(struct index_state *index)
+{
+	struct preload_bulk_result result = { 0 };
+	size_t useful;
+	size_t applied = 0;
+	int enabled = 0;
+	int control, threads;
+
+	/*
+	 * Let the test variable override configuration without bypassing
+	 * any of the proof checks.
+	 */
+	control = git_env_bool("GIT_TEST_PRELOAD_INDEX_BULK", -1);
+	if (control < 0)
+		repo_config_get_bool(index->repo, "core.preloadindexbulk",
+				     &enabled);
+	else
+		enabled = control;
+	if (!enabled ||
+	    fsm_settings__get_mode(index->repo) != FSMONITOR_MODE_DISABLED ||
+	    !preload_bulk_available())
+		return;
+	useful = preload_bulk_useful_candidates(index);
+	trace2_data_intmax("index", index->repo, "preload/bulk_useful",
+			   useful);
+	trace2_data_intmax("index", index->repo, "preload/bulk_cache_nr",
+			   index->cache_nr);
+	if (!useful)
+		return;
+	threads = preload_bulk_threads(useful);
+	trace2_region_enter("index", "preload/bulk", index->repo);
+	if (!preload_bulk_collect(index, threads, &result))
+		applied = preload_bulk_publish_clean(index, &result);
+	preload_bulk_trace_result(index, &result, applied);
+	trace2_region_leave("index", "preload/bulk", index->repo);
+	preload_bulk_result_release(&result);
+}
+#endif
+
 void preload_index(struct index_state *index,
 		   const struct pathspec *pathspec,
 		   unsigned int refresh_flags)
@@ -116,7 +259,14 @@ void preload_index(struct index_state *index,
 
 	repo_config_get_bool(index->repo, "core.preloadindex", &core_preload_index);
 
-	if (!HAVE_THREADS || !core_preload_index)
+	if (!core_preload_index)
+		return;
+
+#ifdef HAVE_PRELOAD_INDEX_BULK
+	if (!pathspec || !pathspec->nr)
+		preload_bulk_try(index);
+#endif
+	if (!HAVE_THREADS)
 		return;
 
 	threads = index->cache_nr / THREAD_COST;

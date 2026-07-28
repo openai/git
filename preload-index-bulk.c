@@ -1,0 +1,85 @@
+#include "git-compat-util.h"
+#include "preload-index-bulk.h"
+#include "read-cache-ll.h"
+
+static int backend_available(const struct preload_bulk_backend *backend)
+{
+	return backend && backend->start && backend->finish &&
+		backend->release && backend->open_dir_at &&
+		backend->scan_directory;
+}
+
+int preload_bulk_available(void)
+{
+	return backend_available(preload_bulk_platform_backend());
+}
+
+int preload_bulk_collect(struct index_state *istate, int threads,
+			 struct preload_bulk_result *result)
+{
+	const struct preload_bulk_backend *backend =
+		preload_bulk_platform_backend();
+	struct preload_bulk_scan scan = {
+		.repo = istate->repo,
+		.istate = istate,
+		.backend = backend,
+		.root_fd = -1,
+		.threads = threads,
+	};
+	struct preload_bulk_run_result run_result = { 0 };
+	const char *start_error, *finish_error = NULL;
+	int scan_error = -1;
+	int clean;
+
+	memset(result, 0, sizeof(*result));
+	result->outcome = "start-fallback";
+	result->reason = "backend-unavailable";
+	if (!backend_available(backend))
+		return -1;
+
+	CALLOC_ARRAY(scan.tracked_state, istate->cache_nr);
+	start_error = backend->start(&scan);
+	if (!start_error) {
+		scan_error = preload_bulk_run_scan(&scan, &run_result);
+		finish_error = backend->finish(&scan);
+	}
+
+	clean = !start_error && !scan_error && !finish_error &&
+		!run_result.changed_dirs &&
+		!run_result.malformed;
+	result->run = run_result;
+	if (start_error) {
+		result->outcome = "start-fallback";
+		result->reason = start_error;
+	} else if (run_result.changed_dirs) {
+		result->outcome = "scan-fallback";
+		result->reason = "filesystem-race";
+	} else if (run_result.malformed) {
+		result->outcome = "scan-fallback";
+		result->reason = "malformed-record";
+	} else if (scan_error) {
+		result->outcome = "scan-fallback";
+		result->reason = "scan-error";
+	} else if (finish_error) {
+		result->outcome = "finish-fallback";
+		result->reason = finish_error;
+	} else {
+		result->outcome = "complete";
+		result->reason = NULL;
+	}
+	if (clean) {
+		result->tracked_state = scan.tracked_state;
+		result->nr = istate->cache_nr;
+		scan.tracked_state = NULL;
+	}
+
+	backend->release(&scan);
+	free(scan.tracked_state);
+	return clean ? 0 : -1;
+}
+
+void preload_bulk_result_release(struct preload_bulk_result *result)
+{
+	FREE_AND_NULL(result->tracked_state);
+	memset(result, 0, sizeof(*result));
+}

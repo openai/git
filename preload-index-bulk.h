@@ -52,6 +52,9 @@ struct preload_bulk_worker {
 };
 
 struct preload_bulk_backend {
+	const char *(*start)(struct preload_bulk_scan *scan);
+	const char *(*finish)(struct preload_bulk_scan *scan);
+	void (*release)(struct preload_bulk_scan *scan);
 	int (*open_dir_at)(struct preload_bulk_worker *worker, int parent_fd,
 			   const char *name);
 	/*
@@ -83,6 +86,14 @@ struct preload_bulk_run_result {
 	int threads;
 };
 
+struct preload_bulk_result {
+	unsigned char *tracked_state;
+	size_t nr;
+	const char *outcome;
+	const char *reason;
+	struct preload_bulk_run_result run;
+};
+
 void preload_bulk_schedule_directory(
 	struct preload_bulk_worker *worker, int parent_fd,
 	const struct preload_bulk_dir_identity *parent_identity,
@@ -101,5 +112,9 @@ void preload_bulk_record_tracked(
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 			  struct preload_bulk_run_result *result);
 const struct preload_bulk_backend *preload_bulk_platform_backend(void);
+int preload_bulk_collect(struct index_state *istate, int threads,
+			 struct preload_bulk_result *result);
+int preload_bulk_available(void);
+void preload_bulk_result_release(struct preload_bulk_result *result);
 
 #endif /* PRELOAD_INDEX_BULK_H */
