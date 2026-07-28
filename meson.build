@@ -342,6 +342,7 @@ libgit_sources = [
   'clean-status-index.c',
   'clean-status-manifest.c',
   'clean-status-sidecar.c',
+  'clean-status-sidecar-issue.c',
   'color.c',
   'column.c',
   'combine-diff.c',
