@@ -134,7 +134,10 @@ struct preload_bulk_pending {
 	unsigned char *tracked_state;
 	struct preload_bulk_stat_update *stat_updates;
 	size_t stat_updates_nr;
+	struct object_id standard_excludes_digest;
+	struct stat scanned_worktree;
 	unsigned provider : 1;
+	unsigned standard_excludes_digest_valid : 1;
 };
 
 static int stat_data_is_zero(const struct stat_data *sd)
@@ -372,6 +375,13 @@ static void preload_bulk_try(struct index_state *index,
 			result.stat_updates_nr = 0;
 		}
 	}
+	if (result.standard_excludes_digest_valid) {
+		pending->provider = provider;
+		pending->standard_excludes_digest_valid = 1;
+		oidcpy(&pending->standard_excludes_digest,
+		       &result.standard_excludes_digest);
+		pending->scanned_worktree = result.scanned_worktree;
+	}
 	if (result.untracked_complete && index->preload_untracked) {
 		*index->preload_untracked = result.untracked;
 		index->preload_untracked_complete = 1;
@@ -394,7 +404,19 @@ static void preload_bulk_finish_state(struct index_state *index,
 		index->preload_bulk_stat_updates_nr =
 			pending->stat_updates_nr;
 		index->preload_bulk_provider_pending = pending->provider;
-		memset(pending, 0, sizeof(*pending));
+		pending->tracked_state = NULL;
+		pending->stat_updates = NULL;
+		pending->stat_updates_nr = 0;
+	}
+	if (pending->standard_excludes_digest_valid) {
+		oidcpy(&index->preload_bulk_standard_excludes_digest,
+		       &pending->standard_excludes_digest);
+		index->preload_bulk_scanned_worktree =
+			pending->scanned_worktree;
+		if (pending->provider)
+			index->preload_bulk_excludes_digest_pending = 1;
+		else
+			index->preload_bulk_excludes_digest_valid = 1;
 	}
 	free(pending->tracked_state);
 	free(pending->stat_updates);
@@ -410,13 +432,22 @@ static int compare_stat_update(const void *va, const void *vb)
 }
 #endif
 
-void preload_index_bulk_result_clear(struct index_state *index)
+void preload_index_bulk_result_consume(struct index_state *index)
 {
 	FREE_AND_NULL(index->preload_bulk_tracked_state);
 	FREE_AND_NULL(index->preload_bulk_stat_updates);
 	index->preload_bulk_tracked_nr = 0;
 	index->preload_bulk_stat_updates_nr = 0;
 	index->preload_bulk_provider_pending = 0;
+	index->preload_bulk_excludes_digest_pending = 0;
+}
+
+void preload_index_bulk_result_clear(struct index_state *index)
+{
+	preload_index_bulk_result_consume(index);
+	index->preload_bulk_excludes_digest_valid = 0;
+	oidclr(&index->preload_bulk_standard_excludes_digest,
+	       index->repo->hash_algo);
 }
 
 int preload_index_bulk_can_close_provider(struct index_state *index)
@@ -446,8 +477,11 @@ int preload_index_bulk_result_accept(struct index_state *index)
 	size_t update_nr = 0;
 	int applied = 0;
 
-	if (!index->preload_bulk_provider_pending)
+	if (!index->preload_bulk_provider_pending &&
+	    !index->preload_bulk_excludes_digest_pending)
 		return 0;
+	if (!index->preload_bulk_provider_pending)
+		goto accept_digest;
 	if (!index->preload_bulk_tracked_state ||
 	    index->preload_bulk_tracked_nr != index->cache_nr)
 		return -1;
@@ -494,11 +528,27 @@ int preload_index_bulk_result_accept(struct index_state *index)
 	FREE_AND_NULL(index->preload_bulk_stat_updates);
 	index->preload_bulk_stat_updates_nr = 0;
 	index->preload_bulk_provider_pending = 0;
+accept_digest:
+	if (index->preload_bulk_excludes_digest_pending) {
+		index->preload_bulk_excludes_digest_pending = 0;
+		index->preload_bulk_excludes_digest_valid = 1;
+	}
 	trace2_data_intmax("index", index->repo,
 			   "preload/bulk_provider_applied", applied);
 #else
 	(void)index;
 #endif
+	return 0;
+}
+
+int preload_index_bulk_standard_excludes_digest(
+	const struct index_state *index, struct object_id *digest,
+	struct stat *scanned_worktree)
+{
+	if (!index->preload_bulk_excludes_digest_valid)
+		return -1;
+	oidcpy(digest, &index->preload_bulk_standard_excludes_digest);
+	*scanned_worktree = index->preload_bulk_scanned_worktree;
 	return 0;
 }
 

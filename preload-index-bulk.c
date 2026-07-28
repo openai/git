@@ -186,9 +186,11 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 		.untracked = STRING_LIST_INIT_DUP,
 	};
 	struct preload_bulk_run_result run_result = { 0 };
+	struct object_id standard_excludes_digest;
 	struct stat root_stat;
 	const char *start_error, *finish_error = NULL;
 	const char *untracked_reason = NULL;
+	int standard_excludes_digest_valid = 0;
 	int scan_error = -1;
 	int clean;
 
@@ -239,7 +241,7 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 
 	CALLOC_ARRAY(scan.tracked_state, istate->cache_nr);
 	start_error = backend->start(&scan);
-	if (!start_error && scan.proof_epoch &&
+	if (!start_error && (scan.proof_epoch || scan.collect_untracked) &&
 	    (scan.root_fd < 0 || fstat(scan.root_fd, &root_stat)))
 		start_error = "root-stat";
 	if (!start_error && scan.proof_epoch)
@@ -251,6 +253,11 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 			exclude_dir.internal.exclude_source_proof =
 				exclude_proof;
 			setup_standard_excludes(&exclude_dir);
+			standard_excludes_digest_valid =
+				!exclude_source_proof_digest(
+					exclude_proof,
+					istate->repo->hash_algo,
+					&standard_excludes_digest);
 		}
 		scan_error = preload_bulk_run_scan(&scan, &run_result);
 		if (!scan_error)
@@ -264,7 +271,8 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 				"index", "preload/bulk_excludes", istate->repo);
 			exclude_proof_valid =
 				exclude_source_proof_validate(exclude_proof);
-			if (!exclude_proof_valid) {
+			if (!standard_excludes_digest_valid ||
+			    !exclude_proof_valid) {
 				run_result.untracked_complete = 0;
 				untracked_reason = "exclude-race";
 			}
@@ -310,6 +318,12 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 		result->can_skip_unseen_preload =
 			scan.can_skip_unseen_preload;
 		result->untracked_complete = run_result.untracked_complete;
+		if (result->untracked_complete) {
+			result->standard_excludes_digest_valid = 1;
+			oidcpy(&result->standard_excludes_digest,
+			       &standard_excludes_digest);
+			result->scanned_worktree = root_stat;
+		}
 		scan.tracked_state = NULL;
 		scan.stat_updates = NULL;
 		scan.stat_updates_nr = 0;
