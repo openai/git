@@ -2,22 +2,26 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "advice.h"
 #include "attr.h"
 #include "attr-fingerprint.h"
 #include "wt-status.h"
+#include "cache-tree.h"
 #include "object.h"
 #include "dir.h"
 #include "commit.h"
 #include "clean-status.h"
 #include "diff.h"
 #include "environment.h"
+#include "exclude-source-proof.h"
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
 #include "object-name.h"
 #include "path.h"
 #include "preload-index.h"
+#include "replace-object.h"
 #include "revision.h"
 #include "diffcore.h"
 #include "quote.h"
@@ -41,6 +45,7 @@
 #include "sequencer.h"
 #include "fsmonitor.h"
 #include "fsmonitor-settings.h"
+#include "wrapper.h"
 
 #define AB_DELAY_WARNING_IN_MS (2 * 1000)
 #define UF_DELAY_WARNING_IN_MS (2 * 1000)
@@ -583,7 +588,11 @@ static struct cache_entry **wt_status_collect_preload_changes(
 			   deleted);
 
 clear:
-	preload_index_bulk_result_clear(istate);
+	/*
+	 * The tracked result is single-use. Keep a closed excludes digest
+	 * available until the index writer has consumed it.
+	 */
+	preload_index_bulk_result_consume(istate);
 	return direct;
 }
 
@@ -732,10 +741,50 @@ static void wt_status_collect_changes_worktree(struct wt_status *s)
 	release_revisions(&rev);
 }
 
+static int wt_status_cache_tree_matches_reference(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	struct object_id reference_tree;
+	struct strbuf reference = STRBUF_INIT;
+	int matches = 0;
+
+	if (!s->allow_clean_status_shortcuts || s->is_initial ||
+	    getenv(INDEX_ENVIRONMENT) || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    !istate->cache_tree ||
+	    istate->cache_tree->entry_count < 0 ||
+	    (unsigned int)istate->cache_tree->entry_count !=
+		    istate->cache_nr)
+		return 0;
+
+	/*
+	 * A replacement below the root can change the effective tree without
+	 * changing the root object name stored in the commit.
+	 */
+	if (replace_refs_enabled(s->repo)) {
+		prepare_replace_object(s->repo);
+		if (oidmap_get_size(&s->repo->objects->replace_map))
+			return 0;
+	}
+
+	strbuf_addf(&reference, "%s^{tree}", s->reference);
+	if (!repo_get_oid_tree(s->repo, reference.buf, &reference_tree) &&
+	    oideq(&istate->cache_tree->oid, &reference_tree))
+		matches = 1;
+	strbuf_release(&reference);
+	return matches;
+}
+
 static void wt_status_collect_changes_index(struct wt_status *s)
 {
 	struct rev_info rev;
 	struct setup_revision_opt opt;
+
+	if (wt_status_cache_tree_matches_reference(s)) {
+		trace2_data_intmax("status", s->repo,
+				   "index/cache-tree-match", 1);
+		return;
+	}
 
 	repo_init_revisions(s->repo, &rev, NULL);
 	memset(&opt, 0, sizeof(opt));
@@ -879,6 +928,109 @@ static unsigned int wt_status_untracked_dir_flags(const struct wt_status *s)
 	return DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
 }
 
+struct wt_status_exclude_context {
+	int root_fd;
+};
+
+static void wt_status_release_exclude_proof(struct wt_status *s)
+{
+	exclude_source_proof_release(s->certify_exclude_proof);
+	s->certify_exclude_proof = NULL;
+	if (s->certify_exclude_context) {
+		if (s->certify_exclude_context->root_fd >= 0)
+			close(s->certify_exclude_context->root_fd);
+		FREE_AND_NULL(s->certify_exclude_context);
+	}
+	oidclr(&s->certify_exclude_digest, s->repo->hash_algo);
+	s->certify_exclude_digest_valid = 0;
+	s->certify_untracked_scan_failed = 0;
+}
+
+#if EXCLUDE_SOURCE_PROOF_HAS_ANCHORED_OPEN
+
+static int wt_status_open_exclude_parent(void *data, const char *path)
+{
+	struct wt_status_exclude_context *context = data;
+	int flags = O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC |
+		O_NOFOLLOW;
+
+	if (is_absolute_path(path))
+		return open(path, flags);
+	return openat(context->root_fd, path, flags);
+}
+
+static void wt_status_prepare_exclude_proof(
+	struct wt_status *s, struct dir_struct *dir)
+{
+	struct wt_status_exclude_context *context;
+	const char *worktree;
+
+	if (!s->certify_clean_status)
+		return;
+	if (!s->certify_exclude_proof) {
+		worktree = repo_get_work_tree(s->repo);
+		if (!worktree)
+			return;
+		CALLOC_ARRAY(context, 1);
+		context->root_fd = open_nofollow(
+			worktree,
+			O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC);
+		if (context->root_fd < 0) {
+			free(context);
+			return;
+		}
+		s->certify_exclude_context = context;
+		s->certify_exclude_proof = exclude_source_proof_create(
+			s->repo->index, context,
+			wt_status_open_exclude_parent);
+	}
+	dir->internal.exclude_source_proof =
+		s->certify_exclude_proof;
+}
+
+static void wt_status_record_exclude_digest(struct wt_status *s)
+{
+	if (s->certify_exclude_digest_valid ||
+	    !s->certify_exclude_proof)
+		return;
+	s->certify_exclude_digest_valid =
+		!exclude_source_proof_digest(
+			s->certify_exclude_proof,
+			s->repo->hash_algo,
+			&s->certify_exclude_digest);
+}
+
+#else
+
+static void wt_status_prepare_exclude_proof(
+	struct wt_status *s UNUSED, struct dir_struct *dir UNUSED)
+{
+}
+
+static void wt_status_record_exclude_digest(struct wt_status *s UNUSED)
+{
+}
+
+#endif
+
+int wt_status_certified_excludes_digest(
+	struct wt_status *s, struct object_id *digest,
+	struct stat *scanned_worktree)
+{
+	if (s->certify_untracked_scan_failed ||
+	    !s->certify_exclude_digest_valid ||
+	    !s->certify_exclude_proof ||
+	    !s->certify_exclude_context ||
+	    s->certify_exclude_context->root_fd < 0 ||
+	    !exclude_source_proof_validate(
+		    s->certify_exclude_proof) ||
+	    fstat(s->certify_exclude_context->root_fd,
+		  scanned_worktree))
+		return -1;
+	oidcpy(digest, &s->certify_exclude_digest);
+	return 0;
+}
+
 static int wt_status_begin_attr_snapshot(struct wt_status *s)
 {
 	int ret;
@@ -931,6 +1083,9 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 	wt_status_begin_attr_snapshot(s);
 	/* Record the provider token before either filesystem traversal. */
 	refresh_fsmonitor(istate);
+	if (s->certify_clean_status &&
+	    !fsmonitor_has_pending_token(istate))
+		fsmonitor_reopen_token(istate);
 	if (s->pathspec.nr ||
 	    s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
 	    s->show_ignored_mode)
@@ -1000,10 +1155,6 @@ static int wt_status_collect_untracked_1(
 
 	if (!s->show_untracked_files)
 		return 0;
-	if (s->untracked_from_preload &&
-	    !istate->untracked &&
-	    !s->show_ignored_mode)
-		return 0;
 
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
 		dir.flags |= wt_status_untracked_dir_flags(s);
@@ -1016,12 +1167,16 @@ static int wt_status_collect_untracked_1(
 		dir.untracked = istate->untracked;
 	}
 
+	wt_status_prepare_exclude_proof(s, &dir);
 	setup_standard_excludes(&dir);
+	wt_status_record_exclude_digest(s);
 	wt_status_finish_untracked_cache_preload(s);
 	dir.internal.untracked_cache_preloaded =
 		s->untracked_cache_preloaded;
 
 	fill_directory(&dir, istate, &s->pathspec);
+	if (s->certify_clean_status && dir.internal.traversal_failed)
+		s->certify_untracked_scan_failed = 1;
 	used_untracked_cache = dir.untracked &&
 		dir.untracked == istate->untracked;
 
@@ -1099,6 +1254,8 @@ static int wt_status_collect_untracked(struct wt_status *s)
 {
 	if (s->untracked_from_token_closure && !s->show_ignored_mode)
 		return 1;
+	if (s->untracked_from_preload && !s->show_ignored_mode)
+		return 0;
 	return wt_status_collect_untracked_1(
 		s, &s->untracked, &s->ignored);
 }
@@ -1155,6 +1312,22 @@ static void wt_status_publish_staged_untracked(
 	SWAP(s->ignored, closure->staged_ignored);
 	s->untracked_from_token_closure = 1;
 	closure->staged_untracked_ready = 0;
+}
+
+static int wt_status_untracked_cache_valid(
+	const struct wt_status_token_closure *closure)
+{
+	const struct index_state *istate = closure->status->repo->index;
+
+	return closure->untracked_ready &&
+		istate->untracked && istate->untracked->root;
+}
+
+static void wt_status_record_bulk_untracked(
+	struct wt_status_token_closure *closure)
+{
+	if (closure->status->repo->index->preload_untracked_complete)
+		closure->untracked_proof_complete = 1;
 }
 
 static int fsmonitor_token_requires_rescan(enum fsmonitor_token_result result)
@@ -1223,22 +1396,6 @@ static void wt_status_refresh_for_token(
 			&s->pathspec, NULL, NULL);
 	}
 	istate->preload_bulk_proof_epoch = NULL;
-}
-
-static int wt_status_untracked_cache_valid(
-	const struct wt_status_token_closure *closure)
-{
-	const struct index_state *istate = closure->status->repo->index;
-
-	return closure->untracked_ready &&
-		istate->untracked && istate->untracked->root;
-}
-
-static void wt_status_record_bulk_untracked(
-	struct wt_status_token_closure *closure)
-{
-	if (closure->status->repo->index->preload_untracked_complete)
-		closure->untracked_proof_complete = 1;
 }
 
 static int wt_status_close_ordinary_fsmonitor_token(
@@ -1592,6 +1749,12 @@ void wt_status_invalidate_refresh(struct wt_status *s)
 {
 	struct index_state *istate = s->repo->index;
 
+	if (s->untracked_from_token_closure) {
+		string_list_clear(&s->untracked, 0);
+		string_list_clear(&s->ignored, 0);
+		s->untracked_from_token_closure = 0;
+	}
+	wt_status_release_exclude_proof(s);
 	wt_status_release_attr_snapshot(s);
 	if (!s->pathspec.nr && !istate->split_index &&
 	    fsmonitor_reopen_token(istate))
@@ -1667,6 +1830,7 @@ void wt_status_collect_free_buffers(struct wt_status *s)
 {
 	untracked_cache_preload_release(s->untracked_cache_preload);
 	s->untracked_cache_preload = NULL;
+	wt_status_release_exclude_proof(s);
 	wt_status_release_attr_snapshot(s);
 	wt_status_state_free_buffers(&s->state);
 }

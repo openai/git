@@ -1582,10 +1582,8 @@ test_expect_success 'bound query accepts a capability superset' '
 
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/status.out &&
-		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep \
-			"^fsmonitor last update builtin:test-capable:0" \
-			.git/fsmonitor &&
+		test_trace2_data fsm_client query/command \
+			"builtin:test-capable:0" <.git/status.trace &&
 		test_grep ! \
 			"\"key\":\"query/incompatible-daemon\"" \
 			.git/status.trace &&
