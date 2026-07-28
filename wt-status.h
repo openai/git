@@ -7,7 +7,10 @@
 #include "remote.h"
 
 struct repository;
+struct stat;
 struct attr_source_snapshot;
+struct exclude_source_proof;
+struct wt_status_exclude_context;
 struct worktree;
 struct untracked_cache_preload;
 
@@ -140,6 +143,8 @@ struct wt_status {
 	/* These are computed during processing of the individual sections */
 	int committable;
 	int workdir_dirty;
+	unsigned allow_clean_status_shortcuts : 1;
+	unsigned certify_clean_status : 1;
 	unsigned untracked_from_token_closure : 1;
 	unsigned untracked_from_preload : 1;
 	unsigned bulk_update_index_stat : 1;
@@ -152,8 +157,13 @@ struct wt_status {
 	uint32_t untracked_in_ms;
 	struct untracked_cache_preload *untracked_cache_preload;
 	struct attr_source_snapshot *attr_source_snapshot;
+	struct exclude_source_proof *certify_exclude_proof;
+	struct wt_status_exclude_context *certify_exclude_context;
+	struct object_id certify_exclude_digest;
 	unsigned untracked_cache_preloaded : 1;
 	unsigned attr_snapshot_failed : 1;
+	unsigned certify_exclude_digest_valid : 1;
+	unsigned certify_untracked_scan_failed : 1;
 };
 
 size_t wt_status_locate_end(const char *s, size_t len);
@@ -171,6 +181,9 @@ int wt_status_refresh_index(struct wt_status *s,
 			    unsigned int refresh_flags,
 			    int require_untracked);
 void wt_status_invalidate_refresh(struct wt_status *s);
+int wt_status_certified_excludes_digest(
+	struct wt_status *s, struct object_id *digest,
+	struct stat *scanned_worktree);
 
 /*
  * Collect all changes between the two trees. Changes will be displayed as if

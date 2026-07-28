@@ -365,6 +365,7 @@ struct dir_struct {
 		unsigned visited_paths;
 		unsigned visited_directories;
 		unsigned untracked_cache_preloaded : 1;
+		unsigned traversal_failed : 1;
 
 		/*
 		 * Optional borrowed proof that covers every exclusion source
