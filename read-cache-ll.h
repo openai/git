@@ -195,7 +195,9 @@ struct index_state {
 		 fsmonitor_untracked_extension_invalid : 1,
 		 fsmonitor_pending_token_from_provider : 1,
 		 preload_untracked_complete : 1,
-		 preload_bulk_provider_pending : 1;
+		 preload_bulk_provider_pending : 1,
+		 preload_bulk_excludes_digest_pending : 1,
+		 preload_bulk_excludes_digest_valid : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
@@ -205,6 +207,8 @@ struct index_state {
 	size_t preload_bulk_tracked_nr;
 	struct preload_bulk_stat_update *preload_bulk_stat_updates;
 	size_t preload_bulk_stat_updates_nr;
+	struct object_id preload_bulk_standard_excludes_digest;
+	struct stat preload_bulk_scanned_worktree;
 	/* Borrowed only while refresh_index() performs a provider scan. */
 	struct clean_status_proof_epoch *preload_bulk_proof_epoch;
 	/* Borrowed for the duration of preload_index(). */
