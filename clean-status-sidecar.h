@@ -5,7 +5,10 @@
 #include "hash.h"
 
 struct clean_status_index_snapshot;
+struct attr_source_snapshot;
+struct repository;
 struct strbuf;
+struct stat;
 
 #define CLEAN_STATUS_SIDECAR_VERSION 1
 
@@ -40,5 +43,11 @@ int clean_status_sidecar_install(
 	const char *index_path, const struct clean_status_sidecar *sidecar,
 	const struct clean_status_index_snapshot *snapshot,
 	const struct git_hash_algo *algo);
+int clean_status_repository_fingerprint(
+	struct repository *repo,
+	const struct attr_source_snapshot *attrs,
+	const struct clean_status_index_snapshot *index,
+	const struct stat *scanned_worktree,
+	unsigned char *out);
 
 #endif /* CLEAN_STATUS_SIDECAR_H */

@@ -960,6 +960,7 @@ integration_tests = [
   't7527-builtin-fsmonitor.sh',
   't7528-signed-commit-ssh.sh',
   't7529-preload-index-apfs.sh',
+  't7530-status-clean-sidecar.sh',
   't7531-semantic-verify.sh',
   't7532-preload-index-linux.sh',
   't7600-merge.sh',
