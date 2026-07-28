@@ -1614,6 +1614,9 @@ struct repository *repo UNUSED)
 	struct clean_status_config_digest clean_digest;
 	unsigned int progress_flag = 0;
 	int fd;
+	int default_status_command = argc == 1 && (!prefix || !*prefix);
+	int exact_clean_command = argc == 2 &&
+		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1696,6 +1699,10 @@ struct repository *repo UNUSED)
 	parse_pathspec(&s.pathspec, 0,
 		       PATHSPEC_PREFER_FULL,
 		       prefix, argv);
+	s.allow_clean_status_shortcuts =
+		default_status_command && !s.pathspec.nr;
+	if (s.allow_clean_status_shortcuts)
+		clean_status_enable_external_history(the_repository);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2)
@@ -1731,6 +1738,22 @@ struct repository *repo UNUSED)
 
 	wt_status_collect(&s);
 
+	if (exact_clean_command && 0 <= fd &&
+	    clean_status_issue_sidecar(&s, &clean_digest, &index_lock))
+		fd = -1;
+	if (0 <= fd) {
+		int external_restored =
+			clean_status_external_history_was_restored(
+				the_repository->index);
+		int external_saved =
+			clean_status_save_external_history(
+				the_repository->index);
+
+		if (external_restored || external_saved) {
+			rollback_lock_file(&index_lock);
+			fd = -1;
+		}
+	}
 	if (0 <= fd)
 		repo_update_index_if_able(the_repository, &index_lock);
 
