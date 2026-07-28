@@ -933,6 +933,8 @@ static enum path_treatment read_directory_recursive(struct dir_struct *dir,
 	struct index_state *istate, const char *path, int len,
 	struct untracked_cache_dir *untracked,
 	int check_only, int stop_at_first_file, const struct pathspec *pathspec);
+static int resolve_dtype_with_error(int dtype, struct index_state *istate,
+				    const char *path, int len, int *failed);
 static int resolve_dtype(int dtype, struct index_state *istate,
 			 const char *path, int len);
 struct dirent *readdir_skip_dot_and_dotdot(DIR *dirp)
@@ -3297,6 +3299,12 @@ cleanup:
 static int resolve_dtype(int dtype, struct index_state *istate,
 			 const char *path, int len)
 {
+	return resolve_dtype_with_error(dtype, istate, path, len, NULL);
+}
+
+static int resolve_dtype_with_error(int dtype, struct index_state *istate,
+				    const char *path, int len, int *failed)
+{
 	struct stat st;
 
 	if (dtype != DT_UNKNOWN)
@@ -3304,8 +3312,11 @@ static int resolve_dtype(int dtype, struct index_state *istate,
 	dtype = get_index_dtype(istate, path, len);
 	if (dtype != DT_UNKNOWN)
 		return dtype;
-	if (lstat(path, &st))
+	if (lstat(path, &st)) {
+		if (failed && !is_missing_file_error(errno))
+			*failed = 1;
 		return dtype;
+	}
 	if (S_ISREG(st.st_mode))
 		return DT_REG;
 	if (S_ISDIR(st.st_mode))
@@ -3361,6 +3372,7 @@ static enum path_treatment treat_path(struct dir_struct *dir,
 				      const struct pathspec *pathspec)
 {
 	int has_path_in_index, dtype, excluded;
+	int dtype_failed = 0;
 
 	if (!cdir->d_name)
 		return treat_path_fast(dir, cdir, istate, path,
@@ -3372,7 +3384,11 @@ static enum path_treatment treat_path(struct dir_struct *dir,
 	if (simplify_away(path->buf, path->len, pathspec))
 		return path_none;
 
-	dtype = resolve_dtype(cdir->d_type, istate, path->buf, path->len);
+	dtype = resolve_dtype_with_error(
+		cdir->d_type, istate, path->buf, path->len,
+		&dtype_failed);
+	if (dtype_failed)
+		dir->internal.traversal_failed = 1;
 
 	/* Always exclude indexed files */
 	has_path_in_index = !!index_file_exists(istate, path->buf, path->len,
@@ -3523,8 +3539,10 @@ static int open_cached_dir(struct cached_dir *cdir,
 		return 0;
 	c_path = path->len ? path->buf : ".";
 	cdir->fdir = opendir(c_path);
-	if (!cdir->fdir)
+	if (!cdir->fdir) {
+		dir->internal.traversal_failed = 1;
 		warning_errno(_("could not open directory '%s'"), c_path);
+	}
 	if (dir->untracked) {
 		invalidate_directory(dir->untracked, untracked);
 		dir->untracked->dir_opened++;
@@ -3534,13 +3552,16 @@ static int open_cached_dir(struct cached_dir *cdir,
 	return 0;
 }
 
-static int read_cached_dir(struct cached_dir *cdir)
+static int read_cached_dir(struct cached_dir *cdir, struct dir_struct *dir)
 {
 	struct dirent *de;
 
 	if (cdir->fdir) {
+		errno = 0;
 		de = readdir_skip_dot_and_dotdot(cdir->fdir);
 		if (!de) {
+			if (errno)
+				dir->internal.traversal_failed = 1;
 			cdir->d_name = NULL;
 			cdir->d_type = DT_UNKNOWN;
 			return -1;
@@ -3698,7 +3719,7 @@ static enum path_treatment read_directory_recursive(struct dir_struct *dir,
 	if (untracked)
 		untracked->check_only = !!check_only;
 
-	while (!read_cached_dir(&cdir)) {
+	while (!read_cached_dir(&cdir, dir)) {
 		/* check how the file or directory should be treated */
 		state = treat_path(dir, untracked, &cdir, istate, &path,
 				   baselen, pathspec);

@@ -2350,6 +2350,23 @@ static struct ref_store *ref_store_init(struct repository *repo,
 	return refs;
 }
 
+int refs_for_each_replace_ref_uncached(struct repository *repo,
+				       refs_for_each_cb cb, void *cb_data)
+{
+	struct ref_store *refs;
+	int ret;
+
+	if (!repo->gitdir)
+		BUG("attempting to get uncached refs outside of repository");
+
+	refs = ref_store_init(repo, repo->ref_storage_format, repo->gitdir,
+			      REF_STORE_READ);
+	ret = refs_for_each_replace_ref(refs, cb, cb_data);
+	ref_store_release(refs);
+	free(refs);
+	return ret;
+}
+
 void ref_store_release(struct ref_store *ref_store)
 {
 	ref_store->be->release(ref_store);
