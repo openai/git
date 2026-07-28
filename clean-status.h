@@ -6,9 +6,11 @@
 struct index_state;
 struct attr_source_snapshot;
 struct clean_status_proof_epoch;
+struct lock_file;
 struct repository;
 struct stat;
 struct strbuf;
+struct wt_status;
 
 enum clean_status_attr_change {
 	CLEAN_STATUS_ATTR_CONTENT_CHANGED = 1 << 0,
@@ -78,6 +80,11 @@ int clean_status_retain_source_index_fd(struct index_state *istate, int fd,
 					const struct stat *st);
 int clean_status_verify_null_index(const struct index_state *istate,
 				   const struct stat *st);
+
+int clean_status_issue_sidecar(
+	struct wt_status *status,
+	const struct clean_status_config_digest *config,
+	struct lock_file *index_lock);
 
 int clean_status_read_fsmonitor_config(struct index_state *istate,
 				       const void *data, unsigned long size);
