@@ -70,6 +70,9 @@ struct preload_bulk_scan {
 	struct index_state *istate;
 	const struct preload_bulk_backend *backend;
 	void *platform_data;
+	const char *test_barrier_path;
+	const char *test_barrier_ready;
+	const char *test_barrier_resume;
 	struct preload_bulk_queue queue;
 	struct preload_bulk_worker *workers;
 	unsigned char *tracked_state;
@@ -115,6 +118,8 @@ const struct preload_bulk_backend *preload_bulk_platform_backend(void);
 int preload_bulk_collect(struct index_state *istate, int threads,
 			 struct preload_bulk_result *result);
 int preload_bulk_available(void);
+int preload_bulk_test_barrier(struct preload_bulk_scan *scan,
+			      const char *path);
 void preload_bulk_result_release(struct preload_bulk_result *result);
 
 #endif /* PRELOAD_INDEX_BULK_H */
