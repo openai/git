@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "parse.h"
 #include "preload-index-bulk.h"
 #include "read-cache-ll.h"
 
@@ -12,6 +13,25 @@ static int backend_available(const struct preload_bulk_backend *backend)
 int preload_bulk_available(void)
 {
 	return backend_available(preload_bulk_platform_backend());
+}
+
+int preload_bulk_test_barrier(struct preload_bulk_scan *scan,
+			      const char *path)
+{
+	struct strbuf buf = STRBUF_INIT;
+	int result;
+
+	if (!scan->test_barrier_path ||
+	    strcmp(scan->test_barrier_path, path))
+		return 0;
+	if (!scan->test_barrier_ready || !scan->test_barrier_resume)
+		return -1;
+
+	write_file(scan->test_barrier_ready, "ready");
+	result = strbuf_read_file(&buf, scan->test_barrier_resume, 1) > 0 ?
+		0 : -1;
+	strbuf_release(&buf);
+	return result;
 }
 
 int preload_bulk_collect(struct index_state *istate, int threads,
@@ -37,10 +57,21 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 	if (!backend_available(backend))
 		return -1;
 
+	if (git_env_bool("GIT_TEST_PRELOAD_INDEX_BULK", 0)) {
+		scan.test_barrier_path = getenv(
+			"GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_PATH");
+		scan.test_barrier_ready = getenv(
+			"GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_READY");
+		scan.test_barrier_resume = getenv(
+			"GIT_TEST_PRELOAD_INDEX_BULK_BARRIER_RESUME");
+	}
+
 	CALLOC_ARRAY(scan.tracked_state, istate->cache_nr);
 	start_error = backend->start(&scan);
 	if (!start_error) {
 		scan_error = preload_bulk_run_scan(&scan, &run_result);
+		if (!scan_error)
+			scan_error = preload_bulk_test_barrier(&scan, "");
 		finish_error = backend->finish(&scan);
 	}
 
