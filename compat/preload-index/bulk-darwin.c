@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 
 #include <sys/attr.h>
+#include <sys/utsname.h>
 #include <sys/vnode.h>
 
 #include "compat/precompose_utf8.h"
@@ -62,6 +63,27 @@ static int preload_bulk_darwin_open_dir_at(
 	}
 	return openat(parent_fd, name,
 		      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
+
+int preload_bulk_darwin_supports_nofollow_any(void)
+{
+#ifdef O_NOFOLLOW_ANY
+	struct utsname uts;
+	char *end;
+	unsigned long major;
+
+	/*
+	 * O_NOFOLLOW_ANY arrived in Darwin 20. Older kernels accept the
+	 * same bit as O_ALERT without enforcing no-follow semantics.
+	 */
+	if (uname(&uts) || !isdigit((unsigned char)uts.release[0]))
+		return 0;
+	errno = 0;
+	major = strtoul(uts.release, &end, 10);
+	return !errno && end != uts.release && *end == '.' && major >= 20;
+#else
+	return 0;
+#endif
 }
 
 static int preload_bulk_darwin_open_relative(struct preload_bulk_scan *scan,
@@ -449,12 +471,35 @@ out:
 	return ret;
 }
 
+static const char *start_scan(struct preload_bulk_scan *scan)
+{
+	const char *error;
+
+	repo_precompose_utf8_prepare(scan->repo);
+	error = preload_bulk_darwin_open_root(scan);
+	if (error)
+		return error;
+	return preload_bulk_darwin_snapshot_root(scan);
+}
+
+static const char *finish_scan(struct preload_bulk_scan *scan)
+{
+	return preload_bulk_darwin_validate_root(scan);
+}
+
 static const struct preload_bulk_backend darwin_backend = {
+	.start = start_scan,
+	.finish = finish_scan,
+	.release = preload_bulk_darwin_release,
 	.open_dir_at = preload_bulk_darwin_open_dir_at,
 	.scan_directory = scan_directory,
 };
 
 const struct preload_bulk_backend *preload_bulk_platform_backend(void)
 {
-	return &darwin_backend;
+#ifdef O_NOFOLLOW_ANY
+	if (preload_bulk_darwin_supports_nofollow_any())
+		return &darwin_backend;
+#endif
+	return NULL;
 }
