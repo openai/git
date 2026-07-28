@@ -275,7 +275,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	add_compile_definitions(PROCFS_EXECUTABLE_PATH="/proc/self/exe" HAVE_DEV_TTY )
 	list(APPEND compat_SOURCES unix-socket.c unix-stream-server.c compat/linux/procinfo.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-	add_compile_definitions(PRECOMPOSE_UNICODE USE_ST_TIMESPEC)
+	add_compile_definitions(HAVE_PRELOAD_INDEX_BULK PRECOMPOSE_UNICODE
+		USE_ST_TIMESPEC)
 	list(APPEND compat_SOURCES
 		compat/darwin/procinfo.c
 		compat/precompose_utf8.c
@@ -677,7 +678,8 @@ parse_makefile_for_sources(libgit_SOURCES ${CMAKE_SOURCE_DIR}/Makefile "LIB_OBJS
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 	list(APPEND libgit_SOURCES
 		preload-index-bulk-index.c
-		preload-index-bulk-thread.c)
+		preload-index-bulk-thread.c
+		preload-index-bulk.c)
 endif()
 
 list(TRANSFORM libgit_SOURCES PREPEND "${CMAKE_SOURCE_DIR}/")
