@@ -1623,4 +1623,69 @@ test_expect_success MACOS 'worktree binding rejects same-gitdir aliases' '
 	git -C binding-a fsmonitor--daemon stop
 '
 
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'configured unused filters establish scoped history' '
+	test_when_finished "rm -rf configured-filter" &&
+	test_create_repo configured-filter &&
+	(
+		cd configured-filter &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config filter.demo.clean cat &&
+		git config core.preloadIndexBulk true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/filter-scope.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/filter-scope.out &&
+		test_must_be_empty .git/filter-scope.out &&
+		test_trace2_data status semantic_verify/prepared 1 \
+			<.git/filter-scope.trace &&
+		! test_trace2_data status semantic_verify/bulk_scan 1 \
+			<.git/filter-scope.trace &&
+		test_trace2_data semantic_verify active-filters 0 \
+			<.git/filter-scope.trace &&
+		test_trace2_data semantic_verify filter-scope-checked 1 \
+			<.git/filter-scope.trace &&
+		test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/filter-scope.trace &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/warm-filter-scope.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/warm-filter-scope.out &&
+		test_must_be_empty .git/warm-filter-scope.out &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/warm-filter-scope.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/warm-filter-scope.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9][0-9]*" <.git/warm-filter-scope.trace &&
+		! test_trace2_data index refresh/sum_lstat \
+			"[1-9][0-9]*" <.git/warm-filter-scope.trace &&
+
+		test_write_lines "tracked filter=demo" >.git/info/attributes &&
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/active-filter.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/active-filter.out &&
+		test_must_be_empty .git/active-filter.out &&
+		test_trace2_data status semantic_verify/prepared 1 \
+			<.git/active-filter.trace &&
+		test_trace2_data semantic_verify active-filters 1 \
+			<.git/active-filter.trace &&
+		test_trace2_data semantic_verify filter-scope-rejected 1 \
+			<.git/active-filter.trace &&
+		! test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/active-filter.trace
+	)
+'
+
 test_done
