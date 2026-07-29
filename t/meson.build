@@ -8,6 +8,7 @@ clar_test_suites = [
   'unit-tests/u-example-decorate.c',
   'unit-tests/u-fsmonitor-attributes.c',
   'unit-tests/u-fsmonitor-clean-proof.c',
+  'unit-tests/u-fsmonitor-response.c',
   'unit-tests/u-hash.c',
   'unit-tests/u-hashmap.c',
   'unit-tests/u-list-objects-filter-options.c',
