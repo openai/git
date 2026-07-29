@@ -44,6 +44,9 @@ int clean_status_refresh_worktree_manifest(struct index_state *istate);
 int clean_status_manifest_global_fallback(const struct index_state *istate);
 void clean_status_record_source_identity(struct index_state *istate,
 					 const struct stat *st);
+/* Takes ownership of fd only when it returns 1. */
+int clean_status_retain_source_index_fd(struct index_state *istate, int fd,
+					const struct stat *st);
 int clean_status_verify_null_index(const struct index_state *istate,
 				   const struct stat *st);
 
