@@ -6,6 +6,7 @@
 #include "parse.h"
 #include "preload-index-bulk.h"
 #include "read-cache-ll.h"
+#include "repository.h"
 #include "trace2.h"
 
 struct preload_bulk_untracked_root {
@@ -179,11 +180,13 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 		.repo = istate->repo,
 		.istate = istate,
 		.backend = backend,
+		.proof_epoch = istate->preload_bulk_proof_epoch,
 		.root_fd = -1,
 		.threads = threads,
 		.untracked = STRING_LIST_INIT_DUP,
 	};
 	struct preload_bulk_run_result run_result = { 0 };
+	struct stat root_stat;
 	const char *start_error, *finish_error = NULL;
 	const char *untracked_reason = NULL;
 	int scan_error = -1;
@@ -236,6 +239,11 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 
 	CALLOC_ARRAY(scan.tracked_state, istate->cache_nr);
 	start_error = backend->start(&scan);
+	if (!start_error && scan.proof_epoch &&
+	    (scan.root_fd < 0 || fstat(scan.root_fd, &root_stat)))
+		start_error = "root-stat";
+	if (!start_error && scan.proof_epoch)
+		scan.root_dev = root_stat.st_dev;
 	if (!start_error) {
 		if (scan.collect_untracked) {
 			exclude_proof = exclude_source_proof_create(
@@ -296,11 +304,15 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 	}
 	if (clean) {
 		result->tracked_state = scan.tracked_state;
+		result->stat_updates = scan.stat_updates;
+		result->stat_updates_nr = scan.stat_updates_nr;
 		result->nr = istate->cache_nr;
 		result->can_skip_unseen_preload =
 			scan.can_skip_unseen_preload;
 		result->untracked_complete = run_result.untracked_complete;
 		scan.tracked_state = NULL;
+		scan.stat_updates = NULL;
+		scan.stat_updates_nr = 0;
 	}
 
 	backend->release(&scan);
@@ -320,12 +332,14 @@ int preload_bulk_collect(struct index_state *istate, int threads,
 		exclude_source_proof_release(exclude_proof);
 	}
 	free(scan.tracked_state);
+	free(scan.stat_updates);
 	return clean ? 0 : -1;
 }
 
 void preload_bulk_result_release(struct preload_bulk_result *result)
 {
 	FREE_AND_NULL(result->tracked_state);
+	FREE_AND_NULL(result->stat_updates);
 	string_list_clear(&result->untracked, 0);
 	memset(result, 0, sizeof(*result));
 }

@@ -31,6 +31,9 @@ struct cache_entry {
 	char name[FLEX_ARRAY]; /* more */
 };
 
+struct clean_status_proof_epoch;
+struct preload_bulk_stat_update;
+
 #define CE_STAGEMASK (0x3000)
 #define CE_EXTENDED  (0x4000)
 #define CE_VALID     (0x8000)
@@ -191,7 +194,8 @@ struct index_state {
 		 fsmonitor_untracked_extension_seen : 1,
 		 fsmonitor_untracked_extension_invalid : 1,
 		 fsmonitor_pending_token_from_provider : 1,
-		 preload_untracked_complete : 1;
+		 preload_untracked_complete : 1,
+		 preload_bulk_provider_pending : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
@@ -199,6 +203,10 @@ struct index_state {
 	struct untracked_cache *untracked;
 	unsigned char *preload_bulk_tracked_state;
 	size_t preload_bulk_tracked_nr;
+	struct preload_bulk_stat_update *preload_bulk_stat_updates;
+	size_t preload_bulk_stat_updates_nr;
+	/* Borrowed only while refresh_index() performs a provider scan. */
+	struct clean_status_proof_epoch *preload_bulk_proof_epoch;
 	/* Borrowed for the duration of preload_index(). */
 	struct string_list *preload_untracked;
 	char *fsmonitor_last_update;
