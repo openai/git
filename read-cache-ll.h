@@ -515,6 +515,9 @@ int repo_refresh_and_write_index(struct repository*, unsigned int refresh_flags,
 
 struct cache_entry *refresh_cache_entry(struct index_state *, struct cache_entry *, unsigned int);
 
+/* The caller must first verify the entry's content and mode against st. */
+void refresh_index_entry_stat(struct index_state *, int, struct stat *);
+
 void set_alternate_index_output(const char *);
 
 extern int verify_index_checksum;
