@@ -8,10 +8,12 @@ struct index_state;
 
 struct clean_status_state {
 	struct clean_status_identity source_identity;
+	struct clean_status_identity source_index_identity;
 	struct clean_status_manifest_state manifest;
 	struct strbuf disk_config_raw;
 	char *disk_config_token;
 	char *config_revalidated_token;
+	int source_index_fd;
 	unsigned char current_config_hash[GIT_MAX_RAWSZ];
 	unsigned char disk_config_hash[GIT_MAX_RAWSZ];
 	unsigned char current_semantic_hash[GIT_MAX_RAWSZ];
@@ -32,6 +34,7 @@ struct clean_status_state {
 	unsigned config_revalidated : 1;
 	unsigned initial_coherent : 1;
 	unsigned source_identity_valid : 1;
+	unsigned source_index_identity_valid : 1;
 	unsigned disk_config_valid : 1;
 	unsigned disk_semantic_valid : 1;
 	unsigned disk_attr_valid : 1;

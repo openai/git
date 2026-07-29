@@ -2288,7 +2288,7 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 
 	istate->timestamp.sec = 0;
 	istate->timestamp.nsec = 0;
-	fd = open(path, O_RDONLY);
+	fd = git_open_cloexec(path, O_RDONLY);
 	if (fd < 0) {
 		if (!must_exist && errno == ENOENT) {
 			set_new_index_sparsity(istate);
@@ -2307,10 +2307,14 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 		die(_("%s: index file smaller than expected"), path);
 
 	mmap = xmmap_gently(NULL, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (mmap == MAP_FAILED)
+	if (mmap == MAP_FAILED) {
+		int mmap_errno = errno;
+
+		close(fd);
+		errno = mmap_errno;
 		die_errno(_("%s: unable to map index file%s"), path,
 			mmap_os_err());
-	close(fd);
+	}
 
 	hdr = (const struct cache_header *)mmap;
 	if (verify_hdr(hdr, mmap_size) < 0)
@@ -2402,9 +2406,13 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	else
 		ensure_correct_sparsity(istate);
 
+	if (!clean_status_retain_source_index_fd(istate, fd, &st))
+		close(fd);
+
 	return istate->cache_nr;
 
 unmap:
+	close(fd);
 	munmap((void *)mmap, mmap_size);
 	die(_("index file corrupt"));
 }
