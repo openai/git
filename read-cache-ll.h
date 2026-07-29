@@ -182,13 +182,21 @@ struct index_state {
 		 drop_cache_tree : 1,
 		 updated_workdir : 1,
 		 updated_skipworktree : 1,
-		 fsmonitor_has_run_once : 1;
+		 fsmonitor_has_run_once : 1,
+		 fsmonitor_token_valid : 1,
+		 fsmonitor_extension_seen : 1,
+		 fsmonitor_untracked_valid : 1,
+		 fsmonitor_untracked_extension_seen : 1,
+		 fsmonitor_untracked_extension_invalid : 1,
+		 fsmonitor_pending_token_from_provider : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
 	struct object_id oid;
 	struct untracked_cache *untracked;
 	char *fsmonitor_last_update;
+	char *fsmonitor_last_update_pending;
+	char *fsmonitor_untracked_token;
 	struct ewah_bitmap *fsmonitor_dirty;
 	struct mem_pool *ce_mem_pool;
 	struct progress *progress;
