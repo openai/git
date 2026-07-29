@@ -1628,9 +1628,10 @@ struct repository *repo UNUSED)
 		progress_flag = REFRESH_PROGRESS;
 	repo_read_index(the_repository);
 	wt_status_start_untracked_cache_preload(&s);
-	refresh_index(the_repository->index,
-		      REFRESH_QUIET|REFRESH_UNMERGED|progress_flag,
-		      &s.pathspec, NULL, NULL);
+	wt_status_refresh_index(
+		&s, REFRESH_QUIET | REFRESH_UNMERGED | progress_flag,
+		s.show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
+		!s.show_ignored_mode);
 
 	if (use_optional_locks())
 		fd = repo_hold_locked_index(the_repository, &index_lock, 0);
