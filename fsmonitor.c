@@ -807,7 +807,43 @@ malformed:
 static enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	const char *since_token, struct fsmonitor_query_result *result)
 {
+	const char *test_sequence =
+		getenv("GIT_TEST_FSMONITOR_QUERY_SEQUENCE");
 	struct strbuf raw = STRBUF_INIT;
+
+	/*
+	 * Tests may script clean, delta, trivial, and error responses with
+	 * C, D, T, and E. A delta uses GIT_TEST_FSMONITOR_QUERY_PATH.
+	 */
+	if (test_sequence && *test_sequence) {
+		static size_t query_nr;
+		const char *path;
+		char outcome;
+
+		if (query_nr >= strlen(test_sequence))
+			return FSMONITOR_QUERY_ERROR;
+		outcome = test_sequence[query_nr++];
+		if (outcome == 'E')
+			return FSMONITOR_QUERY_ERROR;
+
+		strbuf_addf(&result->token, "builtin:test:%"PRIuMAX,
+			    (uintmax_t)query_nr);
+		if (outcome == 'T') {
+			result->outcome = FSMONITOR_QUERY_TRIVIAL;
+			return result->outcome;
+		}
+		if (outcome == 'D') {
+			path = getenv("GIT_TEST_FSMONITOR_QUERY_PATH");
+			if (!path || !*path)
+				return FSMONITOR_QUERY_ERROR;
+			strbuf_addstr(&result->paths, path);
+			strbuf_addch(&result->paths, '\0');
+		} else if (outcome != 'C') {
+			return FSMONITOR_QUERY_ERROR;
+		}
+		result->outcome = FSMONITOR_QUERY_DELTA;
+		return result->outcome;
+	}
 
 	if (!fsmonitor_ipc__send_query(since_token, &raw))
 		fsmonitor_parse_builtin_response(&raw, result);
@@ -849,6 +885,15 @@ static void invalidate_all_fsmonitor(struct index_state *istate)
 		istate->cache_changed |= FSMONITOR_CHANGED;
 }
 
+static void invalidate_all_fsmonitor_strong(struct index_state *istate)
+{
+	unsigned int i;
+
+	invalidate_all_fsmonitor(istate);
+	for (i = 0; i < istate->cache_nr; i++)
+		fsmonitor_invalidate_cache_entry(istate->cache[i]);
+}
+
 void refresh_fsmonitor(struct index_state *istate)
 {
 	static int warn_once = 0;
@@ -860,6 +905,8 @@ void refresh_fsmonitor(struct index_state *istate)
 	char *buf;
 	unsigned int i;
 	int is_trivial = 0;
+	int tracked_requires_bootstrap;
+	int untracked_requires_bootstrap;
 	struct repository *r = istate->repo;
 	enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(r);
 	enum fsmonitor_reason reason = fsm_settings__get_reason(r);
@@ -1000,6 +1047,10 @@ apply_results:
 	 */
 	trace2_region_enter("fsmonitor", "apply_results", istate->repo);
 
+	tracked_requires_bootstrap = !query_success || is_trivial ||
+		!istate->fsmonitor_token_valid;
+	untracked_requires_bootstrap = !istate->fsmonitor_untracked_valid;
+
 	if (query_success && !is_trivial) {
 		/*
 		 * Mark all pathnames returned by the monitor as dirty.
@@ -1027,9 +1078,14 @@ apply_results:
 			}
 		}
 
+		if (tracked_requires_bootstrap)
+			invalidate_all_fsmonitor(istate);
+
 		/* Now mark the untracked cache for fsmonitor usage */
 		if (istate->untracked)
-			istate->untracked->use_fsmonitor = 1;
+			istate->untracked->use_fsmonitor =
+				!tracked_requires_bootstrap &&
+				!untracked_requires_bootstrap;
 
 		if (count > fsmonitor_force_update_threshold)
 			istate->cache_changed |= FSMONITOR_CHANGED;
@@ -1052,9 +1108,152 @@ apply_results:
 
 	strbuf_release(&query_result);
 
-	/* Now that we've updated istate, save the last_update_token */
+	/*
+	 * A token obtained before a full scan cannot describe changes which
+	 * race with that scan. Keep it in memory until the caller closes the
+	 * race with a second query. The last valid token remains safe because
+	 * a query relative to it will return a superset of changes.
+	 */
+	if (tracked_requires_bootstrap) {
+		if (!last_update_token.len) {
+			if (istate->fsmonitor_last_update)
+				strbuf_addstr(&last_update_token,
+					      istate->fsmonitor_last_update);
+			else
+				strbuf_addstr(&last_update_token, "builtin:fake");
+		}
+		FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+		istate->fsmonitor_last_update_pending =
+			strbuf_detach(&last_update_token, NULL);
+		/*
+		 * A trivial response cannot validate prior state, but its
+		 * returned token is still a provider-owned boundary.  Use it
+		 * to anchor the complete scan which the caller will close with
+		 * another query.  Hook providers cannot perform that closing
+		 * query, so do not publish their trivial-response tokens.
+		 */
+		istate->fsmonitor_pending_token_from_provider =
+			query_success &&
+			(fsm_mode == FSMONITOR_MODE_IPC || !is_trivial);
+		istate->fsmonitor_untracked_valid = 0;
+	} else {
+		FREE_AND_NULL(istate->fsmonitor_last_update);
+		istate->fsmonitor_last_update =
+			strbuf_detach(&last_update_token, NULL);
+		if (untracked_requires_bootstrap) {
+			FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+			istate->fsmonitor_last_update_pending =
+				xstrdup(istate->fsmonitor_last_update);
+			istate->fsmonitor_pending_token_from_provider = 1;
+		} else {
+			FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+			istate->fsmonitor_pending_token_from_provider = 0;
+		}
+		if (istate->fsmonitor_untracked_valid && istate->untracked) {
+			FREE_AND_NULL(istate->fsmonitor_untracked_token);
+			istate->fsmonitor_untracked_token =
+				xstrdup(istate->fsmonitor_last_update);
+		}
+	}
+}
+
+int fsmonitor_has_pending_token(const struct index_state *istate)
+{
+	return !!istate->fsmonitor_last_update_pending;
+}
+
+int fsmonitor_pending_token_from_provider(const struct index_state *istate)
+{
+	return istate->fsmonitor_last_update_pending &&
+		istate->fsmonitor_pending_token_from_provider;
+}
+
+enum fsmonitor_token_result fsmonitor_query_pending_token(
+	struct index_state *istate, int untracked_ready)
+{
+	struct fsmonitor_query_result result = FSMONITOR_QUERY_RESULT_INIT;
+	enum fsmonitor_token_result ret;
+	int count;
+
+	if (!istate->fsmonitor_last_update_pending)
+		return FSMONITOR_TOKEN_NOT_PENDING;
+	if (fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC)
+		return FSMONITOR_TOKEN_ERROR;
+
+	query_builtin_fsmonitor(istate->fsmonitor_last_update_pending, &result);
+	if (result.outcome == FSMONITOR_QUERY_ERROR) {
+		istate->fsmonitor_pending_token_from_provider = 0;
+		ret = FSMONITOR_TOKEN_ERROR;
+		goto done;
+	}
+
+	FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+	istate->fsmonitor_last_update_pending =
+		strbuf_detach(&result.token, NULL);
+	istate->fsmonitor_pending_token_from_provider = 1;
+	if (result.outcome == FSMONITOR_QUERY_TRIVIAL) {
+		invalidate_all_fsmonitor_strong(istate);
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "token_closure/trivial", 1);
+		ret = FSMONITOR_TOKEN_TRIVIAL;
+		goto done;
+	}
+
+	count = apply_fsmonitor_paths(istate, &result.paths);
+	if (istate->untracked)
+		istate->untracked->use_fsmonitor = !!untracked_ready;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "token_closure/apply_count", count);
+	ret = count ? FSMONITOR_TOKEN_CHANGED : FSMONITOR_TOKEN_CLEAN;
+
+done:
+	fsmonitor_query_result_release(&result);
+	return ret;
+}
+
+void fsmonitor_accept_pending_token(struct index_state *istate)
+{
+	if (!fsmonitor_pending_token_from_provider(istate))
+		return;
 	FREE_AND_NULL(istate->fsmonitor_last_update);
-	istate->fsmonitor_last_update = strbuf_detach(&last_update_token, NULL);
+	istate->fsmonitor_last_update = istate->fsmonitor_last_update_pending;
+	istate->fsmonitor_last_update_pending = NULL;
+	istate->fsmonitor_pending_token_from_provider = 0;
+	istate->fsmonitor_token_valid = 1;
+	istate->fsmonitor_untracked_valid = 1;
+	if (istate->untracked)
+		istate->untracked->use_fsmonitor = 1;
+	istate->cache_changed |= FSMONITOR_CHANGED;
+	FREE_AND_NULL(istate->fsmonitor_untracked_token);
+	istate->fsmonitor_untracked_token =
+		xstrdup(istate->fsmonitor_last_update);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "token_closure/accepted", 1);
+}
+
+void fsmonitor_reject_pending_token(struct index_state *istate)
+{
+	FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+	istate->fsmonitor_pending_token_from_provider = 0;
+	if (!istate->fsmonitor_token_valid)
+		FREE_AND_NULL(istate->fsmonitor_last_update);
+	invalidate_all_fsmonitor_strong(istate);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "token_closure/rejected", 1);
+}
+
+void fsmonitor_mark_untracked_cache_valid(struct index_state *istate)
+{
+	if (istate->fsmonitor_last_update_pending ||
+	    !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_last_update || !istate->untracked ||
+	    istate->fsmonitor_untracked_valid)
+		return;
+	istate->fsmonitor_untracked_valid = 1;
+	FREE_AND_NULL(istate->fsmonitor_untracked_token);
+	istate->fsmonitor_untracked_token =
+		xstrdup(istate->fsmonitor_last_update);
+	istate->cache_changed |= FSMONITOR_CHANGED;
 }
 
 /*
@@ -1086,6 +1285,7 @@ static void initialize_fsmonitor_last_update(struct index_state *istate)
 
 	strbuf_addf(&last_update, "%"PRIu64"", getnanotime());
 	istate->fsmonitor_last_update = strbuf_detach(&last_update, NULL);
+	istate->fsmonitor_token_valid = 0;
 }
 
 void add_fsmonitor(struct index_state *istate)
@@ -1104,7 +1304,7 @@ void add_fsmonitor(struct index_state *istate)
 		/* reset the untracked cache */
 		if (istate->untracked) {
 			add_untracked_cache(istate);
-			istate->untracked->use_fsmonitor = 1;
+			istate->untracked->use_fsmonitor = 0;
 		}
 
 		/* Update the fsmonitor state */
@@ -1114,6 +1314,13 @@ void add_fsmonitor(struct index_state *istate)
 
 void remove_fsmonitor(struct index_state *istate)
 {
+	istate->fsmonitor_token_valid = 0;
+	istate->fsmonitor_untracked_valid = 0;
+	FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+	istate->fsmonitor_pending_token_from_provider = 0;
+	FREE_AND_NULL(istate->fsmonitor_untracked_token);
+	if (istate->untracked)
+		istate->untracked->use_fsmonitor = 0;
 	if (istate->fsmonitor_last_update) {
 		trace_printf_key(&trace_fsmonitor, "remove fsmonitor");
 		istate->cache_changed |= FSMONITOR_CHANGED;
