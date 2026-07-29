@@ -5,6 +5,8 @@ struct strvec;
 
 void git_set_exec_path(const char *exec_path);
 void git_resolve_executable_dir(const char *path);
+const char *git_executable_path(void);
+void git_mark_executable_as_dispatcher(void);
 const char *git_exec_path(void);
 void setup_path(void);
 const char **prepare_git_cmd(struct strvec *out, const char **argv);
