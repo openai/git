@@ -139,6 +139,7 @@ struct wt_status {
 	/* These are computed during processing of the individual sections */
 	int committable;
 	int workdir_dirty;
+	unsigned untracked_from_token_closure : 1;
 	const char *index_file;
 	FILE *fp;
 	const char *prefix;
@@ -157,6 +158,13 @@ void wt_status_prepare(struct repository *r, struct wt_status *s);
 void wt_status_print(struct wt_status *s);
 void wt_status_collect(struct wt_status *s);
 void wt_status_start_untracked_cache_preload(struct wt_status *s);
+/*
+ * Refresh tracked entries and close any provider token. When requested,
+ * also close a complete untracked-cache scan before accepting that token.
+ */
+int wt_status_refresh_index(struct wt_status *s,
+			    unsigned int refresh_flags,
+			    int require_untracked);
 
 /*
  * Collect all changes between the two trees. Changes will be displayed as if
