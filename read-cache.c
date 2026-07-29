@@ -2471,6 +2471,7 @@ void release_index(struct index_state *istate)
 	free_name_hash(istate);
 	cache_tree_free(&(istate->cache_tree));
 	free(istate->fsmonitor_last_update);
+	free(istate->fsmonitor_last_update_pending);
 	free(istate->fsmonitor_untracked_token);
 	free(istate->cache);
 	discard_split_index(istate);
