@@ -187,13 +187,15 @@ struct index_state {
 		 fsmonitor_extension_seen : 1,
 		 fsmonitor_untracked_valid : 1,
 		 fsmonitor_untracked_extension_seen : 1,
-		 fsmonitor_untracked_extension_invalid : 1;
+		 fsmonitor_untracked_extension_invalid : 1,
+		 fsmonitor_pending_token_from_provider : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
 	struct object_id oid;
 	struct untracked_cache *untracked;
 	char *fsmonitor_last_update;
+	char *fsmonitor_last_update_pending;
 	char *fsmonitor_untracked_token;
 	struct ewah_bitmap *fsmonitor_dirty;
 	struct mem_pool *ce_mem_pool;
