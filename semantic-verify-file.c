@@ -103,9 +103,32 @@ int semantic_verify_classify_entry(struct index_state *istate,
 }
 
 #if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+static int observed_stat_equal(const struct stat *a, const struct stat *b,
+			       int has_platform_identity)
+{
+	if (a->st_dev != b->st_dev || a->st_ino != b->st_ino ||
+	    a->st_mode != b->st_mode || a->st_nlink != b->st_nlink ||
+	    a->st_uid != b->st_uid || a->st_gid != b->st_gid ||
+	    a->st_size != b->st_size || a->st_mtime != b->st_mtime ||
+	    ST_MTIME_NSEC(*a) != ST_MTIME_NSEC(*b) ||
+	    a->st_ctime != b->st_ctime ||
+	    ST_CTIME_NSEC(*a) != ST_CTIME_NSEC(*b))
+		return 0;
+#ifdef __APPLE__
+	if (has_platform_identity &&
+	    (a->st_birthtimespec.tv_sec != b->st_birthtimespec.tv_sec ||
+	     a->st_birthtimespec.tv_nsec != b->st_birthtimespec.tv_nsec ||
+	     a->st_gen != b->st_gen))
+		return 0;
+#else
+	(void)has_platform_identity;
+#endif
+	return 1;
+}
+
 void semantic_verify_file_at(int parent_fd, const char *basename,
 			     const struct stat *observed,
-			     dev_t root_dev,
+			     int observed_has_platform_identity, dev_t root_dev,
 			     const struct cache_entry *ce,
 			     struct repository *repo, void *buffer,
 			     struct semantic_verify_file_result *result)
@@ -138,7 +161,8 @@ void semantic_verify_file_at(int parent_fd, const char *basename,
 	if (fstat(fd, &fd_before))
 		goto unstable;
 	if (fd_before.st_dev != root_dev ||
-	    !path_namespace_stat_equal(&path_before, &fd_before)) {
+	    !observed_stat_equal(&path_before, &fd_before,
+				 observed_has_platform_identity)) {
 		errno = EAGAIN;
 		goto unstable;
 	}
@@ -199,7 +223,7 @@ void semantic_verify_file(struct semantic_verify_root *root,
 			SEMANTIC_VERIFY_RAW_MODIFIED : SEMANTIC_VERIFY_ERROR;
 		return;
 	}
-	semantic_verify_file_at(parent_fd, basename, &path_before,
+	semantic_verify_file_at(parent_fd, basename, &path_before, 1,
 				root->stat.st_dev, ce, repo, buffer, result);
 }
 #else
@@ -214,7 +238,7 @@ static void semantic_verify_file_unavailable(
 void semantic_verify_file_at(
 	int parent_fd UNUSED, const char *basename UNUSED,
 	const struct stat *observed UNUSED,
-	dev_t root_dev UNUSED,
+	int observed_has_platform_identity UNUSED, dev_t root_dev UNUSED,
 	const struct cache_entry *ce UNUSED,
 	struct repository *repo UNUSED, void *buffer UNUSED,
 	struct semantic_verify_file_result *result)

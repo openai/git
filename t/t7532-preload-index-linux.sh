@@ -39,6 +39,27 @@ setup_repo () {
 	git -C "$repo" update-index --refresh
 }
 
+setup_provider_proof_repo () {
+	setup_repo "$1" &&
+	(
+		cd "$1" &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		size=$(test_file_size root) &&
+		mtime=$(test-tool chmtime --get root) &&
+		printf "dirt\n" >root &&
+		test "$(test_file_size root)" = "$size" &&
+		test-tool chmtime =$mtime root &&
+		test "$(test-tool chmtime --get root)" = "$mtime" &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid root &&
+		test_grep ! FSCF .git/index
+	)
+}
+
 test_lazy_prereq LINUX_BULK_PRELOAD '
 	setup_repo linux-bulk-prereq &&
 	GIT_OPTIONAL_LOCKS=0 \
@@ -154,6 +175,60 @@ test_expect_success 'clean entries are published without lstat' '
 	check_data clean.trace preload/bulk_applied 4 &&
 	check_data clean.trace preload/bulk_untracked_complete 1 &&
 	check_lstat_data clean.trace 0
+'
+
+test_expect_success 'provider closure accepts bulk content proofs' '
+	(
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		setup_provider_proof_repo provider-proof &&
+		cd provider-proof &&
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* root$" .git/actual &&
+		test_trace2_data status semantic_verify/bulk_scan 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_content_verify 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_bytes_hashed \
+			"[1-9][0-9]*" <.git/status.trace &&
+		test_trace2_data index preload/bulk_provider_applied 3 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index
+	)
+'
+
+test_expect_success 'provider failure discards bulk content proofs' '
+	(
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		setup_provider_proof_repo provider-failure &&
+		cd provider-failure &&
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CE \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* root$" .git/actual &&
+		test_trace2_data status semantic_verify/bulk_scan 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_content_verify 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_bytes_hashed \
+			"[1-9][0-9]*" <.git/status.trace &&
+		! test_trace2_data index preload/bulk_provider_applied \
+			"[0-9][0-9]*" <.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep ! FSCF .git/index
+	)
 '
 
 test_expect_success 'tracked files ignore a directory type hint' '

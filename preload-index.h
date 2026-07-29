@@ -21,5 +21,7 @@ int repo_read_index_preload(struct repository *,
 			    const struct pathspec *pathspec,
 			    unsigned refresh_flags);
 void preload_index_bulk_result_clear(struct index_state *index);
+int preload_index_bulk_can_close_provider(struct index_state *index);
+int preload_index_bulk_result_accept(struct index_state *index);
 
 #endif /* PRELOAD_INDEX_H */

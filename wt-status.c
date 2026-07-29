@@ -1048,8 +1048,16 @@ static int wt_status_collect_untracked_1(
 	return used_untracked_cache;
 }
 
+static int wt_status_can_use_bulk_provider(
+	struct wt_status *s, unsigned int refresh_flags)
+{
+	return !s->show_ignored_mode && !s->pathspec.nr &&
+		(refresh_flags & REFRESH_DEFER_BULK_DIRTY) &&
+		preload_index_bulk_can_close_provider(s->repo->index);
+}
+
 static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
-	struct wt_status *s)
+	struct wt_status *s, unsigned int refresh_flags)
 {
 	struct index_state *istate = s->repo->index;
 	struct semantic_verify_options options = SEMANTIC_VERIFY_OPTIONS_INIT;
@@ -1064,6 +1072,11 @@ static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
 	    !fsmonitor_pending_token_from_provider(istate) ||
 	    !clean_status_fsmonitor_semantic_adoption_needed(istate))
 		return NULL;
+	if (wt_status_can_use_bulk_provider(s, refresh_flags)) {
+		trace2_data_intmax("status", s->repo,
+				   "semantic_verify/bulk_scan", 1);
+		return NULL;
+	}
 
 	options.require_proof_epoch = 1;
 	options.attr_snapshot = s->attr_source_snapshot;
@@ -1094,7 +1107,9 @@ struct wt_status_token_closure {
 	unsigned int refresh_flags;
 	int require_untracked;
 	int can_prime;
+	int use_bulk_provider;
 	int untracked_ready;
+	int untracked_proof_complete;
 	struct string_list staged_untracked;
 	struct string_list staged_ignored;
 	int staged_untracked_ready;
@@ -1189,17 +1204,37 @@ static void wt_status_discard_semantic_verify(
 
 static void wt_status_refresh_for_token(
 	struct wt_status *s, unsigned int refresh_flags,
-	struct clean_status_proof_epoch **epoch, int *refresh_result)
+	struct clean_status_proof_epoch **epoch, int use_bulk_provider,
+	int *refresh_result)
 {
 	struct index_state *istate = s->repo->index;
 
 	clean_status_release_proof_epoch(*epoch);
 	*epoch = clean_status_capture_proof_epoch(
 		istate, s->attr_source_snapshot);
+	if (*epoch && use_bulk_provider)
+		istate->preload_bulk_proof_epoch = *epoch;
 	if (*epoch) {
 		*refresh_result |= refresh_index(
 			istate, refresh_flags, &s->pathspec, NULL, NULL);
 	}
+	istate->preload_bulk_proof_epoch = NULL;
+}
+
+static int wt_status_untracked_cache_valid(
+	const struct wt_status_token_closure *closure)
+{
+	const struct index_state *istate = closure->status->repo->index;
+
+	return closure->untracked_ready &&
+		istate->untracked && istate->untracked->root;
+}
+
+static void wt_status_record_bulk_untracked(
+	struct wt_status_token_closure *closure)
+{
+	if (closure->status->repo->index->preload_untracked_complete)
+		closure->untracked_proof_complete = 1;
 }
 
 static int wt_status_close_ordinary_fsmonitor_token(
@@ -1219,6 +1254,7 @@ static int wt_status_close_ordinary_fsmonitor_token(
 	if (reliable_stat) {
 		wt_status_refresh_for_token(
 			s, closure->refresh_flags, &scan_epoch,
+			closure->use_bulk_provider,
 			&closure->refresh_result);
 		if (!scan_epoch)
 			return 0;
@@ -1227,8 +1263,12 @@ static int wt_status_close_ordinary_fsmonitor_token(
 			istate, closure->refresh_flags, &s->pathspec,
 			NULL, NULL);
 	}
-	if (!closure->untracked_ready && closure->can_prime) {
-		closure->untracked_ready = wt_status_stage_untracked(closure);
+	wt_status_record_bulk_untracked(closure);
+	if (!closure->untracked_proof_complete && closure->can_prime) {
+		closure->untracked_ready =
+			wt_status_stage_untracked(closure);
+		closure->untracked_proof_complete =
+			closure->untracked_ready;
 		if (closure->queries)
 			trace2_data_intmax(
 				"status", s->repo,
@@ -1245,7 +1285,8 @@ static int wt_status_close_ordinary_fsmonitor_token(
 			break;
 		closure->queries++;
 		result = fsmonitor_query_pending_token(
-			istate, closure->untracked_ready);
+			istate,
+			wt_status_untracked_cache_valid(closure));
 		if (result == FSMONITOR_TOKEN_CLEAN) {
 			if (reliable_stat &&
 			    !clean_status_proof_epoch_matches(
@@ -1253,19 +1294,27 @@ static int wt_status_close_ordinary_fsmonitor_token(
 				wt_status_reset_attr_snapshot_if_changed(s);
 				break;
 			}
-			if (closure->untracked_ready ||
+			if (closure->untracked_proof_complete ||
 			    !closure->require_untracked) {
+				if (preload_index_bulk_result_accept(istate) < 0)
+					break;
 				if (reliable_stat)
 					clean_status_mark_fsmonitor_config_valid(
 						istate,
 						istate->fsmonitor_last_update_pending);
 				clean_status_release_proof_epoch(scan_epoch);
 				fsmonitor_accept_pending_token(
-					istate, closure->untracked_ready);
+					istate,
+					closure->untracked_proof_complete,
+					wt_status_untracked_cache_valid(
+						closure));
 				return 1;
 			}
 			break;
 		}
+		wt_status_discard_staged_untracked(closure);
+		closure->untracked_proof_complete =
+			!closure->require_untracked || !istate->untracked;
 		clean_status_release_proof_epoch(scan_epoch);
 		scan_epoch = NULL;
 		if (!fsmonitor_token_requires_rescan(result))
@@ -1278,6 +1327,7 @@ static int wt_status_close_ordinary_fsmonitor_token(
 		if (reliable_stat) {
 			wt_status_refresh_for_token(
 				s, closure->refresh_flags, &scan_epoch,
+				closure->use_bulk_provider,
 				&closure->refresh_result);
 			if (!scan_epoch)
 				break;
@@ -1286,9 +1336,14 @@ static int wt_status_close_ordinary_fsmonitor_token(
 				istate, closure->refresh_flags,
 				&s->pathspec, NULL, NULL);
 		}
-		if (closure->can_prime)
+		wt_status_record_bulk_untracked(closure);
+		if (!closure->untracked_proof_complete &&
+		    closure->can_prime) {
 			closure->untracked_ready =
 				wt_status_stage_untracked(closure);
+			closure->untracked_proof_complete =
+				closure->untracked_ready;
+		}
 	}
 	clean_status_release_proof_epoch(scan_epoch);
 	return 0;
@@ -1309,7 +1364,8 @@ wt_status_close_semantic_fsmonitor_token(
 	struct index_state *istate = s->repo->index;
 	enum fsmonitor_token_result result;
 	int defer_untracked =
-		closure->can_prime && !closure->untracked_ready;
+		closure->can_prime &&
+		!closure->untracked_proof_complete;
 	int applied;
 
 	if (!semantic_verify_start_token_is_current(istate, *proof)) {
@@ -1321,7 +1377,8 @@ wt_status_close_semantic_fsmonitor_token(
 	/* The first query closes the tracked scan and its semantic proof. */
 	closure->queries++;
 	result = fsmonitor_query_pending_token(
-		istate, defer_untracked ? 0 : closure->untracked_ready);
+		istate, defer_untracked ? 0 :
+		wt_status_untracked_cache_valid(closure));
 	if (result != FSMONITOR_TOKEN_CLEAN) {
 		wt_status_discard_semantic_verify(
 			s, proof, "token-reset");
@@ -1349,7 +1406,10 @@ wt_status_close_semantic_fsmonitor_token(
 	}
 
 	if (defer_untracked) {
-		closure->untracked_ready = wt_status_stage_untracked(closure);
+		closure->untracked_ready =
+			wt_status_stage_untracked(closure);
+		closure->untracked_proof_complete =
+			closure->untracked_ready;
 		trace2_data_intmax(
 			"status", s->repo,
 			"fsmonitor_token/untracked-after-semantic",
@@ -1361,11 +1421,14 @@ wt_status_close_semantic_fsmonitor_token(
 		/* A second query closes the subsequent untracked scan. */
 		closure->queries++;
 		result = fsmonitor_query_pending_token(
-			istate, closure->untracked_ready);
+			istate,
+			wt_status_untracked_cache_valid(closure));
 		if (result != FSMONITOR_TOKEN_CLEAN) {
+			wt_status_discard_staged_untracked(closure);
 			untracked_cache_invalidate_all(istate);
 			fsmonitor_invalidate_semantics(istate);
 			closure->untracked_ready = 0;
+			closure->untracked_proof_complete = 0;
 			wt_status_discard_semantic_verify(
 				s, proof, "token-reset");
 			if (fsmonitor_token_requires_rescan(result))
@@ -1384,7 +1447,9 @@ wt_status_close_semantic_fsmonitor_token(
 		istate, istate->fsmonitor_last_update_pending);
 	semantic_verify_proof_clear(*proof);
 	*proof = NULL;
-	fsmonitor_accept_pending_token(istate, closure->untracked_ready);
+	fsmonitor_accept_pending_token(
+		istate, closure->untracked_proof_complete,
+		wt_status_untracked_cache_valid(closure));
 	return WT_STATUS_TOKEN_CLOSURE_ACCEPTED;
 }
 
@@ -1430,11 +1495,15 @@ static int wt_status_close_fsmonitor_token(
 	}
 
 	closure.can_prime = require_untracked &&
-		istate->untracked && istate->untracked->root &&
+		istate->untracked &&
 		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
 		!s->show_ignored_mode;
+	closure.use_bulk_provider =
+		wt_status_can_use_bulk_provider(s, refresh_flags);
 	closure.untracked_ready = !istate->untracked ||
 		!istate->untracked->root;
+	closure.untracked_proof_complete =
+		!require_untracked || !istate->untracked;
 	if (require_untracked && !closure.can_prime &&
 	    !closure.untracked_ready)
 		BUG("cannot close required untracked scan");
@@ -1463,6 +1532,7 @@ static int wt_status_close_fsmonitor_token(
 fallback:
 	wt_status_discard_semantic_verify(s, &proof, "fallback");
 	wt_status_discard_staged_untracked(&closure);
+	preload_index_bulk_result_clear(istate);
 	fsmonitor_reject_pending_token(istate);
 	if (fstat_is_reliable()) {
 		if (closure.can_prime)
@@ -1488,7 +1558,7 @@ int wt_status_refresh_index(struct wt_status *s,
 
 	wt_status_begin_attr_snapshot(s);
 	refresh_fsmonitor(istate);
-	proof = wt_status_prepare_semantic_verify(s);
+	proof = wt_status_prepare_semantic_verify(s, refresh_flags);
 	ret = wt_status_close_fsmonitor_token(
 		s, proof, refresh_flags, require_untracked, 0);
 	if (istate->preload_untracked == &s->untracked) {
@@ -1573,7 +1643,8 @@ void wt_status_collect(struct wt_status *s)
 	    (used_untracked_cache || !s->repo->index->untracked ||
 	     !s->repo->index->untracked->root)) {
 		if (fsmonitor_pending_token_from_provider(s->repo->index))
-			fsmonitor_accept_pending_token(s->repo->index, 1);
+			fsmonitor_accept_pending_token(
+				s->repo->index, 1, used_untracked_cache);
 		else
 			fsmonitor_reject_pending_token(s->repo->index);
 	}
