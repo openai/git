@@ -2,7 +2,13 @@
 
 #include <sys/resource.h>
 
+#include "attr.h"
+#include "clean-status.h"
+#include "convert.h"
 #include "preload-index-bulk.h"
+#include "read-cache-ll.h"
+#include "semantic-verify-internal.h"
+#include "trace2.h"
 
 #define PRELOAD_INDEX_BULK_OPEN_FD_CAP 128
 #define PRELOAD_INDEX_BULK_OPEN_FD_RESERVE 16
@@ -185,10 +191,75 @@ static void *preload_bulk_worker_main(void *data)
 static void release_workers(struct preload_bulk_scan *scan)
 {
 	for (int i = 0; i < scan->threads; i++) {
+		attr_check_free(scan->workers[i].attr_check);
 		free(scan->workers[i].buffer);
+		free(scan->workers[i].hash_buffer);
+		free(scan->workers[i].stat_updates);
 		strbuf_release(&scan->workers[i].path);
 	}
 	FREE_AND_NULL(scan->workers);
+}
+
+static void prepare_content_verification(struct preload_bulk_scan *scan)
+{
+	if (!scan->proof_epoch)
+		return;
+
+	convert_attrs_prepare(scan->istate);
+	for (int i = 0; i < scan->threads; i++) {
+		scan->workers[i].attr_check = convert_attrs_check_alloc();
+		git_check_attr(
+			scan->istate, "", scan->workers[i].attr_check);
+	}
+	if (!clean_status_proof_epoch_prime_matches(
+		    scan->istate, scan->proof_epoch)) {
+		for (int i = 0; i < scan->threads; i++) {
+			attr_check_free(scan->workers[i].attr_check);
+			scan->workers[i].attr_check = NULL;
+		}
+		git_attr_invalidate_all();
+		return;
+	}
+	for (int i = 0; i < scan->threads; i++)
+		scan->workers[i].hash_buffer =
+			xmalloc(SEMANTIC_VERIFY_HASH_BUFFER_SIZE);
+	scan->verify_content = 1;
+	trace2_data_intmax("index", scan->repo,
+			   "preload/bulk_content_verify", 1);
+}
+
+static void collect_stat_updates(struct preload_bulk_scan *scan)
+{
+	size_t nr = 0;
+
+	for (int i = 0; i < scan->threads; i++) {
+		struct preload_bulk_worker *worker = &scan->workers[i];
+
+		for (size_t j = 0; j < worker->stat_updates_nr; j++) {
+			struct preload_bulk_stat_update *update =
+				&worker->stat_updates[j];
+
+			if (update->cache_pos >= scan->istate->cache_nr)
+				BUG("bulk stat update position out of range");
+			if (scan->tracked_state[update->cache_pos] ==
+			    PRELOAD_BULK_TRACKED_CLEAN)
+				nr++;
+		}
+	}
+	ALLOC_ARRAY(scan->stat_updates, nr);
+	for (int i = 0; i < scan->threads; i++) {
+		struct preload_bulk_worker *worker = &scan->workers[i];
+
+		for (size_t j = 0; j < worker->stat_updates_nr; j++) {
+			struct preload_bulk_stat_update *update =
+				&worker->stat_updates[j];
+
+			if (scan->tracked_state[update->cache_pos] !=
+			    PRELOAD_BULK_TRACKED_CLEAN)
+				continue;
+			scan->stat_updates[scan->stat_updates_nr++] = *update;
+		}
+	}
 }
 
 int preload_bulk_run_scan(struct preload_bulk_scan *scan,
@@ -207,6 +278,7 @@ int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 		scan->workers[i].scan = scan;
 		strbuf_init(&scan->workers[i].path, 0);
 	}
+	prepare_content_verification(scan);
 
 	FLEX_ALLOC_STR(root_task, path, ".");
 	if (!reserve_open_fd(&scan->queue))
@@ -244,9 +316,11 @@ int preload_bulk_run_scan(struct preload_bulk_scan *scan,
 		result->dirs += worker->dirs;
 		result->entries += worker->entries;
 		result->bulk_calls += worker->bulk_calls;
+		result->bytes_hashed += worker->bytes_hashed;
 		result->changed_dirs += worker->changed_dirs;
 		result->malformed += worker->malformed;
 	}
+	collect_stat_updates(scan);
 	result->threads = started_threads;
 	result->untracked_complete =
 		scan->collect_untracked && !scan->queue.untracked_invalid;
