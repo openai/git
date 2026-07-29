@@ -71,6 +71,7 @@
 #define CACHE_EXT_LINK 0x6c696e6b	  /* "link" */
 #define CACHE_EXT_UNTRACKED 0x554E5452	  /* "UNTR" */
 #define CACHE_EXT_FSMONITOR 0x46534D4E	  /* "FSMN" */
+#define CACHE_EXT_FSMONITOR_UNTRACKED 0x46535543 /* "FSUC" */
 #define CACHE_EXT_ENDOFINDEXENTRIES 0x454F4945	/* "EOIE" */
 #define CACHE_EXT_INDEXENTRYOFFSETTABLE 0x49454F54 /* "IEOT" */
 #define CACHE_EXT_SPARSE_DIRECTORIES 0x73646972 /* "sdir" */
@@ -1777,6 +1778,9 @@ static int read_index_extension(struct index_state *istate,
 	case CACHE_EXT_FSMONITOR:
 		read_fsmonitor_extension(istate, data, sz);
 		break;
+	case CACHE_EXT_FSMONITOR_UNTRACKED:
+		read_fsmonitor_untracked_extension(istate, data, sz);
+		break;
 	case CACHE_EXT_ENDOFINDEXENTRIES:
 	case CACHE_EXT_INDEXENTRYOFFSETTABLE:
 		/* already handled in do_read_index() */
@@ -1978,6 +1982,7 @@ static void post_read_index_from(struct index_state *istate)
 	check_ce_order(istate);
 	tweak_untracked_cache(istate);
 	tweak_split_index(istate);
+	prepare_fsmonitor_untracked(istate);
 	tweak_fsmonitor(istate);
 }
 
@@ -2466,6 +2471,8 @@ void release_index(struct index_state *istate)
 	free_name_hash(istate);
 	cache_tree_free(&(istate->cache_tree));
 	free(istate->fsmonitor_last_update);
+	free(istate->fsmonitor_last_update_pending);
+	free(istate->fsmonitor_untracked_token);
 	free(istate->cache);
 	discard_split_index(istate);
 	free_untracked_cache(istate->untracked);
@@ -3066,6 +3073,22 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 
 		write_fsmonitor_extension(&sb, istate);
 		err = write_index_ext_header(f, eoie_c, CACHE_EXT_FSMONITOR, sb.len) < 0;
+		hashwrite(f, sb.buf, sb.len);
+		if (err) {
+			ret = -1;
+			goto out;
+		}
+	}
+	if (write_extensions & WRITE_FSMONITOR_EXTENSION &&
+	    istate->untracked &&
+	    istate->fsmonitor_last_update &&
+	    istate->fsmonitor_untracked_valid) {
+		strbuf_reset(&sb);
+
+		write_fsmonitor_untracked_extension(&sb, istate);
+		err = write_index_ext_header(f, eoie_c,
+					     CACHE_EXT_FSMONITOR_UNTRACKED,
+					     sb.len) < 0;
 		hashwrite(f, sb.buf, sb.len);
 		if (err) {
 			ret = -1;
