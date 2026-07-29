@@ -3,11 +3,16 @@
 
 #include "git-compat-util.h"
 #include "preload-index.h"
+#include "statinfo.h"
 #include "strbuf.h"
 #include "string-list.h"
 #include "thread-utils.h"
 
 struct dir_struct;
+struct attr_check;
+struct clean_status_proof_epoch;
+struct index_state;
+struct repository;
 struct preload_bulk_untracked_root;
 
 struct preload_bulk_dir_identity {
@@ -49,10 +54,16 @@ struct preload_bulk_worker {
 	struct preload_bulk_scan *scan;
 	pthread_t thread;
 	void *buffer;
+	void *hash_buffer;
+	struct attr_check *attr_check;
+	struct preload_bulk_stat_update *stat_updates;
+	size_t stat_updates_nr;
+	size_t stat_updates_alloc;
 	struct strbuf path;
 	uint64_t dirs;
 	uint64_t entries;
 	uint64_t bulk_calls;
+	uint64_t bytes_hashed;
 	uint64_t changed_dirs;
 	uint64_t malformed;
 	unsigned started : 1;
@@ -87,13 +98,18 @@ struct preload_bulk_scan {
 	struct preload_bulk_queue queue;
 	struct preload_bulk_worker *workers;
 	unsigned char *tracked_state;
+	struct preload_bulk_stat_update *stat_updates;
+	size_t stat_updates_nr;
+	struct clean_status_proof_epoch *proof_epoch;
 	struct dir_struct *exclude_dir;
 	pthread_mutex_t exclude_mutex;
 	struct preload_bulk_untracked_root *untracked_roots;
 	struct string_list untracked;
 	int root_fd;
 	int threads;
+	dev_t root_dev;
 	unsigned collect_untracked : 1;
+	unsigned verify_content : 1;
 	unsigned case_insensitive : 1;
 	unsigned can_skip_unseen_preload : 1;
 };
@@ -104,12 +120,15 @@ struct preload_bulk_run_result {
 	uint64_t bulk_calls;
 	uint64_t changed_dirs;
 	uint64_t malformed;
+	uint64_t bytes_hashed;
 	int threads;
 	unsigned untracked_complete : 1;
 };
 
 struct preload_bulk_result {
 	unsigned char *tracked_state;
+	struct preload_bulk_stat_update *stat_updates;
+	size_t stat_updates_nr;
 	size_t nr;
 	const char *outcome;
 	const char *reason;
@@ -118,6 +137,11 @@ struct preload_bulk_result {
 	unsigned can_skip_unseen_preload : 1;
 	struct string_list untracked;
 	unsigned untracked_complete : 1;
+};
+
+struct preload_bulk_stat_update {
+	uint32_t cache_pos;
+	struct stat_data stat_data;
 };
 
 void preload_bulk_schedule_directory(
@@ -134,7 +158,9 @@ int preload_bulk_index_pos_has_tracked_descendants(
 int preload_bulk_index_entry_is_gitlink(struct preload_bulk_scan *scan,
 					int pos);
 void preload_bulk_record_tracked(
-	struct preload_bulk_worker *worker, int pos, const struct stat *st);
+	struct preload_bulk_worker *worker, int pos, int parent_fd,
+	const char *basename, const struct stat *st,
+	int observed_has_platform_identity);
 void preload_bulk_record_tracked_fallback(
 	struct preload_bulk_worker *worker, int pos);
 void preload_bulk_record_tracked_descendants_fallback(
