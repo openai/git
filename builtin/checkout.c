@@ -182,6 +182,7 @@ static int try_update_sparse_directory(const struct object_id *oid,
 		 */
 		oidcpy(&old->oid, oid);
 		old->ce_flags |= CE_UPDATE;
+		the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
 		result = 0;
 	}
 
@@ -698,7 +699,12 @@ static int checkout_paths(const struct checkout_opts *opts,
 		checkout_index = opts->checkout_index;
 
 	if (checkout_index) {
-		if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))
+		unsigned int flags = COMMIT_LOCK;
+
+		if (!the_repository->index->cache_changed &&
+		    !hook_exists(the_repository, "post-index-change"))
+			flags |= SKIP_IF_UNCHANGED;
+		if (write_locked_index(the_repository->index, &lock_file, flags))
 			die(_("unable to write new index file"));
 	} else {
 		/*

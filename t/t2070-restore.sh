@@ -21,6 +21,16 @@ test_expect_success 'setup' '
 	git update-ref refs/heads/one main
 '
 
+test_expect_success 'restore does not rewrite an unchanged index' '
+	test_config core.fsmonitor false &&
+	git update-index --no-fsmonitor &&
+	test-tool chmtime =1000000000 .git/index &&
+	git restore --worktree first.t &&
+	test "$(test-tool chmtime --get .git/index)" = 1000000000 &&
+	git restore --staged first.t &&
+	test "$(test-tool chmtime --get .git/index)" = 1000000000
+'
+
 test_expect_success 'restore without pathspec is not ok' '
 	test_must_fail git restore &&
 	test_must_fail git restore --source=first

@@ -19,6 +19,16 @@ test_expect_success setup '
 	test_tick && git commit -m "next has dir/next but not dir/main"
 '
 
+test_expect_success 'checkout does not rewrite an unchanged index' '
+	test_config core.fsmonitor false &&
+	git update-index --no-fsmonitor &&
+	test-tool chmtime =1000000000 .git/index &&
+	git checkout -- dir/common &&
+	test "$(test-tool chmtime --get .git/index)" = 1000000000 &&
+	git checkout HEAD -- dir/common &&
+	test "$(test-tool chmtime --get .git/index)" = 1000000000
+'
+
 test_expect_success 'checking out paths out of a tree does not clobber unrelated paths' '
 	git checkout next &&
 	git reset --hard &&
