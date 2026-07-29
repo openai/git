@@ -40,6 +40,7 @@ struct fsmonitor_daemon_state {
 	pthread_mutex_t main_lock;
 
 	struct strbuf path_worktree_watch;
+	struct strbuf worktree_identity;
 	struct strbuf path_gitdir_watch;
 	struct alias_info alias;
 	int nr_paths_watching;
