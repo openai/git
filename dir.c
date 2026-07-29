@@ -28,6 +28,7 @@
 #include "varint.h"
 #include "ewah/ewok.h"
 #include "fsmonitor-ll.h"
+#include "fsmonitor.h"
 #include "read-cache-ll.h"
 #include "setup.h"
 #include "sparse-index.h"
@@ -79,10 +80,16 @@ struct untracked_cache_preload_task {
 	char *path;
 	struct stat_data stat_data;
 	struct object_id exclude_oid;
+	unsigned int exclude_mode;
 	unsigned int was_valid : 1;
 	unsigned int stat_checked : 1;
 	unsigned int stat_matches : 1;
 	unsigned int exclude_matches : 1;
+	unsigned int exclude_index_present : 1;
+	unsigned int exclude_index_candidate : 1;
+	unsigned int exclude_index_matches : 1;
+	unsigned int exclude_index_content_matches : 1;
+	unsigned int normalize_exclude_oid : 1;
 	unsigned int update_stat_data : 1;
 };
 
@@ -97,9 +104,11 @@ struct untracked_cache_preload_data {
 
 struct untracked_cache_preload {
 	struct repository *repo;
+	struct index_state *istate;
 	struct untracked_cache *uc;
 	struct untracked_cache_dir *root;
 	struct untracked_cache_preload_task *tasks;
+	struct object_id *exclude_index_oids;
 	struct untracked_cache_preload_data *data;
 	struct cache_time index_timestamp;
 	char *exclude_per_dir;
@@ -107,10 +116,12 @@ struct untracked_cache_preload {
 	int threads;
 	unsigned int dir_flags;
 	uint64_t started_at;
+	unsigned int fsmonitor_excludes_only : 1;
 };
 
 #define UNTRACKED_CACHE_MAX_OVERLAP_THREADS 6
 #define UNTRACKED_CACHE_PRELOAD_COST 1000
+#define UNTRACKED_CACHE_EXCLUDE_PRELOAD_COST 256
 #define UNTRACKED_CACHE_MAX_EXCLUDE_SIZE (1024 * 1024)
 
 static void invalidate_gitignore(struct untracked_cache *uc,
@@ -128,18 +139,22 @@ static void collect_untracked_cache_preload_tasks(
 	struct strbuf *path,
 	struct untracked_cache_preload_task **tasks,
 	size_t *nr,
-	size_t *alloc)
+	size_t *alloc,
+	int fsmonitor_excludes_only)
 {
 	size_t i;
 
-	ALLOC_GROW(*tasks, *nr + 1, *alloc);
-	memset(&(*tasks)[*nr], 0, sizeof(**tasks));
-	(*tasks)[*nr].ucd = ucd;
-	(*tasks)[*nr].path = xstrdup(path->len ? path->buf : ".");
-	(*tasks)[*nr].stat_data = ucd->stat_data;
-	oidcpy(&(*tasks)[*nr].exclude_oid, &ucd->exclude_oid);
-	(*tasks)[*nr].was_valid = ucd->valid;
-	(*nr)++;
+	if (!fsmonitor_excludes_only ||
+	    !is_null_oid(&ucd->exclude_oid)) {
+		ALLOC_GROW(*tasks, *nr + 1, *alloc);
+		memset(&(*tasks)[*nr], 0, sizeof(**tasks));
+		(*tasks)[*nr].ucd = ucd;
+		(*tasks)[*nr].path = xstrdup(path->len ? path->buf : ".");
+		(*tasks)[*nr].stat_data = ucd->stat_data;
+		oidcpy(&(*tasks)[*nr].exclude_oid, &ucd->exclude_oid);
+		(*tasks)[*nr].was_valid = ucd->valid;
+		(*nr)++;
+	}
 
 	for (i = 0; i < ucd->dirs_nr; i++) {
 		struct untracked_cache_dir *child = ucd->dirs[i];
@@ -149,7 +164,7 @@ static void collect_untracked_cache_preload_tasks(
 			strbuf_addch(path, '/');
 		strbuf_addstr(path, child->name);
 		collect_untracked_cache_preload_tasks(child, path, tasks, nr,
-					      alloc);
+					      alloc, fsmonitor_excludes_only);
 		strbuf_setlen(path, old_len);
 	}
 }
@@ -194,7 +209,8 @@ static int exclude_path_matches_fd(const char *path,
 
 static int cached_exclude_file_matches(
 	const struct git_hash_algo *algo,
-	const char *path, const struct object_id *cached_oid)
+	const char *path, const struct object_id *cached_oid,
+	struct object_id *raw_oid_out, unsigned int *mode_out)
 {
 	struct object_id raw_oid, normalized_oid;
 	struct stat st, st_after;
@@ -218,9 +234,13 @@ static int cached_exclude_file_matches(
 	    !path_namespace_stat_equal(&st, &st_after) ||
 	    !exclude_path_matches_fd(path, &st_after))
 		goto out;
+	if (mode_out)
+		*mode_out = st_after.st_mode;
 
 	/* add_patterns() may record either the blob or its LF-normalized form. */
 	hash_object_file(algo, buf, size, OBJ_BLOB, &raw_oid);
+	if (raw_oid_out)
+		oidcpy(raw_oid_out, &raw_oid);
 	if (oideq(&raw_oid, cached_oid)) {
 		ret = 1;
 		goto out;
@@ -236,8 +256,87 @@ out_close:
 	return ret;
 }
 
+static int cached_exclude_file_matches_index_stat(
+	const struct stat_data *sd,
+	const struct stat *st)
+{
+	struct stat_data current;
+	struct stat st_copy = *st;
+
+	/*
+	 * Compare every field saved in the index, independent of the user's
+	 * ordinary stat-match settings.  Unreliable object identities and
+	 * multiply-linked files can conceal changes through paths outside
+	 * the monitor's watch cone, so both retain the content-hash check.
+	 */
+	if (!fstat_is_reliable() || !S_ISREG(st->st_mode) ||
+	    st->st_nlink != 1)
+		return 0;
+	fill_stat_data(&current, &st_copy);
+	return sd->sd_ctime.sec == current.sd_ctime.sec &&
+		sd->sd_ctime.nsec == current.sd_ctime.nsec &&
+		sd->sd_mtime.sec == current.sd_mtime.sec &&
+		sd->sd_mtime.nsec == current.sd_mtime.nsec &&
+		sd->sd_dev == current.sd_dev &&
+		sd->sd_ino == current.sd_ino &&
+		sd->sd_uid == current.sd_uid &&
+		sd->sd_gid == current.sd_gid &&
+		sd->sd_size == current.sd_size;
+}
+
+static void preload_fsmonitor_excludes_from_index(
+	struct untracked_cache_preload *preload)
+{
+	struct repo_config_values *cfg =
+		repo_config_values(preload->istate->repo);
+	size_t i;
+	int stat_candidates = cfg->trust_ctime && cfg->check_stat;
+
+	for (i = 0; i < preload->nr; i++) {
+		struct untracked_cache_preload_task *task = &preload->tasks[i];
+		struct strbuf exclude_path = STRBUF_INIT;
+		struct cache_entry *ce;
+		int pos;
+
+		if (!preload->exclude_per_dir)
+			continue;
+		if (strcmp(task->path, "."))
+			strbuf_addstr(&exclude_path, task->path);
+		if (exclude_path.len)
+			strbuf_addch(&exclude_path, '/');
+		strbuf_addstr(&exclude_path, preload->exclude_per_dir);
+		pos = index_name_pos_sparse(
+			preload->istate, exclude_path.buf,
+			exclude_path.len);
+		if (pos < 0)
+			goto next;
+		ce = preload->istate->cache[pos];
+		if (!S_ISREG(ce->ce_mode) ||
+		    !(ce->ce_flags & CE_FSMONITOR_VALID) ||
+		    ce_skip_worktree(ce) ||
+		    (ce->ce_flags & CE_REMOVE) ||
+		    ce_intent_to_add(ce))
+			goto next;
+		oidcpy(&preload->exclude_index_oids[i], &ce->oid);
+		task->exclude_index_present = 1;
+		if (!stat_candidates ||
+		    is_racy_timestamp(preload->istate, ce) ||
+		    (ce->ce_flags & CE_VALID))
+			goto next;
+		/*
+		 * Snapshot before launching workers.  The main thread may
+		 * refresh cache entries while exclude checks run.
+		 */
+		task->stat_data = ce->ce_stat_data;
+		task->exclude_index_candidate = 1;
+next:
+		strbuf_release(&exclude_path);
+	}
+}
+
 static struct untracked_cache_preload *untracked_cache_preload_start_1(
-	struct index_state *istate, unsigned int dir_flags, int automatic)
+	struct index_state *istate, unsigned int dir_flags, int automatic,
+	int fsmonitor_excludes_only)
 {
 	struct untracked_cache *uc = istate->untracked;
 	struct untracked_cache_preload *preload;
@@ -246,22 +345,35 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 	unsigned long test_threads;
 	int threads, online, create_threads = 1;
 
-	if (!uc || !uc->root || uc->use_fsmonitor ||
-	    uc->dir_flags != dir_flags)
+	if (!uc || !uc->root || uc->dir_flags != dir_flags ||
+	    (fsmonitor_excludes_only ?
+	     !uc->use_fsmonitor :
+	     uc->use_fsmonitor))
 		return NULL;
 
 	CALLOC_ARRAY(preload, 1);
 	preload->repo = istate->repo;
+	preload->istate = istate;
 	preload->uc = uc;
 	preload->root = uc->root;
 	preload->index_timestamp = istate->timestamp;
 	preload->exclude_per_dir = xstrdup_or_null(uc->exclude_per_dir);
 	preload->dir_flags = dir_flags;
+	preload->fsmonitor_excludes_only = fsmonitor_excludes_only;
 	collect_untracked_cache_preload_tasks(
-		uc->root, &path, &preload->tasks, &preload->nr, &alloc);
+		uc->root, &path, &preload->tasks, &preload->nr, &alloc,
+		fsmonitor_excludes_only);
 	strbuf_release(&path);
+	if (fsmonitor_excludes_only) {
+		CALLOC_ARRAY(preload->exclude_index_oids, preload->nr);
+		preload_fsmonitor_excludes_from_index(preload);
+	}
 
-	threads = HAVE_THREADS ? preload->nr / UNTRACKED_CACHE_PRELOAD_COST : 1;
+	threads = HAVE_THREADS ?
+		preload->nr / (fsmonitor_excludes_only ?
+			       UNTRACKED_CACHE_EXCLUDE_PRELOAD_COST :
+			       UNTRACKED_CACHE_PRELOAD_COST) :
+		1;
 	online = HAVE_THREADS ? online_cpus() : 1;
 	if (threads > online * 3)
 		threads = online * 3;
@@ -273,7 +385,7 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 			UNTRACKED_CACHE_MAX_OVERLAP_THREADS : test_threads;
 	if (threads < 1)
 		threads = 1;
-	if ((size_t)threads > preload->nr)
+	if (preload->nr && (size_t)threads > preload->nr)
 		threads = preload->nr;
 	preload->threads = threads;
 
@@ -282,6 +394,9 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 			   "preload_untracked_cache/threads", threads);
 	trace2_data_intmax("dir", istate->repo,
 			   "preload_untracked_cache/automatic", automatic);
+	trace2_data_intmax("dir", istate->repo,
+			   "preload_untracked_cache/fsmonitor-excludes-only",
+			   fsmonitor_excludes_only);
 	CALLOC_ARRAY(preload->data, threads);
 	work = DIV_ROUND_UP(preload->nr, threads);
 	for (i = 0; i < threads; i++) {
@@ -310,6 +425,14 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 	return preload;
 }
 
+struct untracked_cache_preload *
+untracked_cache_preload_start_fsmonitor_excludes(
+	struct index_state *istate, unsigned int dir_flags)
+{
+	return untracked_cache_preload_start_1(
+		istate, dir_flags, 0, 1);
+}
+
 struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	struct index_state *istate, unsigned int dir_flags)
 {
@@ -318,7 +441,7 @@ struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	if (!uc || uc->dir_flags != dir_flags ||
 	    !untracked_cache_auto_preload_worthwhile(uc))
 		return NULL;
-	return untracked_cache_preload_start_1(istate, dir_flags, 1);
+	return untracked_cache_preload_start_1(istate, dir_flags, 1, 0);
 }
 
 static void *preload_untracked_cache_thread(void *_data)
@@ -332,6 +455,47 @@ static void *preload_untracked_cache_thread(void *_data)
 		struct strbuf exclude_path = STRBUF_INIT;
 		struct stat st;
 
+		if (preload->fsmonitor_excludes_only) {
+			struct object_id raw_oid;
+
+			if (!preload->exclude_per_dir)
+				continue;
+			if (strcmp(task->path, "."))
+				strbuf_addstr(&exclude_path, task->path);
+			if (exclude_path.len)
+				strbuf_addch(&exclude_path, '/');
+			strbuf_addstr(&exclude_path,
+				      preload->exclude_per_dir);
+			if (task->exclude_index_candidate &&
+			    oideq(&preload->exclude_index_oids[i],
+				  &task->exclude_oid) &&
+			    !lstat(exclude_path.buf, &st) &&
+			    cached_exclude_file_matches_index_stat(
+				    &task->stat_data, &st)) {
+				task->exclude_mode = st.st_mode;
+				task->exclude_index_matches = 1;
+				task->exclude_index_content_matches = 1;
+				task->exclude_matches = 1;
+				strbuf_release(&exclude_path);
+				continue;
+			}
+			task->exclude_matches = cached_exclude_file_matches(
+				preload->repo->hash_algo,
+				exclude_path.buf,
+				&task->exclude_oid, &raw_oid,
+				&task->exclude_mode);
+			if (task->exclude_matches &&
+			    task->exclude_index_present &&
+			    oideq(&preload->exclude_index_oids[i],
+				  &raw_oid)) {
+				task->exclude_index_content_matches = 1;
+				if (!oideq(&preload->exclude_index_oids[i],
+					   &task->exclude_oid))
+					task->normalize_exclude_oid = 1;
+			}
+			strbuf_release(&exclude_path);
+			continue;
+		}
 		if (!task->was_valid)
 			continue;
 		task->stat_checked = 1;
@@ -361,7 +525,7 @@ static void *preload_untracked_cache_thread(void *_data)
 		strbuf_addstr(&exclude_path, preload->exclude_per_dir);
 		task->exclude_matches = cached_exclude_file_matches(
 			preload->repo->hash_algo, exclude_path.buf,
-			&task->exclude_oid);
+			&task->exclude_oid, NULL, NULL);
 		strbuf_release(&exclude_path);
 	}
 	return NULL;
@@ -415,6 +579,33 @@ static int compute_untracked_cache_valid_recursive(
 	return valid;
 }
 
+static int compute_untracked_cache_disk_valid_recursive(
+	struct untracked_cache_dir *ucd)
+{
+	size_t i;
+	int valid = ucd->valid && is_null_oid(&ucd->exclude_oid);
+
+	for (i = 0; i < ucd->dirs_nr; i++)
+		if (!compute_untracked_cache_disk_valid_recursive(ucd->dirs[i]))
+			valid = 0;
+	ucd->valid_recursive = valid;
+	return valid;
+}
+
+static int compute_untracked_cache_fsmonitor_valid_recursive(
+	struct untracked_cache_dir *ucd)
+{
+	size_t i;
+	int valid = ucd->valid;
+
+	for (i = 0; i < ucd->dirs_nr; i++)
+		if (!compute_untracked_cache_fsmonitor_valid_recursive(
+			    ucd->dirs[i]))
+			valid = 0;
+	ucd->valid_recursive = valid;
+	return valid;
+}
+
 static void untracked_cache_preload_join(
 	struct untracked_cache_preload *preload)
 {
@@ -448,25 +639,219 @@ static void untracked_cache_preload_free(
 	for (i = 0; i < preload->nr; i++)
 		free(preload->tasks[i].path);
 	free(preload->tasks);
+	free(preload->exclude_index_oids);
 	free(preload->exclude_per_dir);
 	free(preload);
 }
 
+static int converted_exclude_matches_cache_and_index(
+	struct untracked_cache_preload *preload,
+	struct untracked_cache_preload_task *task,
+	struct cache_entry *ce,
+	const char *path)
+{
+	struct object_id converted_oid, normalized_oid, raw_oid;
+	struct stat before, after;
+	char *buf = NULL;
+	size_t size;
+	int converted_fd, fd = -1;
+	int cached_matches, ret = 0;
+
+	fd = open_nofollow(path, O_RDONLY);
+	if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) ||
+	    before.st_size < 0 ||
+	    before.st_size > UNTRACKED_CACHE_MAX_EXCLUDE_SIZE)
+		goto done;
+	size = xsize_t(before.st_size);
+	buf = xmallocz(size + 1);
+	if (read_in_full(fd, buf, size) != size)
+		goto done;
+
+	hash_object_file(preload->repo->hash_algo, buf, size, OBJ_BLOB,
+			 &raw_oid);
+	cached_matches = oideq(&raw_oid, &task->exclude_oid);
+	if (!cached_matches) {
+		buf[size] = '\n';
+		hash_object_file(preload->repo->hash_algo, buf, size + 1,
+				 OBJ_BLOB, &normalized_oid);
+		cached_matches = oideq(&normalized_oid,
+				      &task->exclude_oid);
+	}
+	if (!cached_matches || lseek(fd, 0, SEEK_SET) < 0)
+		goto done;
+
+	converted_fd = xdup(fd);
+	if (index_fd(preload->istate, &converted_oid, converted_fd, &before,
+		     OBJ_BLOB, path, 0) ||
+	    !oideq(&converted_oid, &ce->oid))
+		goto done;
+
+	/*
+	 * Keep the descriptor open while computing both identities, then
+	 * prove that neither the opened file nor its pathname changed.
+	 */
+	if (fstat(fd, &after) ||
+	    !path_namespace_stat_equal(&before, &after) ||
+	    !exclude_path_matches_fd(path, &after))
+		goto done;
+	fill_stat_data(&task->stat_data, &after);
+	task->exclude_mode = after.st_mode;
+	ret = 1;
+done:
+	free(buf);
+	if (fd >= 0)
+		close(fd);
+	return ret;
+}
+
+static int update_preloaded_exclude_index_uptodate(
+	struct untracked_cache_preload *preload,
+	struct untracked_cache_preload_task *task,
+	size_t task_nr,
+	size_t *normalized,
+	size_t *index_invalidated,
+	int *exclude_revalidated)
+{
+	struct strbuf path = STRBUF_INIT;
+	struct cache_entry *ce;
+	int content_matches, converts, pos, marked = 0;
+
+	*exclude_revalidated = -1;
+	if (!task->exclude_index_present || !preload->exclude_per_dir)
+		return 0;
+	if (strcmp(task->path, "."))
+		strbuf_addstr(&path, task->path);
+	if (path.len)
+		strbuf_addch(&path, '/');
+	strbuf_addstr(&path, preload->exclude_per_dir);
+	pos = index_name_pos_sparse(preload->istate, path.buf, path.len);
+	if (pos < 0)
+		goto done;
+	ce = preload->istate->cache[pos];
+	if (!ce_stage(ce) && S_ISREG(ce->ce_mode) &&
+	    oideq(&ce->oid, &preload->exclude_index_oids[task_nr])) {
+		if (task->exclude_index_matches) {
+			converts = 0;
+			content_matches = 1;
+		} else {
+			converts = would_convert_to_git(
+				preload->istate, path.buf);
+			content_matches = converts ?
+				converted_exclude_matches_cache_and_index(
+					preload, task, ce, path.buf) :
+				task->exclude_index_content_matches;
+			if (converts)
+				*exclude_revalidated = content_matches;
+		}
+		if (!converts && task->normalize_exclude_oid) {
+			oidcpy(&task->ucd->exclude_oid,
+			       &preload->exclude_index_oids[task_nr]);
+			(*normalized)++;
+		}
+		if (content_matches &&
+		    (ce->ce_flags & CE_FSMONITOR_VALID) &&
+		    !ce_skip_worktree(ce) &&
+		    !(ce->ce_flags & CE_REMOVE) &&
+		    !ce_intent_to_add(ce) &&
+		    (!repo_trust_executable_bit(preload->istate->repo) ||
+		     !((ce->ce_mode ^ task->exclude_mode) & 0100))) {
+			if (converts &&
+			    memcmp(&ce->ce_stat_data, &task->stat_data,
+				   sizeof(ce->ce_stat_data))) {
+				ce->ce_stat_data = task->stat_data;
+				ce->ce_flags |= CE_UPDATE_IN_BASE;
+				preload->istate->cache_changed |=
+					CE_ENTRY_CHANGED;
+			}
+			ce_mark_uptodate(ce);
+			marked = 1;
+		} else {
+			fsmonitor_invalidate_cache_entry(ce);
+			preload->istate->cache_changed |= FSMONITOR_CHANGED;
+			(*index_invalidated)++;
+		}
+	}
+done:
+	strbuf_release(&path);
+	return marked;
+}
+
 int untracked_cache_preload_finish(struct untracked_cache_preload *preload,
-				   struct index_state *istate,
-				   unsigned int dir_flags)
+					   struct index_state *istate,
+					   unsigned int dir_flags,
+					   size_t *index_invalidated)
 {
 	struct untracked_cache *uc;
 	size_t i;
 	int applied = 0;
 
+	if (index_invalidated)
+		*index_invalidated = 0;
 	if (!preload)
 		return 0;
 	untracked_cache_preload_join(preload);
 	uc = istate->untracked;
 	if (uc != preload->uc || !uc || uc->root != preload->root ||
-	    dir_flags != preload->dir_flags)
+	    dir_flags != preload->dir_flags ||
+	    (preload->fsmonitor_excludes_only && !uc->use_fsmonitor))
 		goto done;
+
+	if (preload->fsmonitor_excludes_only) {
+		size_t index_matches = 0;
+		size_t invalidated = 0;
+		size_t index_uptodate = 0;
+		size_t normalized = 0;
+
+		for (i = 0; i < preload->nr; i++) {
+			struct untracked_cache_preload_task *task =
+				&preload->tasks[i];
+			int exclude_matches =
+				oideq(&task->exclude_oid,
+				      &task->ucd->exclude_oid) &&
+				task->exclude_matches;
+			int exclude_revalidated;
+
+			if (!exclude_matches)
+				invalidate_gitignore(uc, task->ucd);
+			else {
+				if (task->exclude_index_matches)
+					index_matches++;
+			}
+			index_uptodate +=
+				update_preloaded_exclude_index_uptodate(
+					preload, task, i, &normalized,
+					&invalidated, &exclude_revalidated);
+			if (exclude_matches && exclude_revalidated == 0)
+				invalidate_gitignore(uc, task->ucd);
+		}
+		if (normalized)
+			istate->cache_changed |= UNTRACKED_CHANGED;
+		trace2_data_intmax(
+			"dir", istate->repo,
+			"preload_untracked_cache/index-excludes",
+			index_matches);
+		trace2_data_intmax(
+			"dir", istate->repo,
+			"preload_untracked_cache/index-uptodate",
+			index_uptodate);
+		trace2_data_intmax(
+			"dir", istate->repo,
+			"preload_untracked_cache/index-invalidated",
+			invalidated);
+		trace2_data_intmax(
+			"dir", istate->repo,
+			"preload_untracked_cache/normalized-excludes",
+			normalized);
+		trace2_data_intmax(
+			"dir", istate->repo,
+			"preload_untracked_cache/valid",
+			compute_untracked_cache_fsmonitor_valid_recursive(
+				preload->root));
+		if (index_invalidated)
+			*index_invalidated = invalidated;
+		applied = 1;
+		goto done;
+	}
 
 	for (i = 0; i < preload->nr; i++) {
 		struct untracked_cache_preload_task *task = &preload->tasks[i];
@@ -1684,6 +2069,10 @@ static int add_patterns(const char *fname, const char *base, int baselen,
 				 (pos = index_name_pos(istate, fname, strlen(fname))) >= 0 &&
 				 !ce_stage(istate->cache[pos]) &&
 				 ce_uptodate(istate->cache[pos]) &&
+				 !(istate->cache[pos]->ce_flags &
+				   (CE_VALID | CE_REMOVE)) &&
+				 !ce_skip_worktree(istate->cache[pos]) &&
+				 !ce_intent_to_add(istate->cache[pos]) &&
 				 !would_convert_to_git(istate, fname))
 				oidcpy(&oid_stat->oid,
 				       &istate->cache[pos]->oid);
@@ -2253,9 +2642,24 @@ static void prep_exclude(struct dir_struct *dir,
 			strbuf_addbuf(&sb, &dir->internal.basebuf);
 			strbuf_addstr(&sb, dir->exclude_per_dir);
 			pl->src = strbuf_detach(&sb, NULL);
-			add_patterns(pl->src, pl->src, stk->baselen, pl, istate,
-				     PATTERN_NOFOLLOW,
-				     untracked ? &oid_stat : NULL);
+			if (add_patterns(pl->src, pl->src, stk->baselen, pl,
+					 istate, PATTERN_NOFOLLOW,
+					 untracked ? &oid_stat : NULL) < 0 &&
+			    untracked && is_null_oid(&oid_stat.oid)) {
+				struct stat st;
+
+				/*
+				 * Keep a non-blob sentinel for a source that is
+				 * present but unreadable.  Otherwise a valid
+				 * untracked-cache directory cannot distinguish
+				 * that state from an absent per-directory
+				 * exclude file.
+				 */
+				if (!lstat(pl->src, &st) ||
+				    !is_missing_file_error(errno))
+					oidcpy(&oid_stat.oid,
+					       the_hash_algo->empty_tree);
+			}
 		}
 		/*
 		 * NEEDSWORK: when untracked cache is enabled, prep_exclude()
@@ -3234,7 +3638,9 @@ static enum path_treatment read_directory_recursive(struct dir_struct *dir,
 	struct strbuf path = STRBUF_INIT;
 
 	strbuf_add(&path, base, baselen);
-	if (untracked && dir->internal.untracked_cache_preloaded &&
+	if (untracked &&
+	    (dir->internal.untracked_cache_preloaded ||
+	     dir->untracked->use_fsmonitor) &&
 	    untracked->valid && untracked->valid_recursive &&
 	    untracked->check_only == !!check_only &&
 	    !untracked->has_untracked &&
@@ -3428,6 +3834,8 @@ static int treat_leading_path(struct dir_struct *dir,
 	return state == path_recurse;
 }
 
+#define UNTRACKED_CACHE_IDENT_VERSION 2
+
 static const char *get_ident_string(void)
 {
 	static struct strbuf sb = STRBUF_INIT;
@@ -3437,8 +3845,9 @@ static const char *get_ident_string(void)
 		return sb.buf;
 	if (uname(&uts) < 0)
 		die_errno(_("failed to get kernel name and information"));
-	strbuf_addf(&sb, "Location %s, system %s", repo_get_work_tree(the_repository),
-		    uts.sysname);
+	strbuf_addf(&sb, "Location %s, system %s, cache version %d",
+		    repo_get_work_tree(the_repository), uts.sysname,
+		    UNTRACKED_CACHE_IDENT_VERSION);
 	return sb.buf;
 }
 
@@ -4502,6 +4911,8 @@ struct untracked_cache *read_untracked_extension(const void *data, unsigned long
 	ewah_each_bit(rd.valid, read_stat, &rd);
 	ewah_each_bit(rd.sha1_valid, read_oid, &rd);
 	next = rd.data;
+	if (next == end)
+		compute_untracked_cache_disk_valid_recursive(uc->root);
 
 done:
 	free(rd.ucd);
