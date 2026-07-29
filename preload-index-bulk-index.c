@@ -3,6 +3,9 @@
 #include "object.h"
 #include "preload-index-bulk.h"
 #include "read-cache-ll.h"
+#include "repository.h"
+#include "semantic-verify.h"
+#include "semantic-verify-internal.h"
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
@@ -78,6 +81,18 @@ static int record_tracked_state(struct preload_bulk_worker *worker, int pos,
 	return recorded;
 }
 
+static void record_stat_update(struct preload_bulk_worker *worker, int pos,
+			       const struct stat_data *stat_data)
+{
+	struct preload_bulk_stat_update *update;
+
+	ALLOC_GROW(worker->stat_updates, worker->stat_updates_nr + 1,
+		   worker->stat_updates_alloc);
+	update = &worker->stat_updates[worker->stat_updates_nr++];
+	update->cache_pos = pos;
+	memcpy(&update->stat_data, stat_data, sizeof(update->stat_data));
+}
+
 static int tracked_entry_is_eligible(const struct cache_entry *ce)
 {
 	return !ce_stage(ce) &&
@@ -109,6 +124,38 @@ static int size_change_is_definitive(const struct cache_entry *ce,
 		 DATA_CHANGED);
 }
 
+static unsigned char verify_content_at(
+	struct preload_bulk_worker *worker, int pos, int parent_fd,
+	const char *basename, const struct stat *st,
+	int observed_has_platform_identity, struct stat_data *stat_data,
+	int *has_stat_update)
+{
+	struct preload_bulk_scan *scan = worker->scan;
+	struct cache_entry *ce = scan->istate->cache[pos];
+	struct semantic_verify_file_result file;
+
+	*has_stat_update = 0;
+	if (!scan->verify_content ||
+	    !semantic_verify_classify_entry(
+		    scan->istate, ce, worker->attr_check, 0, &file))
+		return PRELOAD_BULK_TRACKED_CONTENT_CHECK;
+	semantic_verify_file_at(
+		parent_fd, basename, st, observed_has_platform_identity,
+		scan->root_dev, ce, scan->istate->repo,
+		worker->hash_buffer, &file);
+	worker->bytes_hashed += file.bytes_hashed;
+	if (file.kind == SEMANTIC_VERIFY_RAW_MODIFIED)
+		return PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED;
+	if (file.kind != SEMANTIC_VERIFY_RAW_CLEAN || !file.persistable)
+		return PRELOAD_BULK_TRACKED_CONTENT_CHECK;
+	if (memcmp(&file.stat_data, &ce->ce_stat_data,
+		   sizeof(file.stat_data))) {
+		memcpy(stat_data, &file.stat_data, sizeof(*stat_data));
+		*has_stat_update = 1;
+	}
+	return PRELOAD_BULK_TRACKED_CLEAN;
+}
+
 int preload_bulk_index_entry_is_gitlink(struct preload_bulk_scan *scan,
 					int pos)
 {
@@ -116,12 +163,16 @@ int preload_bulk_index_entry_is_gitlink(struct preload_bulk_scan *scan,
 }
 
 void preload_bulk_record_tracked(
-	struct preload_bulk_worker *worker, int pos, const struct stat *st)
+	struct preload_bulk_worker *worker, int pos, int parent_fd,
+	const char *basename, const struct stat *st,
+	int observed_has_platform_identity)
 {
 	struct preload_bulk_scan *scan = worker->scan;
 	struct cache_entry *ce = scan->istate->cache[pos];
+	struct stat_data stat_data;
 	unsigned int changed;
 	unsigned char state;
+	int has_stat_update = 0;
 
 	if (!tracked_entry_is_eligible(ce))
 		return;
@@ -133,8 +184,12 @@ void preload_bulk_record_tracked(
 	else if (size_change_is_definitive(ce, st, changed))
 		state = PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED;
 	else
-		state = PRELOAD_BULK_TRACKED_CONTENT_CHECK;
-	record_tracked_state(worker, pos, state);
+		state = verify_content_at(
+			worker, pos, parent_fd, basename, st,
+			observed_has_platform_identity, &stat_data,
+			&has_stat_update);
+	if (record_tracked_state(worker, pos, state) && has_stat_update)
+		record_stat_update(worker, pos, &stat_data);
 }
 
 void preload_bulk_record_tracked_fallback(
