@@ -107,6 +107,47 @@ configured_bulk_status () {
 		status --porcelain=v2 >"$output"
 }
 
+setup_provider_proof_repo () {
+	setup_repo "$1" &&
+	(
+		cd "$1" &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		mtime=$(test-tool chmtime --get root) &&
+		printf "dirt\n" >root &&
+		test-tool chmtime =$mtime root &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid root &&
+		test_grep ! FSCF .git/index
+	)
+}
+
+setup_provider_proof_repo_with_untracked_cache () {
+	setup_repo "$1" &&
+	(
+		cd "$1" &&
+		git config core.untrackedCache true &&
+		git status --porcelain=2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep UNTR .git/index &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		mtime=$(test-tool chmtime --get root) &&
+		printf "dirt\n" >root &&
+		test-tool chmtime =$mtime root &&
+		test_write_lines visible >visible &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid root &&
+		test_grep ! FSCF .git/index
+	)
+}
+
 test_expect_success 'bulk preload follows its configuration' '
 	setup_repo opt-in &&
 	GIT_OPTIONAL_LOCKS=0 \
@@ -142,6 +183,79 @@ test_expect_success 'bulk preload waits for fsmonitor provider closure' '
 	configured_bulk_status opt-in actual fsmonitor.trace &&
 	test_must_be_empty actual &&
 	test_grep ! "\"key\":\"preload/bulk_result\"" fsmonitor.trace
+'
+
+test_expect_success 'provider closure accepts bulk content proofs' '
+	setup_provider_proof_repo provider-proof &&
+	(
+		cd provider-proof &&
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* root$" .git/actual &&
+		test_trace2_data status semantic_verify/bulk_scan 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_content_verify 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_bytes_hashed \
+			"[1-9][0-9]*" \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_provider_applied 7 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index
+	)
+'
+
+test_expect_success \
+	'provider bulk preserves an existing untracked-cache binding' '
+	setup_provider_proof_repo_with_untracked_cache provider-proof-uc &&
+	(
+		cd provider-proof-uc &&
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=2 >.git/actual &&
+		test_grep "^1 \.M .* root$" .git/actual &&
+		test_grep "^? visible$" .git/actual &&
+		! test_trace2_data index preload/bulk_untracked_complete 1 \
+			<.git/status.trace &&
+		test_grep \
+			"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+			.git/status.trace >.git/read-directory &&
+		test_line_count = 1 .git/read-directory &&
+		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success 'provider failure discards bulk content proofs' '
+	setup_provider_proof_repo provider-failure &&
+	(
+		cd provider-failure &&
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CE \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* root$" .git/actual &&
+		test_trace2_data status semantic_verify/bulk_scan 1 \
+			<.git/status.trace &&
+		test_trace2_data index preload/bulk_content_verify 1 \
+			<.git/status.trace &&
+		! test_trace2_data index preload/bulk_provider_applied \
+			"[0-9][0-9]*" <.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep ! FSCF .git/index
+	)
 '
 
 cleanup_race () {

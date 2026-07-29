@@ -253,7 +253,8 @@ int preload_bulk_linux_enumerate(
 					worker, pos);
 				continue;
 			}
-			preload_bulk_record_tracked(worker, pos, &st);
+			preload_bulk_record_tracked(
+				worker, pos, fd, de->name, &st, 0);
 		}
 	}
 
