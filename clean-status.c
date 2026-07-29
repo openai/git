@@ -17,6 +17,7 @@ struct clean_status_state *clean_status_get_state(struct index_state *istate)
 {
 	if (!istate->clean_status) {
 		CALLOC_ARRAY(istate->clean_status, 1);
+		istate->clean_status->source_index_fd = -1;
 		clean_status_manifest_init(&istate->clean_status->manifest);
 		strbuf_init(&istate->clean_status->disk_config_raw, 0);
 	}
@@ -184,6 +185,8 @@ void clean_status_release(struct index_state *istate)
 {
 	if (!istate->clean_status)
 		return;
+	if (istate->clean_status->source_index_fd >= 0)
+		close(istate->clean_status->source_index_fd);
 	clean_status_manifest_release(&istate->clean_status->manifest);
 	strbuf_release(&istate->clean_status->disk_config_raw);
 	free(istate->clean_status->disk_config_token);
