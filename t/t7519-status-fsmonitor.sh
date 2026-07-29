@@ -595,6 +595,37 @@ prepare_builtin_closure_repo () {
 }
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin closure initializes a new untracked cache' '
+	test_when_finished "rm -rf builtin-closure-new-uc" &&
+	test_create_repo builtin-closure-new-uc &&
+	(
+		cd builtin-closure-new-uc &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSUC .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep \
+			"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+			.git/status.trace >.git/read-directory &&
+		test_line_count = 1 .git/read-directory &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'builtin clean closure publishes its proof' '
 	test_when_finished "rm -rf builtin-closure-clean" &&
 	prepare_builtin_closure_repo builtin-closure-clean untracked &&
