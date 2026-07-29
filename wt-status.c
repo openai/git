@@ -34,6 +34,7 @@
 #include "worktree.h"
 #include "lockfile.h"
 #include "sequencer.h"
+#include "fsmonitor.h"
 #include "fsmonitor-settings.h"
 
 #define AB_DELAY_WARNING_IN_MS (2 * 1000)
@@ -814,21 +815,50 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 {
 	struct index_state *istate = s->repo->index;
 	unsigned int dir_flags;
+	int has_fsmonitor =
+		fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED;
 
 	if (s->untracked_cache_preload)
 		BUG("untracked-cache preload already started");
-	if (fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED ||
-	    s->pathspec.nr ||
+	if (s->pathspec.nr ||
 	    s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
 	    s->show_ignored_mode)
 		return;
-
 	dir_flags = wt_status_untracked_dir_flags(s);
+	if (has_fsmonitor) {
+		s->untracked_cache_preload =
+			untracked_cache_preload_start_fsmonitor_excludes(
+				istate, dir_flags);
+		return;
+	}
+
 	s->untracked_cache_preload =
 		untracked_cache_preload_start_ordinary(istate, dir_flags);
 }
 
-static int wt_status_collect_untracked_1(struct wt_status *s, int collect)
+static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	size_t index_invalidated = 0;
+
+	if (!s->untracked_cache_preload)
+		return;
+	s->untracked_cache_preloaded = untracked_cache_preload_finish(
+		s->untracked_cache_preload, istate,
+		wt_status_untracked_dir_flags(s), &index_invalidated);
+	s->untracked_cache_preload = NULL;
+	if (!index_invalidated)
+		return;
+
+	trace2_data_intmax("status", s->repo,
+			   "fsmonitor/exclude-index-invalidated",
+			   index_invalidated);
+}
+
+static int wt_status_collect_untracked_1(
+	struct wt_status *s,
+	struct string_list *untracked,
+	struct string_list *ignored)
 {
 	int i;
 	int used_untracked_cache;
@@ -851,11 +881,7 @@ static int wt_status_collect_untracked_1(struct wt_status *s, int collect)
 	}
 
 	setup_standard_excludes(&dir);
-	if (s->untracked_cache_preload) {
-		s->untracked_cache_preloaded = untracked_cache_preload_finish(
-			s->untracked_cache_preload, istate, dir.flags);
-		s->untracked_cache_preload = NULL;
-	}
+	wt_status_finish_untracked_cache_preload(s);
 	dir.internal.untracked_cache_preloaded =
 		s->untracked_cache_preloaded;
 
@@ -863,32 +889,183 @@ static int wt_status_collect_untracked_1(struct wt_status *s, int collect)
 	used_untracked_cache = dir.untracked &&
 		dir.untracked == istate->untracked;
 
-	if (collect) {
-		for (i = 0; i < dir.nr; i++) {
-			struct dir_entry *ent = dir.entries[i];
-			if (index_name_is_other(istate, ent->name, ent->len))
-				string_list_append(&s->untracked, ent->name);
-		}
-		string_list_sort_u(&s->untracked, 0);
-
-		for (i = 0; i < dir.ignored_nr; i++) {
-			struct dir_entry *ent = dir.ignored[i];
-			if (index_name_is_other(istate, ent->name, ent->len))
-				string_list_append(&s->ignored, ent->name);
-		}
-		string_list_sort_u(&s->ignored, 0);
+	for (i = 0; i < dir.nr; i++) {
+		struct dir_entry *ent = dir.entries[i];
+		if (index_name_is_other(istate, ent->name, ent->len))
+			string_list_append(untracked, ent->name);
 	}
+	string_list_sort_u(untracked, 0);
+
+	for (i = 0; i < dir.ignored_nr; i++) {
+		struct dir_entry *ent = dir.ignored[i];
+		if (index_name_is_other(istate, ent->name, ent->len))
+			string_list_append(ignored, ent->name);
+	}
+	string_list_sort_u(ignored, 0);
 
 	dir_clear(&dir);
 
-	if (collect && advice_enabled(ADVICE_STATUS_U_OPTION))
+	if (advice_enabled(ADVICE_STATUS_U_OPTION))
 		s->untracked_in_ms = (getnanotime() - t_begin) / 1000000;
+	if (used_untracked_cache)
+		fsmonitor_mark_untracked_cache_valid(istate);
 	return used_untracked_cache;
 }
 
 static int wt_status_collect_untracked(struct wt_status *s)
 {
-	return wt_status_collect_untracked_1(s, 1);
+	if (s->untracked_from_token_closure && !s->show_ignored_mode)
+		return 1;
+	return wt_status_collect_untracked_1(
+		s, &s->untracked, &s->ignored);
+}
+
+#define FSMONITOR_TOKEN_MAX_QUERIES 3
+
+struct wt_status_token_closure {
+	struct wt_status *status;
+	unsigned int refresh_flags;
+	int can_prime;
+	int untracked_ready;
+	struct string_list staged_untracked;
+	struct string_list staged_ignored;
+	int staged_untracked_ready;
+	int refresh_result;
+	int queries;
+};
+
+static void wt_status_discard_staged_untracked(
+	struct wt_status_token_closure *closure)
+{
+	string_list_clear(&closure->staged_untracked, 0);
+	string_list_clear(&closure->staged_ignored, 0);
+	closure->staged_untracked_ready = 0;
+}
+
+static int wt_status_stage_untracked(
+	struct wt_status_token_closure *closure)
+{
+	wt_status_discard_staged_untracked(closure);
+	closure->staged_untracked_ready =
+		wt_status_collect_untracked_1(
+			closure->status,
+			&closure->staged_untracked,
+			&closure->staged_ignored);
+	if (!closure->staged_untracked_ready)
+		wt_status_discard_staged_untracked(closure);
+	return closure->staged_untracked_ready;
+}
+
+static void wt_status_publish_staged_untracked(
+	struct wt_status_token_closure *closure)
+{
+	struct wt_status *s = closure->status;
+
+	if (!closure->staged_untracked_ready)
+		return;
+	if (s->untracked.nr || s->ignored.nr)
+		BUG("publishing untracked results over collected status");
+	SWAP(s->untracked, closure->staged_untracked);
+	SWAP(s->ignored, closure->staged_ignored);
+	s->untracked_from_token_closure = 1;
+	closure->staged_untracked_ready = 0;
+}
+
+static int wt_status_close_ordinary_fsmonitor_token(
+	struct wt_status_token_closure *closure,
+	int refreshed_before_closure)
+{
+	struct wt_status *s = closure->status;
+	struct index_state *istate = s->repo->index;
+
+	if (!refreshed_before_closure)
+		closure->refresh_result = refresh_index(
+			istate, closure->refresh_flags, &s->pathspec,
+			NULL, NULL);
+	if (!closure->untracked_ready && closure->can_prime)
+		closure->untracked_ready = wt_status_stage_untracked(closure);
+
+	while (closure->queries < FSMONITOR_TOKEN_MAX_QUERIES) {
+		enum fsmonitor_token_result result =
+			fsmonitor_query_pending_token(
+				istate, closure->untracked_ready);
+
+		closure->queries++;
+		if (result == FSMONITOR_TOKEN_CLEAN) {
+			if (closure->untracked_ready) {
+				fsmonitor_accept_pending_token(istate);
+				return 1;
+			}
+			break;
+		}
+		if (result == FSMONITOR_TOKEN_ERROR ||
+		    result == FSMONITOR_TOKEN_NOT_PENDING)
+			break;
+
+		/* Rescan invalidations returned by the closure query. */
+		closure->refresh_result |= refresh_index(
+			istate, closure->refresh_flags, &s->pathspec,
+			NULL, NULL);
+		if (closure->can_prime)
+			closure->untracked_ready =
+				wt_status_stage_untracked(closure);
+	}
+	return 0;
+}
+
+static int wt_status_close_fsmonitor_token(
+	struct wt_status *s, unsigned int refresh_flags,
+	int require_untracked, int refreshed_before_closure)
+{
+	struct index_state *istate = s->repo->index;
+	struct wt_status_token_closure closure = {
+		.status = s,
+		.refresh_flags = refresh_flags,
+		.staged_untracked = STRING_LIST_INIT_DUP,
+		.staged_ignored = STRING_LIST_INIT_DUP,
+	};
+
+	refresh_fsmonitor(istate);
+	if (!fsmonitor_has_pending_token(istate) || s->pathspec.nr ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC) {
+		if (!refreshed_before_closure)
+			closure.refresh_result = refresh_index(
+				istate, refresh_flags, &s->pathspec,
+				NULL, NULL);
+		return closure.refresh_result;
+	}
+
+	closure.can_prime = require_untracked &&
+		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
+		!s->show_ignored_mode;
+	closure.untracked_ready = !istate->untracked ||
+		!istate->untracked->root;
+	if (require_untracked && !closure.can_prime &&
+	    !closure.untracked_ready)
+		BUG("cannot close required untracked scan");
+	trace2_region_enter("status", "fsmonitor_token_closure", s->repo);
+	if (wt_status_close_ordinary_fsmonitor_token(
+		    &closure, refreshed_before_closure))
+		goto accepted;
+
+	/* Keep the last valid token and fall back to complete scans. */
+	wt_status_discard_staged_untracked(&closure);
+	fsmonitor_reject_pending_token(istate);
+	closure.refresh_result |= refresh_index(
+		istate, refresh_flags, &s->pathspec, NULL, NULL);
+accepted:
+	wt_status_publish_staged_untracked(&closure);
+	wt_status_discard_staged_untracked(&closure);
+	trace2_region_leave("status", "fsmonitor_token_closure", s->repo);
+	return closure.refresh_result;
+}
+
+int wt_status_refresh_index(struct wt_status *s,
+			    unsigned int refresh_flags,
+			    int require_untracked)
+{
+	return wt_status_close_fsmonitor_token(
+		s, refresh_flags, require_untracked, 0);
 }
 
 static int has_unmerged(struct wt_status *s)
@@ -906,6 +1083,15 @@ static int has_unmerged(struct wt_status *s)
 
 void wt_status_collect(struct wt_status *s)
 {
+	int used_untracked_cache;
+
+	if (fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED)
+		wt_status_finish_untracked_cache_preload(s);
+	wt_status_close_fsmonitor_token(
+		s, REFRESH_QUIET | REFRESH_UNMERGED,
+		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
+		!s->show_ignored_mode, 1);
+
 	trace2_region_enter("status", "worktrees", s->repo);
 	wt_status_collect_changes_worktree(s);
 	trace2_region_leave("status", "worktrees", s->repo);
@@ -921,8 +1107,19 @@ void wt_status_collect(struct wt_status *s)
 	}
 
 	trace2_region_enter("status", "untracked", s->repo);
-	wt_status_collect_untracked(s);
+	used_untracked_cache = wt_status_collect_untracked(s);
 	trace2_region_leave("status", "untracked", s->repo);
+
+	/* Hook providers have no second query with which to close the scan. */
+	if (fsmonitor_has_pending_token(s->repo->index) && !s->pathspec.nr &&
+	    fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_HOOK &&
+	    (used_untracked_cache || !s->repo->index->untracked ||
+	     !s->repo->index->untracked->root)) {
+		if (fsmonitor_pending_token_from_provider(s->repo->index))
+			fsmonitor_accept_pending_token(s->repo->index);
+		else
+			fsmonitor_reject_pending_token(s->repo->index);
+	}
 
 	wt_status_get_state(s->repo, &s->state, s->branch && !strcmp(s->branch, "HEAD"));
 	if (s->state.merge_in_progress && !has_unmerged(s))
