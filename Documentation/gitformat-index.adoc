@@ -366,6 +366,19 @@ The remaining data of each directory block is grouped by type:
   - An ewah bitmap, the n-th bit indicates whether the n-th index entry
     is not CE_FSMONITOR_VALID.
 
+== File System Monitor untracked-cache token
+
+  The file system monitor untracked-cache token records the provider
+  token associated with an untracked-cache snapshot. The signature for
+  this extension is { 'F', 'S', 'U', 'C' }.
+
+  The extension consists of:
+
+  - 32-bit version number: the current version is 1.
+
+  - A NUL-terminated string containing the opaque file system monitor
+    token associated with the untracked-cache data.
+
 == End of Index Entry
 
   The End of Index Entry (EOIE) is used to locate the end of the variable

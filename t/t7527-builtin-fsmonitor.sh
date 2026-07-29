@@ -389,7 +389,8 @@ test_expect_success 'update-index implicitly starts daemon' '
 
 	# Confirm that the trace2 log contains a record of the
 	# daemon starting.
-	test_subcommand git fsmonitor--daemon start <.git/trace_implicit_1
+	test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+		.git/trace_implicit_1
 '
 
 test_expect_success 'status implicitly starts daemon' '
@@ -405,7 +406,8 @@ test_expect_success 'status implicitly starts daemon' '
 
 	# Confirm that the trace2 log contains a record of the
 	# daemon starting.
-	test_subcommand git fsmonitor--daemon start <.git/trace_implicit_2
+	test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+		.git/trace_implicit_2
 '
 
 edit_files () {
@@ -983,7 +985,8 @@ test_expect_success "submodule absorbgitdirs implicitly starts daemon" '
 
 	# Confirm that the trace2 log contains a record of the
 	# daemon starting.
-	test_subcommand git fsmonitor--daemon start <super-sub.trace
+	test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+		super-sub.trace
 '
 
 start_git_in_background () {
@@ -1446,6 +1449,177 @@ test_expect_success MACOS,HARDLINKS 'hardlink events invalidate all tracked path
 		test_grep "^event: //$" ../hardlink-event.trace &&
 		git fsmonitor--daemon stop
 	)
+'
+
+test_expect_success MACOS 'implicit daemon reuses the invoking Git executable' '
+	test_create_repo same-executable-spawn &&
+	mkdir fake-exec-path &&
+	write_script fake-exec-path/git <<-EOF &&
+	echo invoked >"$TRASH_DIRECTORY/fake-git-used"
+	exit 1
+	EOF
+	(
+		cd same-executable-spawn &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_EXEC_PATH="$TRASH_DIRECTORY/fake-exec-path" \
+		GIT_TRACE2_EVENT="$PWD/.git/spawn.trace" \
+			"$GIT_BUILD_DIR/git" status --porcelain=v2 \
+			>.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_path_is_missing "$TRASH_DIRECTORY/fake-git-used" &&
+		test_grep -F "\"argv\":[\"$GIT_BUILD_DIR/git\",\"fsmonitor--daemon\",\"run\",\"--detach\"]" \
+			.git/spawn.trace &&
+		git fsmonitor--daemon stop
+	)
+'
+
+test_expect_success MACOS 'implicit daemon rediscovers a linked worktree' '
+	test_when_finished "
+		git -C reexec-linked-wt fsmonitor--daemon stop 2>/dev/null || :
+		git -C reexec-linked-main worktree remove --force \
+			../reexec-linked-wt 2>/dev/null || :
+	" &&
+	test_create_repo reexec-linked-main &&
+	(
+		cd reexec-linked-main &&
+		test_commit base tracked &&
+		git worktree add ../reexec-linked-wt &&
+		git -C ../reexec-linked-wt config core.untrackedCache true &&
+		git -C ../reexec-linked-wt config core.fsmonitor true &&
+		linked_worktree=$(test-tool path-utils real_path \
+			../reexec-linked-wt) &&
+		GIT_TRACE2_EVENT="$PWD/../reexec-linked.trace" \
+			git -C ../reexec-linked-wt status --porcelain=v2 \
+			>../reexec-linked.actual &&
+		test_must_be_empty ../reexec-linked.actual &&
+		test_grep "\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+			../reexec-linked.trace &&
+		test_grep \
+			"\"child_class\":\"fsmonitor\",\"cd\":\"$linked_worktree\"" \
+			../reexec-linked.trace &&
+		git -C ../reexec-linked-wt fsmonitor--daemon stop &&
+		git worktree remove ../reexec-linked-wt
+	)
+'
+
+test_expect_success MACOS 'implicit startup treats a bad timeout as best effort' '
+	test_create_repo reexec-timeout &&
+	(
+		cd reexec-timeout &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config fsmonitor.starttimeout nonsense &&
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		git config --unset fsmonitor.starttimeout &&
+		git fsmonitor--daemon stop &&
+		git config fsmonitor.starttimeout nonsense &&
+		test_must_fail git fsmonitor--daemon start 2>.git/err &&
+		test_grep "bad numeric config value" .git/err
+	)
+'
+
+test_expect_success 'bound query replaces a legacy daemon' '
+	test_when_finished \
+		"stop_daemon_delete_repo legacy-daemon-upgrade" &&
+	test_create_repo legacy-daemon-upgrade &&
+	(
+		cd legacy-daemon-upgrade &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git status --porcelain=v2 >/dev/null &&
+		git config core.fsmonitor true &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 --fsmonitor-legacy &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/upgrade.trace" \
+			git status >.git/upgrade.out &&
+		test_trace2_data fsm_client query/incompatible-daemon 1 \
+			<.git/upgrade.trace &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep ! "builtin:test-legacy:0" .git/fsmonitor &&
+		test_grep \
+			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+			.git/upgrade.trace &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
+			git status >.git/warm.out &&
+		! test_trace2_data index refresh/sum_lstat \
+			"[1-9][0-9]*" <.git/warm.trace &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/warm.trace &&
+		test_grep ! \
+			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+			.git/warm.trace
+	)
+'
+
+test_expect_success 'bound query accepts a capability superset' '
+	test_when_finished \
+		"stop_daemon_delete_repo capability-superset" &&
+	test_create_repo capability-superset &&
+	(
+		cd capability-superset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git status --porcelain=v2 >/dev/null &&
+		git config core.fsmonitor true &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 \
+			--fsmonitor-capability-superset &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/status.out &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep \
+			"^fsmonitor last update builtin:test-capable:0" \
+			.git/fsmonitor &&
+		test_grep ! \
+			"\"key\":\"query/incompatible-daemon\"" \
+			.git/status.trace &&
+		test_grep ! \
+			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+			.git/status.trace
+	)
+'
+
+test_expect_success MACOS 'worktree binding rejects same-gitdir aliases' '
+	test_when_finished "git -C binding-a fsmonitor--daemon stop 2>/dev/null || :" &&
+	git init --separate-git-dir="$PWD/binding-gitdir" binding-a &&
+	mkdir binding-b &&
+	cp binding-a/.git binding-b/.git &&
+	(
+		cd binding-a &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TRACE2_EVENT="$PWD/../binding-daemon.trace" \
+			git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null
+	) &&
+	cp binding-a/tracked binding-b/tracked &&
+	echo changed >>binding-b/tracked &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false -C binding-b \
+		status --porcelain=v2 >binding.expect &&
+	GIT_OPTIONAL_LOCKS=0 git -C binding-b \
+		status --porcelain=v2 >binding.actual &&
+	test_cmp binding.expect binding.actual &&
+	test_grep "^1 \.M .* tracked$" binding.actual &&
+	test_grep "\"key\":\"query/worktree-mismatch\",\"value\":\"1\"" \
+		binding-daemon.trace &&
+	git -C binding-a fsmonitor--daemon stop
 '
 
 test_done
