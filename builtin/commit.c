@@ -1731,6 +1731,10 @@ struct repository *repo UNUSED)
 		fd = repo_hold_locked_index(the_repository, &index_lock, 0);
 	else
 		fd = -1;
+	s.bulk_update_index_stat =
+		0 <= fd &&
+		the_repository->index->preload_bulk_tracked_nr ==
+			the_repository->index->cache_nr;
 
 	s.is_initial = repo_get_oid(the_repository, s.reference, &oid) ? 1 : 0;
 	if (!s.is_initial)

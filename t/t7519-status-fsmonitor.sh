@@ -834,6 +834,31 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success PERL_TEST_HELPERS \
+	'index reader rejects an out-of-bounds extension size' '
+	test_when_finished "rm -rf oversized-index-extension" &&
+	test_create_repo oversized-index-extension &&
+	(
+		cd oversized-index-extension &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		test_grep FSMN .git/index >/dev/null &&
+		perl -0777 -pe "
+			\$pos = index(\$_, q(FSMN));
+			die q(FSMN-not-found) if \$pos < 0;
+			substr(\$_, \$pos + 4, 4) = pack(q(N), 0xffffffff);
+		" .git/index >.git/index.bad &&
+		mv .git/index.bad .git/index &&
+		test_must_fail git status --porcelain=v2 2>err &&
+		test_grep "index file corrupt" err
+	)
+'
+
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
 test_expect_success 'incompatible bare repo' '
 	test_when_finished "rm -rf ./bare-clone actual expect" &&
@@ -1578,6 +1603,45 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/status.trace &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success PTHREADS,UNTRACKED_CACHE,SHA1 'load cache-tree and untracked-cache extensions in parallel' '
+	test_create_repo parallel-extensions &&
+	(
+		cd parallel-extensions &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir dir &&
+		echo tracked >dir/tracked &&
+		git config index.threads 4 &&
+		git add dir/tracked &&
+		git commit -m initial &&
+		git config core.untrackedCache true &&
+		git status --porcelain >/dev/null &&
+		echo modified >>dir/tracked &&
+		echo untracked >dir/untracked &&
+		GIT_TEST_INDEX_THREADS=1 \
+		git --no-optional-locks status --porcelain >"$TRASH_DIRECTORY/parallel-serial.status" &&
+		GIT_TEST_INDEX_THREADS=1 \
+		test-tool dump-cache-tree >"$TRASH_DIRECTORY/parallel-serial.tree" &&
+		GIT_TEST_INDEX_THREADS=1 \
+		test-tool dump-untracked-cache >"$TRASH_DIRECTORY/parallel-serial.untracked" &&
+		GIT_TEST_INDEX_THREADS=4 \
+		GIT_TEST_PARALLEL_INDEX_EXTENSIONS=1 \
+		GIT_TRACE2_EVENT="$TRASH_DIRECTORY/parallel-extensions.trace" \
+		git --no-optional-locks status --porcelain >"$TRASH_DIRECTORY/parallel-parallel.status" &&
+		GIT_TEST_INDEX_THREADS=4 GIT_TEST_PARALLEL_INDEX_EXTENSIONS=1 \
+		test-tool dump-cache-tree >"$TRASH_DIRECTORY/parallel-parallel.tree" &&
+		GIT_TEST_INDEX_THREADS=4 GIT_TEST_PARALLEL_INDEX_EXTENSIONS=1 \
+		test-tool dump-untracked-cache >"$TRASH_DIRECTORY/parallel-parallel.untracked" &&
+		test_grep "extension/parallel/tree-untracked" \
+			"$TRASH_DIRECTORY/parallel-extensions.trace" &&
+		test_cmp "$TRASH_DIRECTORY/parallel-serial.status" \
+			 "$TRASH_DIRECTORY/parallel-parallel.status" &&
+		test_cmp "$TRASH_DIRECTORY/parallel-serial.tree" \
+			 "$TRASH_DIRECTORY/parallel-parallel.tree" &&
+		test_cmp "$TRASH_DIRECTORY/parallel-serial.untracked" \
+			 "$TRASH_DIRECTORY/parallel-parallel.untracked"
 	)
 '
 
