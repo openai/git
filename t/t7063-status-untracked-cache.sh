@@ -991,4 +991,220 @@ test_expect_success 'empty repo (no index) and core.untrackedCache' '
 	git -C emptyrepo -c core.untrackedCache=true write-tree
 '
 
+test_expect_success 'directory snapshots ignore weak file-stat configuration' '
+	test_create_repo weak-dir &&
+	(
+		cd weak-dir &&
+		mkdir nested &&
+		echo tracked >tracked &&
+		echo one >nested/one &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		git config core.trustCtime false &&
+		git config core.checkStat minimal &&
+		avoid_racy &&
+		git status --porcelain -uall >/dev/null &&
+		git status --porcelain -uall >/dev/null &&
+		dir_mtime=$(test-tool chmtime --get nested) &&
+		mv nested/one nested/two &&
+		test-tool chmtime =$dir_mtime nested &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain -uall >.git/expect &&
+		git status --porcelain -uall >.git/actual &&
+		test_cmp .git/expect .git/actual
+	)
+'
+
+test_expect_success 'automatic preload observes its directory threshold' '
+	test_create_repo auto-preload-threshold &&
+	(
+		cd auto-preload-threshold &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		sane_unset GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD &&
+		for i in $(test_seq 1 1998)
+		do
+			mkdir "d$i" &&
+			>"d$i/file" || return 1
+		done &&
+		git status --porcelain >/dev/null &&
+		GIT_TRACE2_EVENT="$PWD/.git/below-threshold.trace" \
+			git status --porcelain >/dev/null &&
+		test_grep ! "preload_untracked_cache/automatic" \
+			.git/below-threshold.trace &&
+
+		mkdir d1999 &&
+		>d1999/file &&
+		git status --porcelain >/dev/null &&
+		GIT_TRACE2_EVENT="$PWD/.git/at-threshold.trace" \
+			git status --porcelain >/dev/null &&
+		test_grep \
+			"preload_untracked_cache/automatic.*value.*1" \
+			.git/at-threshold.trace
+	)
+'
+
+test_expect_success 'preload verifies cached per-directory excludes' '
+	test_create_repo auto-exclude &&
+	(
+		cd auto-exclude &&
+		test_write_lines hide-a >.gitignore &&
+		test_write_lines tracked >tracked &&
+		git add .gitignore tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		test_write_lines a >hide-a &&
+		test_write_lines b >hide-b &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		avoid_racy &&
+		mtime=$(test-tool chmtime --get .gitignore) &&
+		test_write_lines hide-b >.gitignore &&
+		test-tool chmtime =$mtime .gitignore &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain >.git/expect &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/actual.trace" \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "preload_untracked_cache/valid.*value.*0" \
+			.git/actual.trace
+	)
+'
+
+test_expect_success 'recursive preload checks descendant directory mtimes' '
+	test_create_repo recursive-preload &&
+	(
+		cd recursive-preload &&
+		mkdir -p a/b &&
+		echo tracked >a/b/tracked &&
+		git add a/b/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		avoid_racy &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/pruned.trace" \
+			git status --porcelain >.git/pruned &&
+		test_must_be_empty .git/pruned &&
+		test_grep \
+			"directories-visited.*value.*0" \
+			.git/pruned.trace &&
+		avoid_racy &&
+		echo untracked >a/b/new-untracked &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain >.git/expect &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual
+	)
+'
+
+test_expect_success 'recursive preload rescans a vanished collapsed witness' '
+	test_create_repo collapsed-witness &&
+	(
+		cd collapsed-witness &&
+		test_write_lines "*.ignored" >.gitignore &&
+		git add .gitignore &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		for i in 00 01
+		do
+			mkdir -p "scratch/d$i" &&
+			test_write_lines "$i" >"scratch/d$i/file" || return 1
+		done &&
+		echo "?? scratch/" >.git/expect &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+		test-tool dump-untracked-cache >.git/cache &&
+		witness=$(sed -n \
+			"s#^/scratch/\\(d[0-9][0-9]*\\)/ .*#\\1#p" \
+			.git/cache | sed -n 1p) &&
+		test -n "$witness" &&
+		avoid_racy &&
+		rm "scratch/$witness/file" &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual
+	)
+'
+
+test_expect_success 'status preloads cached-directory validation' '
+	test_create_repo auto-preload &&
+	(
+		cd auto-preload &&
+		mkdir -p nested/deep &&
+		echo tracked >nested/tracked &&
+		git add nested/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor false &&
+		echo visible >nested/deep/visible &&
+		git -c core.untrackedCache=false status --porcelain \
+			>.git/expect &&
+		avoid_racy &&
+		git status --porcelain >/dev/null &&
+		git status --porcelain >/dev/null &&
+
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=3 \
+		GIT_TRACE2_EVENT="$PWD/.git/normal.trace" \
+			git status --porcelain >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		if test_have_prereq PTHREADS
+		then
+			expect_threads=3
+		else
+			expect_threads=1
+		fi &&
+		test_grep \
+			"preload_untracked_cache/threads.*value.*$expect_threads" \
+			.git/normal.trace &&
+		test_grep "preload_untracked_cache/valid.*value.*1" \
+			.git/normal.trace &&
+		test_grep "opendir.*value.*0" .git/normal.trace &&
+		echo changed >nested/deep/changed &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain >.git/expect-changed &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=3 \
+		GIT_TRACE2_EVENT="$PWD/.git/changed.trace" \
+			git status --porcelain >.git/actual-changed &&
+		test_cmp .git/expect-changed .git/actual-changed &&
+		test_grep "preload_untracked_cache/valid.*value.*0" \
+			.git/changed.trace &&
+		test_grep "opendir.*value.*[1-9][0-9]*" \
+			.git/changed.trace &&
+
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain -- nested >.git/expect-pathspec &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/pathspec.trace" \
+			git status --porcelain -- nested >.git/actual-pathspec &&
+		test_cmp .git/expect-pathspec .git/actual-pathspec &&
+		test_grep ! 'preload_untracked_cache/threads' \
+			.git/pathspec.trace &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.untrackedCache=false \
+			status --porcelain -uall >.git/expect-uall &&
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/uall.trace" \
+			git status --porcelain -uall >.git/actual-uall &&
+		test_cmp .git/expect-uall .git/actual-uall &&
+		test_grep ! 'preload_untracked_cache/threads' .git/uall.trace
+	)
+'
+
 test_done
