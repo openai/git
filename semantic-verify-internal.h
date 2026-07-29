@@ -80,7 +80,7 @@ void semantic_verify_file(struct semantic_verify_root *root,
 			  struct semantic_verify_file_result *result);
 void semantic_verify_file_at(int parent_fd, const char *basename,
 			     const struct stat *observed,
-			     dev_t root_dev,
+			     int observed_has_platform_identity, dev_t root_dev,
 			     const struct cache_entry *ce,
 			     struct repository *repo, void *buffer,
 			     struct semantic_verify_file_result *result);
