@@ -1385,8 +1385,11 @@ done:
 }
 
 void fsmonitor_accept_pending_token(struct index_state *istate,
-				    int untracked_ready)
+				    int untracked_proof_complete,
+				    int untracked_cache_valid)
 {
+	if (untracked_cache_valid && !untracked_proof_complete)
+		BUG("valid untracked cache without a complete proof");
 	if (!fsmonitor_pending_token_from_provider(istate))
 		return;
 	FREE_AND_NULL(istate->fsmonitor_last_update);
@@ -1394,15 +1397,15 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 	istate->fsmonitor_last_update_pending = NULL;
 	istate->fsmonitor_pending_token_from_provider = 0;
 	istate->fsmonitor_token_valid = 1;
-	istate->fsmonitor_untracked_valid = !!untracked_ready;
+	istate->fsmonitor_untracked_valid = !!untracked_cache_valid;
 	if (istate->untracked)
-		istate->untracked->use_fsmonitor = !!untracked_ready;
+		istate->untracked->use_fsmonitor = !!untracked_cache_valid;
 	istate->cache_changed |= FSMONITOR_CHANGED;
 	FREE_AND_NULL(istate->fsmonitor_untracked_token);
-	if (untracked_ready)
+	if (untracked_cache_valid)
 		istate->fsmonitor_untracked_token =
 			xstrdup(istate->fsmonitor_last_update);
-	else {
+	else if (!untracked_proof_complete) {
 		/*
 		 * Keep a query anchored at the accepted tracked token. A
 		 * later in-process status may need to close work done after

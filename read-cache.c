@@ -1642,6 +1642,9 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 			unsigned char state =
 				istate->preload_bulk_tracked_state[i];
 
+			if (istate->preload_bulk_provider_pending &&
+			    state == PRELOAD_BULK_TRACKED_CLEAN)
+				continue;
 			if (state == PRELOAD_BULK_TRACKED_CONTENT_CHECK) {
 				ce->ce_flags |= CE_CONTENT_CHECK_REQUIRED;
 				continue;
@@ -2558,6 +2561,7 @@ void release_index(struct index_state *istate)
 	free(istate->fsmonitor_untracked_token);
 	clean_status_release(istate);
 	free(istate->preload_bulk_tracked_state);
+	free(istate->preload_bulk_stat_updates);
 	free(istate->cache);
 	discard_split_index(istate);
 	free_untracked_cache(istate->untracked);

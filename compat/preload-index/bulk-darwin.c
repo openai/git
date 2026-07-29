@@ -495,7 +495,8 @@ static int enumerate_directory(struct preload_bulk_worker *worker,
 					   entry.uid, entry.gid, entry.access,
 					   entry.linkcount, entry.size))
 				goto malformed_record;
-			preload_bulk_record_tracked(worker, pos, &st);
+			preload_bulk_record_tracked(
+				worker, pos, fd, entry.name, &st, 0);
 
 next_record:
 			record += entry.record_len;
