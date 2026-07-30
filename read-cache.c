@@ -1577,7 +1577,7 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 	 * cache entries quickly then in the single threaded loop below,
 	 * we only have to do the special cases that are left.
 	 */
-	preload_index(istate, pathspec, 0);
+	preload_index(istate, pathspec, flags & REFRESH_DEFER_BULK_DIRTY);
 	trace2_region_enter("index", "refresh", NULL);
 
 	for (i = 0; i < istate->cache_nr; i++) {
@@ -1620,6 +1620,20 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 
 		if (filtered)
 			continue;
+
+		if ((flags & REFRESH_DEFER_BULK_DIRTY) &&
+		    istate->preload_bulk_tracked_nr == istate->cache_nr) {
+			unsigned char state =
+				istate->preload_bulk_tracked_state[i];
+
+			if (state == PRELOAD_BULK_TRACKED_CONTENT_CHECK) {
+				ce->ce_flags |= CE_CONTENT_CHECK_REQUIRED;
+				continue;
+			}
+			if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED ||
+			    state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED)
+				continue;
+		}
 
 		new_entry = refresh_cache_ent(istate, ce, options,
 					      &cache_errno, &changed,
@@ -2527,6 +2541,7 @@ void release_index(struct index_state *istate)
 	free(istate->fsmonitor_last_update_pending);
 	free(istate->fsmonitor_untracked_token);
 	clean_status_release(istate);
+	free(istate->preload_bulk_tracked_state);
 	free(istate->cache);
 	discard_split_index(istate);
 	free_untracked_cache(istate->untracked);
