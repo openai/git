@@ -1703,7 +1703,8 @@ struct repository *repo UNUSED)
 	repo_read_index(the_repository);
 	wt_status_start_untracked_cache_preload(&s);
 	wt_status_refresh_index(
-		&s, REFRESH_QUIET | REFRESH_UNMERGED | progress_flag,
+		&s, REFRESH_QUIET | REFRESH_UNMERGED | progress_flag |
+		REFRESH_DEFER_BULK_DIRTY,
 		s.show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
 		!s.show_ignored_mode);
 
