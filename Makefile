@@ -413,6 +413,9 @@ include shared.mak
 # `compat/fsmonitor/fsm-health-<name>.c` files
 # that implement the `fsm_listen__*()` and `fsm_health__*()` routines.
 #
+# If a platform supports bulk worktree scans during index preload, set
+# PRELOAD_INDEX_BULK_BACKEND to the name of its backend.
+#
 # If your platform has OS-specific ways to tell if a repo is incompatible with
 # fsmonitor (whether the hook or IPC daemon version), set FSMONITOR_OS_SETTINGS
 # to the "<name>" of the corresponding `compat/fsmonitor/fsm-settings-<name>.c`
@@ -1396,6 +1399,15 @@ LIB_OBJS += worktree-attr-source.o
 LIB_OBJS += wrapper.o
 LIB_OBJS += write-or-die.o
 LIB_OBJS += ws.o
+ifdef PRELOAD_INDEX_BULK_BACKEND
+BASIC_CFLAGS += -DHAVE_PRELOAD_INDEX_BULK
+PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-index.o
+PRELOAD_INDEX_BULK_OBJS += preload-index-bulk-thread.o
+PRELOAD_INDEX_BULK_OBJS += preload-index-bulk.o
+PRELOAD_INDEX_BULK_OBJS += compat/preload-index/bulk-$(PRELOAD_INDEX_BULK_BACKEND).o
+PRELOAD_INDEX_BULK_OBJS += $(PRELOAD_INDEX_BULK_PLATFORM_OBJS)
+endif
+LIB_OBJS += $(PRELOAD_INDEX_BULK_OBJS)
 LIB_OBJS += wt-status.o
 LIB_OBJS += xdiff-interface.o
 LIB_OBJS += xdiff/xdiffi.o
@@ -1577,6 +1589,7 @@ CLAR_TEST_SUITES += u-oidmap
 CLAR_TEST_SUITES += u-oidtree
 CLAR_TEST_SUITES += u-path-namespace
 CLAR_TEST_SUITES += u-prio-queue
+CLAR_TEST_SUITES += u-preload-index-bulk-darwin
 CLAR_TEST_SUITES += u-reftable-basics
 CLAR_TEST_SUITES += u-reftable-block
 CLAR_TEST_SUITES += u-reftable-merged
