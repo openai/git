@@ -195,6 +195,8 @@ struct index_state {
 	struct hashmap dir_hash;
 	struct object_id oid;
 	struct untracked_cache *untracked;
+	unsigned char *preload_bulk_tracked_state;
+	size_t preload_bulk_tracked_nr;
 	char *fsmonitor_last_update;
 	char *fsmonitor_last_update_pending;
 	char *fsmonitor_untracked_token;
@@ -480,6 +482,7 @@ int fake_lstat(const struct cache_entry *ce, struct stat *st);
 #define REFRESH_IN_PORCELAIN             (1 << 5) /* user friendly output, not "needs update" */
 #define REFRESH_PROGRESS                 (1 << 6) /* show progress bar if stderr is tty */
 #define REFRESH_IGNORE_SKIP_WORKTREE     (1 << 7) /* ignore skip_worktree entries */
+#define REFRESH_DEFER_BULK_DIRTY         (1 << 8) /* leave bulk results to diff */
 #define REFRESH_IN_PROOF_EPOCH           (1 << 9) /* refresh is bounded by a proof epoch */
 int refresh_index(struct index_state *, unsigned int flags, const struct pathspec *pathspec, char *seen, const char *header_msg);
 /*
