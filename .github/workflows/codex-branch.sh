@@ -161,7 +161,8 @@ meta_control_paths_unchanged () (
 		.github/workflows/main.yml \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
-		.github/workflows \
+		':(glob).github/workflows/*.yml' \
+		':(glob).github/workflows/*.yaml' \
 		':(exclude).github/workflows/codex.yml' \
 		':(exclude).github/workflows/codex-release.yml'
 )
@@ -1304,7 +1305,8 @@ topic_control_paths_unchanged () (
 		.github/workflows/main.yml \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
-		.github/workflows \
+		':(glob).github/workflows/*.yml' \
+		':(glob).github/workflows/*.yaml' \
 		':(exclude).github/workflows/codex-release.yml'
 )
 
