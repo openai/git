@@ -13,16 +13,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  refresh:
-    name: Rebase topics and test codex
+  prepare:
+    name: Rebase topics and assemble codex
     runs-on: ubuntu-24.04
     outputs:
       changed: ${{ steps.rewrite.outputs.changed }}
+      topics: ${{ steps.rewrite.outputs.topics }}
+      artifact-name: ${{ steps.rewrite.outputs.artifact-name }}
+      run-attempt: ${{ steps.rewrite.outputs.run-attempt }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require a successful seed preparation
+        if: github.run_attempt > 1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: codex-seed-${{ github.run_id }}
+          path: ${{ runner.temp }}/codex-seed
+
+      - name: Verify the seed receipt
+        if: github.run_attempt > 1
+        run: test "$(cat "$RUNNER_TEMP/codex-seed/codex-seed-receipt")" = "$GITHUB_SHA"
 
       - name: Pin the controller helper
         run: |
@@ -77,6 +91,15 @@ jobs:
           else
             echo 'changed=false' >>"$GITHUB_OUTPUT"
           fi
+          topics=$(awk -F '\t' '$1 != "refs/heads/codex" {
+              sub("^refs/heads/", "", $1)
+              print $1
+            }' "$RUNNER_TEMP/codex-updates" |
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "topics=$topics" >>"$GITHUB_OUTPUT"
+          echo "artifact-name=codex-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            >>"$GITHUB_OUTPUT"
+          echo "run-attempt=$GITHUB_RUN_ATTEMPT" >>"$GITHUB_OUTPUT"
 
       - name: Summarize candidate
         run: |
@@ -100,17 +123,28 @@ jobs:
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Save immutable publication artifact
-        if: github.run_attempt > 1 && steps.rewrite.outputs.changed == 'true'
+      - name: Save immutable candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: codex-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.rewrite.outputs.artifact-name }}
           path: |
             ${{ runner.temp }}/codex.bundle
             ${{ runner.temp }}/codex-candidate
             ${{ runner.temp }}/codex-inputs
             ${{ runner.temp }}/codex-tested-tree
             ${{ runner.temp }}/codex-updates
+          retention-days: 7
+
+      - name: Record successful seed preparation
+        if: github.run_attempt == 1
+        run: printf '%s\n' "$GITHUB_SHA" >"$RUNNER_TEMP/codex-seed-receipt"
+
+      - name: Save seed receipt
+        if: github.run_attempt == 1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codex-seed-${{ github.run_id }}
+          path: ${{ runner.temp }}/codex-seed-receipt
           retention-days: 7
 
       - name: Explain how to resolve a conflict
@@ -121,10 +155,86 @@ jobs:
             cat "$RUNNER_TEMP/codex-conflict.md" >>"$GITHUB_STEP_SUMMARY"
           fi
 
+  topics:
+    name: Topic ${{ matrix.topic }}
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        topic: ${{ fromJSON(needs.prepare.outputs.topics) }}
+    uses: ./.github/workflows/codex-topic.yml
+    with:
+      topic: ${{ matrix.topic }}
+      artifact-name: ${{ needs.prepare.outputs.artifact-name }}
+    permissions:
+      contents: read
+
+  validate:
+    name: Build and test codex
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin the controller helper
+        run: |
+          cp .github/workflows/codex-branch.sh \
+            "$RUNNER_TEMP/codex-branch-trusted"
+          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
+
+      - name: Load the candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact-name }}
+          path: ${{ runner.temp }}/codex-candidate
+
+      - name: Verify the candidate inputs and objects
+        env:
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          metadata="$RUNNER_TEMP/codex-candidate"
+          helper="$RUNNER_TEMP/codex-branch-trusted"
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
+            sh "$helper" verify-inputs \
+              --base master --codex codex "$metadata/codex-inputs"
+
+          git bundle verify "$metadata/codex.bundle"
+          git fetch "$metadata/codex.bundle" \
+            refs/codex-output/candidate:refs/codex-import/candidate
+          candidate=$(cat "$metadata/codex-candidate")
+          if test "$(git rev-parse refs/codex-import/candidate)" != "$candidate"
+          then
+            echo "::error::bundle candidate does not match the prepared candidate"
+            exit 1
+          fi
+          if test "$(git rev-parse "$candidate^{tree}")" != \
+            "$(cat "$metadata/codex-tested-tree")"
+          then
+            echo "::error::bundle tree does not match the prepared tree"
+            exit 1
+          fi
+          sh "$helper" verify-output \
+            --inputs "$metadata/codex-inputs" \
+            --updates "$metadata/codex-updates" \
+            --result "$metadata/codex-candidate"
+
       - name: Check out the candidate
         run: |
-          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate/codex-candidate")
           git worktree add --detach "$RUNNER_TEMP/codex-source" "$candidate"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            libcurl4-openssl-dev
 
       - name: Build
         run: make -C "$RUNNER_TEMP/codex-source" -j2 DEVELOPER=1
@@ -142,8 +252,14 @@ jobs:
 
   publish:
     name: Atomically publish topics and codex
-    if: github.run_attempt > 1 && needs.refresh.outputs.changed == 'true'
-    needs: refresh
+    if: >-
+      github.run_attempt > 1 &&
+      needs.prepare.outputs.run-attempt == format('{0}', github.run_attempt) &&
+      needs.prepare.outputs.changed == 'true'
+    needs:
+      - prepare
+      - topics
+      - validate
     runs-on: ubuntu-24.04
     environment: codex-publish
     steps:
@@ -156,7 +272,7 @@ jobs:
       - name: Load publication artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: codex-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.prepare.outputs.artifact-name }}
           path: ${{ runner.temp }}/codex-publication
 
       - name: Pin the controller helper

@@ -30,6 +30,8 @@ usage () {
 		[--base <branch>] [--codex <branch>] <snapshot>
 	   or: codex-branch verify-output --inputs <path>
 		--updates <path> --result <path>
+	   or: codex-branch verify-topic --topic <branch> --inputs <path>
+		--updates <path> --result <path>
 	   or: codex-branch publish [--remote <remote>]
 		--inputs <path> --updates <path>
 	   or: codex-branch resolve [--remote <remote>] [--base <branch>]
@@ -138,6 +140,7 @@ control_paths_unchanged () (
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-topics.json \
+		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
 		t/t9905-codex-branch.sh
@@ -262,86 +265,121 @@ prepare_plan () {
 	base_oid=$1
 	topics=$2
 	state=$3
-	raw=$state/revisions
-	commits=$state/commits
-	nodes=$state/nodes
-	pending=$state/pending
-	ready=$state/ready
+	unique=$state/unique-topic-inputs
+	pairs=$state/topic-pairs
 	plan=$state/plan
-	owners=$state/owners
 
-	set -- git rev-list --parents
-	while IFS="$tab" read -r name oid
-	do
-		set -- "$@" "$oid"
-	done <"$topics"
-	set -- "$@" "^$base_oid"
-	"$@" >"$raw"
-	awk '{ print $1 }' "$raw" >"$commits"
-	: >"$nodes"
+	# Multiple refs may intentionally name the same topic tip.  Rewrite that
+	# tip once and let finish_updates() apply the result to every alias.
+	awk -F '\t' '!seen[$2]++ { print }' "$topics" >"$unique" ||
+		die "could not collect unique topic tips"
 
-	while read -r line
-	do
-		set -- $line
-		old=$1
-		shift
-		test $# = 1 || {
-			owner=$(awk -F '\t' -v old="$old" '
-				$2 == old { print $1; exit }
-			' "$topics")
-			test -n "$owner" || owner=$old
-			die "topic history for '$owner' contains merge commit $old; linearize it before refreshing codex"
+	# Siblings may share private history only when that shared prefix is itself
+	# an active topic.  Otherwise there is no single topic that owns the shared
+	# commits, and independently rebasing the siblings would duplicate them.
+	awk -F '\t' '
+		{ name[NR]=$1; oid[NR]=$2 }
+		END {
+			for (i = 1; i <= NR; i++)
+				for (j = i + 1; j <= NR; j++)
+					printf "%s\t%s\t%s\t%s\n",
+						name[i], oid[i], name[j], oid[j]
 		}
-		parent=$1
-		if ! grep -Fqx "$parent" "$commits"
-		then
-			git merge-base --is-ancestor "$parent" "$base_oid" ||
-				die "private commit $old is not based on master"
-		fi
-
-		: >"$owners" || die "could not prepare topic ownership"
-		while IFS="$tab" read -r name tip
-		do
-			if git merge-base --is-ancestor "$old" "$tip"
-			then
-				distance=$(git rev-list --count "$old..$tip") ||
-					die "could not measure topic ownership for $old"
-				printf '%s\t%s\n' "$distance" "$name" >>"$owners" ||
-					die "could not record topic ownership for $old"
-			fi
-		done <"$topics"
-		owner=$(LC_ALL=C sort -t "$tab" -k1,1n -k2,2 "$owners" |
-			awk -F '\t' 'NR == 1 { print $2 }')
-		test -n "$owner" || die "could not assign private commit $old to a topic"
-		printf '%s\t%s\t%s\n' "$old" "$parent" "$owner" >>"$nodes"
-	done <"$raw"
-
-	cp "$nodes" "$pending"
-	: >"$plan"
-	while test -s "$pending"
+	' "$unique" >"$pairs" || die "could not enumerate topic pairs"
+	while IFS="$tab" read -r left_name left_oid right_name right_oid
 	do
-		: >"$ready"
-		while IFS="$tab" read -r old parent owner
+		if git merge-base --is-ancestor "$left_oid" "$right_oid" ||
+			git merge-base --is-ancestor "$right_oid" "$left_oid"
+		then
+			continue
+		fi
+		git merge-base --all "$left_oid" "$right_oid" \
+			>"$state/shared-bases" ||
+			die "could not find the shared history of '$left_name' and '$right_name'"
+		count=$(wc -l <"$state/shared-bases" | tr -d ' ')
+		test "$count" = 1 ||
+			die "topics '$left_name' and '$right_name' have multiple merge bases; restack them into a one-prerequisite topic graph"
+		shared=$(sed -n '1p' "$state/shared-bases")
+		if git merge-base --is-ancestor "$shared" "$base_oid" ||
+			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
+				END { exit !found }' "$unique"
+		then
+			continue
+		fi
+		die "topics '$left_name' and '$right_name' share private commits through $shared; create an active ??/codex/* prerequisite topic at that shared prefix or restack the branches"
+	done <"$pairs"
+
+	: >"$plan"
+	while IFS="$tab" read -r name old
+	do
+		git merge-base --all "$base_oid" "$old" \
+			>"$state/root-bases" ||
+			die "topic '$name' has no common history with master"
+		count=$(wc -l <"$state/root-bases" | tr -d ' ')
+		test "$count" = 1 ||
+			die "topic '$name' has multiple merge bases with master; restack it before refreshing codex"
+		root_base=$(sed -n '1p' "$state/root-bases")
+
+		: >"$state/topic-ancestors"
+		while IFS="$tab" read -r other_name other_oid
 		do
-			if ! grep -Fqx "$parent" "$commits" ||
-				awk -F '\t' -v parent="$parent" \
-					'$1 == parent { found=1 } END { exit !found }' "$plan"
+			test "$other_oid" = "$old" && continue
+			test "$other_oid" = "$root_base" && continue
+			if git merge-base --is-ancestor "$root_base" "$other_oid" &&
+				git merge-base --is-ancestor "$other_oid" "$old"
 			then
-				printf '%s\t%s\t%s\n' "$owner" "$old" "$parent" \
-					>>"$ready"
+				printf '%s\t%s\n' "$other_name" "$other_oid" \
+					>>"$state/topic-ancestors" ||
+					die "could not record a prerequisite for '$name'"
 			fi
-		done <"$pending"
-		test -s "$ready" || die "topic history contains an ancestry cycle"
-		selected=$(LC_ALL=C sort -t "$tab" -k1,1 -k2,2 "$ready" |
-			sed -n '1p')
-		IFS="$tab" read -r owner old parent <<-EOF
-		$selected
-		EOF
-		printf '%s\t%s\t%s\n' "$old" "$parent" "$owner" >>"$plan"
-		awk -F '\t' -v selected="$old" '$1 != selected' "$pending" \
-			>"$pending.next"
-		mv "$pending.next" "$pending"
-	done
+		done <"$unique"
+
+		: >"$state/nearest-ancestors"
+		while IFS="$tab" read -r ancestor_name ancestor_oid
+		do
+			near=t
+			while IFS="$tab" read -r other_name other_oid
+			do
+				test "$ancestor_oid" = "$other_oid" && continue
+				if git merge-base --is-ancestor \
+					"$ancestor_oid" "$other_oid"
+				then
+					near=
+					break
+				fi
+			done <"$state/topic-ancestors"
+			test -z "$near" || printf '%s\t%s\n' \
+				"$ancestor_name" "$ancestor_oid" \
+				>>"$state/nearest-ancestors"
+		done <"$state/topic-ancestors"
+
+		count=$(wc -l <"$state/nearest-ancestors" | tr -d ' ')
+		case "$count" in
+		0)
+			prerequisite=master
+			old_base=$root_base
+			;;
+		1)
+			IFS="$tab" read -r prerequisite old_base \
+				<"$state/nearest-ancestors"
+			;;
+		*)
+			prerequisites=$(cut -f1 "$state/nearest-ancestors" |
+				LC_ALL=C sort | tr '\n' ' ')
+			die "topic '$name' has more than one nearest prerequisite ($prerequisites); restack it onto one prerequisite topic"
+			;;
+		esac
+
+		git merge-base --is-ancestor "$old_base" "$old" ||
+			die "prerequisite '$prerequisite' is not an ancestor of '$name'"
+		merge_commit=$(git rev-list --min-parents=2 \
+			"$old_base..$old" | sed -n '1p')
+		test -z "$merge_commit" ||
+			die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
+		printf '%s\t%s\t%s\t%s\n' \
+			"$name" "$old" "$prerequisite" "$old_base" >>"$plan" ||
+			die "could not record the rewrite plan for '$name'"
+	done <"$unique"
 
 	: >"$state/map"
 	while IFS="$tab" read -r name oid
@@ -355,52 +393,108 @@ prepare_plan () {
 
 rebase_in_progress () {
 	worktree=$1
-	test -d "$(git -C "$worktree" rev-parse --git-path rebase-merge)" ||
-		test -d "$(git -C "$worktree" rev-parse --git-path rebase-apply)"
+	test -d "$(git -C "$worktree" rev-parse --path-format=absolute \
+		--git-path rebase-merge)" ||
+		test -d "$(git -C "$worktree" rev-parse --path-format=absolute \
+		--git-path rebase-apply)"
 }
 
 continue_rerere_resolution () {
 	worktree=$1
 
-	if rebase_in_progress "$worktree" &&
+	while rebase_in_progress "$worktree" &&
 		test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
-	then
-		GIT_EDITOR=true git -C "$worktree" \
+	do
+		if ! GIT_EDITOR=true git -C "$worktree" \
+			-c user.name='github-actions[bot]' \
+			-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 			-c core.hooksPath=/dev/null \
 			-c core.fsmonitor=false \
 			-c commit.gpgSign=false \
 			-c rerere.enabled=true \
 			-c rerere.autoupdate=true \
-			rebase --continue ||
-			die "git rebase --continue failed after rerere staged a resolution"
-		if rebase_in_progress "$worktree"
+			rebase --continue
 		then
-			die "one-commit rebase unexpectedly remained in progress"
+			rebase_in_progress "$worktree" ||
+				die "git rebase --continue failed without recoverable state"
+			test -n "$(git -C "$worktree" \
+				-c core.fsmonitor=false ls-files -u)" && return 1
+			die "git rebase --continue failed after rerere staged a resolution"
 		fi
-		return 0
-	fi
+	done
 
 	! rebase_in_progress "$worktree"
 }
 
-rebase_one () {
+make_topic_sentinel () {
 	worktree=$1
-	old=$2
-	old_parent=$3
-	new_parent=$4
+	name=$2
+	old=$3
+	tree=$(git -C "$worktree" rev-parse "$old^{tree}") ||
+		die "could not read the tree for topic '$name'"
+	message=$(printf 'Codex rewrite sentinel: %s\n\nCodex-Rewrite-Sentinel: %s@%s\n' \
+		"$name" "$name" "$old")
+	printf '%s' "$message" | git -C "$worktree" \
+		-c user.name='github-actions[bot]' \
+		-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+		commit-tree "$tree" -p "$old" ||
+		die "could not create the completion sentinel for '$name'"
+}
+
+completed_topic_tip () {
+	worktree=$1
+	name=$2
+	old=$3
+	new_base=$4
+	head=$(git -C "$worktree" rev-parse HEAD) ||
+		die "could not read the completed rebase for '$name'"
+	marker=$(git -C "$worktree" show -s \
+		--format='%(trailers:key=Codex-Rewrite-Sentinel,valueonly)' "$head") ||
+		die "could not inspect the completion sentinel for '$name'"
+	test "$marker" = "$name@$old" ||
+		die "the rebase for '$name' did not reach its completion sentinel; continue the pinned rebase instead of quitting it"
+	parents=$(git -C "$worktree" rev-list --parents -n 1 "$head") ||
+		die "could not inspect the completion sentinel for '$name'"
+	set -- $parents
+	test $# = 2 || die "the completion sentinel for '$name' is not linear"
+	new=$2
+	test "$new" != "$old" ||
+		die "the stopped rebase for '$name' was aborted; run the pinned resolve command again"
+	test "$(git -C "$worktree" rev-parse "$head^{tree}")" = \
+		"$(git -C "$worktree" rev-parse "$new^{tree}")" ||
+		die "the completion sentinel for '$name' unexpectedly changes the tree"
+	git -C "$worktree" merge-base --is-ancestor "$new_base" "$new" ||
+		die "the completed topic '$name' is not based on its rewritten prerequisite"
+	merge_commit=$(git -C "$worktree" rev-list --min-parents=2 \
+		"$new_base..$new" | sed -n '1p')
+	test -z "$merge_commit" ||
+		die "the completed topic '$name' contains merge commit $merge_commit"
+	printf '%s\n' "$new"
+}
+
+rebase_topic () {
+	worktree=$1
+	name=$2
+	old=$3
+	old_base=$4
+	new_base=$5
+	sentinel=$(make_topic_sentinel "$worktree" "$name" "$old")
 
 	git -C "$worktree" -c core.fsmonitor=false \
-		-c advice.detachedHead=false switch --detach "$old" >/dev/null ||
-		die "could not check out commit $old for rebasing"
+		-c advice.detachedHead=false switch --detach "$sentinel" \
+		>/dev/null 2>&1 ||
+		die "could not check out topic tip $old for rebasing"
 	if GIT_EDITOR=true git -C "$worktree" \
+		-c user.name='github-actions[bot]' \
+		-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
 		-c rerere.enabled=true \
 		-c rerere.autoupdate=true \
-		rebase --merge --empty=drop --reapply-cherry-picks \
+		rebase --merge --empty=drop --keep-empty --reapply-cherry-picks \
 		--no-autostash --no-update-refs \
-		--onto "$new_parent" "$old_parent"
+		--onto "$new_base" "$old_base"
 	then
 		return 0
 	fi
@@ -408,6 +502,133 @@ rebase_one () {
 	rebase_in_progress "$worktree" ||
 		die "git rebase failed without leaving recoverable state"
 	continue_rerere_resolution "$worktree"
+}
+
+copy_rerere_cache () {
+	source=$1
+	worker=$2
+	source_common=$(git -C "$source" rev-parse --path-format=absolute \
+		--git-common-dir) || die "could not locate the source rerere cache"
+	worker_git=$(git -C "$worker" rev-parse --path-format=absolute \
+		--git-dir) || die "could not locate a worker repository"
+	test -d "$source_common/rr-cache" || return 0
+	cp -R "$source_common/rr-cache" "$worker_git/rr-cache" ||
+		die "could not copy the rerere cache into a parallel worker"
+}
+
+record_rebase_failure () {
+	worktree=$1
+	state=$2
+	name=$3
+	old=$4
+	old_base=$5
+	new_base=$6
+	failed_commit=$(git -C "$worktree" rev-parse --verify REBASE_HEAD \
+		2>/dev/null || printf '%s\n' "$old")
+	printf '%s\n' "$old" >"$state/failed-old" || return 1
+	printf '%s\n' "$name" >"$state/failed-owner" || return 1
+	printf '%s\n' "$old_base" >"$state/failed-parent" || return 1
+	printf '%s\n' "$new_base" >"$state/failed-onto" || return 1
+	printf '%s\n' "$failed_commit" >"$state/failed-commit" || return 1
+}
+
+process_wave_sequential () {
+	worktree=$1
+	state=$2
+	ready=$3
+	while IFS="$tab" read -r name old prerequisite old_base new_base
+	do
+		test -z "$(map_lookup "$state/map" "$old")" || continue
+		if rebase_topic "$worktree" "$name" "$old" "$old_base" "$new_base"
+		then
+			new=$(completed_topic_tip "$worktree" "$name" \
+				"$old" "$new_base")
+			git -C "$worktree" -c core.fsmonitor=false \
+				-c advice.detachedHead=false switch --detach "$new" \
+				>/dev/null 2>&1 ||
+				die "could not detach at the rebased tip for '$name'"
+			map_record "$state/map" "$old" "$new"
+		else
+			record_rebase_failure "$worktree" "$state" "$name" \
+				"$old" "$old_base" "$new_base" || return 1
+			return 1
+		fi
+	done <"$ready"
+}
+
+process_wave_parallel () {
+	worktree=$1
+	state=$2
+	ready=$3
+	wave_root=$state/parallel
+	rm -rf "$wave_root"
+	mkdir -p "$wave_root" || die "could not create parallel worker state"
+	jobs=$wave_root/jobs
+	: >"$jobs"
+	sequence=0
+
+	while IFS="$tab" read -r name old prerequisite old_base new_base
+	do
+		sequence=$((sequence + 1))
+		worker=$wave_root/worker-$sequence
+		git -c core.fsmonitor=false clone --shared --no-checkout --quiet \
+			"$worktree" "$worker" ||
+			die "could not create a private rebase worker for '$name'"
+		copy_rerere_cache "$worktree" "$worker"
+		(
+			if rebase_topic "$worker" "$name" "$old" "$old_base" "$new_base"
+			then
+				completed_topic_tip "$worker" "$name" \
+					"$old" "$new_base" >"$worker/new"
+				new=$(sed -n '1p' "$worker/new")
+				git -C "$worker" -c core.fsmonitor=false \
+					-c advice.detachedHead=false switch --detach "$new" \
+					>/dev/null 2>&1 ||
+					die "could not detach the worker at '$name'"
+				exit 0
+			fi
+			exit 1
+		) >"$worker/rebase.log" 2>&1 &
+		pid=$!
+		printf '%s\t%s\t%s\t%s\n' \
+			"$pid" "$name" "$old" "$worker" >>"$jobs" ||
+			die "could not record a parallel rebase worker"
+	done <"$ready"
+
+	failed=
+	while IFS="$tab" read -r pid name old worker
+	do
+		if ! wait "$pid"
+		then
+			failed=t
+		fi
+	done <"$jobs"
+	if test -n "$failed"
+	then
+		while IFS="$tab" read -r pid name old worker
+		do
+			test ! -s "$worker/rebase.log" || {
+				say "Parallel rebase output for $name:" >&2
+				sed 's/^/  /' "$worker/rebase.log" >&2
+			}
+		done <"$jobs"
+		rm -rf "$wave_root"
+		return 1
+	fi
+
+	while IFS="$tab" read -r pid name old worker
+	do
+		new=$(sed -n '1p' "$worker/new")
+		test -n "$new" || die "parallel worker for '$name' produced no tip"
+		git -C "$worktree" -c core.fsmonitor=false \
+			-c protocol.file.allow=always fetch \
+			--no-tags --quiet "$worker" HEAD ||
+			die "could not import the rebased tip for '$name'"
+		test "$(git -C "$worktree" rev-parse FETCH_HEAD)" = "$new" ||
+			die "parallel worker for '$name' imported the wrong tip"
+		map_record "$state/map" "$old" "$new"
+	done <"$jobs"
+	rm -rf "$wave_root"
 }
 
 train_rerere () (
@@ -468,42 +689,59 @@ process_plan () {
 	worktree=$1
 	state=$2
 	base_oid=$(state_value "$state" base-oid)
-	map=$state/map
 	plan=$state/plan
+	ready=$state/ready
+	pending=$state/pending
 
-	while IFS="$tab" read -r old old_parent owner
+	while :
 	do
-		test -z "$(map_lookup "$map" "$old")" || continue
-		if grep -Fqx "$old_parent" "$state/commits"
+		: >"$ready"
+		: >"$pending"
+		progress=
+		while IFS="$tab" read -r name old prerequisite old_base
+		do
+			test -z "$(map_lookup "$state/map" "$old")" || continue
+			printf '%s\n' "$name" >>"$pending"
+			if test "$prerequisite" = master
+			then
+				new_base=$base_oid
+			else
+				new_base=$(map_lookup "$state/map" "$old_base")
+				test -n "$new_base" || continue
+			fi
+			if test "$old_base" = "$new_base"
+			then
+				map_record "$state/map" "$old" "$old"
+				progress=t
+				continue
+			fi
+			printf '%s\t%s\t%s\t%s\t%s\n' \
+				"$name" "$old" "$prerequisite" "$old_base" "$new_base" \
+				>>"$ready"
+		done <"$plan"
+
+		test -s "$pending" || break
+		if ! test -s "$ready"
 		then
-			new_parent=$(map_lookup "$map" "$old_parent")
-			test -n "$new_parent" ||
-				die "parent $old_parent was not rewritten before $old"
-		else
-			new_parent=$base_oid
+			test -n "$progress" && continue
+			die "topic prerequisites contain an ancestry cycle"
 		fi
 
-		if test "$old_parent" = "$new_parent"
+		count=$(wc -l <"$ready" | tr -d ' ')
+		if test "$count" -gt 1
 		then
-			map_record "$map" "$old" "$old" ||
-				die "could not preserve commit $old"
-			continue
-		fi
-
-		if rebase_one "$worktree" "$old" "$old_parent" "$new_parent"
-		then
-			new=$(git -C "$worktree" rev-parse HEAD) ||
-				die "could not read the rebased commit for $old"
-			map_record "$map" "$old" "$new" ||
-				die "could not record the rebased commit for $old"
+			say "Rebasing $count ready topics in parallel."
+			if ! process_wave_parallel "$worktree" "$state" "$ready"
+			then
+				say "A parallel worker stopped; recreating the wave in the pinned worktree." >&2
+				process_wave_sequential "$worktree" "$state" "$ready" ||
+					return 1
+			fi
 		else
-			printf '%s\n' "$old" >"$state/failed-old" || return 1
-			printf '%s\n' "$owner" >"$state/failed-owner" || return 1
-			printf '%s\n' "$old_parent" >"$state/failed-parent" || return 1
-			printf '%s\n' "$new_parent" >"$state/failed-onto" || return 1
-			return 1
+			process_wave_sequential "$worktree" "$state" "$ready" ||
+				return 1
 		fi
-	done <"$plan"
+	done
 
 	finish_updates "$state" || die "could not finish topic updates"
 }
@@ -519,13 +757,13 @@ write_failure () {
 	base_name=$(state_value "$state" base-name)
 	codex_name=$(state_value "$state" codex-name)
 	failed_owner=$(state_value "$state" failed-owner)
-	failed_old=$(state_value "$state" failed-old)
+	failed_commit=$(state_value "$state" failed-commit)
 	inputs_oid=$(input_oid "$state/inputs")
 
 	{
 		say "## No refs were updated"
 		say
-		say "Rebasing \`$failed_owner\` stopped at \`$failed_old\`."
+		say "Rebasing \`$failed_owner\` stopped while applying \`$failed_commit\`."
 		say "The controller did not push any topic branch or \`codex\`."
 		say
 		say "From a clean clone, reproduce the exact pinned rebase with:"
@@ -899,6 +1137,121 @@ verify_inputs () {
 	fi
 }
 
+prepare_input_graph () {
+	inputs=$1
+	graph=$2
+	mkdir -p "$graph" || die "could not prepare input graph verification"
+	awk -F '\t' '$1 == "topic" {
+		name=$2
+		sub("^refs/heads/", "", name)
+		printf "%s\t%s\n", name, $3
+	}' "$inputs" | LC_ALL=C sort >"$graph/topics" ||
+		die "could not read topics from the input snapshot"
+	test -s "$graph/topics" || die "input snapshot contains no topics"
+	while IFS="$tab" read -r name oid
+	do
+		is_active_topic_name "$name" ||
+			die "input snapshot contains invalid active topic '$name'"
+	done <"$graph/topics"
+	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	test -n "$base_oid" || die "input snapshot has no base commit"
+	prepare_plan "$base_oid" "$graph/topics" "$graph"
+}
+
+verify_topic () {
+	topic=
+	inputs=
+	updates=
+	result=
+	while test $# -gt 0
+	do
+		case "$1" in
+		--topic) require_arg "$@"; topic=$2; shift 2 ;;
+		--inputs) require_arg "$@"; inputs=$2; shift 2 ;;
+		--updates) require_arg "$@"; updates=$2; shift 2 ;;
+		--result) require_arg "$@"; result=$2; shift 2 ;;
+		*) die "unknown verify-topic option '$1'" ;;
+		esac
+	done
+	test -n "$topic" || die "verify-topic requires --topic"
+	test -n "$inputs" && test -f "$inputs" || die "verify-topic requires --inputs"
+	test -n "$updates" && test -f "$updates" || die "verify-topic requires --updates"
+	test -n "$result" && test -f "$result" || die "verify-topic requires --result"
+	check_topic "$topic"
+	make_tmp_dir
+	require_full_repository
+
+	LC_ALL=C sort -c "$updates" || die "updates are not canonically sorted"
+	candidate=$(resolve_commit "$(sed -n '1p' "$result")")
+	codex_count=$(awk -F '\t' '$1 == "refs/heads/codex" { count++ }
+		END { print count + 0 }' "$updates")
+	test "$codex_count" = 1 ||
+		die "updates must contain codex exactly once"
+	test "$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
+		"$updates")" = "$candidate" ||
+		die "candidate does not match the codex update"
+	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	test -n "$base_oid" || die "input snapshot has no base commit"
+	resolve_commit "$base_oid" >/dev/null
+	git merge-base --is-ancestor "$base_oid" "$candidate" ||
+		die "candidate is not based on the snapshotted master"
+	control_paths_unchanged "$base_oid" "$candidate" ||
+		die "candidate changes meta-only controller files"
+	graph=$tmp_dir/topic-graph
+	prepare_input_graph "$inputs" "$graph"
+
+	topic_ref=refs/heads/$topic
+	input_count=$(awk -F '\t' -v ref="$topic_ref" \
+		'$1 == "topic" && $2 == ref { count++ } END { print count + 0 }' \
+		"$inputs")
+	update_count=$(awk -F '\t' -v ref="$topic_ref" \
+		'$1 == ref { count++ } END { print count + 0 }' "$updates")
+	test "$input_count" = 1 ||
+		die "input snapshot must contain '$topic_ref' exactly once"
+	test "$update_count" = 1 ||
+		die "updates must contain '$topic_ref' exactly once"
+	old=$(awk -F '\t' -v ref="$topic_ref" '$1 == ref { print $2 }' \
+		"$updates")
+	new=$(awk -F '\t' -v ref="$topic_ref" '$1 == ref { print $3 }' \
+		"$updates")
+	expected_old=$(awk -F '\t' -v ref="$topic_ref" \
+		'$1 == "topic" && $2 == ref { print $3 }' "$inputs")
+	test "$old" = "$expected_old" ||
+		die "old value for '$topic_ref' does not match the input snapshot"
+	resolve_commit "$old" >/dev/null
+	resolve_commit "$new" >/dev/null
+	git merge-base --is-ancestor "$base_oid" "$new" ||
+		die "rewritten '$topic_ref' is not based on master"
+	git merge-base --is-ancestor "$new" "$candidate" ||
+		die "candidate does not contain '$topic_ref'"
+
+	plan_count=$(awk -F '\t' -v old="$old" '$2 == old { count++ }
+		END { print count + 0 }' "$graph/plan")
+	test "$plan_count" = 1 ||
+		die "input graph does not identify one rewrite range for '$topic_ref'"
+	plan_row=$(awk -F '\t' -v old="$old" '$2 == old { print; exit }' \
+		"$graph/plan")
+	IFS="$tab" read -r canonical_name plan_old prerequisite old_base <<-EOF
+	$plan_row
+	EOF
+	if test "$prerequisite" = master
+	then
+		dependency_ref=refs/heads/master
+		dependency_new=$base_oid
+	else
+		dependency_ref=refs/heads/$prerequisite
+		dependency_count=$(awk -F '\t' -v ref="$dependency_ref" \
+			'$1 == ref { count++ } END { print count + 0 }' "$updates")
+		test "$dependency_count" = 1 ||
+			die "updates do not contain prerequisite '$dependency_ref' exactly once"
+		dependency_new=$(awk -F '\t' -v ref="$dependency_ref" \
+			'$1 == ref { print $3 }' "$updates")
+		resolve_commit "$dependency_new" >/dev/null
+	fi
+	git merge-base --is-ancestor "$dependency_new" "$new" ||
+		die "rewrite lost prerequisite '$dependency_ref' -> '$topic_ref'"
+}
+
 verify_output () {
 	inputs=
 	updates=
@@ -931,6 +1284,7 @@ verify_output () {
 		die "updates do not cover exactly codex and every snapshotted topic"
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 	test -n "$base_oid" || die "input snapshot has no base commit"
+	prepare_input_graph "$inputs" "$tmp_dir/topic-graph"
 	git merge-base --is-ancestor "$base_oid" "$candidate" ||
 		die "candidate is not based on the snapshotted master"
 	control_paths_unchanged "$base_oid" "$candidate" ||
@@ -1098,22 +1452,11 @@ resolve_rebase () {
 resolved_rebase_tip () {
 	worktree=$1
 	state=$2
+	failed_owner=$(state_value "$state" failed-owner)
 	failed_old=$(state_value "$state" failed-old)
 	failed_onto=$(state_value "$state" failed-onto)
-	new=$(git -C "$worktree" rev-parse HEAD) ||
-		die "could not read the resolved rebase tip"
-	test "$new" != "$failed_old" ||
-		die "the stopped rebase was aborted; run the pinned resolve command again"
-
-	if test "$new" != "$failed_onto"
-	then
-		parents=$(git -C "$worktree" rev-list --parents -n 1 "$new") ||
-			die "could not inspect the resolved rebase tip"
-		set -- $parents
-		test $# = 2 && test "$2" = "$failed_onto" ||
-			die "resolved rebase tip must be one commit on the pinned parent $failed_onto"
-	fi
-	printf '%s\n' "$new"
+	completed_topic_tip "$worktree" "$failed_owner" \
+		"$failed_old" "$failed_onto"
 }
 
 continue_rewrite () {
@@ -1138,7 +1481,12 @@ continue_rewrite () {
 		die "could not validate the resolved rebase"
 	map_record "$state/map" "$failed_old" "$new"
 	rm -f "$state/failed-old" "$state/failed-owner" \
-		"$state/failed-parent" "$state/failed-onto"
+		"$state/failed-parent" "$state/failed-onto" \
+		"$state/failed-commit"
+	git -C "$worktree" -c core.fsmonitor=false \
+		-c advice.detachedHead=false switch --detach "$new" \
+		>/dev/null 2>&1 ||
+		die "could not detach at the resolved topic tip"
 
 	if ! process_plan "$worktree" "$state"
 	then
@@ -1219,6 +1567,7 @@ case "$command" in
 check-topic) check_topic "$@" ;;
 rewrite) rewrite "$@" ;;
 verify-inputs) verify_inputs "$@" ;;
+verify-topic) verify_topic "$@" ;;
 verify-output) verify_output "$@" ;;
 publish) publish "$@" ;;
 resolve) resolve_rebase "$@" ;;

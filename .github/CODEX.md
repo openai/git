@@ -23,6 +23,12 @@ dependent topic onto its prerequisite instead of merging. Never merge `codex`
 into a topic and never use GitHub's **Update branch** button on these pull
 requests.
 
+Each topic has one inferred prerequisite: its nearest active topic-tip
+ancestor, or `master` when it has none. If two sibling topics share private
+commits, put an active topic ref at that shared prefix and base both siblings
+on it. Otherwise the controller rejects the ambiguous overlap and asks you to
+create that prerequisite topic or restack the branches.
+
 A topic may be the head of a pull request whose base is `codex`. Use a
 same-repository `??/codex/*` head. The topic-retention ruleset prevents GitHub
 from deleting that branch after the pull request is merged.
@@ -36,23 +42,34 @@ button on the default branch. To request a publication:
 2. Open the newest run on `meta`.
 3. Choose **Re-run jobs > Re-run all jobs**.
 
-A push to `meta` creates a new seed run. Attempt 1 only builds and tests.
-Re-running all jobs is the explicit publication request. Use a new `meta` push
-if the seed is too old for GitHub to rerun.
+A push to `meta` creates a new seed run. Attempt 1 prepares the candidate,
+validates each topic in its own workflow job, and builds and tests the result.
+Re-running all jobs is the explicit publication request. Re-running only
+failed jobs cannot publish. Use a new `meta` push if the seed is too old for
+GitHub to rerun or if its preparation job failed before saving the immutable
+attempt-1 candidate.
 
 Each run:
 
 1. snapshots `meta`, `master`, `codex`, and every active topic;
 2. derives all dependencies from commit ancestry;
-3. rebases roots onto current `master` and dependent commits onto their newly
-   rewritten parents, using lexical order only to break independent ties;
+3. rebases each whole topic onto its rewritten prerequisite, processing ready
+   sibling topics concurrently in topological waves;
 4. lets rerere reuse resolutions recorded by the old `codex` history;
 5. merges the rewritten maximal tips into a candidate `codex`;
 6. freezes the exact candidate and rewritten topics in a Git bundle;
-7. builds the candidate, tests the controller against it, then runs the full
-   candidate test suite; and
-8. atomically pushes every topic update and `codex`, with an exact lease for
+7. fans out one structural validation job per rewritten topic;
+8. builds the candidate once, tests the controller against it, then runs the
+   full candidate test suite; and
+9. atomically pushes every topic update and `codex`, with an exact lease for
    each of those refs.
+
+The per-topic jobs run independently and appear separately in the Actions
+summary. They verify each rewritten tip and its inferred prerequisite. The
+controller performs the actual parallel waves, and it never starts a dependent
+topic until its prerequisite has been rewritten. A failed topic square names
+the rewritten ref whose ancestry or containment check failed; the integrated
+build and test remain a single gate.
 
 Any conflict, build failure, test failure, detected moved input, rejected
 lease, or server without atomic-push support updates nothing. The publisher

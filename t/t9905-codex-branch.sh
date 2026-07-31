@@ -56,6 +56,48 @@ test_expect_success 'topic names use the two-character namespace' '
 	test_expect_code 1 sh "$codex_branch" check-topic tb/codex/x..y
 '
 
+test_expect_success 'topics cannot change the reusable controller workflow' '
+	git init --bare control-path.git &&
+	test_create_repo control-path-source &&
+	(
+		cd control-path-source &&
+		git remote add origin ../control-path.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c aa/codex/control-path &&
+		mkdir -p .github/workflows &&
+		write untrusted .github/workflows/codex-topic.yml &&
+		git add .github/workflows/codex-topic.yml &&
+		git commit -m "change controller workflow" &&
+
+		git switch master &&
+		write master master-file &&
+		git add master-file &&
+		git commit -m "new control-path master" &&
+		git branch meta master &&
+		git push origin master meta codex aa/codex/control-path
+	) &&
+
+	git clone control-path.git control-path-runner &&
+	(
+		cd control-path-runner &&
+		fetch_all &&
+		snapshot_refs ../control-path.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates \
+			--inputs inputs --failure failure \
+			2>rewrite.err &&
+		test_grep "meta-only controller files" rewrite.err &&
+		snapshot_refs ../control-path.git >after &&
+		test_cmp before after
+	)
+'
+
 test_expect_success 'rewrite rebases one root topic onto current master' '
 	git init --bare root.git &&
 	test_create_repo root-source &&
@@ -173,6 +215,23 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		manifest_has aa/codex/a "$old_a" "$new_a" updates &&
 		manifest_has bb/codex/b "$old_b" "$new_b" updates &&
 		manifest_has cc/codex/c "$old_c" "$new_c" updates &&
+		sh "$codex_branch" verify-topic --topic aa/codex/a \
+			--inputs inputs --updates updates --result result &&
+		sh "$codex_branch" verify-topic --topic bb/codex/b \
+			--inputs inputs --updates updates --result result &&
+		sh "$codex_branch" verify-topic --topic cc/codex/c \
+			--inputs inputs --updates updates --result result &&
+		sed "s/$new_b\$/$master/" updates >updates-bad &&
+		sh "$codex_branch" verify-topic --topic aa/codex/a \
+			--inputs inputs --updates updates-bad --result result &&
+		sh "$codex_branch" verify-topic --topic cc/codex/c \
+			--inputs inputs --updates updates-bad --result result &&
+		test_expect_code 1 sh "$codex_branch" verify-topic \
+			--topic bb/codex/b --inputs inputs \
+			--updates updates-bad --result result \
+			2>verify-topic.err &&
+		test_grep "lost prerequisite.*aa/codex/a.*bb/codex/b" \
+			verify-topic.err &&
 
 		last_merge=$(git rev-parse "$candidate") &&
 		first_merge=$(git rev-parse "$last_merge^") &&
@@ -212,6 +271,155 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 			refs/heads/aa/codex/a "$old_b" "$old_a" &&
 		test_expect_code 1 sh "$codex_branch" verify-inputs \
 			--remote origin --base master --codex codex inputs
+	)
+'
+
+test_expect_success 'shared private history needs a prerequisite topic' '
+	git init --bare shared-private.git &&
+	test_create_repo shared-private-source &&
+	(
+		cd shared-private-source &&
+		git remote add origin ../shared-private.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c shared-prefix &&
+		write prefix prefix-file &&
+		git add prefix-file &&
+		git commit -m "unrepresented shared prefix" &&
+
+		git switch -c aa/codex/a &&
+		write A a &&
+		git add a &&
+		git commit -m "shared child A" &&
+
+		git switch -c bb/codex/b shared-prefix &&
+		write B b &&
+		git add b &&
+		git commit -m "shared child B" &&
+
+		git switch master &&
+		write master master-file &&
+		git add master-file &&
+		git commit -m "new shared-prefix master" &&
+		git branch meta master &&
+		git push origin master meta codex aa/codex/a bb/codex/b
+	) &&
+
+	git clone shared-private.git shared-private-runner &&
+	(
+		cd shared-private-runner &&
+		fetch_all &&
+		snapshot_refs ../shared-private.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure >out 2>err &&
+		test_grep "share private commits" err &&
+		test_grep "prerequisite topic" err &&
+		test_grep "restack" err &&
+		snapshot_refs ../shared-private.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'represented prerequisite siblings rebase in parallel' '
+	git init --bare parallel.git &&
+	test_create_repo parallel-source &&
+	(
+		cd parallel-source &&
+		git remote add origin ../parallel.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c aa/codex/release &&
+		write first release-first &&
+		git add release-first &&
+		git commit -m "release first" &&
+		write second release-second &&
+		git add release-second &&
+		git commit -m "release second" &&
+
+		git switch -c bb/codex/one &&
+		write one child-one &&
+		git add child-one &&
+		git commit -m "release child one" &&
+
+		git switch -c cc/codex/two aa/codex/release &&
+		write two child-two &&
+		git add child-two &&
+		git commit -m "release child two" &&
+
+		git switch master &&
+		write master master-file &&
+		git add master-file &&
+		git commit -m "new parallel master" &&
+		git branch meta master &&
+		git push origin master meta codex \
+			aa/codex/release bb/codex/one cc/codex/two
+	) &&
+
+	git clone parallel.git parallel-runner &&
+	(
+		cd parallel-runner &&
+		fetch_all &&
+		real_git=$(command -v git) &&
+		barrier=$PWD/parallel-barrier &&
+		mkdir "$barrier" parallel-bin &&
+		write "#!/bin/sh
+case \" \$* \" in
+*\"/parallel/worker-\"*\"rebase --merge\"*)
+	marker=\"$barrier/\$\$\"
+	: >\"\$marker\"
+	attempts=0
+	while test \"\$(find \"$barrier\" -type f | wc -l | tr -d \" \")\" -lt 2
+	do
+		attempts=\$((attempts + 1))
+		test \"\$attempts\" -lt 6 || exit 97
+		sleep 1
+	done
+	;;
+esac
+exec \"$real_git\" \"\$@\"" parallel-bin/git &&
+		chmod +x parallel-bin/git &&
+
+		env PATH="$PWD/parallel-bin:$PATH" sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure >out 2>err &&
+		test_grep "Rebasing 2 ready topics in parallel" out &&
+		test_grep ! "recreating the wave" err &&
+		test 2 -le "$(find "$barrier" -type f | wc -l | tr -d " ")" &&
+
+		master=$(git rev-parse origin/master) &&
+		old_release=$(git rev-parse origin/aa/codex/release) &&
+		old_one=$(git rev-parse origin/bb/codex/one) &&
+		old_two=$(git rev-parse origin/cc/codex/two) &&
+		new_release=$(awk -F "$(printf '\''\t'\'')" \
+			'\''$1 == "refs/heads/aa/codex/release" { print $3 }'\'' \
+			updates) &&
+		new_one=$(awk -F "$(printf '\''\t'\'')" \
+			'\''$1 == "refs/heads/bb/codex/one" { print $3 }'\'' \
+			updates) &&
+		new_two=$(awk -F "$(printf '\''\t'\'')" \
+			'\''$1 == "refs/heads/cc/codex/two" { print $3 }'\'' \
+			updates) &&
+		manifest_has aa/codex/release "$old_release" "$new_release" updates &&
+		manifest_has bb/codex/one "$old_one" "$new_one" updates &&
+		manifest_has cc/codex/two "$old_two" "$new_two" updates &&
+		first=$(find_subject "release first" "$new_release") &&
+		test "$master" = "$(git rev-parse "$first^")" &&
+		test "$first" = "$(git rev-parse "$new_release^")" &&
+		test "$new_release" = "$(git rev-parse "$new_one^")" &&
+		test "$new_release" = "$(git rev-parse "$new_two^")" &&
+		git merge-base --is-ancestor "$new_release" "$new_one" &&
+		git merge-base --is-ancestor "$new_release" "$new_two"
 	)
 '
 
@@ -300,6 +508,68 @@ test_expect_success 'a topic already in master still produces a valid bundle' '
 		git bundle verify candidate.bundle &&
 		test "$(cat result) refs/codex-output/candidate" = \
 			"$(git bundle list-heads candidate.bundle)"
+	)
+'
+
+test_expect_success 'a topic already in master is not a private prerequisite' '
+	git init --bare old-prerequisite.git &&
+	test_create_repo old-prerequisite-source &&
+	(
+		cd old-prerequisite-source &&
+		git remote add origin ../old-prerequisite.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c aa/codex/done &&
+		write done done-file &&
+		git add done-file &&
+		git commit -m "topic now in master" &&
+
+		git switch master &&
+		git merge --ff-only aa/codex/done &&
+		write upstream upstream-file &&
+		git add upstream-file &&
+		git commit -m "upstream after old topic" &&
+
+		git switch -c bb/codex/dependent &&
+		write dependent dependent-file &&
+		git add dependent-file &&
+		git commit -m "dependent after upstream" &&
+
+		git switch master &&
+		write newest newest-file &&
+		git add newest-file &&
+		git commit -m "newest master" &&
+		git branch meta master &&
+		git push origin master meta codex \
+			aa/codex/done bb/codex/dependent
+	) &&
+
+	git clone old-prerequisite.git old-prerequisite-runner &&
+	(
+		cd old-prerequisite-runner &&
+		fetch_all &&
+		master=$(git rev-parse origin/master) &&
+		old_done=$(git rev-parse origin/aa/codex/done) &&
+		old_dependent=$(git rev-parse origin/bb/codex/dependent) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_done=$(awk -F "$(printf '\''\t'\'')" \
+			'\''$1 == "refs/heads/aa/codex/done" { print $3 }'\'' \
+			updates) &&
+		new_dependent=$(awk -F "$(printf '\''\t'\'')" \
+			'\''$1 == "refs/heads/bb/codex/dependent" { print $3 }'\'' \
+			updates) &&
+		test "$master" = "$new_done" &&
+		test "$master" = "$(git rev-parse "$new_dependent^")" &&
+		test 1 = "$(git rev-list --count "$master..$new_dependent")" &&
+		manifest_has aa/codex/done "$old_done" "$new_done" updates &&
+		manifest_has bb/codex/dependent \
+			"$old_dependent" "$new_dependent" updates
 	)
 '
 
@@ -495,14 +765,25 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		git branch codex &&
 
 		git switch -c zz/codex/root &&
+		write before root-before &&
+		git add root-before &&
+		git commit -m "root before conflict" &&
 		write topic shared &&
 		git add shared &&
 		git commit -m "conflicting root" &&
+		write after root-after &&
+		git add root-after &&
+		git commit -m "root after conflict" &&
 
 		git switch -c aa/codex/dependent &&
 		write dependent dependent-file &&
 		git add dependent-file &&
 		git commit -m "dependent topic" &&
+
+		git switch -c yy/codex/clean master &&
+		write clean clean-file &&
+		git add clean-file &&
+		git commit -m "independent clean topic" &&
 
 		git switch master &&
 		write master shared &&
@@ -510,7 +791,7 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		git commit -m "conflicting master" &&
 		git branch meta master &&
 		git push origin master meta codex \
-			aa/codex/dependent zz/codex/root
+			aa/codex/dependent yy/codex/clean zz/codex/root
 	) &&
 
 	git clone conflict.git conflict-runner &&
@@ -521,16 +802,20 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		base=$(git rev-parse origin/master) &&
 		codex=$(git rev-parse origin/codex) &&
 		dependent=$(git rev-parse origin/aa/codex/dependent) &&
+		clean=$(git rev-parse origin/yy/codex/clean) &&
 		root=$(git rev-parse origin/zz/codex/root) &&
-		printf "controller\tmeta\t%s\nbase\trefs/heads/master\t%s\ncodex\trefs/heads/codex\t%s\ntopic\trefs/heads/aa/codex/dependent\t%s\ntopic\trefs/heads/zz/codex/root\t%s\n" \
-			"$controller" "$base" "$codex" "$dependent" "$root" \
+		printf "controller\tmeta\t%s\nbase\trefs/heads/master\t%s\ncodex\trefs/heads/codex\t%s\ntopic\trefs/heads/aa/codex/dependent\t%s\ntopic\trefs/heads/yy/codex/clean\t%s\ntopic\trefs/heads/zz/codex/root\t%s\n" \
+			"$controller" "$base" "$codex" "$dependent" "$clean" "$root" \
 			>expected-inputs &&
 		digest=$(git hash-object expected-inputs) &&
 		snapshot_refs ../conflict.git >before &&
 		test_expect_code 1 sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result result --updates updates \
-			--inputs inputs --failure failure &&
+			--inputs inputs --failure failure \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "Rebasing 2 ready topics in parallel" rewrite.out &&
+		test_grep "recreating the wave" rewrite.err &&
 		snapshot_refs ../conflict.git >after &&
 		test_cmp before after &&
 		test_path_is_file failure &&
@@ -547,6 +832,26 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 
 		sh "$codex_branch" resolve --remote origin \
 			--base master --codex codex --inputs-oid "$digest" \
+			--worktree quit-resolution >quit-resolve.out &&
+		git -C quit-resolution rebase --quit &&
+		git -C quit-resolution restore --staged --worktree . &&
+		test_expect_code 1 sh "$codex_branch" continue \
+			--worktree quit-resolution >quit-continue.out 2>quit-continue.err &&
+		test_grep "completion sentinel" quit-continue.err &&
+		git worktree remove --force quit-resolution &&
+
+		sh "$codex_branch" resolve --remote origin \
+			--base master --codex codex --inputs-oid "$digest" \
+			--worktree abort-resolution >abort-resolve.out &&
+		git -C abort-resolution rebase --abort &&
+		test_expect_code 1 sh "$codex_branch" continue \
+			--worktree abort-resolution >abort-continue.out \
+			2>abort-continue.err &&
+		test_grep "was aborted" abort-continue.err &&
+		git worktree remove --force abort-resolution &&
+
+		sh "$codex_branch" resolve --remote origin \
+			--base master --codex codex --inputs-oid "$digest" \
 			--worktree resolution >resolve.out &&
 		test_grep "Resolution worktree" resolve.out &&
 		write resolved resolution/shared &&
@@ -560,9 +865,16 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 			rev-parse refs/heads/zz/codex/root) &&
 		new_dependent=$(git --git-dir=../conflict.git \
 			rev-parse refs/heads/aa/codex/dependent) &&
+		new_clean=$(git --git-dir=../conflict.git \
+			rev-parse refs/heads/yy/codex/clean) &&
 		test "$root" != "$new_root" &&
 		test "$dependent" != "$new_dependent" &&
+		test "$clean" != "$new_clean" &&
 		test "$new_root" = "$(git rev-parse "$new_dependent^")" &&
+		test "$base" = "$(git rev-parse "$new_clean^")" &&
+		test before = "$(git show "$new_root:root-before")" &&
+		test after = "$(git show "$new_root:root-after")" &&
+		test resolved = "$(git show "$new_root:shared")" &&
 		test "$codex" = "$(git --git-dir=../conflict.git \
 			rev-parse refs/heads/codex)" &&
 		git worktree remove --force resolution
@@ -641,9 +953,16 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 		git add shared &&
 		git commit -m "record resolution" &&
 		git branch codex &&
+
+		git switch -c bb/codex/other aa/codex/rerere^ &&
+		write other other-file &&
+		git add other-file &&
+		git commit -m "independent rerere sibling" &&
+
 		git switch master &&
 		git branch meta master &&
-		git push origin master meta codex aa/codex/rerere
+		git push origin master meta codex \
+			aa/codex/rerere bb/codex/other
 	) &&
 
 	git clone rerere.git rerere-runner &&
@@ -651,16 +970,24 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 		cd rerere-runner &&
 		fetch_all &&
 		old_topic=$(git rev-parse origin/aa/codex/rerere) &&
+		old_other=$(git rev-parse origin/bb/codex/other) &&
 		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result result --updates updates \
-			--inputs inputs --failure failure &&
+			--inputs inputs --failure failure \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "Rebasing 2 ready topics in parallel" rewrite.out &&
+		test_grep ! "recreating the wave" rewrite.err &&
 		candidate=$(cat result) &&
 		new_topic=$(find_subject "rerere topic" "$candidate") &&
+		new_other=$(find_subject "independent rerere sibling" "$candidate") &&
 		test -n "$new_topic" &&
+		test -n "$new_other" &&
 		test resolved = "$(git show "$new_topic:shared")" &&
 		manifest_has aa/codex/rerere \
-			"$old_topic" "$new_topic" updates
+			"$old_topic" "$new_topic" updates &&
+		manifest_has bb/codex/other \
+			"$old_other" "$new_other" updates
 	)
 '
 

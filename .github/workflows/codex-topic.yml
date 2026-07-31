@@ -1,0 +1,89 @@
+name: Validate Codex topic
+
+on:
+  workflow_call:
+    inputs:
+      topic:
+        description: Active topic branch without refs/heads/
+        required: true
+        type: string
+      artifact-name:
+        description: Immutable candidate artifact from the prepare job
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin the controller helper
+        run: |
+          cp .github/workflows/codex-branch.sh \
+            "$RUNNER_TEMP/codex-branch-trusted"
+          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
+
+      - name: Load the candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/codex-candidate
+
+      - name: Verify ${{ inputs.topic }}
+        env:
+          READ_TOKEN: ${{ github.token }}
+          TOPIC: ${{ inputs.topic }}
+        run: |
+          metadata="$RUNNER_TEMP/codex-candidate"
+          helper="$RUNNER_TEMP/codex-branch-trusted"
+          topic_ref="refs/heads/$TOPIC"
+
+          sh "$helper" check-topic "$TOPIC"
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
+            sh "$helper" verify-inputs \
+              --base master --codex codex "$metadata/codex-inputs"
+
+          git bundle verify "$metadata/codex.bundle"
+          git fetch "$metadata/codex.bundle" \
+            refs/codex-output/candidate:refs/codex-import/candidate
+          candidate=$(cat "$metadata/codex-candidate")
+          if test "$(git rev-parse refs/codex-import/candidate)" != "$candidate"
+          then
+            echo "::error::bundle candidate does not match the prepared candidate"
+            exit 1
+          fi
+          sh "$helper" verify-topic --topic "$TOPIC" \
+            --inputs "$metadata/codex-inputs" \
+            --updates "$metadata/codex-updates" \
+            --result "$metadata/codex-candidate"
+
+          count=$(awk -F '\t' -v ref="$topic_ref" \
+            '$1 == ref { count++ } END { print count + 0 }' \
+            "$metadata/codex-updates")
+          if test "$count" != 1
+          then
+            echo "::error::$topic_ref is not present exactly once in the candidate"
+            exit 1
+          fi
+          old=$(awk -F '\t' -v ref="$topic_ref" \
+            '$1 == ref { print $2 }' "$metadata/codex-updates")
+          new=$(awk -F '\t' -v ref="$topic_ref" \
+            '$1 == ref { print $3 }' "$metadata/codex-updates")
+
+          {
+            echo "## $TOPIC"
+            echo
+            echo "Old tip: \`$old\`"
+            echo "Rebased tip: \`$new\`"
+          } >>"$GITHUB_STEP_SUMMARY"
