@@ -25,15 +25,18 @@ usage () {
 	   or: codex-branch rewrite [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--rerere-from <branch>]
 		[--result <path>] [--updates <path>] [--inputs <path>]
-		[--bundle <path>] [--failure <path>] [--worktree <path>]
+		[--bundle <path>] [--topic-tuples <path>] [--failure <path>]
+		[--worktree <path>] [--require-automation]
 	   or: codex-branch verify-inputs [--remote <remote>]
 		[--base <branch>] [--codex <branch>] <snapshot>
 	   or: codex-branch verify-output --inputs <path>
-		--updates <path> --result <path>
+		--updates <path> --result <path> [--require-automation]
 	   or: codex-branch verify-topic --topic <branch> --inputs <path>
 		--updates <path> --result <path>
-	   or: codex-branch publish [--remote <remote>]
-		--inputs <path> --updates <path>
+	   or: codex-branch stage [--remote <remote>] [--staging <branch>]
+		--inputs <path> --updates <path> [--require-automation]
+	   or: codex-branch promote [--remote <remote>] [--staging <branch>]
+		--inputs <path> --updates <path> [--require-automation]
 	   or: codex-branch resolve [--remote <remote>] [--base <branch>]
 		[--codex <branch>] --inputs-oid <oid> [--worktree <path>]
 	   or: codex-branch continue --worktree <path>
@@ -133,7 +136,7 @@ contains_integration_marker () (
 	test -n "$markers"
 )
 
-control_paths_unchanged () (
+legacy_control_paths_unchanged () (
 	base_oid=$1
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
@@ -145,6 +148,83 @@ control_paths_unchanged () (
 		.github/workflows/codex-branch.sh \
 		t/t9905-codex-branch.sh
 )
+
+meta_control_paths_unchanged () (
+	base_oid=$1
+	head_oid=$2
+	git diff --quiet "$base_oid" "$head_oid" -- \
+		.github/CODEX.md \
+		.github/rulesets/codex-branch.json \
+		.github/rulesets/codex-topics.json \
+		.github/workflows/codex-topic.yml \
+		.github/workflows/codex-branch.sh \
+		.github/workflows/main.yml \
+		t/t9905-codex-branch.sh &&
+	git diff --quiet "$base_oid" "$head_oid" -- \
+		.github/workflows \
+		':(exclude).github/workflows/codex.yml' \
+		':(exclude).github/workflows/codex-release.yml'
+)
+
+write_automation_workflow () {
+	cat <<-'EOF'
+	name: Refresh codex
+
+	on: workflow_dispatch
+
+	permissions:
+	  contents: read
+
+	jobs:
+	  refresh:
+	    uses: openai/git/.github/workflows/codex.yml@meta
+	    secrets: inherit
+	EOF
+}
+
+automation_workflow_matches () {
+	head_oid=$1
+	make_tmp_dir
+	write_automation_workflow >"$tmp_dir/expected-automation.yml"
+	git show "$head_oid:.github/workflows/codex.yml" \
+		>"$tmp_dir/actual-automation.yml" 2>/dev/null || return 1
+	cmp -s "$tmp_dir/expected-automation.yml" \
+		"$tmp_dir/actual-automation.yml"
+}
+
+release_workflow_is_codex_only () {
+	head_oid=$1
+	make_tmp_dir
+	if ! git cat-file -e \
+		"$head_oid:.github/workflows/codex-release.yml" 2>/dev/null
+	then
+		return 0
+	fi
+	git show "$head_oid:.github/workflows/codex-release.yml" \
+		>"$tmp_dir/codex-release.yml" 2>/dev/null || return 1
+	test "$(grep -c '^on:$' "$tmp_dir/codex-release.yml")" = 1 || return 1
+	awk '
+		$0 == "on:" && !found {
+			found = 1
+			in_trigger = 1
+		}
+		in_trigger && $0 != "" {
+			if (seen && $0 !~ /^[[:space:]]/) exit
+			print
+			seen = 1
+		}
+		END { if (!found) exit 1 }
+	' "$tmp_dir/codex-release.yml" >"$tmp_dir/release-trigger" || return 1
+	cat >"$tmp_dir/expected-release-trigger" <<-'EOF'
+	on:
+	  push:
+	    branches:
+	      - codex
+	EOF
+	cmp -s "$tmp_dir/expected-release-trigger" \
+		"$tmp_dir/release-trigger" || return 1
+	! grep -F 'CODEX_BRANCH_TOKEN' "$tmp_dir/codex-release.yml" >/dev/null
+}
 
 collect_topics () (
 	remote=$1
@@ -685,6 +765,40 @@ write_complete_updates () {
 	rm -f "$output.unsorted"
 }
 
+write_topic_tuples () {
+	state=$1
+	output=$2
+	base_oid=$(state_value "$state" base-oid)
+	: >"$output.unsorted" || die "could not prepare topic tuples"
+	while IFS="$tab" read -r ref old new
+	do
+		name=${ref#refs/heads/}
+		plan_row=$(awk -F '\t' -v old="$old" '$2 == old { print; exit }' \
+			"$state/plan")
+		test -n "$plan_row" ||
+			die "rewrite plan has no range for '$name'"
+		IFS="$tab" read -r canonical_name plan_old prerequisite old_base <<-EOF
+		$plan_row
+		EOF
+		if test "$prerequisite" = master
+		then
+			dependency_new=$base_oid
+		else
+			dependency_new=$(awk -F '\t' -v ref="refs/heads/$prerequisite" \
+				'$1 == ref { print $3 }' "$state/topic-updates")
+			test -n "$dependency_new" ||
+				die "rewritten prerequisite '$prerequisite' is missing"
+		fi
+		printf '%s\t%s\t%s\t%s\n' \
+			"$name" "$old" "$dependency_new" "$new" \
+			>>"$output.unsorted" ||
+			die "could not record topic tuple for '$name'"
+	done <"$state/topic-updates"
+	LC_ALL=C sort "$output.unsorted" >"$output" ||
+		die "could not sort topic tuples"
+	rm -f "$output.unsorted"
+}
+
 process_plan () {
 	worktree=$1
 	state=$2
@@ -759,6 +873,7 @@ write_failure () {
 	failed_owner=$(state_value "$state" failed-owner)
 	failed_commit=$(state_value "$state" failed-commit)
 	inputs_oid=$(input_oid "$state/inputs")
+	require_automation=$(state_value "$state" require-automation)
 
 	{
 		say "## No refs were updated"
@@ -777,6 +892,10 @@ write_failure () {
 			"$(shell_quote "$remote")" \
 			"$(shell_quote "$base_name")" \
 			"$(shell_quote "$codex_name")"
+		if test -n "$require_automation"
+		then
+			printf '  --require-automation \\\n'
+		fi
 		printf '  --inputs-oid %s\n' "$(shell_quote "$inputs_oid")"
 		say '```'
 		say
@@ -831,7 +950,7 @@ write_integration_failure () {
 		say "\`codex\` into the topic and do not choose an arbitrary merge order."
 		say "Make the real dependency explicit by rebasing the conflicting topic"
 		say "and its descendants onto the prerequisite topic, then push that"
-		say "coherent topic graph and rerun the latest \`meta\` workflow."
+		say "coherent topic graph and run \`Refresh codex\` again."
 		if test -s "$state/integration-merged"
 		then
 			say
@@ -942,8 +1061,9 @@ assemble_candidate () {
 	done <"$state/topic-updates"
 	candidate=$(git -C "$worktree" rev-parse HEAD) ||
 		die "could not resolve the codex candidate"
-	control_paths_unchanged "$base_oid" "$candidate" ||
-		die "a Codex topic changes meta-only controller files"
+	require_automation=$(state_value "$state" require-automation)
+	verify_control_paths "$state/inputs" "$state/topic-updates" \
+		"$candidate" "$state" "$require_automation"
 
 	printf '%s\n' "$candidate"
 }
@@ -991,6 +1111,7 @@ initialize_rewrite () {
 	state=$6
 	inputs=$7
 	topics=$8
+	require_automation=$9
 
 	mkdir -p "$state"
 	cp "$inputs" "$state/inputs"
@@ -1005,6 +1126,7 @@ initialize_rewrite () {
 	printf '%s\n' "$codex_name" >"$state/codex-name"
 	printf '%s\n' "$codex_oid" >"$state/codex-oid"
 	printf '%s\n' "$rerere_name" >"$state/rerere-name"
+	printf '%s\n' "$require_automation" >"$state/require-automation"
 	printf '%s\n' "$script_path" >"$state/helper"
 
 	prepare_plan "$base_oid" "$state/topics" "$state"
@@ -1023,8 +1145,10 @@ rewrite () {
 	updates_file=
 	inputs_file=
 	bundle_file=
+	topic_tuples_file=
 	failure_file=
 	worktree=
+	require_automation=
 
 	while test $# -gt 0
 	do
@@ -1037,8 +1161,10 @@ rewrite () {
 		--updates) require_arg "$@"; updates_file=$2; shift 2 ;;
 		--inputs) require_arg "$@"; inputs_file=$2; shift 2 ;;
 		--bundle) require_arg "$@"; bundle_file=$2; shift 2 ;;
+		--topic-tuples) require_arg "$@"; topic_tuples_file=$2; shift 2 ;;
 		--failure) require_arg "$@"; failure_file=$2; shift 2 ;;
 		--worktree) require_arg "$@"; worktree=$2; shift 2 ;;
+		--require-automation) require_automation=t; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown rewrite option '$1'" ;;
 		esac
@@ -1067,7 +1193,7 @@ rewrite () {
 		>/dev/null
 	state=$(state_path "$worktree")
 	initialize_rewrite "$remote" "$base_name" "$codex_name" "$rerere_name" \
-		"$worktree" "$state" "$inputs" "$topics"
+		"$worktree" "$state" "$inputs" "$topics" "$require_automation"
 
 	if ! process_plan "$worktree" "$state"
 	then
@@ -1077,8 +1203,12 @@ rewrite () {
 
 	if ! candidate=$(assemble_candidate "$worktree" "$state")
 	then
-		write_integration_failure "$failure_file" "$state" "$worktree"
-		die "codex integration conflicts while merging '$(state_value "$state" integration-failed-name)'; no refs were updated"
+		if test -f "$state/integration-failed-name"
+		then
+			write_integration_failure "$failure_file" "$state" "$worktree"
+			die "codex integration conflicts while merging '$(state_value "$state" integration-failed-name)'; no refs were updated"
+		fi
+		die "codex candidate validation failed; no refs were updated"
 	fi
 	codex_oid=$(state_value "$state" codex-oid)
 	contained=t
@@ -1094,10 +1224,13 @@ rewrite () {
 		candidate=$codex_oid
 	fi
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
+	write_topic_tuples "$state" "$tmp_dir/topic-tuples"
 
 	test -z "$result_file" || printf '%s\n' "$candidate" >"$result_file"
 	test -z "$updates_file" || cp "$tmp_dir/updates" "$updates_file"
 	test -z "$bundle_file" || create_bundle "$bundle_file" "$state" "$candidate"
+	test -z "$topic_tuples_file" ||
+		cp "$tmp_dir/topic-tuples" "$topic_tuples_file"
 	say "rewrote all active topics and assembled codex candidate $candidate"
 }
 
@@ -1158,6 +1291,95 @@ prepare_input_graph () {
 	prepare_plan "$base_oid" "$graph/topics" "$graph"
 }
 
+topic_control_paths_unchanged () (
+	base_oid=$1
+	head_oid=$2
+	git diff --quiet "$base_oid" "$head_oid" -- \
+		.github/CODEX.md \
+		.github/rulesets/codex-branch.json \
+		.github/rulesets/codex-topics.json \
+		.github/workflows/codex-topic.yml \
+		.github/workflows/codex.yml \
+		.github/workflows/codex-branch.sh \
+		.github/workflows/main.yml \
+		t/t9905-codex-branch.sh &&
+	git diff --quiet "$base_oid" "$head_oid" -- \
+		.github/workflows \
+		':(exclude).github/workflows/codex-release.yml'
+)
+
+verify_control_paths () {
+	inputs=$1
+	updates=$2
+	candidate=$3
+	graph=$4
+	require_automation=$5
+	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+
+	if test -z "$require_automation"
+	then
+		legacy_control_paths_unchanged "$base_oid" "$candidate" ||
+			die "candidate changes meta-only controller files"
+		return
+	fi
+
+	meta_control_paths_unchanged "$base_oid" "$candidate" ||
+		die "candidate changes a protected controller or CI file"
+	automation_workflow_matches "$candidate" ||
+		die "candidate does not contain the canonical Refresh codex workflow"
+	release_workflow_is_codex_only "$candidate" ||
+		die "candidate release workflow must run only for pushes to codex and must not use CODEX_BRANCH_TOKEN"
+
+	automation_count=0
+	while IFS="$tab" read -r ref old new
+	do
+		test "$ref" != refs/heads/codex || continue
+		name=${ref#refs/heads/}
+		plan_row=$(awk -F '\t' -v old="$old" '$2 == old { print; exit }' \
+			"$graph/plan")
+		test -n "$plan_row" ||
+			die "input graph has no rewrite range for '$ref'"
+		IFS="$tab" read -r canonical_name plan_old prerequisite old_base <<-EOF
+		$plan_row
+		EOF
+		if test "$prerequisite" = master
+		then
+			dependency_new=$base_oid
+		else
+			dependency_ref=refs/heads/$prerequisite
+			dependency_new=$(awk -F '\t' -v ref="$dependency_ref" \
+				'$1 == ref { print $3 }' "$updates")
+			test -n "$dependency_new" ||
+				die "updates do not contain prerequisite '$dependency_ref'"
+		fi
+
+		case "$name" in
+		??/codex/automation)
+			automation_count=$((automation_count + 1))
+			test "$prerequisite" = master ||
+				die "automation topic '$name' must be based directly on master"
+			make_tmp_dir
+			git diff --name-only "$dependency_new" "$new" \
+				>"$tmp_dir/automation-paths" ||
+				die "could not inspect automation topic '$name'"
+			printf '%s\n' .github/workflows/codex.yml \
+				>"$tmp_dir/expected-automation-paths"
+			cmp -s "$tmp_dir/expected-automation-paths" \
+				"$tmp_dir/automation-paths" ||
+				die "automation topic '$name' must change only .github/workflows/codex.yml"
+			automation_workflow_matches "$new" ||
+				die "automation topic '$name' does not contain the canonical Refresh codex workflow"
+			;;
+		*)
+			topic_control_paths_unchanged "$dependency_new" "$new" ||
+				die "topic '$name' changes a protected controller or CI file"
+			;;
+		esac
+	done <"$updates"
+	test "$automation_count" = 1 ||
+		die "exactly one active ??/codex/automation topic is required"
+}
+
 verify_topic () {
 	topic=
 	inputs=
@@ -1195,7 +1417,7 @@ verify_topic () {
 	resolve_commit "$base_oid" >/dev/null
 	git merge-base --is-ancestor "$base_oid" "$candidate" ||
 		die "candidate is not based on the snapshotted master"
-	control_paths_unchanged "$base_oid" "$candidate" ||
+	legacy_control_paths_unchanged "$base_oid" "$candidate" ||
 		die "candidate changes meta-only controller files"
 	graph=$tmp_dir/topic-graph
 	prepare_input_graph "$inputs" "$graph"
@@ -1256,12 +1478,14 @@ verify_output () {
 	inputs=
 	updates=
 	result=
+	require_automation=
 	while test $# -gt 0
 	do
 		case "$1" in
 		--inputs) require_arg "$@"; inputs=$2; shift 2 ;;
 		--updates) require_arg "$@"; updates=$2; shift 2 ;;
 		--result) require_arg "$@"; result=$2; shift 2 ;;
+		--require-automation) require_automation=t; shift ;;
 		*) die "unknown verify-output option '$1'" ;;
 		esac
 	done
@@ -1287,8 +1511,8 @@ verify_output () {
 	prepare_input_graph "$inputs" "$tmp_dir/topic-graph"
 	git merge-base --is-ancestor "$base_oid" "$candidate" ||
 		die "candidate is not based on the snapshotted master"
-	control_paths_unchanged "$base_oid" "$candidate" ||
-		die "candidate changes meta-only controller files"
+	verify_control_paths "$inputs" "$updates" "$candidate" \
+		"$tmp_dir/topic-graph" "$require_automation"
 	while IFS="$tab" read -r ref old new
 	do
 		git check-ref-format "$ref" >/dev/null || die "invalid update ref '$ref'"
@@ -1348,33 +1572,130 @@ push_updates () {
 	"$@"
 }
 
-publish () {
+staging_ref () {
+	name=$1
+	git check-ref-format "refs/heads/$name" >/dev/null 2>&1 ||
+		die "invalid staging branch '$name'"
+	case "$name" in
+	??/codex/*|codex|master|meta)
+		die "staging branch '$name' overlaps a protected input or output"
+		;;
+	esac
+	printf 'refs/heads/%s\n' "$name"
+}
+
+remote_head_oid () {
+	remote=$1
+	ref=$2
+	git ls-remote --refs "$remote" "$ref" |
+		awk -v ref="$ref" '$2 == ref { print $1; exit }'
+}
+
+stage_candidate () {
 	remote=origin
+	staging=codex-staging
 	inputs=
 	updates=
+	require_automation=
 	while test $# -gt 0
 	do
 		case "$1" in
 		--remote) require_arg "$@"; remote=$2; shift 2 ;;
+		--staging) require_arg "$@"; staging=$2; shift 2 ;;
 		--inputs) require_arg "$@"; inputs=$2; shift 2 ;;
 		--updates) require_arg "$@"; updates=$2; shift 2 ;;
-		*) die "unknown publish option '$1'" ;;
+		--require-automation) require_automation=t; shift ;;
+		*) die "unknown stage option '$1'" ;;
 		esac
 	done
 	test -n "$inputs" && test -n "$updates" ||
-		die "publish requires --inputs and --updates"
+		die "stage requires --inputs and --updates"
 	test -f "$inputs" || die "input snapshot '$inputs' does not exist"
 	test -f "$updates" || die "update manifest '$updates' does not exist"
 	make_tmp_dir
 	candidate=$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
 		"$updates")
 	test -n "$candidate" || die "update manifest has no codex candidate"
-	printf '%s\n' "$candidate" >"$tmp_dir/publish-result" ||
-		die "could not prepare publication verification"
-	verify_output --inputs "$inputs" --updates "$updates" \
-		--result "$tmp_dir/publish-result"
+	printf '%s\n' "$candidate" >"$tmp_dir/stage-result" ||
+		die "could not prepare staging verification"
+	set -- --inputs "$inputs" --updates "$updates" \
+		--result "$tmp_dir/stage-result"
+	test -z "$require_automation" || set -- "$@" --require-automation
+	verify_output "$@"
 	verify_inputs --remote "$remote" "$inputs"
-	push_updates "$remote" "$updates" all
+	ref=$(staging_ref "$staging")
+	old=$(remote_head_oid "$remote" "$ref")
+
+	# A failed CI run intentionally leaves staging behind.  Recreate an
+	# identical ref so a new dispatch still produces a fresh push event.
+	if test -n "$old" && test "$old" = "$candidate"
+	then
+		git -c core.hooksPath=/dev/null push --atomic --porcelain \
+			"--force-with-lease=$ref:$old" "$remote" ":$ref"
+		old=
+	fi
+	git -c core.hooksPath=/dev/null push --atomic --porcelain \
+		"--force-with-lease=$ref:$old" "$remote" "$candidate:$ref"
+}
+
+promote_updates () {
+	remote=$1
+	updates=$2
+	ref=$3
+	candidate=$4
+
+	set -- git -c core.hooksPath=/dev/null push --atomic --porcelain
+	while IFS="$tab" read -r update_ref old new
+	do
+		set -- "$@" "--force-with-lease=$update_ref:$old"
+	done <"$updates"
+	set -- "$@" "--force-with-lease=$ref:$candidate" "$remote"
+	while IFS="$tab" read -r update_ref old new
+	do
+		set -- "$@" "$new:$update_ref"
+	done <"$updates"
+	set -- "$@" ":$ref"
+	"$@"
+}
+
+promote () {
+	remote=origin
+	staging=codex-staging
+	inputs=
+	updates=
+	require_automation=
+	while test $# -gt 0
+	do
+		case "$1" in
+		--remote) require_arg "$@"; remote=$2; shift 2 ;;
+		--staging) require_arg "$@"; staging=$2; shift 2 ;;
+		--inputs) require_arg "$@"; inputs=$2; shift 2 ;;
+		--updates) require_arg "$@"; updates=$2; shift 2 ;;
+		--require-automation) require_automation=t; shift ;;
+		*) die "unknown promote option '$1'" ;;
+		esac
+	done
+	test -n "$inputs" && test -n "$updates" ||
+		die "promote requires --inputs and --updates"
+	test -f "$inputs" || die "input snapshot '$inputs' does not exist"
+	test -f "$updates" || die "update manifest '$updates' does not exist"
+	make_tmp_dir
+	candidate=$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
+		"$updates")
+	test -n "$candidate" || die "update manifest has no codex candidate"
+	printf '%s\n' "$candidate" >"$tmp_dir/promote-result" ||
+		die "could not prepare promotion verification"
+	set -- --inputs "$inputs" --updates "$updates" \
+		--result "$tmp_dir/promote-result"
+	test -z "$require_automation" || set -- "$@" --require-automation
+	verify_output "$@"
+	# Keep the remote snapshot check next to the staging read and atomic push.
+	verify_inputs --remote "$remote" "$inputs"
+	ref=$(staging_ref "$staging")
+	staged=$(remote_head_oid "$remote" "$ref")
+	test "$staged" = "$candidate" ||
+		die "staging ref '$ref' moved or disappeared before promotion"
+	promote_updates "$remote" "$updates" "$ref" "$candidate"
 }
 
 resolve_rebase () {
@@ -1383,6 +1704,7 @@ resolve_rebase () {
 	codex_name=codex
 	inputs_oid=
 	worktree=
+	require_automation=
 
 	while test $# -gt 0
 	do
@@ -1392,6 +1714,7 @@ resolve_rebase () {
 		--codex) require_arg "$@"; codex_name=$2; shift 2 ;;
 		--inputs-oid) require_arg "$@"; inputs_oid=$2; shift 2 ;;
 		--worktree) require_arg "$@"; worktree=$2; shift 2 ;;
+		--require-automation) require_automation=t; shift ;;
 		*) die "unknown resolve option '$1'" ;;
 		esac
 	done
@@ -1425,7 +1748,7 @@ resolve_rebase () {
 		>/dev/null
 	state=$(state_path "$worktree")
 	initialize_rewrite "$remote" "$base_name" "$codex_name" "$codex_name" \
-		"$worktree" "$state" "$inputs" "$topics"
+		"$worktree" "$state" "$inputs" "$topics" "$require_automation"
 
 	if process_plan "$worktree" "$state"
 	then
@@ -1533,18 +1856,25 @@ publish_topics () {
 	temporary_worktree=$candidate_worktree
 	if ! candidate=$(assemble_candidate "$candidate_worktree" "$state")
 	then
-		write_integration_failure "$tmp_dir/integration-conflict" \
-			"$state" "$candidate_worktree"
-		cat "$tmp_dir/integration-conflict" >&2
-		die "topic graph cannot be integrated; no refs were updated"
+		if test -f "$state/integration-failed-name"
+		then
+			write_integration_failure "$tmp_dir/integration-conflict" \
+				"$state" "$candidate_worktree"
+			cat "$tmp_dir/integration-conflict" >&2
+			die "topic graph cannot be integrated; no refs were updated"
+		fi
+		die "rewritten topic graph failed candidate validation; no refs were updated"
 	fi
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
 	printf '%s\n' "$candidate" >"$tmp_dir/result" ||
 		die "could not prepare topic verification"
+	require_automation=$(state_value "$state" require-automation)
 	(
 		cd "$worktree" || exit 1
-		verify_output --inputs "$state/inputs" \
-			--updates "$tmp_dir/updates" --result "$tmp_dir/result"
+		set -- --inputs "$state/inputs" --updates "$tmp_dir/updates" \
+			--result "$tmp_dir/result"
+		test -z "$require_automation" || set -- "$@" --require-automation
+		verify_output "$@"
 	) || die "rewritten topic graph failed output verification"
 	git -C "$worktree" -c core.fsmonitor=false worktree remove --force \
 		"$candidate_worktree" >/dev/null ||
@@ -1557,7 +1887,7 @@ publish_topics () {
 			--codex "$codex_name" "$state/inputs" || exit 1
 		push_updates "$remote" "$state/topic-updates" topics
 	) || die "topic publication failed; no topic refs were updated by this transaction"
-	say "Topic refs updated. Re-run all jobs on the latest meta workflow run to rebuild codex."
+	say "Topic refs updated. Run Refresh codex from the Actions page to rebuild codex."
 }
 
 test $# -gt 0 || { usage >&2; exit 129; }
@@ -1569,7 +1899,8 @@ rewrite) rewrite "$@" ;;
 verify-inputs) verify_inputs "$@" ;;
 verify-topic) verify_topic "$@" ;;
 verify-output) verify_output "$@" ;;
-publish) publish "$@" ;;
+stage) stage_candidate "$@" ;;
+promote) promote "$@" ;;
 resolve) resolve_rebase "$@" ;;
 continue) continue_rewrite "$@" ;;
 publish-topics) publish_topics "$@" ;;

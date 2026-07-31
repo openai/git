@@ -1,12 +1,13 @@
 # Maintaining `codex`
 
-`master` stays equivalent to upstream. This orphan `meta` branch contains the
-controller, workflow, tests, documentation, and ruleset recipes. Never merge
-`meta` into `master` or `codex`.
+`master` stays equivalent to upstream. The orphan `meta` branch contains the
+controller, reusable workflows, tests, documentation, and ruleset recipes.
+Never merge `meta` into `master` or `codex`.
 
 The active inputs are every branch matching `??/codex/*`, where `??` is a
 two-character owner name. A `-wip` or `-stale` suffix makes a branch inactive.
-There is no topic list, order file, or other maintained state.
+The commit graph supplies the dependency order; there is no topic list, order
+file, or other maintained state.
 
 ## Topic branches and pull requests
 
@@ -18,122 +19,140 @@ git switch -c tb/codex/my-topic origin/master
 git push -u origin HEAD
 ```
 
-The commit graph is the dependency graph. Keep topic history linear; rebase a
-dependent topic onto its prerequisite instead of merging. Never merge `codex`
-into a topic and never use GitHub's **Update branch** button on these pull
-requests.
+Keep topic history linear. Rebase a dependent topic onto its prerequisite;
+never merge `codex` into a topic or use GitHub's **Update branch** button on
+these pull requests.
 
-Each topic has one inferred prerequisite: its nearest active topic-tip
-ancestor, or `master` when it has none. If two sibling topics share private
-commits, put an active topic ref at that shared prefix and base both siblings
-on it. Otherwise the controller rejects the ambiguous overlap and asks you to
-create that prerequisite topic or restack the branches.
+The controller infers one prerequisite for each topic: its nearest active
+topic-tip ancestor, or `master` for a root topic. If sibling topics share
+private commits, create an active topic at that shared prefix and base both
+siblings on it. Otherwise the controller rejects the ambiguous overlap.
 
 A topic may be the head of a pull request whose base is `codex`. Use a
-same-repository `??/codex/*` head. The topic-retention ruleset prevents GitHub
-from deleting that branch after the pull request is merged.
+same-repository `??/codex/*` head. The topic ruleset keeps these branches after
+their pull requests are merged.
+
+## Keep the dispatch workflow on `codex`
+
+GitHub shows **Run workflow** only for a workflow present on the default
+branch. Exactly one active `??/codex/automation` topic must therefore be based
+directly on `master` and change only `.github/workflows/codex.yml` to this
+exact trampoline:
+
+```yaml
+name: Refresh codex
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    uses: openai/git/.github/workflows/codex.yml@meta
+    secrets: inherit
+```
+
+The controller enforces that exact file. It remains in each generated `codex`
+tree, while the implementation stays on orphan `meta`. No controller files or
+custom patches belong on `master`.
 
 ## Refresh `codex`
 
-The workflow lives only on `meta`, so GitHub cannot show its **Run workflow**
-button on the default branch. To request a publication:
+1. Open **Actions > Refresh codex**.
+2. Choose **Run workflow**, select `codex`, and run it.
 
-1. Open **Actions > Codex branch**.
-2. Open the newest run on `meta`.
-3. Choose **Re-run jobs > Re-run all jobs**.
+Always start a fresh dispatch. Do not use **Re-run failed jobs**: a retry must
+snapshot the current refs and stage a fresh candidate.
 
-A push to `meta` creates a new seed run. Attempt 1 prepares the candidate,
-validates each topic in its own workflow job, and builds and tests the result.
-Re-running all jobs is the explicit publication request. Re-running only
-failed jobs cannot publish. Use a new `meta` push if the seed is too old for
-GitHub to rerun or if its preparation job failed before saving the immutable
-attempt-1 candidate.
-
-Each run:
+The reusable controller then:
 
 1. snapshots `meta`, `master`, `codex`, and every active topic;
-2. derives all dependencies from commit ancestry;
-3. rebases each whole topic onto its rewritten prerequisite, processing ready
-   sibling topics concurrently in topological waves;
-4. lets rerere reuse resolutions recorded by the old `codex` history;
-5. merges the rewritten maximal tips into a candidate `codex`;
-6. freezes the exact candidate and rewritten topics in a Git bundle;
-7. fans out one structural validation job per rewritten topic;
-8. builds the candidate once, tests the controller against it, then runs the
-   full candidate test suite; and
-9. atomically pushes every topic update and `codex`, with an exact lease for
-   each of those refs.
+2. infers dependencies from ancestry and rebases ready topics in parallel
+   topological waves, using rerere resolutions learned from the old `codex`;
+3. merges the rewritten maximal tips and runs the controller tests;
+4. uses `CODEX_BRANCH_TOKEN` to push the exact candidate to the fixed
+   `codex-staging` branch;
+5. waits for the ordinary full CI workflow to succeed for that exact staging
+   commit;
+6. fans out one API-only validation square per topic; and
+7. revalidates the snapshot, then atomically updates every topic and `codex`
+   with exact leases while deleting `codex-staging` in the same push.
 
-The per-topic jobs run independently and appear separately in the Actions
-summary. They verify each rewritten tip and its inferred prerequisite. The
-controller performs the actual parallel waves, and it never starts a dependent
-topic until its prerequisite has been rewritten. A failed topic square names
-the rewritten ref whose ancestry or containment check failed; the integrated
-build and test remain a single gate.
+The topic squares do not check out or execute candidate code. They read refs
+and compare commits through the GitHub API, verifying the live topic tip, its
+rewritten prerequisite, and its containment in the exact staging candidate.
+The ordinary CI workflow may reuse its own earlier successful result when the
+commit or tree is identical; that is CI's existing redundancy policy.
 
-Any conflict, build failure, test failure, detected moved input, rejected
-lease, or server without atomic-push support updates nothing. The publisher
-rechecks `meta`, `master`, `codex`, and the complete topic namespace immediately
-before its single push; Git places server-side exact leases on every topic and
-`codex` ref in that atomic transaction.
+Until the final push, `codex` and all topic refs remain unchanged. A CI,
+validation, lease, or promotion failure after staging leaves `codex-staging`
+at the candidate for inspection. Successful promotion updates all primary refs
+and deletes staging as one atomic transaction.
+
+Git can place server-side leases only on refs included in the push. The
+controller therefore refetches `meta`, `master`, `codex`, and the complete
+topic namespace immediately before promotion, then places exact leases on
+every ref it mutates or deletes in the atomic transaction. A new input created
+in the final fetch-to-push window is handled by the next run.
 
 ## Resolve a rebase conflict
 
-The failed run's summary says **No refs were updated** and contains one pinned
-`codex-branch resolve` command. Run that command from a clean clone. It verifies
-the exact input snapshot, creates a disposable worktree, reconstructs the
-successful prefix, and stops in the same ordinary rebase.
+The failed run summary says **No refs were updated** and prints a pinned
+`codex-branch resolve` command. From a clean clone:
 
-In the printed worktree:
+1. Run the exact fetch, detached checkout, and `resolve` commands from the
+   summary. The helper verifies the original snapshot, creates a disposable
+   worktree, and stops at the same rebase conflict.
+2. Change to the printed worktree and run:
 
-```sh
-git status
-git rebase --show-current-patch
-# Edit the conflicted files.
-git add <files>
-git diff --cached --check
-git rebase --continue
-```
+   ```sh
+   git status
+   git rebase --show-current-patch
+   # Edit every conflicted file.
+   git add <files>
+   git diff --cached --check
+   git rebase --continue
+   ```
 
-Repeat edit/add/continue until the rebase finishes. To abandon the attempt,
-run `git rebase --abort` and delete the disposable worktree.
+3. Repeat the edit/add/check/continue sequence until the rebase finishes.
+4. Run the exact `codex-branch continue --worktree ...` command printed by the
+   helper. If another topic conflicts, resolve it the same way and run
+   `continue` again.
+5. Review the rewritten topic tips, then run the printed `publish-topics`
+   command. It rechecks the original snapshot and atomically pushes every
+   rewritten topic with an exact lease.
+6. Start a new **Actions > Refresh codex > Run workflow** dispatch to stage,
+   test, and promote the resulting `codex`.
 
-Then run the exact `codex-branch continue --worktree ...` command printed by
-the helper. If another topic conflicts, resolve it the same way and run
-`continue` again. When the whole ancestry graph is coherent, the helper prints
-one `publish-topics` command. Review the rewritten tips and run that command;
-it verifies the original snapshot again and performs one atomic push with an
-exact lease for every topic ref. Finally, **Re-run all jobs** on the latest
-`meta` seed to build, test, and publish `codex`.
+To abandon recovery, run `git rebase --abort` and delete the disposable
+worktree. Do not use `git rebase --quit`, push only the first conflicted topic,
+add `+` to a failed push, or use an unqualified force push. If a lease fails,
+start again from a fresh dispatch.
 
-Do not force-push only the branch that first conflicted. If `A -> B -> C`,
-replacing only `B` makes neither the old `A -> B` nor the old `B -> C`
-relationship true. With no order manifest, the controller must finish and
-publish the coherent topic graph together.
-
-If a lease fails, do not add `+` or use an unqualified force push. Start again
-from the newest workflow run.
-
-If the rewritten maximal topics conflict while assembling `codex`, the run
-summary names the topic, the maximal topics already integrated, and the
-conflicted paths. This means two topics declared independent by ancestry are
-not actually independent. Rebase the conflicting topic and its descendants
-onto the real prerequisite topic, push that coherent topic graph, and rerun.
-Do not resolve this by merging `codex` into a topic or by inventing an order.
+If maximal topics conflict while the controller assembles `codex`, the topics
+were declared independent by ancestry but are not independent in practice.
+Rebase the conflicting topic and its descendants onto the real prerequisite,
+push that coherent graph, and start a fresh dispatch. Do not fix this by
+merging `codex` into a topic or by maintaining a manual order.
 
 ## Configure publishing
 
 Create a protected environment named `codex-publish`:
 
-1. Restrict deployment branches to `meta`.
+1. Restrict deployment branches to `codex`.
 2. Add at least one required reviewer and disable self-review.
-3. Add an environment secret named `CODEX_BRANCH_TOKEN` with repository
-   **Contents: read and write** and **Workflows: read and write**.
+3. Add a repository or organization Actions secret named
+   `CODEX_BRANCH_TOKEN` for an organization-admin bot matching the ruleset
+   bypass actor. Give it **Actions: read**, **Contents: read and write**, and
+   **Workflows: read and write** for this repository.
 
-Use an organization-admin bot account, matching the bypass actor in the
-provided rulesets. Do not use a repository secret. The workflow gives
-candidate code no credential; only the fresh publisher job can read the
-environment secret.
+The staging job uses the secret to trigger ordinary push CI. The
+`codex-publish` environment gates only the final promotion, so one approval is
+enough. Candidate CI and the API-only topic jobs never receive this token.
+Topics may change only `.github/workflows/codex-release.yml`; its trigger must
+remain exactly a push to `codex`, and it may not reference the publisher token.
+The controller rejects every other topic-controlled workflow change.
 
 Generated merge commits use GitHub's standard `github-actions[bot]` identity
 and subjects of the form `Merge <topic> into codex`.
@@ -143,12 +162,12 @@ and subjects of the form `Merge <topic> into codex`.
 Import both JSON files under **Settings > Rules > Rulesets > New ruleset >
 Import a ruleset**.
 
-- `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks deletion,
-  which keeps topic heads after pull-request merges.
+- `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks
+  deletion, preserving topic heads after pull-request merges.
 - `.github/rulesets/codex-branch.json` protects `codex` with pull-request,
-  review, deletion, and force-push rules while allowing the administrator used
-  by the publisher to bypass them.
+  review, deletion, and force-push rules while allowing the publisher's
+  organization-admin bot to bypass them.
 
-Rulesets cannot require that a pull request's head matches `??/codex/*`.
-Reviewers must enforce that convention. Do not require topic heads to be up to
-date with `codex`; that would copy the generated aggregate into an input.
+Rulesets cannot require a pull request head to match `??/codex/*`; reviewers
+must enforce that convention. Do not require topic heads to be up to date with
+`codex`, because that would copy the generated aggregate into an input.

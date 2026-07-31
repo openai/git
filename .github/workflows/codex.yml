@@ -1,9 +1,7 @@
-name: Codex branch
+name: Codex branch controller
 
 on:
-  push:
-    branches:
-      - meta
+  workflow_call:
 
 permissions:
   contents: read
@@ -17,51 +15,35 @@ jobs:
     name: Rebase topics and assemble codex
     runs-on: ubuntu-24.04
     outputs:
-      changed: ${{ steps.rewrite.outputs.changed }}
-      topics: ${{ steps.rewrite.outputs.topics }}
       artifact-name: ${{ steps.rewrite.outputs.artifact-name }}
+      candidate: ${{ steps.rewrite.outputs.candidate }}
+      controller-oid: ${{ steps.rewrite.outputs.controller-oid }}
       run-attempt: ${{ steps.rewrite.outputs.run-attempt }}
+      topics: ${{ steps.rewrite.outputs.topics }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check out the pinned controller
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Require a successful seed preparation
-        if: github.run_attempt > 1
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: codex-seed-${{ github.run_id }}
-          path: ${{ runner.temp }}/codex-seed
-
-      - name: Verify the seed receipt
-        if: github.run_attempt > 1
-        run: test "$(cat "$RUNNER_TEMP/codex-seed/codex-seed-receipt")" = "$GITHUB_SHA"
-
-      - name: Pin the controller helper
-        run: |
-          cp .github/workflows/codex-branch.sh \
-            "$RUNNER_TEMP/codex-branch-trusted"
-          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
 
       - name: Fetch and pin all inputs
         env:
           READ_TOKEN: ${{ github.token }}
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
-          if test "$GITHUB_REF" != refs/heads/meta
-          then
-            echo "::error::This workflow must run from meta"
-            exit 1
-          fi
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = openai/git
+          test "$WORKFLOW_REPOSITORY" = openai/git
           basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
           git -c http.extraheader="AUTHORIZATION: basic $basic" \
             fetch --force --prune origin \
             '+refs/heads/*:refs/remotes/origin/*'
-          if test "$(git rev-parse refs/remotes/origin/meta)" != "$GITHUB_SHA"
-          then
-            echo "::error::meta moved; use its latest workflow run"
-            exit 1
-          fi
+          test "$(git rev-parse refs/remotes/origin/meta)" = "$WORKFLOW_SHA"
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
 
       - name: Configure generated commits
         run: |
@@ -71,35 +53,37 @@ jobs:
 
       - name: Rebase every topic and assemble codex
         id: rewrite
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
-          sh "$RUNNER_TEMP/codex-branch-trusted" rewrite \
+          set -euo pipefail
+          helper="$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh"
+          sh "$helper" rewrite \
             --base master \
             --codex codex \
             --rerere-from codex \
+            --require-automation \
             --result "$RUNNER_TEMP/codex-candidate" \
             --updates "$RUNNER_TEMP/codex-updates" \
             --inputs "$RUNNER_TEMP/codex-inputs" \
             --bundle "$RUNNER_TEMP/codex.bundle" \
+            --topic-tuples "$RUNNER_TEMP/codex-topic-tuples" \
             --failure "$RUNNER_TEMP/codex-conflict.md"
 
           candidate=$(cat "$RUNNER_TEMP/codex-candidate")
-          git rev-parse "$candidate^{tree}" >"$RUNNER_TEMP/codex-tested-tree"
-          if awk -F '\t' '$2 != $3 { changed=1 } END { exit !changed }' \
-            "$RUNNER_TEMP/codex-updates"
-          then
-            echo 'changed=true' >>"$GITHUB_OUTPUT"
-          else
-            echo 'changed=false' >>"$GITHUB_OUTPUT"
-          fi
-          topics=$(awk -F '\t' '$1 != "refs/heads/codex" {
-              sub("^refs/heads/", "", $1)
-              print $1
-            }' "$RUNNER_TEMP/codex-updates" |
-            jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "topics=$topics" >>"$GITHUB_OUTPUT"
+          topics=$(jq -Rnc '
+            [inputs | split("\t") | {
+              topic: .[0],
+              old_topic_oid: .[1],
+              rewritten_prerequisite_oid: .[2],
+              rewritten_topic_oid: .[3]
+            }]' <"$RUNNER_TEMP/codex-topic-tuples")
           echo "artifact-name=codex-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             >>"$GITHUB_OUTPUT"
+          echo "candidate=$candidate" >>"$GITHUB_OUTPUT"
+          echo "controller-oid=$WORKFLOW_SHA" >>"$GITHUB_OUTPUT"
           echo "run-attempt=$GITHUB_RUN_ATTEMPT" >>"$GITHUB_OUTPUT"
+          echo "topics=$topics" >>"$GITHUB_OUTPUT"
 
       - name: Summarize candidate
         run: |
@@ -114,7 +98,8 @@ jobs:
             echo
             echo '| Ref | Old | New |'
             echo '| --- | --- | --- |'
-            awk -F '\t' '{ printf "| `%s` | `%s` | `%s` |\n", $1, $2, $3 }' \
+            awk -F '\t' \
+              '{ printf "| `%s` | `%s` | `%s` |\n", $1, $2, $3 }' \
               "$RUNNER_TEMP/codex-updates"
             echo
             echo '```'
@@ -123,7 +108,7 @@ jobs:
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Save immutable candidate
+      - name: Freeze the immutable candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ steps.rewrite.outputs.artifact-name }}
@@ -131,21 +116,33 @@ jobs:
             ${{ runner.temp }}/codex.bundle
             ${{ runner.temp }}/codex-candidate
             ${{ runner.temp }}/codex-inputs
-            ${{ runner.temp }}/codex-tested-tree
+            ${{ runner.temp }}/codex-topic-tuples
             ${{ runner.temp }}/codex-updates
+          if-no-files-found: error
           retention-days: 7
 
-      - name: Record successful seed preparation
-        if: github.run_attempt == 1
-        run: printf '%s\n' "$GITHUB_SHA" >"$RUNNER_TEMP/codex-seed-receipt"
+      - name: Check out the candidate for controller tests
+        run: |
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          git worktree add --detach "$RUNNER_TEMP/codex-source" "$candidate"
 
-      - name: Save seed receipt
-        if: github.run_attempt == 1
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: codex-seed-${{ github.run_id }}
-          path: ${{ runner.temp }}/codex-seed-receipt
-          retention-days: 7
+      - name: Install controller-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            gettext \
+            libcurl4-openssl-dev
+
+      - name: Build the candidate for controller tests
+        run: make -C "$RUNNER_TEMP/codex-source" -j2 DEVELOPER=1
+
+      - name: Test the controller
+        run: |
+          cd "$RUNNER_TEMP/codex-source/t"
+          TEST_DIRECTORY="$RUNNER_TEMP/codex-source/t" \
+          GIT_BUILD_DIR="$RUNNER_TEMP/codex-source" \
+          CODEX_BRANCH="$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh" \
+            sh "$GITHUB_WORKSPACE/t/t9905-codex-branch.sh"
 
       - name: Explain how to resolve a conflict
         if: failure()
@@ -155,36 +152,23 @@ jobs:
             cat "$RUNNER_TEMP/codex-conflict.md" >>"$GITHUB_STEP_SUMMARY"
           fi
 
-  topics:
-    name: Topic ${{ matrix.topic }}
+  stage:
+    name: Stage codex and wait for full CI
     needs: prepare
-    if: needs.prepare.result == 'success'
-    strategy:
-      fail-fast: false
-      matrix:
-        topic: ${{ fromJSON(needs.prepare.outputs.topics) }}
-    uses: ./.github/workflows/codex-topic.yml
-    with:
-      topic: ${{ matrix.topic }}
-      artifact-name: ${{ needs.prepare.outputs.artifact-name }}
-    permissions:
-      contents: read
-
-  validate:
-    name: Build and test codex
-    needs: prepare
+    if: >-
+      needs.prepare.outputs.run-attempt == format('{0}', github.run_attempt)
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      staging-oid: ${{ needs.prepare.outputs.candidate }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check out the pinned controller
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Pin the controller helper
-        run: |
-          cp .github/workflows/codex-branch.sh \
-            "$RUNNER_TEMP/codex-branch-trusted"
-          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
 
       - name: Load the candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -192,143 +176,190 @@ jobs:
           name: ${{ needs.prepare.outputs.artifact-name }}
           path: ${{ runner.temp }}/codex-candidate
 
-      - name: Verify the candidate inputs and objects
+      - name: Import and verify the candidate bundle
         env:
-          READ_TOKEN: ${{ github.token }}
+          CONTROLLER_OID: ${{ needs.prepare.outputs.controller-oid }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
+          set -euo pipefail
+          test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
           metadata="$RUNNER_TEMP/codex-candidate"
-          helper="$RUNNER_TEMP/codex-branch-trusted"
-          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=http.extraheader \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
-            sh "$helper" verify-inputs \
-              --base master --codex codex "$metadata/codex-inputs"
-
           git bundle verify "$metadata/codex.bundle"
           git fetch "$metadata/codex.bundle" \
             refs/codex-output/candidate:refs/codex-import/candidate
-          candidate=$(cat "$metadata/codex-candidate")
-          if test "$(git rev-parse refs/codex-import/candidate)" != "$candidate"
-          then
-            echo "::error::bundle candidate does not match the prepared candidate"
-            exit 1
-          fi
-          if test "$(git rev-parse "$candidate^{tree}")" != \
-            "$(cat "$metadata/codex-tested-tree")"
-          then
-            echo "::error::bundle tree does not match the prepared tree"
-            exit 1
-          fi
-          sh "$helper" verify-output \
-            --inputs "$metadata/codex-inputs" \
-            --updates "$metadata/codex-updates" \
-            --result "$metadata/codex-candidate"
+          test "$(git rev-parse refs/codex-import/candidate)" = \
+            "$(cat "$metadata/codex-candidate")"
 
-      - name: Check out the candidate
-        run: |
-          candidate=$(cat "$RUNNER_TEMP/codex-candidate/codex-candidate")
-          git worktree add --detach "$RUNNER_TEMP/codex-source" "$candidate"
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes \
-            gettext \
-            libcurl4-openssl-dev
-
-      - name: Build
-        run: make -C "$RUNNER_TEMP/codex-source" -j2 DEVELOPER=1
-
-      - name: Test the controller
-        run: |
-          cd "$RUNNER_TEMP/codex-source/t"
-          TEST_DIRECTORY="$RUNNER_TEMP/codex-source/t" \
-          GIT_BUILD_DIR="$RUNNER_TEMP/codex-source" \
-          CODEX_BRANCH="$RUNNER_TEMP/codex-branch-trusted" \
-            sh "$GITHUB_WORKSPACE/t/t9905-codex-branch.sh"
-
-      - name: Test
-        run: make -C "$RUNNER_TEMP/codex-source" -j2 DEVELOPER=1 test
-
-  publish:
-    name: Atomically publish topics and codex
-    if: >-
-      github.run_attempt > 1 &&
-      needs.prepare.outputs.run-attempt == format('{0}', github.run_attempt) &&
-      needs.prepare.outputs.changed == 'true'
-    needs:
-      - prepare
-      - topics
-      - validate
-    runs-on: ubuntu-24.04
-    environment: codex-publish
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.sha }}
-
-      - name: Load publication artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ needs.prepare.outputs.artifact-name }}
-          path: ${{ runner.temp }}/codex-publication
-
-      - name: Pin the controller helper
-        run: |
-          cp .github/workflows/codex-branch.sh \
-            "$RUNNER_TEMP/codex-branch-trusted"
-          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
-
-      - name: Verify live inputs without the publishing credential
-        env:
-          READ_TOKEN: ${{ github.token }}
-        run: |
-          metadata="$RUNNER_TEMP/codex-publication"
-          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=http.extraheader \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
-            sh "$RUNNER_TEMP/codex-branch-trusted" verify-inputs \
-              --base master --codex codex "$metadata/codex-inputs"
-
-      - name: Import and verify the tested objects
-        run: |
-          metadata="$RUNNER_TEMP/codex-publication"
-          git bundle verify "$metadata/codex.bundle"
-          git fetch "$metadata/codex.bundle" \
-            refs/codex-output/candidate:refs/codex-import/candidate
-          candidate=$(cat "$metadata/codex-candidate")
-          if test "$(git rev-parse refs/codex-import/candidate)" != "$candidate"
-          then
-            echo "::error::bundle candidate does not match the tested candidate"
-            exit 1
-          fi
-          if test "$(git rev-parse "$candidate^{tree}")" != \
-            "$(cat "$metadata/codex-tested-tree")"
-          then
-            echo "::error::bundle tree does not match the tested tree"
-            exit 1
-          fi
-          git fsck --strict --no-dangling "$candidate"
-          sh "$RUNNER_TEMP/codex-branch-trusted" verify-output \
-            --inputs "$metadata/codex-inputs" \
-            --updates "$metadata/codex-updates" \
-            --result "$metadata/codex-candidate"
-
-      - name: Atomically update every changed ref
+      - name: Push the exact staging candidate
+        id: staging
         env:
           GH_TOKEN: ${{ secrets.CODEX_BRANCH_TOKEN }}
         run: |
-          metadata="$RUNNER_TEMP/codex-publication"
-          if test -z "$GH_TOKEN"
-          then
-            echo "::error::CODEX_BRANCH_TOKEN is required to publish"
+          set -euo pipefail
+          test -n "$GH_TOKEN" || {
+            echo '::error::CODEX_BRANCH_TOKEN is required to stage codex'
             exit 1
-          fi
+          }
+          metadata="$RUNNER_TEMP/codex-candidate"
+          candidate=$(cat "$metadata/codex-candidate")
+          baseline=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100" \
+            --jq '[.workflow_runs[].id] | max // 0')
+          echo "baseline-run-id=$baseline" >>"$GITHUB_OUTPUT"
           gh auth setup-git
-          sh "$RUNNER_TEMP/codex-branch-trusted" publish \
+          sh "$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh" stage \
+            --staging codex-staging \
+            --require-automation \
             --inputs "$metadata/codex-inputs" \
             --updates "$metadata/codex-updates"
+
+      - name: Wait for CI on the exact staging SHA
+        env:
+          BASELINE_RUN_ID: ${{ steps.staging.outputs.baseline-run-id }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          GH_TOKEN: ${{ secrets.CODEX_BRANCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          workflow_runs="repos/$GITHUB_REPOSITORY/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$CANDIDATE&per_page=100"
+          run_id=
+          for attempt in $(seq 1 60)
+          do
+            run_id=$(gh api "$workflow_runs" --jq \
+              ".workflow_runs | map(select(.id > ($BASELINE_RUN_ID | tonumber) and .head_branch == \"codex-staging\" and .head_sha == \"$CANDIDATE\" and .event == \"push\")) | sort_by(.id) | .[0].id // empty")
+            test -z "$run_id" || break
+            sleep 5
+          done
+          test -n "$run_id" || {
+            echo "::error::no CI run appeared for codex-staging at $CANDIDATE"
+            exit 1
+          }
+
+          conclusion=
+          url=
+          for attempt in $(seq 1 180)
+          do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+            status=$(jq -r .status <<<"$run")
+            conclusion=$(jq -r '.conclusion // empty' <<<"$run")
+            url=$(jq -r .html_url <<<"$run")
+            test "$status" != completed || break
+            sleep 30
+          done
+          test "$status" = completed || {
+            echo "::error::CI run $run_id did not complete before the timeout"
+            exit 1
+          }
+          test "$conclusion" = success || {
+            echo "::error::CI failed for exact staging SHA $CANDIDATE: $url"
+            exit 1
+          }
+
+          jobs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")
+          config_conclusion=$(jq -r \
+            '[.jobs[] | select(.name == "config")][0].conclusion // empty' \
+            <<<"$jobs")
+          test "$config_conclusion" = success || {
+            echo "::error::CI config did not run successfully on codex-staging"
+            exit 1
+          }
+          {
+            echo '## Staging CI'
+            echo
+            echo "Candidate: \`$CANDIDATE\`"
+            echo "Full CI: [$run_id]($url)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  topics:
+    name: Topic ${{ matrix.topic }}
+    needs:
+      - prepare
+      - stage
+    if: >-
+      needs.stage.result == 'success' &&
+      needs.prepare.outputs.run-attempt == format('{0}', github.run_attempt)
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.topics) }}
+    uses: openai/git/.github/workflows/codex-topic.yml@meta
+    with:
+      topic: ${{ matrix.topic }}
+      old-topic-oid: ${{ matrix.old_topic_oid }}
+      rewritten-prerequisite-oid: ${{ matrix.rewritten_prerequisite_oid }}
+      rewritten-topic-oid: ${{ matrix.rewritten_topic_oid }}
+      staging-oid: ${{ needs.stage.outputs.staging-oid }}
+      controller-oid: ${{ needs.prepare.outputs.controller-oid }}
+    permissions:
+      contents: read
+
+  promote:
+    name: Atomically promote topics and codex
+    needs:
+      - prepare
+      - stage
+      - topics
+    if: >-
+      needs.stage.result == 'success' &&
+      needs.topics.result == 'success' &&
+      needs.prepare.outputs.run-attempt == format('{0}', github.run_attempt)
+    runs-on: ubuntu-24.04
+    environment: codex-publish
+    steps:
+      - name: Check out the pinned controller
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load the candidate metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact-name }}
+          path: ${{ runner.temp }}/codex-candidate
+
+      - name: Import and verify the candidate bundle
+        env:
+          CONTROLLER_OID: ${{ needs.prepare.outputs.controller-oid }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
+          metadata="$RUNNER_TEMP/codex-candidate"
+          git bundle verify "$metadata/codex.bundle"
+          git fetch "$metadata/codex.bundle" \
+            refs/codex-output/candidate:refs/codex-import/candidate
+          test "$(git rev-parse refs/codex-import/candidate)" = \
+            "$(cat "$metadata/codex-candidate")"
+
+      - name: Revalidate and atomically promote
+        env:
+          CONTROLLER_OID: ${{ needs.prepare.outputs.controller-oid }}
+          GH_TOKEN: ${{ secrets.CODEX_BRANCH_TOKEN }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
+          test -n "$GH_TOKEN" || {
+            echo '::error::CODEX_BRANCH_TOKEN is required to promote codex'
+            exit 1
+          }
+          metadata="$RUNNER_TEMP/codex-candidate"
+          gh auth setup-git
+          sh "$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh" promote \
+            --staging codex-staging \
+            --require-automation \
+            --inputs "$metadata/codex-inputs" \
+            --updates "$metadata/codex-updates"
+
+      - name: Summarize promotion
+        run: |
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate/codex-candidate")
+          {
+            echo '## Published codex'
+            echo
+            echo "Promoted: \`$candidate\`"
+            echo 'Deleted: `refs/heads/codex-staging`'
+          } >>"$GITHUB_STEP_SUMMARY"

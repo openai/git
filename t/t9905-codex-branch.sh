@@ -44,6 +44,51 @@ manifest_has () {
 	' "$4"
 }
 
+tuple_has () {
+	awk -F '\t' -v topic="$1" -v old="$2" -v prerequisite="$3" \
+		-v new="$4" '
+		$1 == topic && $2 == old && $3 == prerequisite && $4 == new {
+			found = 1
+		}
+		END { exit !found }
+	' "$5"
+}
+
+snapshot_without_staging () {
+	snapshot_refs "$1" |
+	sed '/^refs\/heads\/codex-staging[[:space:]]/d'
+}
+
+write_automation_workflow () {
+	cat >"$1" <<-\EOF
+	name: Refresh codex
+
+	on: workflow_dispatch
+
+	permissions:
+	  contents: read
+
+	jobs:
+	  refresh:
+	    uses: openai/git/.github/workflows/codex.yml@meta
+	    secrets: inherit
+	EOF
+}
+
+write_release_workflow () {
+	cat >"$2" <<-EOF
+	name: Codex Git release
+
+	on:
+	  push:
+	    branches:
+	      - $1
+
+	permissions:
+	  contents: read
+	EOF
+}
+
 test_expect_success 'topic names use the two-character namespace' '
 	sh "$codex_branch" check-topic tb/codex/release &&
 	test_expect_code 1 sh "$codex_branch" check-topic t/codex/release &&
@@ -94,6 +139,187 @@ test_expect_success 'topics cannot change the reusable controller workflow' '
 			2>rewrite.err &&
 		test_grep "meta-only controller files" rewrite.err &&
 		snapshot_refs ../control-path.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'required automation is the exact isolated trampoline' '
+	git init --bare automation.git &&
+	test_create_repo automation-source &&
+	(
+		cd automation-source &&
+		git remote add origin ../automation.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c aa/codex/automation &&
+		mkdir -p .github/workflows &&
+		write_automation_workflow .github/workflows/codex.yml &&
+		git add .github/workflows/codex.yml &&
+		git commit -m "add automation trampoline" &&
+
+		git switch -c automation-bad master &&
+		mkdir -p .github/workflows &&
+		write wrong .github/workflows/codex.yml &&
+		git add .github/workflows/codex.yml &&
+		git commit -m "add wrong automation" &&
+
+		git switch -c automation-extra master &&
+		mkdir -p .github/workflows &&
+		write_automation_workflow .github/workflows/codex.yml &&
+		write extra automation-extra &&
+		git add .github/workflows/codex.yml automation-extra &&
+		git commit -m "add non-isolated automation" &&
+
+		git switch -c bb/codex/control master &&
+		mkdir -p .github/workflows &&
+		write changed .github/workflows/main.yml &&
+		git add .github/workflows/main.yml &&
+		git commit -m "change protected CI" &&
+
+		git switch -c release-staging master &&
+		mkdir -p .github/workflows &&
+		write_release_workflow codex-staging \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "publish releases from staging" &&
+
+		git switch -c workflow-extra master &&
+		mkdir -p .github/workflows &&
+		write untrusted .github/workflows/extra.yml &&
+		git add .github/workflows/extra.yml &&
+		git commit -m "add another workflow" &&
+
+		git switch -c cc/codex/feature master &&
+		write feature feature-file &&
+		git add feature-file &&
+		git commit -m "ordinary feature" &&
+
+		git switch master &&
+		write master master-file &&
+		git add master-file &&
+		git commit -m "automation master" &&
+		git branch meta master &&
+		git push origin master meta codex aa/codex/automation \
+			cc/codex/feature automation-bad automation-extra \
+			bb/codex/control:refs/heads/control-invalid \
+			release-staging:refs/heads/release-invalid \
+			workflow-extra:refs/heads/workflow-invalid
+	) &&
+
+	git clone automation.git automation-runner &&
+	(
+		cd automation-runner &&
+		fetch_all &&
+		snapshot_refs ../automation.git >before &&
+		good=$(git rev-parse origin/aa/codex/automation) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			--require-automation &&
+		candidate=$(cat result) &&
+		write_automation_workflow expected-automation.yml &&
+		git show "$candidate:.github/workflows/codex.yml" \
+			>actual-automation.yml &&
+		test_cmp expected-automation.yml actual-automation.yml &&
+
+		git --git-dir=../automation.git update-ref -d \
+			refs/heads/aa/codex/automation &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result missing-result --updates missing-updates \
+			--inputs missing-inputs --failure missing-failure \
+			--require-automation 2>missing.err &&
+		test_grep "canonical Refresh codex workflow" missing.err &&
+
+		git --git-dir=../automation.git update-ref \
+			refs/heads/aa/codex/automation "$good" &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/dd/codex/automation "$good" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result duplicate-result --updates duplicate-updates \
+			--inputs duplicate-inputs --failure duplicate-failure \
+			--require-automation 2>duplicate.err &&
+		test_grep "exactly one active.*automation topic" duplicate.err &&
+		git --git-dir=../automation.git update-ref -d \
+			refs/heads/dd/codex/automation "$good" &&
+
+		bad=$(git --git-dir=../automation.git \
+			rev-parse refs/heads/automation-bad) &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/aa/codex/automation "$bad" "$good" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result bad-result --updates bad-updates \
+			--inputs bad-inputs --failure bad-failure \
+			--require-automation 2>bad.err &&
+		test_grep "canonical Refresh codex workflow" bad.err &&
+
+		extra=$(git --git-dir=../automation.git \
+			rev-parse refs/heads/automation-extra) &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/aa/codex/automation "$extra" "$bad" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result extra-result --updates extra-updates \
+			--inputs extra-inputs --failure extra-failure \
+			--require-automation 2>extra.err &&
+		test_grep "must change only .github/workflows/codex.yml" \
+			extra.err &&
+
+		control=$(git --git-dir=../automation.git \
+			rev-parse refs/heads/control-invalid) &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/aa/codex/automation "$good" "$extra" &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/bb/codex/control "$control" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result control-result --updates control-updates \
+			--inputs control-inputs --failure control-failure \
+			--require-automation 2>control.err &&
+		test_grep "protected controller or CI file" control.err &&
+		git --git-dir=../automation.git update-ref -d \
+			refs/heads/bb/codex/control "$control" &&
+
+		release=$(git --git-dir=../automation.git \
+			rev-parse refs/heads/release-invalid) &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/bb/codex/control "$release" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result release-result --updates release-updates \
+			--inputs release-inputs --failure release-failure \
+			--require-automation 2>release.err &&
+		test_grep "release workflow must run only for pushes to codex" \
+			release.err &&
+		git --git-dir=../automation.git update-ref -d \
+			refs/heads/bb/codex/control "$release" &&
+
+		extra_workflow=$(git --git-dir=../automation.git \
+			rev-parse refs/heads/workflow-invalid) &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/bb/codex/control "$extra_workflow" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result workflow-result --updates workflow-updates \
+			--inputs workflow-inputs --failure workflow-failure \
+			--require-automation 2>workflow.err &&
+		test_grep "protected controller or CI file" workflow.err &&
+		git --git-dir=../automation.git update-ref -d \
+			refs/heads/bb/codex/control "$extra_workflow" &&
+		snapshot_refs ../automation.git >after &&
 		test_cmp before after
 	)
 '
@@ -199,7 +425,8 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result result --updates updates \
-			--inputs inputs --failure failure &&
+			--inputs inputs --topic-tuples tuples \
+			--failure failure &&
 		candidate=$(cat result) &&
 		new_a=$(find_subject "topic A" "$candidate") &&
 		new_b=$(find_subject "topic B" "$candidate") &&
@@ -215,6 +442,10 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		manifest_has aa/codex/a "$old_a" "$new_a" updates &&
 		manifest_has bb/codex/b "$old_b" "$new_b" updates &&
 		manifest_has cc/codex/c "$old_c" "$new_c" updates &&
+		test 3 = "$(wc -l <tuples | tr -d " ")" &&
+		tuple_has aa/codex/a "$old_a" "$master" "$new_a" tuples &&
+		tuple_has bb/codex/b "$old_b" "$new_a" "$new_b" tuples &&
+		tuple_has cc/codex/c "$old_c" "$master" "$new_c" tuples &&
 		sh "$codex_branch" verify-topic --topic aa/codex/a \
 			--inputs inputs --updates updates --result result &&
 		sh "$codex_branch" verify-topic --topic bb/codex/b \
@@ -573,12 +804,12 @@ test_expect_success 'a topic already in master is not a private prerequisite' '
 	)
 '
 
-test_expect_success 'publish uses exact leases and updates all refs atomically' '
-	git init --bare publish.git &&
-	test_create_repo publish-source &&
+test_expect_success 'stage leaves primary refs untouched and promote is atomic' '
+	git init --bare promotion.git &&
+	test_create_repo promotion-source &&
 	(
-		cd publish-source &&
-		git remote add origin ../publish.git &&
+		cd promotion-source &&
+		git remote add origin ../promotion.git &&
 		write base shared &&
 		git add shared &&
 		install_rerere_train &&
@@ -588,24 +819,24 @@ test_expect_success 'publish uses exact leases and updates all refs atomically' 
 		git switch -c aa/codex/a &&
 		write A a &&
 		git add a &&
-		git commit -m "publish topic A" &&
+		git commit -m "promotion topic A" &&
 
 		git switch -c bb/codex/b master &&
 		write B b &&
 		git add b &&
-		git commit -m "publish topic B" &&
+		git commit -m "promotion topic B" &&
 
 		git switch master &&
 		write master master-file &&
 		git add master-file &&
-		git commit -m "publish master" &&
+		git commit -m "promotion master" &&
 		git branch meta master &&
 		git push origin master meta codex aa/codex/a bb/codex/b
 	) &&
 
-	git clone publish.git publish-runner &&
+	git clone promotion.git promotion-runner &&
 	(
-		cd publish-runner &&
+		cd promotion-runner &&
 		fetch_all &&
 		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
@@ -613,25 +844,50 @@ test_expect_success 'publish uses exact leases and updates all refs atomically' 
 			--inputs inputs --failure failure &&
 		sh "$codex_branch" verify-output \
 			--inputs inputs --updates updates --result result &&
-		GIT_TRACE=1 sh "$codex_branch" publish \
+		candidate=$(cat result) &&
+		snapshot_without_staging ../promotion.git >before-stage &&
+		GIT_TRACE=1 sh "$codex_branch" stage \
 			--remote origin --inputs inputs --updates updates \
-			>publish.out 2>publish.trace &&
-		test_grep "push --atomic --porcelain" publish.trace &&
+			>stage.out 2>stage.trace &&
+		test_grep "push --atomic --porcelain" stage.trace &&
+		test_grep \
+			"force-with-lease=refs/heads/codex-staging:" \
+			stage.trace &&
+		test "$candidate" = "$(git --git-dir=../promotion.git \
+			rev-parse refs/heads/codex-staging)" &&
+		snapshot_without_staging ../promotion.git >after-stage &&
+		test_cmp before-stage after-stage &&
 		while IFS="$(printf '\''\t'\'')" read -r ref old new
 		do
-			grep -F "force-with-lease=$ref:$old" publish.trace &&
-			test "$new" = "$(git --git-dir=../publish.git \
+			test "$old" = "$(git --git-dir=../promotion.git \
 				rev-parse "$ref")" || return 1
-		done <updates
+		done <updates &&
+
+		GIT_TRACE=1 sh "$codex_branch" promote \
+			--remote origin --inputs inputs --updates updates \
+			>promote.out 2>promote.trace &&
+		test_grep "push --atomic --porcelain" promote.trace &&
+		grep -F \
+			"force-with-lease=refs/heads/codex-staging:$candidate" \
+			promote.trace &&
+		grep -F ":refs/heads/codex-staging" promote.trace &&
+		while IFS="$(printf '\''\t'\'')" read -r ref old new
+		do
+			grep -F "force-with-lease=$ref:$old" promote.trace &&
+			test "$new" = "$(git --git-dir=../promotion.git \
+				rev-parse "$ref")" || return 1
+		done <updates &&
+		test_must_fail git --git-dir=../promotion.git rev-parse --verify \
+			refs/heads/codex-staging
 	)
 '
 
-test_expect_success 'one ref racing after verification rejects the whole publish' '
-	git init --bare publish-race.git &&
-	test_create_repo publish-race-source &&
+test_expect_success 'stale staging and output leases fail without partial promotion' '
+	git init --bare promotion-race.git &&
+	test_create_repo promotion-race-source &&
 	(
-		cd publish-race-source &&
-		git remote add origin ../publish-race.git &&
+		cd promotion-race-source &&
+		git remote add origin ../promotion-race.git &&
 		write base shared &&
 		git add shared &&
 		install_rerere_train &&
@@ -656,9 +912,9 @@ test_expect_success 'one ref racing after verification rejects the whole publish
 		git push origin master meta codex aa/codex/a bb/codex/b
 	) &&
 
-	git clone publish-race.git publish-race-runner &&
+	git clone promotion-race.git promotion-race-runner &&
 	(
-		cd publish-race-runner &&
+		cd promotion-race-runner &&
 		fetch_all &&
 		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
@@ -666,15 +922,32 @@ test_expect_success 'one ref racing after verification rejects the whole publish
 			--inputs inputs --failure failure &&
 		sh "$codex_branch" verify-output \
 			--inputs inputs --updates updates --result result &&
+		candidate=$(cat result) &&
+		master=$(git rev-parse origin/master) &&
+		sh "$codex_branch" stage --remote origin \
+			--inputs inputs --updates updates &&
+		snapshot_without_staging ../promotion-race.git >primary-before &&
+
+		git --git-dir=../promotion-race.git update-ref \
+			refs/heads/codex-staging "$master" "$candidate" &&
+		test_expect_code 1 sh "$codex_branch" promote \
+			--remote origin --inputs inputs --updates updates \
+			>staging.out 2>staging.err &&
+		test_grep "staging ref.*moved or disappeared" staging.err &&
+		snapshot_without_staging ../promotion-race.git \
+			>primary-after-staging-race &&
+		test_cmp primary-before primary-after-staging-race &&
+		git --git-dir=../promotion-race.git update-ref \
+			refs/heads/codex-staging "$candidate" "$master" &&
 
 		race_ref=refs/heads/aa/codex/a &&
 		race_old=$(awk -F "$(printf '\''\t'\'')" -v ref="$race_ref" \
 			'\''$1 == ref { print $2 }'\'' updates) &&
-		race_new=$(git rev-parse origin/master) &&
+		race_new=$master &&
 		test "$race_old" != "$race_new" &&
 		real_git=$(command -v git) &&
-		remote_git=$(pwd)/../publish-race.git &&
-		mkdir race-bin &&
+		remote_git=$(pwd)/../promotion-race.git &&
+		mkdir topic-race-bin &&
 		write "#!/bin/sh
 case \" \$* \" in
 *\" push \"*)
@@ -682,22 +955,66 @@ case \" \$* \" in
 		\"$race_ref\" \"$race_new\" \"$race_old\" || exit
 	;;
 esac
-exec \"$real_git\" \"\$@\"" race-bin/git &&
-		chmod +x race-bin/git &&
+exec \"$real_git\" \"\$@\"" topic-race-bin/git &&
+		chmod +x topic-race-bin/git &&
 
-		test_expect_code 1 env PATH="$PWD/race-bin:$PATH" \
-			sh "$codex_branch" publish \
+		test_expect_code 1 env PATH="$PWD/topic-race-bin:$PATH" \
+			sh "$codex_branch" promote \
 			--remote origin --inputs inputs --updates updates \
-			>publish.out 2>publish.err &&
-		test "$race_new" = "$(git --git-dir=../publish-race.git \
+			>topic-race.out 2>topic-race.err &&
+		test "$race_new" = "$(git --git-dir=../promotion-race.git \
 			rev-parse "$race_ref")" &&
 		while IFS="$(printf '\''\t'\'')" read -r ref old new
 		do
 			test "$ref" = "$race_ref" && continue
-			test "$old" = "$(git --git-dir=../publish-race.git \
+			test "$old" = "$(git --git-dir=../promotion-race.git \
 				rev-parse "$ref")" || return 1
 		done <updates &&
-		test_grep -i "atomic\|stale\|failed to update ref" publish.err
+		test "$candidate" = "$(git --git-dir=../promotion-race.git \
+			rev-parse refs/heads/codex-staging)" &&
+		test_grep -i "atomic\|stale\|failed to update ref" topic-race.err &&
+		git --git-dir=../promotion-race.git update-ref \
+			"$race_ref" "$race_old" "$race_new" &&
+		snapshot_without_staging ../promotion-race.git \
+			>primary-after-topic-race &&
+		test_cmp primary-before primary-after-topic-race &&
+
+		race_ref=refs/heads/codex &&
+		race_old=$(awk -F "$(printf '\''\t'\'')" -v ref="$race_ref" \
+			'\''$1 == ref { print $2 }'\'' updates) &&
+		race_new=$master &&
+		test "$race_old" != "$race_new" &&
+		mkdir codex-race-bin &&
+		write "#!/bin/sh
+case \" \$* \" in
+*\" push \"*)
+	\"$real_git\" --git-dir=\"$remote_git\" update-ref \\
+		\"$race_ref\" \"$race_new\" \"$race_old\" || exit
+	;;
+esac
+exec \"$real_git\" \"\$@\"" codex-race-bin/git &&
+		chmod +x codex-race-bin/git &&
+
+		test_expect_code 1 env PATH="$PWD/codex-race-bin:$PATH" \
+			sh "$codex_branch" promote \
+			--remote origin --inputs inputs --updates updates \
+			>codex-race.out 2>codex-race.err &&
+		test "$race_new" = "$(git --git-dir=../promotion-race.git \
+			rev-parse "$race_ref")" &&
+		while IFS="$(printf '\''\t'\'')" read -r ref old new
+		do
+			test "$ref" = "$race_ref" && continue
+			test "$old" = "$(git --git-dir=../promotion-race.git \
+				rev-parse "$ref")" || return 1
+		done <updates &&
+		test "$candidate" = "$(git --git-dir=../promotion-race.git \
+			rev-parse refs/heads/codex-staging)" &&
+		test_grep -i "atomic\|stale\|failed to update ref" codex-race.err &&
+		git --git-dir=../promotion-race.git update-ref \
+			"$race_ref" "$race_old" "$race_new" &&
+		snapshot_without_staging ../promotion-race.git \
+			>primary-after-codex-race &&
+		test_cmp primary-before primary-after-codex-race
 	)
 '
 
