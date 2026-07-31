@@ -1,0 +1,217 @@
+name: Codex branch
+
+on:
+  push:
+    branches:
+      - meta
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-branch-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Rebase topics and test codex
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.rewrite.outputs.changed }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pin the controller helper
+        run: |
+          cp .github/workflows/codex-branch.sh \
+            "$RUNNER_TEMP/codex-branch-trusted"
+          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
+
+      - name: Fetch and pin all inputs
+        env:
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          if test "$GITHUB_REF" != refs/heads/meta
+          then
+            echo "::error::This workflow must run from meta"
+            exit 1
+          fi
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --force --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*'
+          if test "$(git rev-parse refs/remotes/origin/meta)" != "$GITHUB_SHA"
+          then
+            echo "::error::meta moved; use its latest workflow run"
+            exit 1
+          fi
+
+      - name: Configure generated commits
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Rebase every topic and assemble codex
+        id: rewrite
+        run: |
+          sh "$RUNNER_TEMP/codex-branch-trusted" rewrite \
+            --base master \
+            --codex codex \
+            --rerere-from codex \
+            --result "$RUNNER_TEMP/codex-candidate" \
+            --updates "$RUNNER_TEMP/codex-updates" \
+            --inputs "$RUNNER_TEMP/codex-inputs" \
+            --bundle "$RUNNER_TEMP/codex.bundle" \
+            --failure "$RUNNER_TEMP/codex-conflict.md"
+
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          git rev-parse "$candidate^{tree}" >"$RUNNER_TEMP/codex-tested-tree"
+          if awk -F '\t' '$2 != $3 { changed=1 } END { exit !changed }' \
+            "$RUNNER_TEMP/codex-updates"
+          then
+            echo 'changed=true' >>"$GITHUB_OUTPUT"
+          else
+            echo 'changed=false' >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize candidate
+        run: |
+          old_codex=$(awk -F '\t' '$1 == "codex" { print $3 }' \
+            "$RUNNER_TEMP/codex-inputs")
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          {
+            echo '## Codex candidate'
+            echo
+            echo "Old codex: \`$old_codex\`"
+            echo "Candidate: \`$candidate\`"
+            echo
+            echo '| Ref | Old | New |'
+            echo '| --- | --- | --- |'
+            awk -F '\t' '{ printf "| `%s` | `%s` | `%s` |\n", $1, $2, $3 }' \
+              "$RUNNER_TEMP/codex-updates"
+            echo
+            echo '```'
+            git --no-pager diff --no-ext-diff --no-textconv \
+              --stat "$old_codex" "$candidate"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Save immutable publication artifact
+        if: github.run_attempt > 1 && steps.rewrite.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: codex-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/codex.bundle
+            ${{ runner.temp }}/codex-candidate
+            ${{ runner.temp }}/codex-inputs
+            ${{ runner.temp }}/codex-tested-tree
+            ${{ runner.temp }}/codex-updates
+          retention-days: 7
+
+      - name: Explain how to resolve a conflict
+        if: failure()
+        run: |
+          if test -f "$RUNNER_TEMP/codex-conflict.md"
+          then
+            cat "$RUNNER_TEMP/codex-conflict.md" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check out the candidate
+        run: |
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          git worktree add --detach "$RUNNER_TEMP/codex-source" "$candidate"
+
+      - name: Build
+        run: make -C "$RUNNER_TEMP/codex-source" -j2 DEVELOPER=1
+
+      - name: Test the controller
+        run: |
+          cd "$RUNNER_TEMP/codex-source/t"
+          TEST_DIRECTORY="$RUNNER_TEMP/codex-source/t" \
+          GIT_BUILD_DIR="$RUNNER_TEMP/codex-source" \
+          CODEX_BRANCH="$RUNNER_TEMP/codex-branch-trusted" \
+            sh "$GITHUB_WORKSPACE/t/t9905-codex-branch.sh"
+
+      - name: Test
+        run: make -C "$RUNNER_TEMP/codex-source" -j2 DEVELOPER=1 test
+
+  publish:
+    name: Atomically publish topics and codex
+    if: github.run_attempt > 1 && needs.refresh.outputs.changed == 'true'
+    needs: refresh
+    runs-on: ubuntu-24.04
+    environment: codex-publish
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Load publication artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: codex-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-publication
+
+      - name: Pin the controller helper
+        run: |
+          cp .github/workflows/codex-branch.sh \
+            "$RUNNER_TEMP/codex-branch-trusted"
+          chmod +x "$RUNNER_TEMP/codex-branch-trusted"
+
+      - name: Verify live inputs without the publishing credential
+        env:
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          metadata="$RUNNER_TEMP/codex-publication"
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
+            sh "$RUNNER_TEMP/codex-branch-trusted" verify-inputs \
+              --base master --codex codex "$metadata/codex-inputs"
+
+      - name: Import and verify the tested objects
+        run: |
+          metadata="$RUNNER_TEMP/codex-publication"
+          git bundle verify "$metadata/codex.bundle"
+          git fetch "$metadata/codex.bundle" \
+            refs/codex-output/candidate:refs/codex-import/candidate
+          candidate=$(cat "$metadata/codex-candidate")
+          if test "$(git rev-parse refs/codex-import/candidate)" != "$candidate"
+          then
+            echo "::error::bundle candidate does not match the tested candidate"
+            exit 1
+          fi
+          if test "$(git rev-parse "$candidate^{tree}")" != \
+            "$(cat "$metadata/codex-tested-tree")"
+          then
+            echo "::error::bundle tree does not match the tested tree"
+            exit 1
+          fi
+          git fsck --strict --no-dangling "$candidate"
+          sh "$RUNNER_TEMP/codex-branch-trusted" verify-output \
+            --inputs "$metadata/codex-inputs" \
+            --updates "$metadata/codex-updates" \
+            --result "$metadata/codex-candidate"
+
+      - name: Atomically update every changed ref
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_BRANCH_TOKEN }}
+        run: |
+          metadata="$RUNNER_TEMP/codex-publication"
+          if test -z "$GH_TOKEN"
+          then
+            echo "::error::CODEX_BRANCH_TOKEN is required to publish"
+            exit 1
+          fi
+          gh auth setup-git
+          sh "$RUNNER_TEMP/codex-branch-trusted" publish \
+            --inputs "$metadata/codex-inputs" \
+            --updates "$metadata/codex-updates"
