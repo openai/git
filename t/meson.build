@@ -1126,6 +1126,7 @@ integration_tests = [
   't9902-completion.sh',
   't9903-bash-prompt.sh',
   't9904-url-parse.sh',
+  't9905-codex-branch.sh',
 ]
 
 benchmarks = [

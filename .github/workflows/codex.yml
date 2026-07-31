@@ -1,0 +1,240 @@
+name: Codex branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Update codex after the candidate passes
+        required: true
+        type: boolean
+        default: false
+  pull_request:
+    branches:
+      - codex
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'codex-branch-refresh' || format('codex-topic-{0}', github.event.pull_request.number) }}
+  cancel-in-progress: false
+
+jobs:
+  validate-topic:
+    name: Validate Codex topic
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a retained topic branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          if test "$HEAD_REPOSITORY" != "$REPOSITORY"
+          then
+            echo "::error::Codex topics must be branches in $REPOSITORY"
+            exit 1
+          fi
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --no-tags origin "$HEAD_SHA"
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --no-tags origin \
+            '+refs/heads/master:refs/remotes/origin/master'
+          .github/workflows/codex-branch.sh check-pr \
+            "$HEAD_REF" "$HEAD_SHA" "$BASE_SHA" origin/master
+
+  refresh:
+    name: Rebuild codex
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a master dispatch
+        run: |
+          if test "$GITHUB_REF" != refs/heads/master
+          then
+            echo "::error::Run this workflow from master"
+            exit 1
+          fi
+
+      - name: Fetch the base, codex, and all topics
+        env:
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --force --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*'
+          if test "$(git rev-parse refs/remotes/origin/master)" != "$GITHUB_SHA"
+          then
+            echo "::error::master moved; start a new workflow run"
+            exit 1
+          fi
+          git rev-parse refs/remotes/origin/codex > \
+            "$RUNNER_TEMP/codex-before"
+
+      - name: Configure integration commits
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Assemble candidate
+        run: |
+          .github/workflows/codex-branch.sh assemble \
+            --base master \
+            --rerere-from codex \
+            --result "$RUNNER_TEMP/codex-candidate" \
+            --inputs "$RUNNER_TEMP/codex-inputs" \
+            --failure "$RUNNER_TEMP/codex-conflict.md"
+
+      - name: Summarize candidate
+        run: |
+          old_codex=$(cat "$RUNNER_TEMP/codex-before")
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          {
+            echo '## Codex candidate'
+            echo
+            echo "Old codex: \`$old_codex\`"
+            echo "Candidate: \`$candidate\`"
+            echo
+            echo '```'
+            git --no-pager diff --no-ext-diff --no-textconv \
+              --stat "$old_codex" "$candidate"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Freeze publication metadata
+        if: inputs.publish
+        run: |
+          candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          git rev-parse "$candidate^{tree}" >"$RUNNER_TEMP/codex-tested-tree"
+
+      - name: Save publication metadata
+        if: inputs.publish
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/codex-before
+            ${{ runner.temp }}/codex-inputs
+            ${{ runner.temp }}/codex-tested-tree
+          retention-days: 1
+
+      - name: Explain how to resolve a conflict
+        if: failure()
+        run: |
+          if test -f "$RUNNER_TEMP/codex-conflict.md"
+          then
+            cat "$RUNNER_TEMP/codex-conflict.md" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build
+        run: make -j2 DEVELOPER=1
+
+      - name: Test
+        run: make test
+
+  publish:
+    name: Publish codex
+    if: inputs.publish
+    needs: refresh
+    runs-on: ubuntu-24.04
+    environment: codex-publish
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Load publication metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: codex-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-publication
+
+      - name: Verify publication inputs
+        env:
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          metadata="$RUNNER_TEMP/codex-publication"
+          cp .github/workflows/codex-branch.sh \
+            "$RUNNER_TEMP/codex-branch-trusted"
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
+            .github/workflows/codex-branch.sh verify-inputs \
+            --base master "$metadata/codex-inputs"
+          old_codex=$(cat "$metadata/codex-before")
+          if test "$(git rev-parse refs/remotes/origin/codex)" != "$old_codex"
+          then
+            echo "::error::codex moved while the candidate was running"
+            exit 1
+          fi
+
+      - name: Configure integration commits
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Rebuild the tested tree
+        run: |
+          metadata="$RUNNER_TEMP/codex-publication"
+          .github/workflows/codex-branch.sh assemble \
+            --base master \
+            --rerere-from codex \
+            --result "$RUNNER_TEMP/codex-publish-candidate"
+          candidate=$(cat "$RUNNER_TEMP/codex-publish-candidate")
+          actual_tree=$(git rev-parse "$candidate^{tree}")
+          tested_tree=$(cat "$metadata/codex-tested-tree")
+          if test "$actual_tree" != "$tested_tree"
+          then
+            echo "::error::rebuilt tree does not match the tested tree"
+            exit 1
+          fi
+
+      - name: Update codex
+        env:
+          GH_TOKEN: ${{ secrets.CODEX_BRANCH_TOKEN }}
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          if test -z "$GH_TOKEN"
+          then
+            echo "::error::CODEX_BRANCH_TOKEN is required to publish"
+            exit 1
+          fi
+          metadata="$RUNNER_TEMP/codex-publication"
+          basic=$(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
+            sh "$RUNNER_TEMP/codex-branch-trusted" verify-inputs \
+            --base master "$metadata/codex-inputs"
+          old_codex=$(cat "$metadata/codex-before")
+          if test "$(git rev-parse refs/remotes/origin/codex)" != "$old_codex"
+          then
+            echo "::error::codex moved before publication"
+            exit 1
+          fi
+          candidate=$(cat "$RUNNER_TEMP/codex-publish-candidate")
+          gh auth setup-git
+          git -c core.hooksPath=/dev/null push \
+            --force-with-lease="refs/heads/codex:$old_codex" \
+            origin "$candidate:refs/heads/codex"
