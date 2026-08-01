@@ -11,7 +11,7 @@ codex_branch=${CODEX_BRANCH:-$TEST_DIRECTORY/../.github/workflows/codex-branch.s
 codex_workflow=${CODEX_WORKFLOW:-$(dirname "$codex_branch")/codex.yml}
 codex_root=$(CDPATH= cd "$(dirname "$codex_branch")/../.." && pwd)
 codex_entrypoint=${CODEX_ENTRYPOINT:-$codex_root/codex}
-codex_bot_name='ChatGPT Codex Connector'
+codex_bot_name='chatgpt-codex-connector[bot]'
 codex_bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
 write () {
@@ -1571,6 +1571,7 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 		test -n "$new_topic" &&
 		test -n "$new_other" &&
 		test resolved = "$(git show "$new_topic:shared")" &&
+		has_codex_bot_committer "$new_topic" &&
 		manifest_has aa/codex/rerere \
 			"$old_topic" "$new_topic" updates &&
 		manifest_has bb/codex/other \
