@@ -10,7 +10,7 @@ script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path=${CODEX_ENTRYPOINT:-$script_dir/$(basename "$0")}
 meta_config_path=codex.config
 tab=$(printf '\t')
-bot_name='ChatGPT Codex Connector'
+bot_name='chatgpt-codex-connector[bot]'
 bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
 say () {

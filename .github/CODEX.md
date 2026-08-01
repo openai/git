@@ -288,7 +288,7 @@ rejects every other topic-controlled workflow change.
 
 Rebased topic commits preserve their original authors. Generated commits and
 rebase committers use
-`ChatGPT Codex Connector <199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>`.
+`chatgpt-codex-connector[bot] <199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>`.
 Generated merge and `meta` state commits use that identity as both author and
 committer. These commits are deliberately unsigned and do not claim verified
 GitHub App authentication. GitHub records the local credential owner as the
