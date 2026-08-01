@@ -8,7 +8,9 @@ export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 . ./test-lib.sh
 
 codex_branch=${CODEX_BRANCH:-$TEST_DIRECTORY/../.github/workflows/codex-branch.sh}
-codex_workflow=$(dirname "$codex_branch")/codex.yml
+codex_workflow=${CODEX_WORKFLOW:-$(dirname "$codex_branch")/codex.yml}
+codex_root=$(CDPATH= cd "$(dirname "$codex_branch")/../.." && pwd)
+codex_entrypoint=${CODEX_ENTRYPOINT:-$codex_root/codex}
 
 write () {
 	printf '%s\n' "$1" >"$2"
@@ -80,6 +82,143 @@ write_release_workflow () {
 	EOF
 }
 
+install_meta_state () {
+	meta_branch=$1
+	base_branch=$2
+	output_branch=$3
+	meta_parent=$(git rev-parse "$meta_branch") &&
+	output_tip=$(git rev-parse "$output_branch") &&
+	state_topics=.codex-state-topics &&
+	state_rows=.codex-state-rows &&
+	state_bases=.codex-state-bases &&
+	state_config=.codex-state-config &&
+	state_index=.codex-state-index &&
+	: >"$state_topics" &&
+	git for-each-ref --format="%(refname:short)%09%(objectname)" refs/heads |
+	while IFS="$(printf '\t')" read -r name oid
+	do
+		case "$name" in
+		??/codex/?*) ;;
+		*) continue ;;
+		esac
+		case "$name" in
+		*-wip|*-stale|??/codex/*/*) continue ;;
+		esac
+		if git merge-base --is-ancestor "$oid" "$output_tip"
+		then
+			printf "%s\t%s\n" "$name" "$oid"
+		fi
+	done | LC_ALL=C sort >"$state_topics" &&
+	set -- git merge-base --all --octopus "$base_branch" "$output_tip" &&
+	while IFS="$(printf '\t')" read -r name oid
+	do
+		set -- "$@" "$oid"
+	done <"$state_topics" &&
+	"$@" >"$state_bases" &&
+	test "$(wc -l <"$state_bases" | tr -d " ")" = 1 &&
+	base_tip=$(sed -n 1p "$state_bases") &&
+	: >"$state_rows" &&
+	while IFS="$(printf '\t')" read -r name oid
+	do
+		prerequisite=$base_branch &&
+		prerequisite_tip=$base_tip &&
+		while IFS="$(printf '\t')" read -r other_name other_oid
+		do
+			test "$name" = "$other_name" && continue
+			if git merge-base --is-ancestor "$other_oid" "$oid" &&
+				git merge-base --is-ancestor "$prerequisite_tip" "$other_oid"
+			then
+				prerequisite=$other_name &&
+				prerequisite_tip=$other_oid
+			fi
+		done <"$state_topics" &&
+		printf "%s\t%s\t%s\n" "$name" "$oid" "$prerequisite" \
+			>>"$state_rows"
+	done <"$state_topics" &&
+	{
+		printf "[codex]\n" &&
+		printf "\tversion = 1\n" &&
+		printf "\tbase-ref = refs/heads/%s\n" "$base_branch" &&
+		printf "\tbase-tip = %s\n" "$base_tip" &&
+		printf "\toutput-ref = refs/heads/%s\n" "$output_branch" &&
+		printf "\toutput-tip = %s\n" "$output_tip" &&
+		while IFS="$(printf '\t')" read -r name oid prerequisite
+		do
+			printf "\n[branch \"%s\"]\n" "$name" &&
+			printf "\tremote = .\n" &&
+			printf "\tmerge = refs/heads/%s\n" "$prerequisite" &&
+			printf "\tcodex-tip = %s\n" "$oid"
+		done <"$state_rows"
+	} >"$state_config" &&
+	blob=$(git hash-object -w "$state_config") &&
+	helper_blob=$(git hash-object -w "$codex_branch") &&
+	rm -f "$state_index" &&
+	GIT_INDEX_FILE=$state_index git read-tree "$meta_parent^{tree}" &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100644,"$blob",codex.config &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100755,"$helper_blob",.github/workflows/codex-branch.sh &&
+	tree=$(GIT_INDEX_FILE=$state_index git write-tree) &&
+	meta_tip=$(printf "%s\n" "meta: initialize Codex topic state" |
+		git commit-tree "$tree" -p "$meta_parent") &&
+	git update-ref "refs/heads/$meta_branch" "$meta_tip" "$meta_parent" &&
+	rm -f "$state_topics" "$state_rows" "$state_bases" \
+		"$state_config" "$state_index"
+}
+
+install_explicit_meta_state () (
+	meta_branch=$1
+	base_branch=$2
+	output_branch=$3
+	rows=$4
+	meta_parent=$(git rev-parse "$meta_branch") &&
+	output_tip=$(git rev-parse "$output_branch") &&
+	state_bases=.codex-explicit-state-bases &&
+	state_config=.codex-explicit-state-config &&
+	state_index=.codex-explicit-state-index &&
+	set -- git merge-base --all --octopus "$base_branch" "$output_tip" &&
+	while IFS="$(printf '\t')" read -r name oid prerequisite
+	do
+		set -- "$@" "$oid"
+	done <"$rows" &&
+	"$@" >"$state_bases" &&
+	test "$(wc -l <"$state_bases" | tr -d " ")" = 1 &&
+	base_tip=$(sed -n 1p "$state_bases") &&
+	{
+		printf "[codex]\n" &&
+		printf "\tversion = 1\n" &&
+		printf "\tbase-ref = refs/heads/%s\n" "$base_branch" &&
+		printf "\tbase-tip = %s\n" "$base_tip" &&
+		printf "\toutput-ref = refs/heads/%s\n" "$output_branch" &&
+		printf "\toutput-tip = %s\n" "$output_tip" &&
+		while IFS="$(printf '\t')" read -r name oid prerequisite
+		do
+			printf "\n[branch \"%s\"]\n" "$name" &&
+			printf "\tremote = .\n" &&
+			printf "\tmerge = refs/heads/%s\n" "$prerequisite" &&
+			printf "\tcodex-tip = %s\n" "$oid"
+		done <"$rows"
+	} >"$state_config" &&
+	blob=$(git hash-object -w "$state_config") &&
+	helper_blob=$(git hash-object -w "$codex_branch") &&
+	rm -f "$state_index" &&
+	GIT_INDEX_FILE=$state_index git read-tree "$meta_parent^{tree}" &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100644,"$blob",codex.config &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100755,"$helper_blob",.github/workflows/codex-branch.sh &&
+	tree=$(GIT_INDEX_FILE=$state_index git write-tree) &&
+	meta_tip=$(printf "%s\n" "meta: initialize explicit Codex topic state" |
+		git commit-tree "$tree" -p "$meta_parent") &&
+	git update-ref "refs/heads/$meta_branch" "$meta_tip" "$meta_parent" &&
+	rm -f "$state_bases" "$state_config" "$state_index"
+)
+
+updated_tip () {
+	awk -F "$(printf '\t')" -v ref="refs/heads/$1" \
+		'$1 == ref { print $3 }' "$2"
+}
+
 test_expect_success 'topic names use the two-character namespace' '
 	sh "$codex_branch" check-topic tb/codex/release &&
 	test_expect_code 1 sh "$codex_branch" check-topic t/codex/release &&
@@ -130,6 +269,7 @@ test_expect_success 'topics cannot change the meta branch ruleset' '
 		git add master-file &&
 		git commit -m "new control-path master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/control-path
 	) &&
 
@@ -220,6 +360,7 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 		git add master-file &&
 		git commit -m "automation master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/automation \
 			cc/codex/feature automation-bad automation-extra \
 			bb/codex/control:refs/heads/control-invalid \
@@ -381,6 +522,7 @@ test_expect_success 'rewrite rebases one root topic onto current master' '
 		git add master-file &&
 		git commit -m "new master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/root
 	) &&
 
@@ -442,6 +584,7 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		git add master-file &&
 		git commit -m "new graph master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex \
 			aa/codex/a bb/codex/b cc/codex/c
 	) &&
@@ -567,6 +710,7 @@ test_expect_success 'shared private history needs a prerequisite topic' '
 		git add master-file &&
 		git commit -m "new shared-prefix master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/a bb/codex/b
 	) &&
 
@@ -622,6 +766,7 @@ test_expect_success 'represented prerequisite siblings rebase sequentially' '
 		git add master-file &&
 		git commit -m "new sequential master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex \
 			aa/codex/release bb/codex/one cc/codex/two
 	) &&
@@ -683,6 +828,7 @@ test_expect_success 'rewrite bundle transfers the exact output over pinned input
 		git add master-file &&
 		git commit -m "bundle master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/bundle
 	) &&
 
@@ -697,10 +843,16 @@ test_expect_success 'rewrite bundle transfers the exact output over pinned input
 			--failure failure &&
 		git bundle verify candidate.bundle &&
 		candidate=$(cat result) &&
+		meta=$(updated_tip meta updates) &&
+		test 2 = "$(git bundle list-heads candidate.bundle | wc -l |
+			tr -d " ")" &&
 		test "$candidate" = "$(git bundle list-heads candidate.bundle |
 			awk '\''$2 == "refs/codex-output/candidate" { print $1 }'\'')" &&
+		test "$meta" = "$(git bundle list-heads candidate.bundle |
+			awk '\''$2 == "refs/codex-output/meta" { print $1 }'\'')" &&
 		test_must_fail git show-ref --verify \
-			refs/codex-output/candidate
+			refs/codex-output/candidate &&
+		test_must_fail git show-ref --verify refs/codex-output/meta
 	) &&
 
 	git clone bundle.git bundle-verifier &&
@@ -708,7 +860,7 @@ test_expect_success 'rewrite bundle transfers the exact output over pinned input
 		cd bundle-verifier &&
 		fetch_all &&
 		git fetch ../bundle-builder/candidate.bundle \
-			refs/codex-output/candidate:refs/codex-output/candidate &&
+			"+refs/codex-output/*:refs/codex-output/*" &&
 		test "$(cat ../bundle-builder/result)" = \
 			"$(git rev-parse refs/codex-output/candidate)" &&
 		sh "$codex_branch" verify-output \
@@ -730,6 +882,7 @@ test_expect_success 'a topic already in master still produces a valid bundle' '
 		git commit -m base &&
 		git branch codex &&
 		git branch meta &&
+		install_meta_state meta master codex &&
 		git branch aa/codex/done &&
 		git push origin master meta codex aa/codex/done
 	) &&
@@ -744,8 +897,12 @@ test_expect_success 'a topic already in master still produces a valid bundle' '
 			--bundle candidate.bundle --failure failure &&
 		test "$(git rev-parse origin/master)" = "$(cat result)" &&
 		git bundle verify candidate.bundle &&
-		test "$(cat result) refs/codex-output/candidate" = \
-			"$(git bundle list-heads candidate.bundle)"
+		candidate=$(cat result) &&
+		meta=$(updated_tip meta updates) &&
+		test "$candidate" = "$(git bundle list-heads candidate.bundle |
+			awk '\''$2 == "refs/codex-output/candidate" { print $1 }'\'')" &&
+		test "$meta" = "$(git bundle list-heads candidate.bundle |
+			awk '\''$2 == "refs/codex-output/meta" { print $1 }'\'')"
 	)
 '
 
@@ -782,6 +939,7 @@ test_expect_success 'a topic already in master is not a private prerequisite' '
 		git add newest-file &&
 		git commit -m "newest master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex \
 			aa/codex/done bb/codex/dependent
 	) &&
@@ -838,6 +996,7 @@ test_expect_success 'stage leaves primary refs untouched and promote is atomic' 
 		git add master-file &&
 		git commit -m "promotion master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/a bb/codex/b
 	) &&
 
@@ -935,6 +1094,7 @@ test_expect_success 'stale staging and output leases fail without partial promot
 		git add master-file &&
 		git commit -m "racing master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/a bb/codex/b
 	) &&
 
@@ -1040,7 +1200,44 @@ exec \"$real_git\" \"\$@\"" codex-race-bin/git &&
 			"$race_ref" "$race_old" "$race_new" &&
 		snapshot_without_staging ../promotion-race.git \
 			>primary-after-codex-race &&
-		test_cmp primary-before primary-after-codex-race
+		test_cmp primary-before primary-after-codex-race &&
+
+		race_ref=refs/heads/meta &&
+		race_old=$(awk -F "$(printf '\''\t'\'')" -v ref="$race_ref" \
+			'\''$1 == ref { print $2 }'\'' updates) &&
+		race_new=$master &&
+		test "$race_old" != "$race_new" &&
+		mkdir meta-race-bin &&
+		write "#!/bin/sh
+case \" \$* \" in
+*\" push \"*)
+	\"$real_git\" --git-dir=\"$remote_git\" update-ref \\
+		\"$race_ref\" \"$race_new\" \"$race_old\" || exit
+	;;
+esac
+exec \"$real_git\" \"\$@\"" meta-race-bin/git &&
+		chmod +x meta-race-bin/git &&
+
+		test_expect_code 1 env PATH="$PWD/meta-race-bin:$PATH" \
+			sh "$codex_branch" promote \
+			--remote origin --inputs inputs --updates updates \
+			>meta-race.out 2>meta-race.err &&
+		test "$race_new" = "$(git --git-dir=../promotion-race.git \
+			rev-parse "$race_ref")" &&
+		while IFS="$(printf '\''\t'\'')" read -r ref old new
+		do
+			test "$ref" = "$race_ref" && continue
+			test "$old" = "$(git --git-dir=../promotion-race.git \
+				rev-parse "$ref")" || return 1
+		done <updates &&
+		test "$candidate" = "$(git --git-dir=../promotion-race.git \
+			rev-parse refs/heads/codex-staging)" &&
+		test_grep -i "atomic\|stale\|failed to update ref" meta-race.err &&
+		git --git-dir=../promotion-race.git update-ref \
+			"$race_ref" "$race_old" "$race_new" &&
+		snapshot_without_staging ../promotion-race.git \
+			>primary-after-meta-race &&
+		test_cmp primary-before primary-after-meta-race
 	)
 '
 
@@ -1066,6 +1263,7 @@ test_expect_success 'a non-conflict rebase error fails closed' '
 		git add master-file &&
 		git commit -m "rebase error master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/error
 	) &&
 
@@ -1133,6 +1331,7 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		git add shared &&
 		git commit -m "conflicting master" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex \
 			aa/codex/dependent yy/codex/clean zz/codex/root
 	) &&
@@ -1141,22 +1340,19 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 	(
 		cd conflict-runner &&
 		fetch_all &&
-		controller=$(git rev-parse HEAD) &&
+		controller=$(git rev-parse origin/meta) &&
 		base=$(git rev-parse origin/master) &&
 		codex=$(git rev-parse origin/codex) &&
 		dependent=$(git rev-parse origin/aa/codex/dependent) &&
 		clean=$(git rev-parse origin/yy/codex/clean) &&
 		root=$(git rev-parse origin/zz/codex/root) &&
-		printf "controller\tmeta\t%s\nbase\trefs/heads/master\t%s\ncodex\trefs/heads/codex\t%s\ntopic\trefs/heads/aa/codex/dependent\t%s\ntopic\trefs/heads/yy/codex/clean\t%s\ntopic\trefs/heads/zz/codex/root\t%s\n" \
-			"$controller" "$base" "$codex" "$dependent" "$clean" "$root" \
-			>expected-inputs &&
-		digest=$(git hash-object expected-inputs) &&
 		snapshot_refs ../conflict.git >before &&
 		test_expect_code 1 sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result result --updates updates \
 			--inputs inputs --failure failure \
 			>rewrite.out 2>rewrite.err &&
+		digest=$(git hash-object inputs) &&
 		snapshot_refs ../conflict.git >after &&
 		test_cmp before after &&
 		test_path_is_file failure &&
@@ -1167,7 +1363,7 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		test_grep "git rebase --show-current-patch" failure &&
 		test_grep "git add" failure &&
 		test_grep "git rebase --continue" failure &&
-		test_grep "codex-branch continue" failure &&
+		test_grep "Meta/codex continue" failure &&
 		test_grep "git push --force-with-lease" failure &&
 		test_grep "Do not force-push only" failure &&
 
@@ -1234,6 +1430,7 @@ test_expect_success 'integration conflicts identify the missing dependency' '
 		git commit -m base &&
 		git branch codex &&
 		git branch meta &&
+		install_meta_state meta master codex &&
 
 		git switch -c aa/codex/a &&
 		write A shared &&
@@ -1302,6 +1499,7 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 
 		git switch master &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex \
 			aa/codex/rerere bb/codex/other
 	) &&
@@ -1353,6 +1551,7 @@ test_expect_success 'rewrite rejects a private merge in a topic' '
 		git commit -m topic &&
 		git merge --no-ff private-side -m "private merge" &&
 		git branch meta master &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/merged
 	) &&
 
@@ -1369,6 +1568,881 @@ test_expect_success 'rewrite rejects a private merge in a topic' '
 		test_grep -i merge err &&
 		snapshot_refs ../private.git >after &&
 		test_cmp before after
+	)
+'
+
+test_expect_success 'a rewritten parent replaces rather than duplicates its old history' '
+	git init --bare parent-rewrite.git &&
+	test_create_repo parent-rewrite-source &&
+	(
+		cd parent-rewrite-source &&
+		git remote add origin ../parent-rewrite.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/parent &&
+		write old parent-file &&
+		git add parent-file &&
+		git commit -m "old parent" &&
+
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "unchanged child" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch --detach master &&
+		write replacement parent-file &&
+		git add parent-file &&
+		git commit -m "replacement parent" &&
+		git branch -f aa/codex/parent HEAD &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/child
+	) &&
+
+	git clone parent-rewrite.git parent-rewrite-runner &&
+	(
+		cd parent-rewrite-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_parent=$(updated_tip aa/codex/parent updates) &&
+		new_child=$(updated_tip bb/codex/child updates) &&
+		test -n "$new_parent" &&
+		test "$new_parent" = "$(git rev-parse "$new_child^")" &&
+		test 2 = "$(git rev-list --count origin/master..$new_child)" &&
+		test 1 = "$(git log --format=%s origin/master..$new_child |
+			grep -c "^replacement parent$")" &&
+		git log --format=%s origin/master..$new_child >subjects &&
+		! grep -q "^old parent$" subjects
+	)
+'
+
+test_expect_success 'a disjoint parent rewrite drops stale parent content from its child' '
+	git init --bare disjoint-parent.git &&
+	test_create_repo disjoint-parent-source &&
+	(
+		cd disjoint-parent-source &&
+		git remote add origin ../disjoint-parent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/parent &&
+		write old old-parent-file &&
+		git add old-parent-file &&
+		git commit -m "old disjoint parent" &&
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "disjoint child" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch --detach master &&
+		write new new-parent-file &&
+		git add new-parent-file &&
+		git commit -m "new disjoint parent" &&
+		git branch -f aa/codex/parent HEAD &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/child
+	) &&
+
+	git clone disjoint-parent.git disjoint-parent-runner &&
+	(
+		cd disjoint-parent-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		test new = "$(git show "$candidate:new-parent-file")" &&
+		test child = "$(git show "$candidate:child-file")" &&
+		test_must_fail git cat-file -e "$candidate:old-parent-file"
+	)
+'
+
+test_expect_success 'rewinding a parent does not migrate its removed commit into the child' '
+	git init --bare parent-rewind.git &&
+	test_create_repo parent-rewind-source &&
+	(
+		cd parent-rewind-source &&
+		git remote add origin ../parent-rewind.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/parent &&
+		write kept kept-parent-file &&
+		git add kept-parent-file &&
+		git commit -m "kept parent commit" &&
+		kept=$(git rev-parse HEAD) &&
+		write removed removed-parent-file &&
+		git add removed-parent-file &&
+		git commit -m "removed parent commit" &&
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "child after rewind" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git branch -f aa/codex/parent "$kept" &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/child
+	) &&
+
+	git clone parent-rewind.git parent-rewind-runner &&
+	(
+		cd parent-rewind-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_parent=$(updated_tip aa/codex/parent updates) &&
+		new_child=$(updated_tip bb/codex/child updates) &&
+		test "$new_parent" = "$(git rev-parse "$new_child^")" &&
+		test kept = "$(git show "$new_child:kept-parent-file")" &&
+		test child = "$(git show "$new_child:child-file")" &&
+		test_must_fail git cat-file -e "$new_child:removed-parent-file" &&
+		git log --format=%s origin/master..$new_child >subjects &&
+		! grep -q "^removed parent commit$" subjects
+	)
+'
+
+test_expect_success 'a child restacked onto current master is explicitly reparented' '
+	git init --bare reparent-master.git &&
+	test_create_repo reparent-master-source &&
+	(
+		cd reparent-master-source &&
+		git remote add origin ../reparent-master.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/parent &&
+		write parent parent-file &&
+		git add parent-file &&
+		git commit -m "reparent parent" &&
+		old_parent=$(git rev-parse HEAD) &&
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "reparent child" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch master &&
+		write current master-file &&
+		git add master-file &&
+		git commit -m "current master for reparent" &&
+		git switch bb/codex/child &&
+		git rebase --onto master "$old_parent" &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/child
+	) &&
+
+	git clone reparent-master.git reparent-master-runner &&
+	(
+		cd reparent-master-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_parent=$(updated_tip aa/codex/parent updates) &&
+		new_child=$(updated_tip bb/codex/child updates) &&
+		new_meta=$(updated_tip meta updates) &&
+		test "$(git rev-parse origin/master)" = \
+			"$(git rev-parse "$new_child^")" &&
+		test_must_fail git merge-base --is-ancestor \
+			"$new_parent" "$new_child" &&
+		git show "$new_meta:codex.config" >next.config &&
+		test refs/heads/master = "$(git config -f next.config \
+			--get branch.bb/codex/child.merge)"
+	)
+'
+
+test_expect_success 'removing a parent while its stale child survives is rejected' '
+	git init --bare removed-parent.git &&
+	test_create_repo removed-parent-source &&
+	(
+		cd removed-parent-source &&
+		git remote add origin ../removed-parent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/parent &&
+		write parent parent-file &&
+		git add parent-file &&
+		git commit -m "removed prerequisite" &&
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "stale surviving child" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git push origin master meta codex bb/codex/child
+	) &&
+
+	git clone removed-parent.git removed-parent-runner &&
+	(
+		cd removed-parent-runner &&
+		fetch_all &&
+		snapshot_refs ../removed-parent.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "published prerequisite.*was retired" err &&
+		snapshot_refs ../removed-parent.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'an empty dependent follows its rewritten equal-tip parent' '
+	git init --bare empty-dependent.git &&
+	test_create_repo empty-dependent-source &&
+	(
+		cd empty-dependent-source &&
+		git remote add origin ../empty-dependent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/parent &&
+		write old parent-file &&
+		git add parent-file &&
+		git commit -m "equal-tip old parent" &&
+		old_parent=$(git rev-parse HEAD) &&
+		git branch bb/codex/empty &&
+		git branch codex &&
+		git branch meta master &&
+		printf "aa/codex/parent\t%s\tmaster\n" "$old_parent" \
+			>explicit.rows &&
+		printf "bb/codex/empty\t%s\taa/codex/parent\n" "$old_parent" \
+			>>explicit.rows &&
+		install_explicit_meta_state meta master codex explicit.rows &&
+
+		git switch --detach master &&
+		write replacement parent-file &&
+		git add parent-file &&
+		git commit -m "equal-tip replacement parent" &&
+		git branch -f aa/codex/parent HEAD &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/empty
+	) &&
+
+	git clone empty-dependent.git empty-dependent-runner &&
+	(
+		cd empty-dependent-runner &&
+		fetch_all &&
+		old_empty=$(git rev-parse origin/bb/codex/empty) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_parent=$(updated_tip aa/codex/parent updates) &&
+		new_empty=$(updated_tip bb/codex/empty updates) &&
+		test "$old_empty" != "$new_empty" &&
+		test "$new_parent" = "$new_empty" &&
+		test replacement = "$(git show "$new_empty:parent-file")"
+	)
+'
+
+test_expect_success 'an unexplained commit added directly to codex is rejected' '
+	git init --bare direct-codex.git &&
+	test_create_repo direct-codex-source &&
+	(
+		cd direct-codex-source &&
+		git remote add origin ../direct-codex.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/topic &&
+		write topic topic-file &&
+		git add topic-file &&
+		git commit -m "represented topic" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch codex &&
+		write unexplained unexplained-file &&
+		git add unexplained-file &&
+		git commit -m "unexplained direct codex commit" &&
+		git push origin master meta codex aa/codex/topic
+	) &&
+
+	git clone direct-codex.git direct-codex-runner &&
+	(
+		cd direct-codex-runner &&
+		fetch_all &&
+		snapshot_refs ../direct-codex.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "not represented by an active" err &&
+		snapshot_refs ../direct-codex.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'a clean topic merge above recorded codex is accepted' '
+	git init --bare merged-codex.git &&
+	test_create_repo merged-codex-source &&
+	(
+		cd merged-codex-source &&
+		git remote add origin ../merged-codex.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/topic &&
+		write first topic-first &&
+		git add topic-first &&
+		git commit -m "first represented topic commit" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		write second topic-second &&
+		git add topic-second &&
+		git commit -m "second represented topic commit" &&
+		git switch codex &&
+		git merge --no-ff aa/codex/topic -m "merge updated topic into codex" &&
+		git push origin master meta codex aa/codex/topic
+	) &&
+
+	git clone merged-codex.git merged-codex-runner &&
+	(
+		cd merged-codex-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		test "$(git rev-parse "$candidate^{tree}")" = \
+			"$(git rev-parse origin/codex^{tree})" &&
+		test second = "$(git show "$candidate:topic-second")"
+	)
+'
+
+test_expect_success 'initialize emits canonical tree-same state and rejects a mismatch' '
+	git init --bare initialize.git &&
+	test_create_repo initialize-source &&
+	(
+		cd initialize-source &&
+		git remote add origin ../initialize.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		base=$(git rev-parse HEAD) &&
+		git switch -c aa/codex/parent &&
+		write parent parent-file &&
+		git add parent-file &&
+		git commit -m "initialize parent" &&
+		parent=$(git rev-parse HEAD) &&
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "initialize child" &&
+		git branch codex &&
+		codex=$(git rev-parse codex) &&
+		git branch meta master &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/child &&
+		printf "%s\n%s\n%s\n" "$base" "$parent" "$codex" \
+			>../initialize-oids &&
+
+		git switch codex &&
+		write mismatch unmatched-file &&
+		git add unmatched-file &&
+		git commit -m "unmatched codex-only content" &&
+		git branch mismatch-codex &&
+		git push origin mismatch-codex
+	) &&
+
+	git clone initialize.git initialize-runner &&
+	(
+		cd initialize-runner &&
+		fetch_all &&
+		base=$(sed -n 1p ../initialize-oids) &&
+		parent=$(sed -n 2p ../initialize-oids) &&
+		codex=$(sed -n 3p ../initialize-oids) &&
+		sh "$codex_branch" initialize --remote origin \
+			--base master --codex codex --output initialized.config \
+			>initialize.out &&
+		{
+			printf "[codex]\n" &&
+			printf "\tversion = 1\n" &&
+			printf "\tbase-ref = refs/heads/master\n" &&
+			printf "\tbase-tip = %s\n" "$base" &&
+			printf "\toutput-ref = refs/heads/codex\n" &&
+			printf "\toutput-tip = %s\n" "$codex" &&
+			printf "\n[branch \"aa/codex/parent\"]\n" &&
+			printf "\tremote = .\n" &&
+			printf "\tmerge = refs/heads/master\n" &&
+			printf "\tcodex-tip = %s\n" "$parent" &&
+			printf "\n[branch \"bb/codex/child\"]\n" &&
+			printf "\tremote = .\n" &&
+			printf "\tmerge = refs/heads/aa/codex/parent\n" &&
+			printf "\tcodex-tip = %s\n" "$codex"
+		} >expected.config &&
+		test_cmp expected.config initialized.config &&
+		test_grep "known-good codex tree" initialize.out &&
+
+		mismatch=$(git -C ../initialize-source rev-parse mismatch-codex) &&
+		git --git-dir=../initialize.git update-ref refs/heads/codex \
+			"$mismatch" "$codex" &&
+		test_expect_code 1 sh "$codex_branch" initialize --remote origin \
+			--base master --codex codex --output mismatch.config \
+			>mismatch.out 2>mismatch.err &&
+		test_grep "do not reconstruct the known-good codex tree" mismatch.err &&
+		test_path_is_missing mismatch.config
+	)
+'
+
+test_expect_success 'a partially advanced root uses its intermediate master boundary' '
+	git init --bare partial-master.git &&
+	test_create_repo partial-master-source &&
+	(
+		cd partial-master-source &&
+		git remote add origin ../partial-master.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		write published published-base-file &&
+		git add published-base-file &&
+		git commit -m "published master boundary" &&
+		published_base=$(git rev-parse HEAD) &&
+
+		git switch -c aa/codex/root &&
+		write topic topic-file &&
+		git add topic-file &&
+		git commit -m "partially advanced root topic" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch master &&
+		write intermediate intermediate-master-file &&
+		git add intermediate-master-file &&
+		git commit -m "intermediate master" &&
+		intermediate=$(git rev-parse HEAD) &&
+		write current current-master-file &&
+		git add current-master-file &&
+		git commit -m "current master" &&
+		git switch aa/codex/root &&
+		git rebase --onto "$intermediate" "$published_base" &&
+		test "$intermediate" = "$(git rev-parse HEAD^)" &&
+		git push origin master meta codex aa/codex/root
+	) &&
+
+	git clone partial-master.git partial-master-runner &&
+	(
+		cd partial-master-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_root=$(updated_tip aa/codex/root updates) &&
+		test "$(git rev-parse origin/master)" = \
+			"$(git rev-parse "$new_root^")" &&
+		test 1 = "$(git rev-list --count origin/master..$new_root)" &&
+		test topic = "$(git show "$new_root:topic-file")" &&
+		test intermediate = \
+			"$(git show "$new_root:intermediate-master-file")" &&
+		test current = "$(git show "$new_root:current-master-file")"
+	)
+'
+
+test_expect_success 'rewriting master does not transfer removed base commits into a root topic' '
+	git init --bare rewritten-master.git &&
+	test_create_repo rewritten-master-source &&
+	(
+		cd rewritten-master-source &&
+		git remote add origin ../rewritten-master.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		root_base=$(git rev-parse HEAD) &&
+		write removed removed-base-file &&
+		git add removed-base-file &&
+		git commit -m "removed published master commit" &&
+
+		git switch -c aa/codex/root &&
+		write topic topic-file &&
+		git add topic-file &&
+		git commit -m "root after rewritten master" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch --detach "$root_base" &&
+		write replacement replacement-base-file &&
+		git add replacement-base-file &&
+		git commit -m "replacement master commit" &&
+		git branch -f master HEAD &&
+		git push origin master meta codex aa/codex/root
+	) &&
+
+	git clone rewritten-master.git rewritten-master-runner &&
+	(
+		cd rewritten-master-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_root=$(updated_tip aa/codex/root updates) &&
+		test "$(git rev-parse origin/master)" = \
+			"$(git rev-parse "$new_root^")" &&
+		test 1 = "$(git rev-list --count origin/master..$new_root)" &&
+		test replacement = \
+			"$(git show "$new_root:replacement-base-file")" &&
+		test topic = "$(git show "$new_root:topic-file")" &&
+		test_must_fail git cat-file -e "$new_root:removed-base-file"
+	)
+'
+
+test_expect_success 'an absorbed parent can retire after its child is restacked on master' '
+	git init --bare absorbed-parent.git &&
+	test_create_repo absorbed-parent-source &&
+	(
+		cd absorbed-parent-source &&
+		git remote add origin ../absorbed-parent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/parent &&
+		write parent parent-file &&
+		git add parent-file &&
+		git commit -m "parent later absorbed by master" &&
+		old_parent=$(git rev-parse HEAD) &&
+		git switch -c bb/codex/child &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "child of absorbed parent" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch master &&
+		git cherry-pick --no-commit "$old_parent" &&
+		git commit -m "absorb parent patch into master" &&
+		git switch bb/codex/child &&
+		git rebase --onto master "$old_parent" &&
+		git branch -D aa/codex/parent &&
+		git push origin master meta codex bb/codex/child
+	) &&
+
+	git clone absorbed-parent.git absorbed-parent-runner &&
+	(
+		cd absorbed-parent-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_child=$(updated_tip bb/codex/child updates) &&
+		new_meta=$(updated_tip meta updates) &&
+		test "$(git rev-parse origin/master)" = \
+			"$(git rev-parse "$new_child^")" &&
+		test parent = "$(git show "$new_child:parent-file")" &&
+		test child = "$(git show "$new_child:child-file")" &&
+		git show "$new_meta:codex.config" >next.config &&
+		test refs/heads/master = "$(git config -f next.config \
+			--get branch.bb/codex/child.merge)" &&
+		test_must_fail git config -f next.config \
+			--get branch.aa/codex/parent.codex-tip
+	)
+'
+
+test_expect_success 'a coherent restack can swap a published dependency' '
+	git init --bare dependency-swap.git &&
+	test_create_repo dependency-swap-source &&
+	(
+		cd dependency-swap-source &&
+		git remote add origin ../dependency-swap.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/a &&
+		write A a-file &&
+		git add a-file &&
+		git commit -m "dependency A" &&
+		old_a=$(git rev-parse HEAD) &&
+		git switch -c bb/codex/b &&
+		write B b-file &&
+		git add b-file &&
+		git commit -m "dependency B" &&
+		old_b=$(git rev-parse HEAD) &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch --detach master &&
+		git cherry-pick "$old_b" &&
+		new_b=$(git rev-parse HEAD) &&
+		git branch -f bb/codex/b "$new_b" &&
+		git cherry-pick "$old_a" &&
+		git branch -f aa/codex/a HEAD &&
+		git push origin master meta codex aa/codex/a bb/codex/b
+	) &&
+
+	git clone dependency-swap.git dependency-swap-runner &&
+	(
+		cd dependency-swap-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		new_a=$(updated_tip aa/codex/a updates) &&
+		new_b=$(updated_tip bb/codex/b updates) &&
+		new_meta=$(updated_tip meta updates) &&
+		test "$(git rev-parse origin/master)" = \
+			"$(git rev-parse "$new_b^")" &&
+		test "$new_b" = "$(git rev-parse "$new_a^")" &&
+		git show "$new_meta:codex.config" >next.config &&
+		test refs/heads/master = "$(git config -f next.config \
+			--get branch.bb/codex/b.merge)" &&
+		test refs/heads/bb/codex/b = "$(git config -f next.config \
+			--get branch.aa/codex/a.merge)"
+	)
+'
+
+test_expect_success 'Meta/codex pins both controller files to Meta HEAD' '
+	test_create_repo wrapper-pin &&
+	(
+		cd wrapper-pin &&
+		write base tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git branch meta
+	) &&
+	git -C wrapper-pin worktree add ../wrapper-pin-Meta meta &&
+	mkdir -p wrapper-pin-Meta/.github/workflows &&
+	cp "$codex_entrypoint" wrapper-pin-Meta/codex &&
+	cp "$codex_branch" \
+		wrapper-pin-Meta/.github/workflows/codex-branch.sh &&
+	chmod +x wrapper-pin-Meta/codex \
+		wrapper-pin-Meta/.github/workflows/codex-branch.sh &&
+	git -C wrapper-pin-Meta add codex .github/workflows/codex-branch.sh &&
+	git -C wrapper-pin-Meta commit -m "install pinned controller" &&
+	(
+		cd wrapper-pin &&
+		../wrapper-pin-Meta/codex check-topic aa/codex/topic
+	) &&
+	write dirty wrapper-pin-Meta/.github/workflows/codex-branch.sh &&
+	(
+		cd wrapper-pin &&
+		test_expect_code 1 ../wrapper-pin-Meta/codex \
+			check-topic aa/codex/topic 2>../dirty-helper.err
+	) &&
+	test_grep ".github/workflows/codex-branch.sh must match Meta/HEAD" \
+		dirty-helper.err &&
+	git -C wrapper-pin-Meta restore .github/workflows/codex-branch.sh &&
+	printf "\n# dirty\n" >>wrapper-pin-Meta/codex &&
+	(
+		cd wrapper-pin &&
+		test_expect_code 1 ../wrapper-pin-Meta/codex \
+			check-topic aa/codex/topic 2>../dirty-wrapper.err
+	) &&
+	test_grep "codex must match Meta/HEAD" dirty-wrapper.err
+'
+
+test_expect_success 'rewrite requires codex.config on meta' '
+	git init --bare missing-state.git &&
+	test_create_repo missing-state-source &&
+	(
+		cd missing-state-source &&
+		git remote add origin ../missing-state.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch meta &&
+		git switch -c aa/codex/topic &&
+		write topic topic-file &&
+		git add topic-file &&
+		git commit -m "missing-state topic" &&
+		git branch codex &&
+		git push origin master meta codex aa/codex/topic
+	) &&
+
+	git clone missing-state.git missing-state-runner &&
+	(
+		cd missing-state-runner &&
+		fetch_all &&
+		snapshot_refs ../missing-state.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "meta has no codex.config" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../missing-state.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'rewrite rejects malformed and noncanonical codex.config' '
+	git init --bare invalid-state.git &&
+	test_create_repo invalid-state-source &&
+	(
+		cd invalid-state-source &&
+		git remote add origin ../invalid-state.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/topic &&
+		write topic topic-file &&
+		git add topic-file &&
+		git commit -m "invalid-state topic" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		valid_meta=$(git rev-parse meta) &&
+
+		git switch --detach "$valid_meta" &&
+		printf "[codex]\n\tversion = 1\n" >codex.config &&
+		git add codex.config &&
+		git commit -m "malformed codex state" &&
+		malformed=$(git rev-parse HEAD) &&
+		git branch malformed-state "$malformed" &&
+
+		git switch --detach "$valid_meta" &&
+		git show "$valid_meta:codex.config" >codex.config &&
+		printf "\n" >>codex.config &&
+		git add codex.config &&
+		git commit -m "noncanonical codex state" &&
+		git branch noncanonical-state &&
+		git branch -f meta "$malformed" &&
+		git push origin master meta codex aa/codex/topic \
+			malformed-state noncanonical-state
+	) &&
+
+	git clone invalid-state.git invalid-state-runner &&
+	(
+		cd invalid-state-runner &&
+		fetch_all &&
+		snapshot_refs ../invalid-state.git >before-malformed &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result malformed-result \
+			--updates malformed-updates --inputs malformed-inputs \
+			--failure malformed-failure >malformed.out 2>malformed.err &&
+		test_grep "codex.config is missing.*base-ref" malformed.err &&
+		snapshot_refs ../invalid-state.git >after-malformed &&
+		test_cmp before-malformed after-malformed &&
+
+		malformed=$(git rev-parse origin/meta) &&
+		noncanonical=$(git rev-parse origin/noncanonical-state) &&
+		git --git-dir=../invalid-state.git update-ref refs/heads/meta \
+			"$noncanonical" "$malformed" &&
+		fetch_all &&
+		snapshot_refs ../invalid-state.git >before-noncanonical &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result noncanonical-result \
+			--updates noncanonical-updates --inputs noncanonical-inputs \
+			--failure noncanonical-failure \
+			>noncanonical.out 2>noncanonical.err &&
+		test_grep "codex.config is not in canonical form" noncanonical.err &&
+		snapshot_refs ../invalid-state.git >after-noncanonical &&
+		test_cmp before-noncanonical after-noncanonical
+	)
+'
+
+test_expect_success 'verify-output rejects malformed generated meta commits' '
+	git init --bare malformed-meta-output.git &&
+	test_create_repo malformed-meta-output-source &&
+	(
+		cd malformed-meta-output-source &&
+		git remote add origin ../malformed-meta-output.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/topic &&
+		write topic topic-file &&
+		git add topic-file &&
+		git commit -m "meta-output topic" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git switch master &&
+		write current master-file &&
+		git add master-file &&
+		git commit -m "meta-output master" &&
+		git push origin master meta codex aa/codex/topic
+	) &&
+
+	git clone malformed-meta-output.git malformed-meta-output-runner &&
+	(
+		cd malformed-meta-output-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		sh "$codex_branch" verify-output \
+			--inputs inputs --updates updates --result result &&
+
+		old_meta=$(awk -F "$(printf '\''\t'\'')" \
+			'\''$1 == "controller" { print $3 }'\'' inputs) &&
+		valid_meta=$(updated_tip meta updates) &&
+		config_blob=$(git rev-parse "$valid_meta:codex.config") &&
+		GIT_INDEX_FILE=$PWD/bad-mode-index \
+			git read-tree "$old_meta^{tree}" &&
+		GIT_INDEX_FILE=$PWD/bad-mode-index git update-index \
+			--add --cacheinfo 100755,"$config_blob",codex.config &&
+		bad_mode_tree=$(GIT_INDEX_FILE=$PWD/bad-mode-index \
+			git write-tree) &&
+		bad_mode_meta=$(printf "%s\n" "meta: invalid config mode" |
+			git commit-tree "$bad_mode_tree" -p "$old_meta") &&
+		awk -F "$(printf '\''\t'\'')" -v OFS="$(printf '\''\t'\'')" \
+			-v meta="$bad_mode_meta" \
+			'\''$1 == "refs/heads/meta" { $3=meta } { print }'\'' \
+			updates >bad-mode-updates &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates bad-mode-updates --result result \
+			>bad-mode.out 2>bad-mode.err &&
+		test_grep "codex.config as one regular blob" bad-mode.err &&
+
+		extra_blob=$(printf "%s\n" extra | git hash-object -w --stdin) &&
+		GIT_INDEX_FILE=$PWD/extra-path-index \
+			git read-tree "$valid_meta^{tree}" &&
+		GIT_INDEX_FILE=$PWD/extra-path-index git update-index \
+			--add --cacheinfo 100644,"$extra_blob",unexpected-meta-path &&
+		extra_tree=$(GIT_INDEX_FILE=$PWD/extra-path-index git write-tree) &&
+		extra_meta=$(printf "%s\n" "meta: invalid extra path" |
+			git commit-tree "$extra_tree" -p "$old_meta") &&
+		awk -F "$(printf '\''\t'\'')" -v OFS="$(printf '\''\t'\'')" \
+			-v meta="$extra_meta" \
+			'\''$1 == "refs/heads/meta" { $3=meta } { print }'\'' \
+			updates >extra-path-updates &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates extra-path-updates --result result \
+			>extra-path.out 2>extra-path.err &&
+		test_grep "changes more than codex.config" extra-path.err
 	)
 '
 

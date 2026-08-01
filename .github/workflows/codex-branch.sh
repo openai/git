@@ -7,7 +7,8 @@ tmp_dir=
 temporary_worktree=
 preserve_worktree=
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
-script_path=$script_dir/$(basename "$0")
+script_path=${CODEX_ENTRYPOINT:-$script_dir/$(basename "$0")}
+meta_config_path=codex.config
 tab=$(printf '\t')
 
 say () {
@@ -22,6 +23,11 @@ die () {
 usage () {
 	cat <<-\EOF
 	usage: codex-branch check-topic <branch>
+	   or: codex-branch initialize [--remote <remote>] [--base <branch>]
+		[--codex <branch>] [--output <path>] [--require-automation]
+	   or: codex-branch refresh [--session <directory>]
+		[--remote <remote>] [--base <branch>] [--codex <branch>]
+		[--rerere-from <branch>] [--require-automation]
 	   or: codex-branch rewrite [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--rerere-from <branch>]
 		[--result <path>] [--updates <path>] [--inputs <path>]
@@ -85,6 +91,13 @@ resolve_commit () {
 		die "'$1' is not a commit"
 }
 
+require_full_commit_oid () {
+	oid=$1
+	resolved=$(resolve_commit "$oid")
+	test "$resolved" = "$oid" ||
+		die "'$oid' is not a full commit object ID"
+}
+
 remote_ref () {
 	printf 'refs/remotes/%s/%s\n' "$1" "$2"
 }
@@ -145,6 +158,8 @@ legacy_control_paths_unchanged () (
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
+		codex \
+		codex.config \
 		t/t9905-codex-branch.sh
 )
 
@@ -159,6 +174,8 @@ meta_control_paths_unchanged () (
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex-branch.sh \
 		.github/workflows/main.yml \
+		codex \
+		codex.config \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		':(glob).github/workflows/*.yml' \
@@ -267,7 +284,7 @@ write_input_snapshot () (
 	output=$7
 
 	{
-		printf 'controller\tmeta\t%s\n' "$controller_oid"
+		printf 'controller\trefs/heads/meta\t%s\n' "$controller_oid"
 		printf 'base\trefs/heads/%s\t%s\n' "$base_name" "$base_oid"
 		printf 'codex\trefs/heads/%s\t%s\n' "$codex_name" "$codex_oid"
 		while IFS="$tab" read -r name oid
@@ -283,15 +300,15 @@ snapshot_inputs () {
 	codex_name=$3
 	output=$4
 	topics_output=$5
-	controller_oid=${6:-}
-
-	if test -z "$controller_oid"
-	then
-		controller_oid=$(resolve_commit HEAD)
-	else
-		controller_oid=$(resolve_commit "$controller_oid")
-	fi
+	controller_oid=${6:-${CODEX_CONTROLLER_OID:-}}
 	remote_controller_oid=$(resolve_commit "$(remote_ref "$remote" meta)")
+
+	if test -n "$controller_oid"
+	then
+		controller_oid=$(resolve_commit "$controller_oid")
+	else
+		controller_oid=$remote_controller_oid
+	fi
 	test "$remote_controller_oid" = "$controller_oid" ||
 		die "current meta does not match the pinned controller"
 	base_oid=$(resolve_commit "$(remote_ref "$remote" "$base_name")")
@@ -323,33 +340,289 @@ state_value () {
 	sed -n '1p' "$state/$key"
 }
 
-map_lookup () {
-	map=$1
-	old=$2
-	awk -F '\t' -v old="$old" '$1 == old { value=$2 } END {
-		if (value != "") print value
-	}' "$map"
+require_state_controller () {
+	state=$1
+	expected=$(state_value "$state" controller-oid)
+	input_controller=$(awk -F '\t' '$1 == "controller" { print $3 }' \
+		"$state/inputs")
+	test "$input_controller" = "$expected" ||
+		die "recovery state controller does not match its pinned input snapshot"
+	expected_helper=$(git rev-parse \
+		"$expected:.github/workflows/codex-branch.sh" 2>/dev/null) ||
+		die "pinned meta $expected has no controller helper"
+	actual_helper=$(git hash-object "$script_dir/$(basename "$0")") ||
+		die "could not verify the recovery controller helper"
+	test "$actual_helper" = "$expected_helper" ||
+		die "the executing controller helper does not match pinned meta $expected"
+	actual=${CODEX_CONTROLLER_OID:-}
+	if test -n "$actual"
+	then
+		actual=$(resolve_commit "$actual")
+		test "$actual" = "$expected" ||
+			die "this recovery session belongs to meta $expected; run continue or publish-topics through that pinned Meta/codex"
+	fi
 }
 
-map_record () {
-	map=$1
-	old=$2
+result_lookup () {
+	results=$1
+	name=$2
+	awk -F '\t' -v name="$name" '$1 == name { value=$2 } END {
+		if (value != "") print value
+	}' "$results"
+}
+
+result_record () {
+	results=$1
+	name=$2
 	new=$3
-	existing=$(map_lookup "$map" "$old")
+	existing=$(result_lookup "$results" "$name")
 	if test -n "$existing"
 	then
 		test "$existing" = "$new" ||
-			die "commit $old was mapped to both $existing and $new"
+			die "topic '$name' was rewritten to both $existing and $new"
 		return
 	fi
-	printf '%s\t%s\n' "$old" "$new" >>"$map" ||
-		die "could not record rewritten commit $old"
+	printf '%s\t%s\n' "$name" "$new" >>"$results" ||
+		die "could not record rewritten topic '$name'"
 }
 
+transform_lookup () {
+	map=$1
+	old=$2
+	old_base=$3
+	new_base=$4
+	awk -F '\t' -v old="$old" -v old_base="$old_base" \
+		-v new_base="$new_base" '
+		$1 == old && $2 == old_base && $3 == new_base { value=$4 }
+		END { if (value != "") print value }
+	' "$map"
+}
+
+transform_record () {
+	map=$1
+	old=$2
+	old_base=$3
+	new_base=$4
+	new=$5
+	existing=$(transform_lookup "$map" "$old" "$old_base" "$new_base")
+	if test -n "$existing"
+	then
+		test "$existing" = "$new" ||
+			die "rewrite $old ($old_base -> $new_base) produced both $existing and $new"
+		return
+	fi
+	printf '%s\t%s\t%s\t%s\n' "$old" "$old_base" "$new_base" "$new" \
+		>>"$map" || die "could not cache rewrite of $old"
+}
+
+config_subsection_quote () (
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+)
+
+write_meta_config () (
+	base_name=$1
+	base_oid=$2
+	codex_name=$3
+	codex_oid=$4
+	rows=$5
+	output=$6
+
+	{
+		printf '[codex]\n'
+		printf '\tversion = 1\n'
+		printf '\tbase-ref = refs/heads/%s\n' "$base_name"
+		printf '\tbase-tip = %s\n' "$base_oid"
+		printf '\toutput-ref = refs/heads/%s\n' "$codex_name"
+		printf '\toutput-tip = %s\n' "$codex_oid"
+		while IFS="$tab" read -r name tip prerequisite
+		do
+			quoted=$(config_subsection_quote "$name")
+			printf '\n[branch "%s"]\n' "$quoted"
+			printf '\tremote = .\n'
+			printf '\tmerge = refs/heads/%s\n' "$prerequisite"
+			printf '\tcodex-tip = %s\n' "$tip"
+		done <"$rows"
+	} >"$output" || die "could not write $meta_config_path"
+)
+
+config_get_one () (
+	config=$1
+	key=$2
+	values=$(git config --no-includes --file "$config" --get-all "$key" || :)
+	test -n "$values" || die "$meta_config_path is missing '$key'"
+	test "$(printf '%s\n' "$values" | wc -l | tr -d ' ')" = 1 ||
+		die "$meta_config_path has more than one '$key'"
+	printf '%s\n' "$values"
+)
+
+published_tip () (
+	rows=$1
+	name=$2
+	awk -F '\t' -v name="$name" '$1 == name { value=$2 }
+		END { if (value != "") print value }' "$rows"
+)
+
+published_prerequisite () (
+	rows=$1
+	name=$2
+	awk -F '\t' -v name="$name" '$1 == name { value=$3 }
+		END { if (value != "") print value }' "$rows"
+)
+
+read_meta_config () (
+	controller_oid=$1
+	base_name=$2
+	codex_name=$3
+	state=$4
+	config=$state/published-config
+	rows=$state/published-topics
+
+	git show "$controller_oid:$meta_config_path" >"$config" 2>/dev/null ||
+		die "meta has no $meta_config_path; run Meta/codex initialize before refreshing"
+	version=$(config_get_one "$config" codex.version)
+	test "$version" = 1 ||
+		die "$meta_config_path has unsupported version '$version'"
+	base_ref=$(config_get_one "$config" codex.base-ref)
+	base_tip=$(config_get_one "$config" codex.base-tip)
+	output_ref=$(config_get_one "$config" codex.output-ref)
+	output_tip=$(config_get_one "$config" codex.output-tip)
+	test "$base_ref" = "refs/heads/$base_name" ||
+		die "$meta_config_path records base '$base_ref', not refs/heads/$base_name"
+	test "$output_ref" = "refs/heads/$codex_name" ||
+		die "$meta_config_path records output '$output_ref', not refs/heads/$codex_name"
+	require_full_commit_oid "$base_tip"
+	require_full_commit_oid "$output_tip"
+
+	: >"$rows"
+	git config --no-includes --file "$config" --get-regexp \
+		'^branch\..*\.codex-tip$' >"$state/published-tip-keys" || :
+	while IFS=' ' read -r key tip
+	do
+		name=${key#branch.}
+		name=${name%.codex-tip}
+		is_active_topic_name "$name" ||
+			die "$meta_config_path records invalid topic '$name'"
+		remote=$(config_get_one "$config" "branch.$name.remote")
+		merge=$(config_get_one "$config" "branch.$name.merge")
+		test "$remote" = . ||
+			die "$meta_config_path gives '$name' non-local remote '$remote'"
+		case "$merge" in
+		"refs/heads/$base_name") prerequisite=$base_name ;;
+		refs/heads/*)
+			prerequisite=${merge#refs/heads/}
+			is_active_topic_name "$prerequisite" ||
+				die "$meta_config_path gives '$name' invalid prerequisite '$merge'"
+			;;
+		*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
+		esac
+		require_full_commit_oid "$tip"
+		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisite" >>"$rows" ||
+			die "could not read '$name' from $meta_config_path"
+	done <"$state/published-tip-keys"
+	LC_ALL=C sort -o "$rows" "$rows"
+	test "$(cut -f1 "$rows" | sort -u | wc -l | tr -d ' ')" = \
+		"$(wc -l <"$rows" | tr -d ' ')" ||
+		die "$meta_config_path records a topic more than once"
+
+	while IFS="$tab" read -r name tip prerequisite
+	do
+		test "$name" != "$prerequisite" ||
+			die "$meta_config_path makes '$name' its own prerequisite"
+		if published_depends_on "$rows" "$prerequisite" "$name"
+		then
+			die "$meta_config_path contains a dependency cycle through '$name'"
+		fi
+		if test "$prerequisite" = "$base_name"
+		then
+			prerequisite_tip=$base_tip
+		else
+			prerequisite_tip=$(published_tip "$rows" "$prerequisite")
+			test -n "$prerequisite_tip" ||
+				die "$meta_config_path records missing prerequisite '$prerequisite' for '$name'"
+		fi
+		git merge-base --is-ancestor "$prerequisite_tip" "$tip" ||
+			die "$meta_config_path boundary for '$name' is not in its published history"
+		git merge-base --is-ancestor "$tip" "$output_tip" ||
+			die "$meta_config_path output does not contain published topic '$name'"
+	done <"$rows"
+	git merge-base --is-ancestor "$base_tip" "$output_tip" ||
+		die "$meta_config_path output is not based on its recorded base"
+
+	write_meta_config "$base_name" "$base_tip" "$codex_name" "$output_tip" \
+		"$rows" "$state/canonical-published-config"
+	cmp -s "$config" "$state/canonical-published-config" ||
+		die "$meta_config_path is not in canonical form"
+	printf '%s\n' "$base_tip" >"$state/published-base-oid"
+	printf '%s\n' "$output_tip" >"$state/published-codex-oid"
+)
+
+topic_contains_commit () (
+	topics=$1
+	commit=$2
+	while IFS="$tab" read -r name tip
+	do
+		if git merge-base --is-ancestor "$commit" "$tip"
+		then
+			return 0
+		fi
+	done <"$topics"
+	return 1
+)
+
+validate_live_codex_delta () (
+	published=$1
+	current=$2
+	topics=$3
+	state=$4
+	test "$published" != "$current" || return 0
+	git merge-base --is-ancestor "$published" "$current" ||
+		die "current codex no longer contains the output recorded by $meta_config_path"
+	git rev-list --first-parent --reverse "$published..$current" \
+		>"$state/codex-first-parent-delta" ||
+		die "could not inspect commits added directly to codex"
+	previous=$published
+	while read -r commit
+	do
+		parents=$(git show -s --format=%P "$commit") ||
+			die "could not inspect codex commit $commit"
+		set -- $parents
+		test $# -ge 1 && test "$1" = "$previous" ||
+			die "codex first-parent history is not based on its recorded output"
+		case "$#" in
+		1)
+			topic_contains_commit "$topics" "$commit" ||
+				die "codex commit $commit is not represented by an active ??/codex/* topic"
+			;;
+		2)
+			second=$2
+			topic_contains_commit "$topics" "$second" ||
+				die "codex merge $commit has no active ??/codex/* topic containing its second parent"
+			if ! git merge-tree --write-tree "$previous" "$second" \
+				>"$state/codex-merge-tree" 2>/dev/null
+			then
+				die "codex merge $commit contains a conflict resolution not represented by a topic; extract it into an active topic before refreshing"
+			fi
+			test "$(wc -l <"$state/codex-merge-tree" | tr -d ' ')" = 1 ||
+				die "could not verify the tree of codex merge $commit"
+			expected_tree=$(sed -n '1p' "$state/codex-merge-tree")
+			actual_tree=$(git rev-parse "$commit^{tree}") ||
+				die "could not inspect the tree of codex merge $commit"
+			test "$expected_tree" = "$actual_tree" ||
+				die "codex merge $commit contains changes not represented by its topic"
+			;;
+		*)
+			die "codex commit $commit is an octopus merge; reconstruct it from one-prerequisite topics before refreshing"
+			;;
+		esac
+		previous=$commit
+	done <"$state/codex-first-parent-delta"
+)
+
 prepare_plan () {
-	base_oid=$1
-	topics=$2
-	state=$3
+	base_name=$1
+	base_oid=$2
+	topics=$3
+	state=$4
 	unique=$state/unique-topic-inputs
 	pairs=$state/topic-pairs
 	plan=$state/plan
@@ -441,7 +714,7 @@ prepare_plan () {
 		count=$(wc -l <"$state/nearest-ancestors" | tr -d ' ')
 		case "$count" in
 		0)
-			prerequisite=master
+			prerequisite=$base_name
 			old_base=$root_base
 			;;
 		1)
@@ -461,20 +734,457 @@ prepare_plan () {
 			"$old_base..$old" | sed -n '1p')
 		test -z "$merge_commit" ||
 			die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
-		printf '%s\t%s\t%s\t%s\n' \
-			"$name" "$old" "$prerequisite" "$old_base" >>"$plan" ||
+		printf '%s\t%s\t%s\t%s\t%s\n' \
+			"$name" "$old" "$prerequisite" "$old_base" "$old_base" \
+			>>"$plan" ||
 			die "could not record the rewrite plan for '$name'"
 	done <"$unique"
 
 	: >"$state/map"
-	while IFS="$tab" read -r name oid
-	do
-		if git merge-base --is-ancestor "$oid" "$base_oid"
-		then
-			map_record "$state/map" "$oid" "$base_oid"
-		fi
-	done <"$topics"
+	: >"$state/results"
 }
+
+published_depends_on () (
+	rows=$1
+	child=$2
+	ancestor=$3
+	limit=$(wc -l <"$rows" | tr -d ' ')
+	steps=0
+	while test "$steps" -le "$limit"
+	do
+		parent=$(published_prerequisite "$rows" "$child")
+		test -n "$parent" || return 1
+		test "$parent" = "$ancestor" && return 0
+		published_tip "$rows" "$parent" >/dev/null || return 1
+		child=$parent
+		steps=$((steps + 1))
+	done
+	die "$meta_config_path contains a dependency cycle"
+)
+
+current_topic_tip () (
+	topics=$1
+	name=$2
+	awk -F '\t' -v name="$name" '$1 == name { value=$2 }
+		END { if (value != "") print value }' "$topics"
+)
+
+effective_topic_tip () (
+	topics=$1
+	name=$2
+	base_oid=$3
+	tip=$(current_topic_tip "$topics" "$name")
+	test -n "$tip" || return 0
+	if git merge-base --is-ancestor "$tip" "$base_oid"
+	then
+		printf '%s\n' "$base_oid"
+	else
+		printf '%s\n' "$tip"
+	fi
+)
+
+root_replay_boundary () (
+	name=$1
+	published_base=$2
+	current_base=$3
+	current_tip=$4
+	state=$5
+	if git merge-base --is-ancestor "$current_base" "$published_base" &&
+		git merge-base --is-ancestor "$published_base" "$current_tip"
+	then
+		printf '%s\n' "$published_base"
+		return
+	fi
+	if git merge-base --is-ancestor "$published_base" "$current_base" &&
+		git merge-base --is-ancestor "$current_base" "$current_tip"
+	then
+		printf '%s\n' "$current_base"
+		return
+	fi
+	if git merge-base --is-ancestor "$published_base" "$current_tip"
+	then
+		git merge-base --all "$current_base" "$current_tip" \
+			>"$state/root-replay-bases" ||
+			die "could not compare '$name' with current master"
+		count=$(wc -l <"$state/root-replay-bases" | tr -d ' ')
+		if test "$count" = 1
+		then
+			shared=$(sed -n '1p' "$state/root-replay-bases")
+			if git merge-base --is-ancestor "$published_base" "$shared"
+			then
+				printf '%s\n' "$shared"
+				return
+			fi
+		fi
+		printf '%s\n' "$published_base"
+		return
+	fi
+	if git merge-base --is-ancestor "$current_base" "$current_tip"
+	then
+		printf '%s\n' "$current_base"
+		return
+	fi
+	git merge-base --all "$current_base" "$current_tip" \
+		>"$state/root-replay-bases" ||
+		die "topic '$name' has no common history with master"
+	count=$(wc -l <"$state/root-replay-bases" | tr -d ' ')
+	test "$count" = 1 ||
+		die "topic '$name' has multiple merge bases with master; restack it before refreshing codex"
+	shared=$(sed -n '1p' "$state/root-replay-bases")
+	git merge-base --is-ancestor "$published_base" "$shared" ||
+		die "topic '$name' forks before the last published master boundary"
+	printf '%s\n' "$shared"
+)
+
+choose_replay_boundary () (
+	name=$1
+	old_base=$2
+	current_base=$3
+	current_tip=$4
+	state=$5
+
+	if git merge-base --is-ancestor "$current_base" "$old_base" &&
+		git merge-base --is-ancestor "$old_base" "$current_tip"
+	then
+		# The prerequisite moved backwards.  Keep the old boundary so its
+		# removed commits do not silently become part of the child topic.
+		printf '%s\n' "$old_base"
+		return
+	fi
+	if git merge-base --is-ancestor "$old_base" "$current_base" &&
+		git merge-base --is-ancestor "$current_base" "$current_tip"
+	then
+		# The child was already advanced or restacked onto the current tip.
+		printf '%s\n' "$current_base"
+		return
+	fi
+	if git merge-base --is-ancestor "$old_base" "$current_tip"
+	then
+		git merge-base --all "$current_base" "$current_tip" \
+			>"$state/replay-bases" ||
+			die "could not compare the old and current prerequisite of '$name'"
+		count=$(wc -l <"$state/replay-bases" | tr -d ' ')
+		if test "$count" = 1
+		then
+			shared=$(sed -n '1p' "$state/replay-bases")
+			if git merge-base --is-ancestor "$old_base" "$shared"
+			then
+				# The child contains an intermediate advance of its parent.
+				printf '%s\n' "$shared"
+				return
+			fi
+		fi
+		# The prerequisite was rewritten while the child stayed on the
+		# last published prerequisite.
+		printf '%s\n' "$old_base"
+		return
+	fi
+	if git merge-base --is-ancestor "$current_base" "$current_tip"
+	then
+		# The child was explicitly restacked and no longer contains the
+		# old published boundary.
+		printf '%s\n' "$current_base"
+		return
+	fi
+
+	die "topic '$name' contains neither its last published nor current prerequisite; restack it explicitly before refreshing codex"
+)
+
+prepare_stateful_plan () (
+	base_name=$1
+	base_oid=$2
+	topics=$3
+	state=$4
+	published=$state/published-topics
+	published_base=$(state_value "$state" published-base-oid)
+	pairs=$state/topic-pairs
+	plan=$state/plan
+
+	# If two current tips are no longer comparable, their old recorded edge
+	# still proves ownership across a prerequisite rewrite.  New incomparable
+	# topics must not share an unrepresented private prefix.
+	awk -F '\t' '
+		{ name[NR]=$1; oid[NR]=$2 }
+		END {
+			for (i = 1; i <= NR; i++)
+				for (j = i + 1; j <= NR; j++)
+					printf "%s\t%s\t%s\t%s\n",
+						name[i], oid[i], name[j], oid[j]
+		}
+	' "$topics" >"$pairs" || die "could not enumerate topic pairs"
+	while IFS="$tab" read -r left_name left_oid right_name right_oid
+	do
+		test "$left_oid" = "$right_oid" && continue
+		if git merge-base --is-ancestor "$left_oid" "$right_oid" ||
+			git merge-base --is-ancestor "$right_oid" "$left_oid"
+		then
+			continue
+		fi
+		if published_depends_on "$published" "$left_name" "$right_name" ||
+			published_depends_on "$published" "$right_name" "$left_name"
+		then
+			continue
+		fi
+		git merge-base --all "$left_oid" "$right_oid" \
+			>"$state/shared-bases" ||
+			die "could not find the shared history of '$left_name' and '$right_name'"
+		count=$(wc -l <"$state/shared-bases" | tr -d ' ')
+		test "$count" = 1 ||
+			die "topics '$left_name' and '$right_name' have multiple merge bases; restack them into a one-prerequisite topic graph"
+		shared=$(sed -n '1p' "$state/shared-bases")
+		if git merge-base --is-ancestor "$shared" "$base_oid" ||
+			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
+				END { exit !found }' "$topics"
+		then
+			continue
+		fi
+		die "topics '$left_name' and '$right_name' share private commits through $shared; create an active ??/codex/* prerequisite topic at that shared prefix or restack the branches"
+	done <"$pairs"
+
+	: >"$plan"
+	while IFS="$tab" read -r name current_tip
+	do
+		old_base=
+		reparented=
+		: >"$state/topic-ancestors"
+		while IFS="$tab" read -r other_name other_tip
+		do
+			test "$other_name" = "$name" && continue
+			test "$other_tip" = "$current_tip" && continue
+			git merge-base --is-ancestor "$other_tip" "$base_oid" &&
+				continue
+			if git merge-base --is-ancestor "$other_tip" "$current_tip"
+			then
+				printf '%s\t%s\n' "$other_name" "$other_tip" \
+					>>"$state/topic-ancestors" ||
+					die "could not record a current prerequisite for '$name'"
+			fi
+		done <"$topics"
+		: >"$state/nearest-ancestors"
+		while IFS="$tab" read -r ancestor_name ancestor_tip
+		do
+			near=t
+			while IFS="$tab" read -r other_name other_tip
+			do
+				test "$ancestor_tip" = "$other_tip" && continue
+				if git merge-base --is-ancestor "$ancestor_tip" "$other_tip"
+				then
+					near=
+					break
+				fi
+			done <"$state/topic-ancestors"
+			test -z "$near" || printf '%s\t%s\n' \
+				"$ancestor_name" "$ancestor_tip" \
+				>>"$state/nearest-ancestors"
+		done <"$state/topic-ancestors"
+		published_tip_oid=$(published_tip "$published" "$name")
+		count=$(wc -l <"$state/nearest-ancestors" | tr -d ' ')
+		case "$count" in
+		0) current_nearest= ; current_nearest_tip= ;;
+		1) IFS="$tab" read -r current_nearest current_nearest_tip \
+			<"$state/nearest-ancestors" ;;
+		*)
+			current_nearest=
+			if test -n "$published_tip_oid"
+			then
+				old_prerequisite=$(published_prerequisite "$published" "$name")
+				current_nearest_tip=$(awk -F '\t' \
+					-v name="$old_prerequisite" '$1 == name { print $2 }' \
+					"$state/nearest-ancestors")
+				test -z "$current_nearest_tip" ||
+					current_nearest=$old_prerequisite
+			fi
+			if test -z "$current_nearest"
+			then
+				unique_nearest_tips=$(cut -f2 "$state/nearest-ancestors" |
+					sort -u | wc -l | tr -d ' ')
+				if test "$unique_nearest_tips" = 1
+				then
+					IFS="$tab" read -r current_nearest current_nearest_tip \
+						<"$state/nearest-ancestors"
+				fi
+			fi
+			if test -z "$current_nearest"
+			then
+				prerequisites=$(cut -f1 "$state/nearest-ancestors" |
+					LC_ALL=C sort | tr '\n' ' ')
+				die "topic '$name' has more than one nearest current prerequisite ($prerequisites); configure or restack it onto one topic"
+			fi
+			;;
+		esac
+
+		if test -n "$published_tip_oid"
+		then
+			old_prerequisite=$(published_prerequisite "$published" "$name")
+			if test "$old_prerequisite" = "$base_name"
+			then
+				published_prerequisite_tip=$published_base
+				old_prerequisite_tip=$base_oid
+			else
+				published_prerequisite_tip=$(published_tip \
+					"$published" "$old_prerequisite")
+				old_prerequisite_tip=$(effective_topic_tip "$topics" \
+					"$old_prerequisite" "$base_oid")
+			fi
+			if test "$old_prerequisite" != "$base_name" &&
+				test -n "$old_prerequisite_tip"
+			then
+				git merge-base --all "$old_prerequisite_tip" \
+					"$published_tip_oid" >"$state/ownership-bases" ||
+					die "could not verify ownership between '$old_prerequisite' and '$name'"
+				if test "$(wc -l <"$state/ownership-bases" | tr -d ' ')" = 1
+				then
+					ownership_base=$(sed -n '1p' "$state/ownership-bases")
+					if test "$ownership_base" != "$published_prerequisite_tip" &&
+						git merge-base --is-ancestor \
+							"$published_prerequisite_tip" "$ownership_base" &&
+						! git merge-base --is-ancestor "$ownership_base" "$base_oid" &&
+						test "$current_tip" != "$old_prerequisite_tip"
+					then
+						die "prerequisite '$old_prerequisite' now contains commits previously owned by '$name'; restack or retire the affected topic explicitly"
+					fi
+				fi
+			fi
+			published_parent_is_upstream=
+			if test "$old_prerequisite" != "$base_name" &&
+				git merge-base --is-ancestor "$published_prerequisite_tip" \
+					"$base_oid"
+			then
+				published_parent_is_upstream=t
+			fi
+			if test -n "$current_nearest" &&
+				test "$current_nearest" != "$old_prerequisite"
+			then
+				# An exact active topic tip in the current history is an
+				# explicit restack (and may intentionally insert or reorder
+				# a prerequisite).
+				prerequisite=$current_nearest
+				prerequisite_tip=$current_nearest_tip
+				reparented=t
+			elif test "$old_prerequisite" != "$base_name" &&
+				test -n "$old_prerequisite_tip" &&
+				test "$old_prerequisite_tip" = "$current_tip"
+			then
+				# Equal-tip aliases do not appear in the nearest-ancestor
+				# search, but retain their configured edge.
+				prerequisite=$old_prerequisite
+				prerequisite_tip=$old_prerequisite_tip
+				reparented=
+			elif test "$old_prerequisite" != "$base_name" &&
+				{ test -n "$published_parent_is_upstream" ||
+					! git merge-base --is-ancestor \
+						"$published_prerequisite_tip" "$current_tip"; } &&
+				git merge-base --is-ancestor "$base_oid" "$current_tip"
+			then
+				# With the published prerequisite absent, a root history is
+				# an explicit restack onto master.
+				prerequisite=$base_name
+				prerequisite_tip=$base_oid
+				old_base=$base_oid
+				reparented=t
+			elif test "$old_prerequisite" = "$base_name" ||
+				test -n "$old_prerequisite_tip"
+			then
+				prerequisite=$old_prerequisite
+				prerequisite_tip=$old_prerequisite_tip
+				reparented=
+			else
+				die "published prerequisite '$old_prerequisite' of '$name' was retired while '$name' still contains its old boundary; restack '$name' onto a surviving topic or current master first"
+			fi
+
+			if test "$reparented" = t
+			then
+				git merge-base --is-ancestor "$prerequisite_tip" \
+					"$current_tip" ||
+					die "new prerequisite '$prerequisite' is not in '$name'"
+				test -n "${old_base:-}" || old_base=$prerequisite_tip
+			else
+				old_base=$(choose_replay_boundary "$name" \
+					"$published_prerequisite_tip" "$prerequisite_tip" \
+					"$current_tip" "$state")
+			fi
+		else
+			if test -n "$current_nearest"
+			then
+				prerequisite=$current_nearest
+				prerequisite_tip=$current_nearest_tip
+			else
+				prerequisite=$base_name
+				prerequisite_tip=$base_oid
+			fi
+			if test "$prerequisite" = "$base_name"
+			then
+				old_base=$(root_replay_boundary "$name" "$published_base" \
+					"$prerequisite_tip" "$current_tip" "$state")
+			elif git merge-base --is-ancestor "$prerequisite_tip" "$current_tip"
+			then
+				old_base=$prerequisite_tip
+			else
+				die "new topic '$name' is not based on '$prerequisite'"
+			fi
+		fi
+
+		merge_commit=$(git rev-list --min-parents=2 \
+			"$old_base..$current_tip" | sed -n '1p')
+		test -z "$merge_commit" ||
+			die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
+		printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$current_tip" \
+			"$prerequisite" "$old_base" "$prerequisite_tip" >>"$plan" ||
+			die "could not record the stateful rewrite plan for '$name'"
+	done <"$topics"
+	while IFS="$tab" read -r name current_tip prerequisite old_base prerequisite_tip
+	do
+		test "$name" != "$prerequisite" ||
+			die "topic '$name' cannot be its own prerequisite"
+		if test "$prerequisite" != "$base_name"
+		then
+			current_topic_tip "$topics" "$prerequisite" >/dev/null ||
+				die "topic '$name' has missing prerequisite '$prerequisite'"
+			if published_depends_on "$plan" "$prerequisite" "$name"
+			then
+				die "current topic prerequisites contain a cycle through '$name'"
+			fi
+		fi
+	done <"$plan"
+	while IFS="$tab" read -r left_name left_oid right_name right_oid
+	do
+		test "$left_oid" = "$right_oid" && continue
+		if git merge-base --is-ancestor "$left_oid" "$right_oid" ||
+			git merge-base --is-ancestor "$right_oid" "$left_oid" ||
+			published_depends_on "$plan" "$left_name" "$right_name" ||
+			published_depends_on "$plan" "$right_name" "$left_name"
+		then
+			continue
+		fi
+		git merge-base --all "$left_oid" "$right_oid" \
+			>"$state/final-shared-bases" ||
+			die "could not validate the final topic ownership graph"
+		test "$(wc -l <"$state/final-shared-bases" | tr -d ' ')" = 1 ||
+			die "topics '$left_name' and '$right_name' have multiple merge bases after reparenting"
+		shared=$(sed -n '1p' "$state/final-shared-bases")
+		if git merge-base --is-ancestor "$shared" "$base_oid" ||
+			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
+				END { exit !found }' "$topics"
+		then
+			continue
+		fi
+		die "topics '$left_name' and '$right_name' would become siblings while sharing private commits through $shared; create a prerequisite topic at that prefix or restack them"
+	done <"$pairs"
+
+	# A removed topic is a valid retirement only when no surviving topic still
+	# records it as its prerequisite.
+	while IFS="$tab" read -r old_name old_tip old_prerequisite
+	do
+		current_topic_tip "$topics" "$old_name" >/dev/null && continue
+		if awk -F '\t' -v prerequisite="$old_name" \
+			'$3 == prerequisite { found=1 } END { exit !found }' "$plan"
+		then
+			die "published topic '$old_name' was removed while an active topic still depends on it"
+		fi
+	done <"$published"
+	: >"$state/map"
+	: >"$state/results"
+)
 
 rebase_in_progress () {
 	worktree=$1
@@ -605,8 +1315,20 @@ process_ready_topics () {
 	ready=$3
 	while IFS="$tab" read -r name old prerequisite old_base new_base
 	do
-		test -z "$(map_lookup "$state/map" "$old")" || continue
-		if rebase_topic "$worktree" "$name" "$old" "$old_base" "$new_base"
+		new=$(transform_lookup "$state/map" "$old" "$old_base" \
+			"$new_base")
+		if test -n "$new"
+		then
+			result_record "$state/results" "$name" "$new"
+			continue
+		fi
+		if test "$old" = "$old_base"
+		then
+			new=$new_base
+		elif test "$old_base" = "$new_base"
+		then
+			new=$old
+		elif rebase_topic "$worktree" "$name" "$old" "$old_base" "$new_base"
 		then
 			new=$(completed_topic_tip "$worktree" "$name" \
 				"$old" "$new_base")
@@ -614,12 +1336,14 @@ process_ready_topics () {
 				-c advice.detachedHead=false switch --detach "$new" \
 				>/dev/null 2>&1 ||
 				die "could not detach at the rebased tip for '$name'"
-			map_record "$state/map" "$old" "$new"
 		else
 			record_rebase_failure "$worktree" "$state" "$name" \
 				"$old" "$old_base" "$new_base" || return 1
 			return 1
 		fi
+		transform_record "$state/map" "$old" "$old_base" "$new_base" \
+			"$new"
+		result_record "$state/results" "$name" "$new"
 	done <"$ready"
 }
 
@@ -648,12 +1372,12 @@ train_rerere () (
 
 finish_updates () {
 	state=$1
-	map=$state/map
+	results=$state/results
 	updates=$state/topic-updates
 	: >"$updates" || die "could not prepare topic updates"
 	while IFS="$tab" read -r name old
 	do
-		new=$(map_lookup "$map" "$old")
+		new=$(result_lookup "$results" "$name")
 		test -n "$new" || die "topic '$name' was not rewritten"
 		printf 'refs/heads/%s\t%s\t%s\n' "$name" "$old" "$new" \
 			>>"$updates" || die "could not record update for '$name'"
@@ -666,9 +1390,14 @@ write_complete_updates () {
 	output=$3
 	codex_name=$(state_value "$state" codex-name)
 	codex_oid=$(state_value "$state" codex-oid)
+	controller_oid=$(state_value "$state" controller-oid)
+	meta_oid=$(state_value "$state" meta-oid)
 
 	cp "$state/topic-updates" "$output.unsorted" ||
 		die "could not prepare complete update manifest"
+	printf 'refs/heads/meta\t%s\t%s\n' \
+		"$controller_oid" "$meta_oid" >>"$output.unsorted" ||
+		die "could not record the meta state update"
 	printf 'refs/heads/%s\t%s\t%s\n' \
 		"$codex_name" "$codex_oid" "$candidate" >>"$output.unsorted" ||
 		die "could not record the codex update"
@@ -677,10 +1406,71 @@ write_complete_updates () {
 	rm -f "$output.unsorted"
 }
 
+write_next_meta_config () (
+	state=$1
+	candidate=$2
+	rows=$state/next-published-topics
+	: >"$rows"
+	while IFS="$tab" read -r name old
+	do
+		new=$(result_lookup "$state/results" "$name")
+		test -n "$new" || die "topic '$name' has no rewritten tip"
+		prerequisite=$(awk -F '\t' -v name="$name" \
+			'$1 == name { value=$3 } END { if (value != "") print value }' \
+			"$state/plan")
+		test -n "$prerequisite" ||
+			die "topic '$name' has no recorded prerequisite"
+		printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" >>"$rows" ||
+			die "could not record next state for '$name'"
+	done <"$state/topics"
+	LC_ALL=C sort -o "$rows" "$rows"
+	write_meta_config "$(state_value "$state" base-name)" \
+		"$(state_value "$state" base-oid)" \
+		"$(state_value "$state" codex-name)" "$candidate" \
+		"$rows" "$state/next-meta-config"
+)
+
+create_meta_commit () (
+	state=$1
+	controller_oid=$(state_value "$state" controller-oid)
+	write_next_meta_config "$state" "$2"
+
+	if git diff --no-index --quiet "$state/published-config" \
+		"$state/next-meta-config"
+	then
+		printf '%s\n' "$controller_oid" >"$state/meta-oid"
+		return
+	fi
+
+	index=$state/meta-index
+	rm -f "$index"
+	blob=$(git hash-object -w "$state/next-meta-config") ||
+		die "could not store the next $meta_config_path"
+	GIT_INDEX_FILE=$index git read-tree "$controller_oid^{tree}" ||
+		die "could not read the pinned meta tree"
+	GIT_INDEX_FILE=$index git update-index --add --cacheinfo \
+		100644,"$blob","$meta_config_path" ||
+		die "could not add the next $meta_config_path"
+	tree=$(GIT_INDEX_FILE=$index git write-tree) ||
+		die "could not write the next meta tree"
+	message=$(printf 'meta: record refreshed Codex topics\n\nUpdate the generated topic prerequisites and published boundaries after a successful Codex refresh.\n')
+	meta_oid=$(printf '%s' "$message" | git -c commit.gpgSign=false \
+		commit-tree "$tree" -p "$controller_oid") ||
+		die "could not create the next meta state commit"
+	printf '%s\n' "$meta_oid" >"$state/meta-oid"
+	git diff-tree --no-commit-id --name-only -r \
+		"$controller_oid" "$meta_oid" >"$state/meta-changed-paths" ||
+		die "could not inspect the next meta commit"
+	printf '%s\n' "$meta_config_path" >"$state/expected-meta-changed-paths"
+	cmp -s "$state/meta-changed-paths" "$state/expected-meta-changed-paths" ||
+		die "generated meta commit changes more than $meta_config_path"
+)
+
 process_plan () {
 	worktree=$1
 	state=$2
 	base_oid=$(state_value "$state" base-oid)
+	base_name=$(state_value "$state" base-name)
 	plan=$state/plan
 	ready=$state/ready
 	pending=$state/pending
@@ -690,20 +1480,26 @@ process_plan () {
 		: >"$ready"
 		: >"$pending"
 		progress=
-		while IFS="$tab" read -r name old prerequisite old_base
+		while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
 		do
-			test -z "$(map_lookup "$state/map" "$old")" || continue
+			test -z "$(result_lookup "$state/results" "$name")" || continue
 			printf '%s\n' "$name" >>"$pending"
-			if test "$prerequisite" = master
+			if test "$prerequisite" = "$base_name"
 			then
 				new_base=$base_oid
 			else
-				new_base=$(map_lookup "$state/map" "$old_base")
+				new_base=$(result_lookup "$state/results" "$prerequisite")
 				test -n "$new_base" || continue
+			fi
+			if test "$old" = "$old_base"
+			then
+				result_record "$state/results" "$name" "$new_base"
+				progress=t
+				continue
 			fi
 			if test "$old_base" = "$new_base"
 			then
-				map_record "$state/map" "$old" "$old"
+				result_record "$state/results" "$name" "$old"
 				progress=t
 				continue
 			fi
@@ -752,8 +1548,9 @@ write_failure () {
 		say '```sh'
 		printf 'git fetch %s +refs/heads/\\*:refs/remotes/%s/\\*\n' \
 			"$(shell_quote "$remote")" "$remote"
-		printf 'git switch --detach %s\n' "$(shell_quote "$controller_oid")"
-		printf './.github/workflows/codex-branch.sh resolve \\\n'
+		printf 'git worktree add --detach Meta %s\n' \
+			"$(shell_quote "$controller_oid")"
+		printf 'Meta/codex resolve \\\n'
 		printf '  --remote %s --base %s --codex %s \\\n' \
 			"$(shell_quote "$remote")" \
 			"$(shell_quote "$base_name")" \
@@ -778,7 +1575,7 @@ write_failure () {
 		say '```'
 		say
 		say "Repeat edit/add/continue until that rebase finishes, then run the"
-		say "\`codex-branch continue\` command printed by the helper. It finishes"
+		say "\`Meta/codex continue\` command printed by the helper. It finishes"
 		say "the remaining graph and prints one exact-lease atomic topic push."
 		say "That final command is a \`git push --force-with-lease=... --atomic\`"
 		say "transaction covering every rewritten topic ref."
@@ -924,8 +1721,11 @@ assemble_candidate () {
 	candidate=$(git -C "$worktree" rev-parse HEAD) ||
 		die "could not resolve the codex candidate"
 	require_automation=$(state_value "$state" require-automation)
-	verify_control_paths "$state/inputs" "$state/topic-updates" \
-		"$candidate" "$state" "$require_automation"
+	if ! test -f "$state/initializing"
+	then
+		verify_control_paths "$state/inputs" "$state/topic-updates" \
+			"$candidate" "$state" "$require_automation"
+	fi
 
 	printf '%s\n' "$candidate"
 }
@@ -935,11 +1735,26 @@ create_bundle () {
 	state=$2
 	candidate=$3
 	base_oid=$(state_value "$state" base-oid)
+	controller_oid=$(state_value "$state" controller-oid)
+	meta_oid=$(state_value "$state" meta-oid)
 
 	test ! -e "$bundle" || die "bundle path '$bundle' already exists"
 	git update-ref refs/codex-output/candidate "$candidate" ||
 		die "could not retain the bundle candidate"
 	set -- git bundle create "$bundle" refs/codex-output/candidate
+	if test "$meta_oid" != "$controller_oid"
+	then
+		git update-ref refs/codex-output/meta "$meta_oid" ||
+			die "could not retain the next meta state"
+		set -- "$@" refs/codex-output/meta
+		# Test and migration repositories may have a non-orphan meta whose
+		# old history contains the candidate. Excluding that history would
+		# also suppress the candidate head from the bundle.
+		if ! git merge-base --is-ancestor "$candidate" "$controller_oid"
+		then
+			set -- "$@" "^$controller_oid"
+		fi
+	fi
 	if test "$candidate" = "$base_oid"
 	then
 		parents=$(git show -s --format=%P "$candidate") ||
@@ -958,10 +1773,12 @@ create_bundle () {
 	if ! "$@"
 	then
 		git update-ref -d refs/codex-output/candidate || :
+		git update-ref -d refs/codex-output/meta || :
 		die "could not create candidate bundle"
 	fi
 	git update-ref -d refs/codex-output/candidate ||
 		die "could not remove the temporary bundle ref"
+	git update-ref -d refs/codex-output/meta || :
 }
 
 initialize_rewrite () {
@@ -980,6 +1797,8 @@ initialize_rewrite () {
 	cp "$topics" "$state/topics"
 	controller_oid=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
+	base_name=${base_ref#refs/heads/}
 	codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
 	printf '%s\n' "$controller_oid" >"$state/controller-oid"
 	printf '%s\n' "$remote" >"$state/remote"
@@ -991,11 +1810,217 @@ initialize_rewrite () {
 	printf '%s\n' "$require_automation" >"$state/require-automation"
 	printf '%s\n' "$script_path" >"$state/helper"
 
-	prepare_plan "$base_oid" "$state/topics" "$state"
+	read_meta_config "$controller_oid" "$base_name" "$codex_name" "$state"
+	published_codex_oid=$(state_value "$state" published-codex-oid)
+	validate_live_codex_delta "$published_codex_oid" "$codex_oid" \
+		"$state/topics" "$state"
+	prepare_stateful_plan "$base_name" "$base_oid" "$state/topics" "$state"
 	if test -n "$rerere_name" && test "$codex_oid" != "$base_oid"
 	then
 		train_rerere "$worktree" "$base_oid" "$codex_oid"
 	fi
+}
+
+initialize_config () {
+	remote=origin
+	base_name=master
+	codex_name=codex
+	initialize_output=
+	require_automation=
+	while test $# -gt 0
+	do
+		case "$1" in
+		--remote) require_arg "$@"; remote=$2; shift 2 ;;
+		--base) require_arg "$@"; base_name=$2; shift 2 ;;
+		--codex) require_arg "$@"; codex_name=$2; shift 2 ;;
+		--output) require_arg "$@"; initialize_output=$2; shift 2 ;;
+		--require-automation) require_automation=t; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown initialize option '$1'" ;;
+		esac
+	done
+
+	make_tmp_dir
+	require_full_repository
+	inputs=$tmp_dir/inputs
+	topics=$tmp_dir/topics
+	fetch_heads "$remote"
+	snapshot_inputs "$remote" "$base_name" "$codex_name" "$inputs" \
+		"$topics"
+	controller_oid=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
+	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
+	if git cat-file -e "$controller_oid:$meta_config_path" 2>/dev/null
+	then
+		die "meta already contains $meta_config_path; run refresh instead"
+	fi
+
+	set -- git merge-base --all --octopus "$base_oid" "$codex_oid"
+	while IFS="$tab" read -r name tip
+	do
+		set -- "$@" "$tip"
+	done <"$topics"
+	"$@" >"$tmp_dir/initial-bases" ||
+		die "could not infer the common published base"
+	test "$(wc -l <"$tmp_dir/initial-bases" | tr -d ' ')" = 1 ||
+		die "master, codex, and the active topics do not have one unambiguous common base"
+	published_base=$(sed -n '1p' "$tmp_dir/initial-bases")
+	require_full_commit_oid "$published_base"
+	git merge-base --is-ancestor "$published_base" "$codex_oid" ||
+		die "the inferred published base is not in codex"
+	while IFS="$tab" read -r name tip
+	do
+		git merge-base --is-ancestor "$tip" "$codex_oid" ||
+			die "active topic '$name' is not contained by the known-good codex branch"
+	done <"$topics"
+
+	worktree=$tmp_dir/initialize-worktree
+	temporary_worktree=$worktree
+	git -c core.fsmonitor=false worktree add --detach "$worktree" \
+		"$published_base" >/dev/null ||
+		die "could not create the initialization worktree"
+	state=$(state_path "$worktree")
+	mkdir -p "$state"
+	cp "$topics" "$state/topics"
+	awk -F '\t' -v OFS='\t' -v base="$published_base" \
+		'$1 == "base" { $3=base } { print }' "$inputs" >"$state/inputs"
+	printf '%s\n' "$controller_oid" >"$state/controller-oid"
+	printf '%s\n' "$remote" >"$state/remote"
+	printf '%s\n' "$base_name" >"$state/base-name"
+	printf '%s\n' "$published_base" >"$state/base-oid"
+	printf '%s\n' "$codex_name" >"$state/codex-name"
+	printf '%s\n' "$codex_oid" >"$state/codex-oid"
+	printf '%s\n' "$require_automation" >"$state/require-automation"
+	printf '%s\n' "$script_path" >"$state/helper"
+	: >"$state/initializing"
+	prepare_plan "$base_name" "$published_base" "$state/topics" "$state"
+	mv "$state/plan" "$state/unique-plan" ||
+		die "could not retain the inferred initialization plan"
+	: >"$state/plan"
+	while IFS="$tab" read -r name tip
+	do
+		row=$(awk -F '\t' -v tip="$tip" '$2 == tip { print; exit }' \
+			"$state/unique-plan")
+		test -n "$row" || die "could not infer a prerequisite for '$name'"
+		IFS="$tab" read -r representative ignored prerequisite old_base prerequisite_tip <<-EOF
+		$row
+		EOF
+		printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$tip" \
+			"$prerequisite" "$old_base" "$prerequisite_tip" \
+			>>"$state/plan"
+	done <"$state/topics"
+	: >"$state/results"
+	: >"$state/map"
+	while IFS="$tab" read -r name tip prerequisite old_base prerequisite_tip
+	do
+		if test "$prerequisite" = "$base_name"
+		then
+			test "$old_base" = "$published_base" ||
+				die "root topic '$name' is not based on the inferred published base"
+		else
+			parent_tip=$(current_topic_tip "$state/topics" "$prerequisite")
+			test -n "$parent_tip" && test "$old_base" = "$parent_tip" ||
+				die "topic '$name' is not based on the exact tip of '$prerequisite'"
+		fi
+		result_record "$state/results" "$name" "$tip"
+	done <"$state/plan"
+	finish_updates "$state"
+	if test "$codex_oid" != "$published_base"
+	then
+		train_rerere "$worktree" "$published_base" "$codex_oid"
+	fi
+	if ! candidate=$(assemble_candidate "$worktree" "$state")
+	then
+		die "active topics cannot reconstruct the known-good codex branch"
+	fi
+	test "$(git rev-parse "$candidate^{tree}")" = \
+		"$(git rev-parse "$codex_oid^{tree}")" ||
+		die "active topics do not reconstruct the known-good codex tree; extract every shipped patch into a topic before initializing"
+	if test -n "$require_automation"
+	then
+		verify_control_paths "$state/inputs" "$state/topic-updates" \
+			"$candidate" "$state" "$require_automation"
+	fi
+
+	: >"$state/initial-topics"
+	while IFS="$tab" read -r name tip prerequisite old_base prerequisite_tip
+	do
+		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisite" \
+			>>"$state/initial-topics"
+	done <"$state/plan"
+	LC_ALL=C sort -o "$state/initial-topics" "$state/initial-topics"
+	write_meta_config "$base_name" "$published_base" "$codex_name" \
+		"$codex_oid" "$state/initial-topics" "$state/initial-config"
+	if test -z "$initialize_output"
+	then
+		meta_worktree=${CODEX_META_WORKTREE:-}
+		test -n "$meta_worktree" ||
+			die "initialize must be run as Meta/codex (or with --output)"
+		test -z "$(git -C "$meta_worktree" -c core.fsmonitor=false status --porcelain)" ||
+			die "Meta worktree must be clean before initialization"
+		initialize_output=$meta_worktree/$meta_config_path
+	fi
+	case "$initialize_output" in
+	/*) ;;
+	*) initialize_output=$(pwd)/$initialize_output ;;
+	esac
+	test ! -e "$initialize_output" ||
+		die "initialization output '$initialize_output' already exists"
+	cp "$state/initial-config" "$initialize_output" ||
+		die "could not write initialization output '$initialize_output'"
+	say "verified that the active topics reconstruct known-good codex tree $(git rev-parse "$codex_oid^{tree}")"
+	say "wrote $initialize_output; no refs were updated"
+	say "review and commit only $meta_config_path on meta before running Refresh codex"
+}
+
+local_refresh () {
+	remote=origin
+	base_name=master
+	codex_name=codex
+	rerere_name=codex
+	session=
+	require_automation=
+	while test $# -gt 0
+	do
+		case "$1" in
+		--session) require_arg "$@"; session=$2; shift 2 ;;
+		--remote) require_arg "$@"; remote=$2; shift 2 ;;
+		--base) require_arg "$@"; base_name=$2; shift 2 ;;
+		--codex) require_arg "$@"; codex_name=$2; shift 2 ;;
+		--rerere-from) require_arg "$@"; rerere_name=$2; shift 2 ;;
+		--require-automation) require_automation=t; shift ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown refresh option '$1'" ;;
+		esac
+	done
+	if test -z "$session"
+	then
+		common_dir=$(git rev-parse --path-format=absolute --git-common-dir) ||
+			die "could not locate the shared repository state"
+		mkdir -p "$common_dir/codex-refresh" ||
+			die "could not create local refresh storage"
+		session=$(mktemp -d "$common_dir/codex-refresh/session.XXXXXX") ||
+			die "could not create a local refresh session"
+	else
+		case "$session" in
+		/*) ;;
+		*) session=$(pwd)/$session ;;
+		esac
+		test ! -e "$session" || die "refresh session '$session' already exists"
+		mkdir -p "$session" || die "could not create refresh session '$session'"
+	fi
+	set -- --remote "$remote" --base "$base_name" --codex "$codex_name" \
+		--rerere-from "$rerere_name" \
+		--result "$session/codex-candidate" \
+		--updates "$session/codex-updates" \
+		--inputs "$session/codex-inputs" \
+		--bundle "$session/codex.bundle" \
+		--failure "$session/codex-conflict.md"
+	test -z "$require_automation" || set -- "$@" --require-automation
+	fetch_heads "$remote"
+	rewrite "$@"
+	say "local refresh session: $session"
+	say "no refs were updated; inspect codex-updates and codex.bundle"
 }
 
 rewrite () {
@@ -1083,6 +2108,7 @@ rewrite () {
 	then
 		candidate=$codex_oid
 	fi
+	create_meta_commit "$state" "$candidate"
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
 
 	test -z "$result_file" || printf '%s\n' "$candidate" >"$result_file"
@@ -1145,7 +2171,18 @@ prepare_input_graph () {
 	done <"$graph/topics"
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 	test -n "$base_oid" || die "input snapshot has no base commit"
-	prepare_plan "$base_oid" "$graph/topics" "$graph"
+	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
+	base_name=${base_ref#refs/heads/}
+	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
+	codex_ref=$(awk -F '\t' '$1 == "codex" { print $2 }' "$inputs")
+	controller_oid=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
+	base_name=${base_ref#refs/heads/}
+	codex_name=${codex_ref#refs/heads/}
+	read_meta_config "$controller_oid" "$base_name" "$codex_name" "$graph"
+	codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
+	validate_live_codex_delta "$(state_value "$graph" published-codex-oid)" \
+		"$codex_oid" "$graph/topics" "$graph"
+	prepare_stateful_plan "$base_name" "$base_oid" "$graph/topics" "$graph"
 }
 
 topic_control_paths_unchanged () (
@@ -1160,6 +2197,8 @@ topic_control_paths_unchanged () (
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
 		.github/workflows/main.yml \
+		codex \
+		codex.config \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		':(glob).github/workflows/*.yml' \
@@ -1192,16 +2231,18 @@ verify_control_paths () {
 	automation_count=0
 	while IFS="$tab" read -r ref old new
 	do
-		test "$ref" != refs/heads/codex || continue
+		case "$ref" in
+		refs/heads/meta|refs/heads/codex) continue ;;
+		esac
 		name=${ref#refs/heads/}
-		plan_row=$(awk -F '\t' -v old="$old" '$2 == old { print; exit }' \
+		plan_row=$(awk -F '\t' -v name="$name" '$1 == name { print; exit }' \
 			"$graph/plan")
 		test -n "$plan_row" ||
 			die "input graph has no rewrite range for '$ref'"
-		IFS="$tab" read -r canonical_name plan_old prerequisite old_base <<-EOF
+		IFS="$tab" read -r canonical_name plan_old prerequisite old_base prerequisite_tip <<-EOF
 		$plan_row
 		EOF
-		if test "$prerequisite" = master
+		if test "$prerequisite" = "$base_name"
 		then
 			dependency_new=$base_oid
 		else
@@ -1239,6 +2280,72 @@ verify_control_paths () {
 		die "exactly one active ??/codex/automation topic is required"
 }
 
+verify_meta_update () (
+	inputs=$1
+	updates=$2
+	candidate=$3
+	graph=$4
+	old_meta=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
+	new_meta=$(awk -F '\t' '$1 == "refs/heads/meta" { print $3 }' "$updates")
+	test -n "$new_meta" || die "updates contain no meta state commit"
+	resolve_commit "$new_meta" >/dev/null
+	if test "$new_meta" != "$old_meta"
+	then
+		parents=$(git show -s --format=%P "$new_meta") ||
+			die "could not inspect the next meta state commit"
+		test "$parents" = "$old_meta" ||
+			die "next meta state is not a direct child of the pinned controller"
+		git diff-tree --no-commit-id --name-only -r \
+			"$old_meta" "$new_meta" >"$graph/meta-changed-paths" ||
+			die "could not inspect changed meta paths"
+		printf '%s\n' "$meta_config_path" >"$graph/expected-meta-changed-paths"
+		cmp -s "$graph/meta-changed-paths" \
+			"$graph/expected-meta-changed-paths" ||
+			die "next meta state changes more than $meta_config_path"
+	fi
+	git ls-tree "$new_meta" -- "$meta_config_path" \
+		>"$graph/meta-config-entry" ||
+		die "could not inspect $meta_config_path in the next meta state"
+	awk -v path="$meta_config_path" '
+		{
+			actual=$0
+			sub(/^[^\t]*\t/, "", actual)
+			if ($1 == "100644" && $2 == "blob" && actual == path)
+				valid++
+		}
+		END { exit !(NR == 1 && valid == 1) }
+	' "$graph/meta-config-entry" ||
+		die "next meta state must contain $meta_config_path as one regular blob"
+
+	: >"$graph/expected-meta-topics"
+	while IFS="$tab" read -r name old
+	do
+		ref=refs/heads/$name
+		new=$(awk -F '\t' -v ref="$ref" '$1 == ref { print $3 }' "$updates")
+		test -n "$new" || die "updates contain no rewritten tip for '$name'"
+		prerequisite=$(awk -F '\t' -v name="$name" \
+			'$1 == name { value=$3 } END { if (value != "") print value }' \
+			"$graph/plan")
+		test -n "$prerequisite" ||
+			die "verified graph contains no prerequisite for '$name'"
+		printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" \
+			>>"$graph/expected-meta-topics"
+	done <"$graph/topics"
+	LC_ALL=C sort -o "$graph/expected-meta-topics" \
+		"$graph/expected-meta-topics"
+	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
+	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	codex_ref=$(awk -F '\t' '$1 == "codex" { print $2 }' "$inputs")
+	base_name=${base_ref#refs/heads/}
+	codex_name=${codex_ref#refs/heads/}
+	write_meta_config "$base_name" "$base_oid" "$codex_name" "$candidate" \
+		"$graph/expected-meta-topics" "$graph/expected-meta-config"
+	git show "$new_meta:$meta_config_path" >"$graph/actual-meta-config" \
+		2>/dev/null || die "next meta state has no $meta_config_path"
+	cmp -s "$graph/expected-meta-config" "$graph/actual-meta-config" ||
+		die "next meta state does not describe the verified Codex output"
+)
+
 verify_output () {
 	inputs=
 	updates=
@@ -1266,7 +2373,7 @@ verify_output () {
 	LC_ALL=C sort -c "$updates" || die "updates are not canonically sorted"
 	test "$(cut -f1 "$updates" | sort -u | wc -l | tr -d ' ')" = \
 		"$(wc -l <"$updates" | tr -d ' ')" || die "updates contain duplicate refs"
-	awk -F '\t' '$1 == "codex" || $1 == "topic" { print $2 }' "$inputs" \
+	awk -F '\t' '$1 == "controller" || $1 == "codex" || $1 == "topic" { print $2 }' "$inputs" \
 		| LC_ALL=C sort >"$tmp_dir/expected-update-refs"
 	cut -f1 "$updates" | LC_ALL=C sort >"$tmp_dir/actual-update-refs"
 	cmp -s "$tmp_dir/expected-update-refs" "$tmp_dir/actual-update-refs" ||
@@ -1276,6 +2383,8 @@ verify_output () {
 	prepare_input_graph "$inputs" "$tmp_dir/topic-graph"
 	git merge-base --is-ancestor "$base_oid" "$candidate" ||
 		die "candidate is not based on the snapshotted master"
+	verify_meta_update "$inputs" "$updates" "$candidate" \
+		"$tmp_dir/topic-graph"
 	verify_control_paths "$inputs" "$updates" "$candidate" \
 		"$tmp_dir/topic-graph" "$require_automation"
 	while IFS="$tab" read -r ref old new
@@ -1286,8 +2395,9 @@ verify_output () {
 		test "$old" = "$expected_old" ||
 			die "old value for '$ref' does not match the input snapshot"
 		resolve_commit "$old" >/dev/null
-		resolve_commit "$new" >/dev/null
+		require_full_commit_oid "$new"
 		case "$ref" in
+		refs/heads/meta) ;;
 		refs/heads/codex) ;;
 		refs/heads/??/codex/?*)
 			git merge-base --is-ancestor "$base_oid" "$new" ||
@@ -1298,19 +2408,24 @@ verify_output () {
 		*) die "unexpected update ref '$ref'" ;;
 		esac
 	done <"$updates"
-	while IFS="$tab" read -r ref_a old_a new_a
+	while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
 	do
-		case "$ref_a" in refs/heads/codex) continue ;; esac
-		while IFS="$tab" read -r ref_b old_b new_b
-		do
-			case "$ref_b" in refs/heads/codex) continue ;; esac
-			if git merge-base --is-ancestor "$old_a" "$old_b"
-			then
-				git merge-base --is-ancestor "$new_a" "$new_b" ||
-					die "rewrite lost dependency '$ref_a' -> '$ref_b'"
-			fi
-		done <"$updates"
-	done <"$updates"
+		ref=refs/heads/$name
+		new=$(awk -F '\t' -v ref="$ref" '$1 == ref { print $3 }' \
+			"$updates")
+		if test "$prerequisite" = "$base_name"
+		then
+			new_prerequisite=$base_oid
+		else
+			prerequisite_ref=refs/heads/$prerequisite
+			new_prerequisite=$(awk -F '\t' -v ref="$prerequisite_ref" \
+				'$1 == ref { print $3 }' "$updates")
+			test -n "$new_prerequisite" ||
+				die "updates contain no configured prerequisite '$prerequisite_ref'"
+		fi
+		git merge-base --is-ancestor "$new_prerequisite" "$new" ||
+			die "rewrite lost configured dependency '$prerequisite' -> '$name'"
+	done <"$tmp_dir/topic-graph/plan"
 }
 
 push_updates () {
@@ -1322,7 +2437,7 @@ push_updates () {
 	while IFS="$tab" read -r ref old new
 	do
 		case "$filter:$ref" in
-		topics:refs/heads/codex) continue ;;
+		topics:refs/heads/meta|topics:refs/heads/codex) continue ;;
 		esac
 		set -- "$@" "--force-with-lease=$ref:$old"
 	done <"$updates"
@@ -1330,7 +2445,7 @@ push_updates () {
 	while IFS="$tab" read -r ref old new
 	do
 		case "$filter:$ref" in
-		topics:refs/heads/codex) continue ;;
+		topics:refs/heads/meta|topics:refs/heads/codex) continue ;;
 		esac
 		set -- "$@" "$new:$ref"
 	done <"$updates"
@@ -1461,6 +2576,13 @@ promote () {
 	test "$staged" = "$candidate" ||
 		die "staging ref '$ref' moved or disappeared before promotion"
 	promote_updates "$remote" "$updates" "$ref" "$candidate"
+	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
+	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	current_base=$(remote_head_oid "$remote" "$base_ref")
+	if test "$current_base" != "$base_oid"
+	then
+		say "warning: $base_ref moved to $current_base during the final push; the published candidate passed CI at the pinned base $base_oid, so run Refresh codex again"
+	fi
 }
 
 resolve_rebase () {
@@ -1559,15 +2681,21 @@ continue_rewrite () {
 	test -n "$worktree" || die "continue requires --worktree"
 	state=$(state_path "$worktree")
 	test -d "$state" || die "'$worktree' has no Codex rewrite state"
+	require_state_controller "$state"
 	if rebase_in_progress "$worktree"
 	then
 		die "the rebase is still in progress; resolve it and run git rebase --continue"
 	fi
 	require_clean_worktree "$worktree"
 	failed_old=$(state_value "$state" failed-old)
+	failed_owner=$(state_value "$state" failed-owner)
+	failed_parent=$(state_value "$state" failed-parent)
+	failed_onto=$(state_value "$state" failed-onto)
 	new=$(resolved_rebase_tip "$worktree" "$state") ||
 		die "could not validate the resolved rebase"
-	map_record "$state/map" "$failed_old" "$new"
+	transform_record "$state/map" "$failed_old" "$failed_parent" \
+		"$failed_onto" "$new"
+	result_record "$state/results" "$failed_owner" "$new"
 	rm -f "$state/failed-old" "$state/failed-owner" \
 		"$state/failed-parent" "$state/failed-onto" \
 		"$state/failed-commit"
@@ -1603,6 +2731,7 @@ publish_topics () {
 	state=$(state_path "$worktree")
 	test -f "$state/topic-updates" ||
 		die "the topic rewrite has not completed"
+	require_state_controller "$state"
 	if rebase_in_progress "$worktree"
 	then
 		die "a rebase is still in progress in '$worktree'"
@@ -1630,6 +2759,7 @@ publish_topics () {
 		fi
 		die "rewritten topic graph failed candidate validation; no refs were updated"
 	fi
+	create_meta_commit "$state" "$candidate"
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
 	printf '%s\n' "$candidate" >"$tmp_dir/result" ||
 		die "could not prepare topic verification"
@@ -1660,6 +2790,8 @@ command=$1
 shift
 case "$command" in
 check-topic) check_topic "$@" ;;
+initialize) initialize_config "$@" ;;
+refresh) local_refresh "$@" ;;
 rewrite) rewrite "$@" ;;
 verify-inputs) verify_inputs "$@" ;;
 verify-output) verify_output "$@" ;;

@@ -1,0 +1,32 @@
+#!/bin/sh
+
+set -eu
+
+meta_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+CODEX_ENTRYPOINT=$meta_dir/codex
+meta_common_dir=$(git -C "$meta_dir" rev-parse --path-format=absolute \
+  --git-common-dir)
+caller_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+test "$meta_common_dir" = "$caller_common_dir" || {
+  echo >&2 'Meta/codex must be a linked worktree of the repository being refreshed'
+  exit 1
+}
+for control_path in codex .github/workflows/codex-branch.sh
+do
+  expected=$(git -C "$meta_dir" rev-parse "HEAD:$control_path" 2>/dev/null) || {
+    echo >&2 "Meta/HEAD does not contain $control_path"
+    exit 1
+  }
+  actual=$(git -C "$meta_dir" hash-object "$control_path") || exit 1
+  test "$actual" = "$expected" || {
+    echo >&2 "$control_path must match Meta/HEAD"
+    exit 1
+  }
+done
+CODEX_CONTROLLER_OID=$(git -C "$meta_dir" rev-parse --verify HEAD^{commit})
+CODEX_META_WORKTREE=$meta_dir
+export CODEX_ENTRYPOINT
+export CODEX_CONTROLLER_OID
+export CODEX_META_WORKTREE
+
+exec "$meta_dir/.github/workflows/codex-branch.sh" "$@"
