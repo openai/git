@@ -11,6 +11,8 @@ codex_branch=${CODEX_BRANCH:-$TEST_DIRECTORY/../.github/workflows/codex-branch.s
 codex_workflow=${CODEX_WORKFLOW:-$(dirname "$codex_branch")/codex.yml}
 codex_root=$(CDPATH= cd "$(dirname "$codex_branch")/../.." && pwd)
 codex_entrypoint=${CODEX_ENTRYPOINT:-$codex_root/codex}
+codex_bot_name='ChatGPT Codex Connector'
+codex_bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
 write () {
 	printf '%s\n' "$1" >"$2"
@@ -219,6 +221,25 @@ updated_tip () {
 		'$1 == ref { print $3 }' "$2"
 }
 
+has_codex_bot_committer () (
+	commit=$1
+	test "$(git show -s --format=%cn "$commit")" = "$codex_bot_name" &&
+	test "$(git show -s --format=%ce "$commit")" = "$codex_bot_email"
+)
+
+has_codex_bot_author () (
+	commit=$1
+	test "$(git show -s --format=%an "$commit")" = "$codex_bot_name" &&
+	test "$(git show -s --format=%ae "$commit")" = "$codex_bot_email"
+)
+
+has_same_author () (
+	old=$1
+	new=$2
+	test "$(git show -s --format="%an <%ae>" "$old")" = \
+		"$(git show -s --format="%an <%ae>" "$new")"
+)
+
 test_expect_success 'topic names use the two-character namespace' '
 	sh "$codex_branch" check-topic tb/codex/release &&
 	test_expect_code 1 sh "$codex_branch" check-topic t/codex/release &&
@@ -231,19 +252,42 @@ test_expect_success 'topic names use the two-character namespace' '
 	test_expect_code 1 sh "$codex_branch" check-topic tb/codex/x..y
 '
 
-test_expect_success 'generated commits do not hard-code the Actions bot' '
-	! grep -F "github-actions[bot]" "$codex_branch"
+test_expect_success 'generated commits use the Codex connector identity' '
+	! grep -F "github-actions[bot]" "$codex_branch" &&
+	! grep -F "github-actions[bot]" "$codex_workflow" &&
+	grep -F "$codex_bot_name" "$codex_branch" &&
+	grep -F "$codex_bot_email" "$codex_branch"
 '
 
-test_expect_success 'refresh has no topic fanout and delegates testing to staging CI' '
+test_expect_success 'refresh only prepares an immutable local-publish artifact' '
 	! grep -F "codex-topic.yml" "$codex_workflow" &&
 	! grep -E "make -C|t9905-codex-branch.sh" "$codex_workflow" &&
 	! grep -E "clone --shared|parallel worker" "$codex_branch" &&
-	! grep -E "CODEX_BRANCH_TOKEN|CODEX_BRANCH_MANAGER_TOKEN|secret-broker|id-token" \
+	! grep -E "CODEX_BRANCH_TOKEN|CODEX_BRANCH_MANAGER_TOKEN|CODEX_DEPLOY_KEY|secret-broker|id-token" \
 		"$codex_workflow" &&
-	test_grep "CODEX_DEPLOY_KEY" "$codex_workflow" &&
-	test_grep "environment: codex-publish" "$codex_workflow" &&
-	test_grep "Wait for CI on the exact staging SHA" "$codex_workflow"
+	! grep -F "environment: codex-publish" "$codex_workflow" &&
+	! grep -E "^[[:space:]]+git .*push" "$codex_workflow" &&
+	! grep -E "codex.* (stage|promote)([[:space:]]|$)" "$codex_workflow" &&
+	! grep -F "Wait for CI on the exact staging SHA" "$codex_workflow" &&
+	! grep -E "^  publish:" "$codex_workflow" &&
+	test_grep "actions/upload-artifact" "$codex_workflow" &&
+	test_grep "runner.temp }}/codex-run" "$codex_workflow" &&
+	test_grep "GITHUB_RUN_ATTEMPT" "$codex_workflow" &&
+	test_grep "Meta/codex publish-run" "$codex_workflow" &&
+	sed -n "/^          path: |$/,/^          if-no-files-found:/p" \
+		"$codex_workflow" |
+	sed -n "s,.*runner.temp }}/\\(codex[^ ]*\\)$,\\1,p" |
+	LC_ALL=C sort >artifact-files.actual &&
+	printf "%s\n" codex.bundle codex-candidate codex-inputs codex-run \
+		codex-updates | LC_ALL=C sort >artifact-files.expect &&
+	test_cmp artifact-files.expect artifact-files.actual &&
+	for ruleset in codex-branch codex-meta
+	do
+		rules="$codex_root/.github/rulesets/$ruleset.json" &&
+		test 1 = "$(grep -c "301000140" "$rules")" &&
+		test_grep "\"actor_type\": \"User\"" "$rules" &&
+		! grep -F "DeployKey" "$rules" || return 1
+	done
 '
 
 test_expect_success 'topics cannot change the meta branch ruleset' '
@@ -598,9 +642,8 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		old_c=$(git rev-parse origin/cc/codex/c) &&
 		master=$(git rev-parse origin/master) &&
 		test "$old_a" = "$(git rev-parse "$old_b^")" &&
-		git config user.name "github-actions[bot]" &&
-		git config user.email \
-			"41898282+github-actions[bot]@users.noreply.github.com" &&
+		git config user.name "Configured Local User" &&
+		git config user.email "configured-local-user@example.com" &&
 
 		(
 			unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL &&
@@ -626,19 +669,22 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		manifest_has aa/codex/a "$old_a" "$new_a" updates &&
 		manifest_has bb/codex/b "$old_b" "$new_b" updates &&
 		manifest_has cc/codex/c "$old_c" "$new_c" updates &&
+		has_same_author "$old_a" "$new_a" &&
+		has_same_author "$old_b" "$new_b" &&
+		has_same_author "$old_c" "$new_c" &&
 
 		last_merge=$(git rev-parse "$candidate") &&
 		first_merge=$(git rev-parse "$last_merge^") &&
-		test "$(git show -s --format=%cn "$new_a")" = \
-			"github-actions[bot]" &&
-		test "$(git show -s --format=%cn "$new_b")" = \
-			"github-actions[bot]" &&
-		test "$(git show -s --format=%cn "$new_c")" = \
-			"github-actions[bot]" &&
-		test "$(git show -s --format=%cn "$first_merge")" = \
-			"github-actions[bot]" &&
-		test "$(git show -s --format=%cn "$last_merge")" = \
-			"github-actions[bot]" &&
+		new_meta=$(updated_tip meta updates) &&
+		has_codex_bot_committer "$new_a" &&
+		has_codex_bot_committer "$new_b" &&
+		has_codex_bot_committer "$new_c" &&
+		has_codex_bot_committer "$first_merge" &&
+		has_codex_bot_committer "$last_merge" &&
+		has_codex_bot_committer "$new_meta" &&
+		has_codex_bot_author "$first_merge" &&
+		has_codex_bot_author "$last_merge" &&
+		has_codex_bot_author "$new_meta" &&
 		test "$new_c" = "$(git rev-parse "$last_merge^2")" &&
 		test "$new_b" = "$(git rev-parse "$first_merge^2")" &&
 		test "$master" = "$(git rev-parse "$first_merge^")" &&
@@ -1346,6 +1392,7 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		dependent=$(git rev-parse origin/aa/codex/dependent) &&
 		clean=$(git rev-parse origin/yy/codex/clean) &&
 		root=$(git rev-parse origin/zz/codex/root) &&
+		old_conflicting=$(find_subject "conflicting root" "$root") &&
 		snapshot_refs ../conflict.git >before &&
 		test_expect_code 1 sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
@@ -1362,7 +1409,7 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		test_grep "git status" failure &&
 		test_grep "git rebase --show-current-patch" failure &&
 		test_grep "git add" failure &&
-		test_grep "git rebase --continue" failure &&
+		test_grep "exact Meta/codex continue command printed by resolve" failure &&
 		test_grep "Meta/codex continue" failure &&
 		test_grep "git push --force-with-lease" failure &&
 		test_grep "Do not force-push only" failure &&
@@ -1391,9 +1438,9 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 			--base master --codex codex --inputs-oid "$digest" \
 			--worktree resolution >resolve.out &&
 		test_grep "Resolution worktree" resolve.out &&
+		test_grep "continue --worktree ." resolve.out &&
 		write resolved resolution/shared &&
 		git -C resolution add shared &&
-		GIT_EDITOR=true git -C resolution rebase --continue &&
 		sh "$codex_branch" continue --worktree resolution \
 			>continue.out &&
 		test_grep "publish-topics" continue.out &&
@@ -1404,6 +1451,7 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 			rev-parse refs/heads/aa/codex/dependent) &&
 		new_clean=$(git --git-dir=../conflict.git \
 			rev-parse refs/heads/yy/codex/clean) &&
+		new_conflicting=$(find_subject "conflicting root" "$new_root") &&
 		test "$root" != "$new_root" &&
 		test "$dependent" != "$new_dependent" &&
 		test "$clean" != "$new_clean" &&
@@ -1412,6 +1460,8 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 		test before = "$(git show "$new_root:root-before")" &&
 		test after = "$(git show "$new_root:root-after")" &&
 		test resolved = "$(git show "$new_root:shared")" &&
+		has_same_author "$old_conflicting" "$new_conflicting" &&
+		has_codex_bot_committer "$new_conflicting" &&
 		test "$codex" = "$(git --git-dir=../conflict.git \
 			rev-parse refs/heads/codex)" &&
 		git worktree remove --force resolution
@@ -2443,6 +2493,309 @@ test_expect_success 'verify-output rejects malformed generated meta commits' '
 			--inputs inputs --updates extra-path-updates --result result \
 			>extra-path.out 2>extra-path.err &&
 		test_grep "changes more than codex.config" extra-path.err
+	)
+'
+
+test_expect_success PYTHON 'publish-run authenticates the artifact and promotes its exact candidate' '
+	git init --bare publish-run.git &&
+	test_create_repo publish-run-source &&
+	(
+		cd publish-run-source &&
+		git remote add origin ../publish-run.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c aa/codex/automation &&
+		mkdir -p .github/workflows &&
+		write_automation_workflow .github/workflows/codex.yml &&
+		git add .github/workflows/codex.yml &&
+		git commit -m "install refresh trampoline" &&
+
+		git switch master &&
+		write current master-file &&
+		git add master-file &&
+		git commit -m "publish-run master" &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git push origin master meta codex aa/codex/automation
+	) &&
+
+	git clone publish-run.git publish-run-runner &&
+	(
+		cd publish-run-runner &&
+		fetch_all &&
+		support="$TRASH_DIRECTORY/publish-run-support" &&
+		mkdir -p "$support" &&
+		controller=$(git rev-parse origin/meta) &&
+		old_codex=$(git rev-parse origin/codex) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --require-automation \
+			--result "$support/codex-candidate" \
+			--updates "$support/codex-updates" \
+			--inputs "$support/codex-inputs" \
+			--bundle "$support/codex.bundle" \
+			--failure "$support/codex-failure" &&
+		candidate=$(cat "$support/codex-candidate") &&
+		new_meta=$(updated_tip meta "$support/codex-updates") &&
+		{
+			printf "repository\topenai/git\n" &&
+			printf "run-id\t4242\n" &&
+			printf "run-attempt\t1\n" &&
+			printf "event\tworkflow_dispatch\n" &&
+			printf "caller-ref\trefs/heads/codex\n" &&
+			printf "caller-sha\t%s\n" "$old_codex" &&
+			printf "workflow-path\t.github/workflows/codex.yml\n" &&
+			printf "controller-oid\t%s\n" "$controller" &&
+			printf "candidate\t%s\n" "$candidate" &&
+			printf "artifact-name\tcodex-candidate-4242-1\n"
+		} >"$support/codex-run" &&
+
+		git update-ref refs/codex-output/candidate "$candidate" &&
+		git update-ref refs/codex-output/meta "$new_meta" &&
+		git update-ref refs/codex-output/unexpected "$candidate" &&
+		git bundle create "$support/extra-head.bundle" \
+			refs/codex-output/candidate refs/codex-output/meta \
+			refs/codex-output/unexpected &&
+		git update-ref -d refs/codex-output/candidate &&
+		git update-ref -d refs/codex-output/meta &&
+		git update-ref -d refs/codex-output/unexpected &&
+
+		git init "$support/artifact" &&
+		cp "$support/codex.bundle" "$support/codex-candidate" \
+			"$support/codex-inputs" "$support/codex-run" \
+			"$support/codex-updates" "$support/artifact" &&
+		(
+			cd "$support/artifact" &&
+			git add codex.bundle codex-candidate codex-inputs \
+				codex-run codex-updates &&
+			git commit -m "good candidate artifact" &&
+			good=$(git rev-parse HEAD) &&
+			git archive --format=zip --output="$support/good.zip" \
+				"$good" &&
+
+			sed "s/^run-id.*4242$/run-id	9999/" codex-run \
+				>codex-run.bad &&
+			mv codex-run.bad codex-run &&
+			git add codex-run &&
+			git commit -m "bad artifact metadata" &&
+			git archive --format=zip \
+				--output="$support/bad-metadata.zip" HEAD &&
+
+			git switch --detach "$good" &&
+			write extra unexpected &&
+			git add unexpected &&
+			git commit -m "extra artifact member" &&
+			git archive --format=zip --output="$support/extra.zip" \
+				HEAD &&
+
+			git switch --detach "$good" &&
+			rm codex-candidate &&
+			ln -s codex-run codex-candidate &&
+			git add codex-candidate &&
+			git commit -m "non-regular artifact member" &&
+			git archive --format=zip --output="$support/symlink.zip" \
+				HEAD &&
+
+			git switch --detach "$good" &&
+			cp "$support/extra-head.bundle" codex.bundle &&
+			git add codex.bundle &&
+			git commit -m "bundle with an extra advertised head" &&
+			git archive --format=zip \
+				--output="$support/extra-head.zip" HEAD
+		) &&
+		cat >"$support/duplicate.py" <<-\EOF &&
+		import sys
+		import zipfile
+
+		source, target = sys.argv[1:]
+		with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as dst:
+		    for item in src.infolist():
+		        data = src.read(item.filename)
+		        dst.writestr(item, data)
+		        if item.filename == "codex-run":
+		            dst.writestr(item, data)
+		EOF
+		python3 "$support/duplicate.py" "$support/good.zip" \
+			"$support/duplicate.zip" 2>/dev/null &&
+
+		mkdir -p "$support/bin" &&
+		real_git=$(command -v git) &&
+		cat >"$support/bin/git" <<-\EOF &&
+		#!/bin/sh
+		printf "%s\\n" "$*" >>"$FAKE_GIT_LOG"
+		case "$*" in
+		"remote get-url --all origin")
+			printf "%s\\n" https://github.com/openai/git
+			exit 0
+			;;
+		"remote get-url --push --all origin")
+			printf "%s\\n" https://github.com/openai/git
+			if test "${FAKE_MULTIPLE_PUSHURLS:-}" = 1
+			then
+				printf "%s\\n" git@github.com:openai/git.git
+			fi
+			exit 0
+			;;
+		esac
+		exec "$FAKE_REAL_GIT" "$@"
+		EOF
+		chmod +x "$support/bin/git" &&
+		cat >"$support/bin/gh" <<-\EOF &&
+		#!/bin/sh
+		printf "%s\\n" "$*" >>"$FAKE_GH_LOG"
+		test "$1" = api &&
+		test "$2" = --hostname &&
+		test "$3" = github.com || exit 96
+		endpoint=$4
+		shift 4
+		case "$endpoint" in
+		repos/openai/git/actions/runs/4242)
+			case "$*" in
+			*referenced_workflows*)
+				case "$*" in
+				*"openai/git/.github/workflows/codex.yml@$FAKE_CONTROLLER"*\
+				*"refs/heads/meta"*\
+				*".sha == "*"$FAKE_CONTROLLER"*) ;;
+				*) exit 95 ;;
+				esac
+				if test "${FAKE_GH_MODE:-}" = wrong-controller
+				then
+					printf "0\\n"
+				else
+					printf "1\\n"
+				fi
+				;;
+			*)
+				api_id=4242
+				test "${FAKE_GH_MODE:-}" != wrong-run || api_id=9999
+				printf "%s\\t1\\tcompleted\\tsuccess\\tworkflow_dispatch\\tcodex\\t%s\\t.github/workflows/codex.yml\\topenai/git\\thttps://example/run/4242\\n" \
+					"$api_id" "$FAKE_OLD_CODEX"
+				;;
+			esac
+			;;
+		repos/openai/git/actions/runs/4242/artifacts?per_page=100)
+			printf "9001\\tfalse\\n"
+			;;
+		repos/openai/git/actions/artifacts/9001/zip)
+			cat "$FAKE_ARTIFACT_ZIP"
+			;;
+		repos/openai/git/actions/workflows/main.yml/runs*)
+			case "$*" in
+			*"max // 0"*) printf "100\\n" ;;
+			*) printf "101\\n" ;;
+			esac
+			;;
+		repos/openai/git/actions/runs/101)
+			printf "101\\tpush\\tcodex-staging\\t%s\\t.github/workflows/main.yml\\tcompleted\\tsuccess\\thttps://example/ci/101\\n" \
+				"$FAKE_CANDIDATE"
+			;;
+		repos/openai/git/actions/runs/101/jobs?per_page=100)
+			printf "success\\n"
+			;;
+		user)
+			printf "test-publisher\\n"
+			;;
+		*)
+			printf "unexpected gh endpoint: %s\\n" "$endpoint" >&2
+			exit 97
+			;;
+		esac
+		EOF
+		chmod +x "$support/bin/gh" &&
+
+		git worktree add --detach Meta "$controller" &&
+		git status --porcelain >"$support/nested-status" &&
+		test_line_count = 1 "$support/nested-status" &&
+		test_grep "?? Meta/" "$support/nested-status" &&
+		publish_prepared () {
+			artifact=$1 &&
+			env PATH="$support/bin:$PATH" GH_HOST=attacker.example \
+				CODEX_CONTROLLER_OID="$controller" \
+				CODEX_META_WORKTREE="$PWD/Meta" \
+				FAKE_REAL_GIT="$real_git" \
+				FAKE_GIT_LOG="$support/git.log" \
+				FAKE_GH_LOG="$support/gh.log" \
+				FAKE_ARTIFACT_ZIP="$artifact" \
+				FAKE_CONTROLLER="$controller" \
+				FAKE_OLD_CODEX="$old_codex" \
+				FAKE_CANDIDATE="$candidate" \
+				FAKE_MULTIPLE_PUSHURLS="${FAKE_MULTIPLE_PUSHURLS:-}" \
+				FAKE_GH_MODE="${FAKE_GH_MODE:-}" \
+				sh "$codex_branch" publish-run 4242
+		} &&
+		snapshot_refs ../publish-run.git >"$support/before" &&
+
+		write dirty dirty &&
+		: >"$support/gh.log" &&
+		test_expect_code 1 publish_prepared "$support/good.zip" \
+			>"$support/dirty.out" 2>"$support/dirty.err" &&
+		test_grep "must be clean" "$support/dirty.err" &&
+		test_must_be_empty "$support/gh.log" &&
+		rm dirty &&
+
+		: >"$support/gh.log" &&
+		FAKE_MULTIPLE_PUSHURLS=1 test_expect_code 1 \
+			publish_prepared "$support/good.zip" \
+			>"$support/pushurl.out" 2>"$support/pushurl.err" &&
+		test_grep "origin must have exactly one push URL" \
+			"$support/pushurl.err" &&
+		test_must_be_empty "$support/gh.log" &&
+
+		FAKE_GH_MODE=wrong-run test_expect_code 1 \
+			publish_prepared "$support/good.zip" \
+			>"$support/wrong-run.out" 2>"$support/wrong-run.err" &&
+		test_grep "Actions returned the wrong run" \
+			"$support/wrong-run.err" &&
+		FAKE_GH_MODE=wrong-controller test_expect_code 1 \
+			publish_prepared "$support/good.zip" \
+			>"$support/controller.out" 2>"$support/controller.err" &&
+		test_grep "was not executed by the pinned meta controller" \
+			"$support/controller.err" &&
+		test_expect_code 1 publish_prepared "$support/bad-metadata.zip" \
+			>"$support/metadata.out" 2>"$support/metadata.err" &&
+		test_grep "run metadata does not exactly match" \
+			"$support/metadata.err" &&
+		test_expect_code 1 publish_prepared "$support/duplicate.zip" \
+			>"$support/duplicate.out" 2>"$support/duplicate.err" &&
+		test_grep "does not contain exactly the expected files" \
+			"$support/duplicate.err" &&
+		test_expect_code 1 publish_prepared "$support/extra.zip" \
+			>"$support/extra.out" 2>"$support/extra.err" &&
+		test_grep "does not contain exactly the expected files" \
+			"$support/extra.err" &&
+		test_expect_code 1 publish_prepared "$support/symlink.zip" \
+			>"$support/symlink.out" 2>"$support/symlink.err" &&
+		test_grep "contains a non-regular entry" "$support/symlink.err" &&
+		test_expect_code 1 publish_prepared "$support/extra-head.zip" \
+			>"$support/heads.out" 2>"$support/heads.err" &&
+		test_grep "bundle heads do not match the frozen update manifest" \
+			"$support/heads.err" &&
+		snapshot_refs ../publish-run.git >"$support/after-rejections" &&
+		test_cmp "$support/before" "$support/after-rejections" &&
+
+		: >"$support/gh.log" &&
+		publish_prepared "$support/good.zip" \
+			>"$support/publish.out" 2>"$support/publish.err" &&
+		test_grep "Published codex candidate $candidate from Actions run 4242" \
+			"$support/publish.out" &&
+		! grep -v "^api --hostname github.com " "$support/gh.log" &&
+		test_grep "actions/artifacts/9001/zip" "$support/gh.log" &&
+		test_grep ".github/workflows/codex.yml@$controller" \
+			"$support/gh.log" &&
+		test_grep "refs/heads/meta" "$support/gh.log" &&
+		test_grep "actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100" \
+			"$support/gh.log" &&
+		test_grep "actions/runs/101/jobs" "$support/gh.log" &&
+		while IFS="$(printf "\t")" read -r ref old new
+		do
+			test "$new" = "$(git --git-dir=../publish-run.git \
+				rev-parse "$ref")" || return 1
+		done <"$support/codex-updates" &&
+		test_must_fail git --git-dir=../publish-run.git show-ref --verify \
+			refs/heads/codex-staging
 	)
 '
 

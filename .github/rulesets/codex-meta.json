@@ -31,8 +31,8 @@
   ],
   "bypass_actors": [
     {
-      "actor_id": null,
-      "actor_type": "DeployKey",
+      "actor_id": 301000140,
+      "actor_type": "User",
       "bypass_mode": "always"
     },
     {
