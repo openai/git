@@ -272,6 +272,15 @@ and Git records the configured user as the pusher. To add or remove a
 publisher, change the exact `User` actor in both rulesets. Do not replace it
 with a broad repository role or a shared long-lived credential.
 
+The built-in `GITHUB_TOKEN` is not a substitute for the local publisher.
+[GitHub suppresses push-triggered workflows for pushes made with that
+token](https://docs.github.com/en/actions/concepts/security/github_token), so
+it would skip both the exact staging CI run and the final release workflow.
+Giving the shared GitHub Actions App a ruleset bypass would also authorize it
+outside this controller. Moving publication into Actions therefore requires a
+separate, narrowly scoped GitHub App credential; until one is provisioned, the
+local publisher remains the security and audit boundary.
+
 The local helper downloads the artifact through `gh`, but pushes through
 `origin`. Those credentials can theoretically identify different users, so
 the helper prints the authenticated `gh` login before staging. Verify the
