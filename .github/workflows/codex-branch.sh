@@ -10,6 +10,8 @@ script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path=${CODEX_ENTRYPOINT:-$script_dir/$(basename "$0")}
 meta_config_path=codex.config
 tab=$(printf '\t')
+bot_name='ChatGPT Codex Connector'
+bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
 say () {
 	printf '%s\n' "$*"
@@ -41,6 +43,7 @@ usage () {
 		--inputs <path> --updates <path> [--require-automation]
 	   or: codex-branch promote [--remote <remote>] [--staging <branch>]
 		--inputs <path> --updates <path> [--require-automation]
+	   or: codex-branch publish-run <run-id>
 	   or: codex-branch resolve [--remote <remote>] [--base <branch>]
 		[--codex <branch>] --inputs-oid <oid> [--worktree <path>]
 	   or: codex-branch continue --worktree <path>
@@ -84,6 +87,48 @@ require_clean_worktree () (
 	worktree=$1
 	test -z "$(git -C "$worktree" -c core.fsmonitor=false status --porcelain)" ||
 		die "worktree '$worktree' must be clean"
+)
+
+require_clean_publish_worktrees () (
+	caller_top=$(git rev-parse --show-toplevel) ||
+		die "could not find the publishing worktree"
+	caller=$(CDPATH= cd "$caller_top" && pwd -P) ||
+		die "could not resolve the publishing worktree"
+	meta_input=$(CDPATH= cd "$1" && pwd -P) ||
+		die "could not resolve the Meta worktree"
+	meta_top=$(git -C "$meta_input" rev-parse --show-toplevel) ||
+		die "could not find the Meta worktree"
+	meta=$(CDPATH= cd "$meta_top" && pwd -P) ||
+		die "could not resolve the Meta worktree"
+	test "$meta" = "$meta_input" ||
+		die "CODEX_META_WORKTREE is not a worktree root"
+	caller_common=$(git -C "$caller" rev-parse --path-format=absolute \
+		--git-common-dir) || die "could not locate the publishing repository"
+	meta_common=$(git -C "$meta" rev-parse --path-format=absolute \
+		--git-common-dir) || die "could not locate the Meta repository"
+	test "$caller_common" = "$meta_common" ||
+		die "Meta must be a linked worktree of the publishing repository"
+	require_clean_worktree "$meta"
+	if test "$caller" = "$meta"
+	then
+		exit 0
+	fi
+	case "$meta" in
+	"$caller"/*)
+		relative_meta=${meta#"$caller"/}
+		test -n "$relative_meta" &&
+			test "$relative_meta" != "$meta" ||
+			die "could not locate the nested Meta worktree"
+		dirty=$(git -C "$caller" -c core.fsmonitor=false status \
+			--porcelain -- . ":(exclude,literal)$relative_meta") ||
+			die "could not inspect the publishing worktree"
+		;;
+	*)
+		dirty=$(git -C "$caller" -c core.fsmonitor=false status --porcelain) ||
+			die "could not inspect the publishing worktree"
+		;;
+	esac
+	test -z "$dirty" || die "worktree '$caller' must be clean"
 )
 
 resolve_commit () {
@@ -1200,7 +1245,9 @@ continue_rerere_resolution () {
 	while rebase_in_progress "$worktree" &&
 		test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
 	do
-		if ! GIT_EDITOR=true git -C "$worktree" \
+		if ! GIT_COMMITTER_NAME=$bot_name \
+			GIT_COMMITTER_EMAIL=$bot_email \
+			GIT_EDITOR=true git -C "$worktree" \
 			-c core.hooksPath=/dev/null \
 			-c core.fsmonitor=false \
 			-c commit.gpgSign=false \
@@ -1227,7 +1274,9 @@ make_topic_sentinel () {
 		die "could not read the tree for topic '$name'"
 	message=$(printf 'Codex rewrite sentinel: %s\n\nCodex-Rewrite-Sentinel: %s@%s\n' \
 		"$name" "$name" "$old")
-	printf '%s' "$message" | git -C "$worktree" \
+	printf '%s' "$message" | GIT_AUTHOR_NAME=$bot_name \
+		GIT_AUTHOR_EMAIL=$bot_email GIT_COMMITTER_NAME=$bot_name \
+		GIT_COMMITTER_EMAIL=$bot_email git -C "$worktree" \
 		commit-tree "$tree" -p "$old" ||
 		die "could not create the completion sentinel for '$name'"
 }
@@ -1275,7 +1324,8 @@ rebase_topic () {
 		-c advice.detachedHead=false switch --detach "$sentinel" \
 		>/dev/null 2>&1 ||
 		die "could not check out topic tip $old for rebasing"
-	if GIT_EDITOR=true git -C "$worktree" \
+	if GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+		GIT_EDITOR=true git -C "$worktree" \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
@@ -1454,7 +1504,9 @@ create_meta_commit () (
 	tree=$(GIT_INDEX_FILE=$index git write-tree) ||
 		die "could not write the next meta tree"
 	message=$(printf 'meta: record refreshed Codex topics\n\nUpdate the generated topic prerequisites and published boundaries after a successful Codex refresh.\n')
-	meta_oid=$(printf '%s' "$message" | git -c commit.gpgSign=false \
+	meta_oid=$(printf '%s' "$message" | GIT_AUTHOR_NAME=$bot_name \
+		GIT_AUTHOR_EMAIL=$bot_email GIT_COMMITTER_NAME=$bot_name \
+		GIT_COMMITTER_EMAIL=$bot_email git -c commit.gpgSign=false \
 		commit-tree "$tree" -p "$controller_oid") ||
 		die "could not create the next meta state commit"
 	printf '%s\n' "$meta_oid" >"$state/meta-oid"
@@ -1571,12 +1623,12 @@ write_failure () {
 		say '# Edit the conflicted files.'
 		say 'git add <files>'
 		say 'git diff --cached --check'
-		say 'git rebase --continue'
+		say '# Run the exact Meta/codex continue command printed by resolve.'
 		say '```'
 		say
-		say "Repeat edit/add/continue until that rebase finishes, then run the"
-		say "\`Meta/codex continue\` command printed by the helper. It finishes"
-		say "the remaining graph and prints one exact-lease atomic topic push."
+		say "Repeat edit/add/\`Meta/codex continue\` if another conflict stops."
+		say "The helper records the canonical Codex bot as committer, finishes"
+		say "the remaining graph, and prints one exact-lease atomic topic push."
 		say "That final command is a \`git push --force-with-lease=... --atomic\`"
 		say "transaction covering every rewritten topic ref."
 		say "Do not force-push only \`$failed_owner\`; that would sever its"
@@ -1639,7 +1691,9 @@ merge_topic () {
 	message=$(printf 'Merge %s into codex\n\nIntegrate the current %s topic into the internally distributed codex branch.\n\nCodex-Integration: %s@%s' \
 		"$name" "$name" "$name" "$oid")
 
-	if git -C "$worktree" \
+	if GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+		git -C "$worktree" \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
@@ -1655,7 +1709,9 @@ merge_topic () {
 		return 1
 	git -C "$worktree" -c core.fsmonitor=false diff --cached --check ||
 		return 1
-	git -C "$worktree" \
+	GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+		git -C "$worktree" \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
@@ -2507,7 +2563,7 @@ stage_candidate () {
 	old=$(remote_head_oid "$remote" "$ref")
 
 	# A failed CI run intentionally leaves staging behind. Recreate an
-	# identical ref so a new deploy-key push starts fresh push CI.
+	# identical ref so a new user-authenticated push starts fresh push CI.
 	if test -n "$old" && test "$old" = "$candidate"
 	then
 		git -c core.hooksPath=/dev/null push --atomic --porcelain \
@@ -2585,6 +2641,287 @@ promote () {
 	fi
 }
 
+require_openai_git_origin () (
+	fetch_urls=$(git remote get-url --all origin 2>/dev/null) ||
+		die "origin has no fetch URL"
+	push_urls=$(git remote get-url --push --all origin 2>/dev/null) ||
+		die "origin has no push URL"
+	test -n "$fetch_urls" &&
+		test "$(printf '%s\n' "$fetch_urls" | wc -l | tr -d ' ')" = 1 ||
+		die "origin must have exactly one fetch URL"
+	test -n "$push_urls" &&
+		test "$(printf '%s\n' "$push_urls" | wc -l | tr -d ' ')" = 1 ||
+		die "origin must have exactly one push URL"
+	for url in "$fetch_urls" "$push_urls"
+	do
+		case "$url" in
+		git@github.com:openai/git|git@github.com:openai/git.git|\
+		ssh://git@github.com/openai/git|ssh://git@github.com/openai/git.git|\
+		https://github.com/openai/git|https://github.com/openai/git.git) ;;
+		*) die "origin must fetch from and push to the canonical openai/git repository" ;;
+		esac
+	done
+)
+
+artifact_value () (
+	key=$1
+	file=$2
+	count=$(awk -F '\t' -v key="$key" '$1 == key { count++ }
+		END { print count + 0 }' "$file")
+	test "$count" = 1 || die "artifact metadata needs exactly one '$key' row"
+	awk -F '\t' -v key="$key" '$1 == key { print substr($0, length($1) + 2) }' \
+		"$file"
+)
+
+extract_candidate_artifact () (
+	archive=$1
+	output=$2
+	names=$3
+	expected=$4
+
+	unzip -t "$archive" >/dev/null || die "candidate artifact is not a valid ZIP archive"
+	unzip -Z1 "$archive" >"$names" ||
+		die "could not list the candidate artifact"
+	{
+		printf '%s\n' codex.bundle codex-candidate codex-inputs \
+			codex-run codex-updates
+	} | LC_ALL=C sort >"$expected"
+	LC_ALL=C sort "$names" >"$names.sorted" ||
+		die "could not inspect the candidate artifact"
+	cmp -s "$expected" "$names.sorted" ||
+		die "candidate artifact does not contain exactly the expected files"
+	regular=$(zipinfo -s "$archive" | awk '
+		$1 ~ /^-/ { regular++ }
+		$1 ~ /^[dl]/ { bad=1 }
+		END {
+			if (bad) exit 1
+			print regular + 0
+		}
+	') || die "candidate artifact contains a non-regular entry"
+	test "$regular" = 5 ||
+		die "candidate artifact entries are not five regular files"
+	mkdir -p "$output" || die "could not create candidate artifact directory"
+	umask 077
+	while read -r name
+	do
+		unzip -p "$archive" "$name" >"$output/$name" ||
+			die "could not extract '$name' from the candidate artifact"
+		test -f "$output/$name" && test ! -L "$output/$name" ||
+			die "candidate artifact member '$name' is not a regular file"
+	done <"$expected"
+)
+
+wait_for_staging_ci () (
+	gh_command=$1
+	repository=$2
+	candidate=$3
+	baseline=$4
+	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100"
+
+	run_id=
+	attempt=0
+	while test "$attempt" -lt 60
+	do
+		attempt=$((attempt + 1))
+		run_id=$("$gh_command" api --hostname github.com "$workflow_runs" --jq \
+			".workflow_runs | map(select(.id > ($baseline | tonumber) and .head_branch == \"codex-staging\" and .head_sha == \"$candidate\" and .event == \"push\" and .path == \".github/workflows/main.yml\")) | sort_by(.id) | .[0].id // empty") ||
+			die "could not query staging CI"
+		test -z "$run_id" || break
+		sleep 5
+	done
+	test -n "$run_id" ||
+		die "no new CI run appeared for codex-staging at $candidate"
+	case "$run_id" in
+	''|*[!0-9]*) die "staging CI returned an invalid run ID" ;;
+	esac
+
+	attempt=0
+	status=
+	conclusion=
+	url=
+	while test "$attempt" -lt 180
+	do
+		attempt=$((attempt + 1))
+		"$gh_command" api --hostname github.com \
+			"repos/$repository/actions/runs/$run_id" --jq \
+			'[.id, .event, .head_branch, .head_sha, .path, .status, (.conclusion // ""), .html_url] | @tsv' \
+			>"$tmp_dir/ci-run" || die "could not inspect staging CI run $run_id"
+		test "$(wc -l <"$tmp_dir/ci-run" | tr -d ' ')" = 1 ||
+			die "staging CI returned malformed run metadata"
+		IFS="$tab" read -r actual_id event branch sha path status \
+			conclusion url <"$tmp_dir/ci-run"
+		test "$actual_id" = "$run_id" && test "$event" = push &&
+			test "$branch" = codex-staging && test "$sha" = "$candidate" &&
+			test "$path" = .github/workflows/main.yml ||
+			die "staging CI run $run_id no longer identifies the exact candidate"
+		test "$status" != completed || break
+		sleep 30
+	done
+	test "$status" = completed ||
+		die "CI run $run_id did not complete before the timeout"
+	test "$conclusion" = success ||
+		die "CI failed for exact staging SHA $candidate: $url"
+
+	config_conclusion=$("$gh_command" api --hostname github.com \
+		"repos/$repository/actions/runs/$run_id/jobs?per_page=100" --jq \
+		'[.jobs[] | select(.name == "config") | .conclusion] | if length == 1 then .[0] else "" end') ||
+		die "could not inspect jobs for staging CI run $run_id"
+	test "$config_conclusion" = success ||
+		die "CI config did not run successfully on codex-staging"
+	say "Full staging CI passed: $url"
+)
+
+publish_run () {
+	test $# = 1 || { usage >&2; exit 129; }
+	run_id=$1
+	case "$run_id" in
+	''|*[!0-9]*) die "publish-run requires a numeric Actions run ID" ;;
+	esac
+
+	controller_oid=${CODEX_CONTROLLER_OID:-}
+	test -n "$controller_oid" ||
+		die "run publish-run through the pinned Meta/codex entry point"
+	meta_worktree=${CODEX_META_WORKTREE:-}
+	test -n "$meta_worktree" && test -d "$meta_worktree" ||
+		die "publish-run requires its pinned Meta worktree"
+	require_full_commit_oid "$controller_oid"
+	test "$(git -C "$meta_worktree" rev-parse --verify HEAD^{commit})" = \
+		"$controller_oid" || die "Meta/HEAD does not match the pinned controller"
+	require_full_repository
+	require_clean_publish_worktrees "$meta_worktree"
+	require_openai_git_origin
+	command -v gh >/dev/null 2>&1 || die "publish-run requires the GitHub CLI (gh)"
+	command -v unzip >/dev/null 2>&1 || die "publish-run requires unzip"
+	command -v zipinfo >/dev/null 2>&1 || die "publish-run requires zipinfo"
+
+	make_tmp_dir
+	repository=openai/git
+	endpoint="repos/$repository/actions/runs/$run_id"
+	gh api --hostname github.com "$endpoint" --jq \
+		'[.id, .run_attempt, .status, .conclusion, .event, .head_branch, .head_sha, .path, .repository.full_name, .html_url] | @tsv' \
+		>"$tmp_dir/run" || die "could not read Actions run $run_id"
+	test "$(wc -l <"$tmp_dir/run" | tr -d ' ')" = 1 ||
+		die "Actions run $run_id returned malformed metadata"
+	IFS="$tab" read -r api_id run_attempt status conclusion event \
+		head_branch head_sha workflow_path api_repository run_url \
+		<"$tmp_dir/run"
+	test "$api_id" = "$run_id" || die "Actions returned the wrong run"
+	case "$run_attempt" in
+	''|*[!0-9]*) die "Actions run has an invalid attempt" ;;
+	esac
+	test "$status" = completed && test "$conclusion" = success ||
+		die "Actions run $run_id has not completed successfully"
+	test "$event" = workflow_dispatch && test "$head_branch" = codex &&
+		test "$workflow_path" = .github/workflows/codex.yml &&
+		test "$api_repository" = "$repository" ||
+		die "Actions run $run_id is not a Refresh codex dispatch from openai/git:codex"
+
+	artifact_name=codex-candidate-$run_id-$run_attempt
+	gh api --hostname github.com "$endpoint/artifacts?per_page=100" \
+		--paginate --jq \
+		".artifacts[] | select(.name == \"$artifact_name\") | [.id, .expired] | @tsv" \
+		>"$tmp_dir/artifacts" || die "could not list artifacts for Actions run $run_id"
+	test "$(wc -l <"$tmp_dir/artifacts" | tr -d ' ')" = 1 ||
+		die "Actions run $run_id does not have exactly one '$artifact_name' artifact"
+	IFS="$tab" read -r artifact_id expired <"$tmp_dir/artifacts"
+	case "$artifact_id" in
+	''|*[!0-9]*) die "Actions returned an invalid artifact ID" ;;
+	esac
+	test "$expired" = false || die "candidate artifact '$artifact_name' has expired"
+	gh api --hostname github.com \
+		"repos/$repository/actions/artifacts/$artifact_id/zip" \
+		>"$tmp_dir/artifact.zip" || die "could not download '$artifact_name'"
+	metadata=$tmp_dir/candidate
+	extract_candidate_artifact "$tmp_dir/artifact.zip" "$metadata" \
+		"$tmp_dir/artifact-names" "$tmp_dir/expected-artifact-names"
+
+	run_controller=$(artifact_value controller-oid "$metadata/codex-run")
+	artifact_candidate=$(artifact_value candidate "$metadata/codex-run")
+	test "$(wc -l <"$metadata/codex-candidate" | tr -d ' ')" = 1 ||
+		die "candidate artifact must contain exactly one candidate OID"
+	test "$run_controller" = "$controller_oid" ||
+		die "prepared run uses a different meta controller than Meta/HEAD"
+	input_controller=$(awk -F '\t' '$1 == "controller" { print $3 }' \
+		"$metadata/codex-inputs")
+	input_codex=$(awk -F '\t' '$1 == "codex" { print $3 }' \
+		"$metadata/codex-inputs")
+	update_candidate=$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
+		"$metadata/codex-updates")
+	test -n "$input_controller" && test "$input_controller" = "$run_controller" ||
+		die "candidate input snapshot does not match its controller"
+	test -n "$input_codex" && test "$head_sha" = "$input_codex" ||
+		die "Actions caller SHA does not match the snapshotted codex input"
+	test "$artifact_candidate" = "$(sed -n '1p' "$metadata/codex-candidate")" &&
+		test "$artifact_candidate" = "$update_candidate" ||
+		die "candidate metadata and update manifest disagree"
+
+	controller_matches=$(gh api --hostname github.com "$endpoint" --jq \
+		"[.referenced_workflows[] | select(.path == \"openai/git/.github/workflows/codex.yml@$run_controller\" and .ref == \"refs/heads/meta\" and .sha == \"$run_controller\")] | length") ||
+		die "could not verify the reusable controller for Actions run $run_id"
+	test "$controller_matches" = 1 ||
+		die "Actions run $run_id was not executed by the pinned meta controller"
+	{
+		printf 'repository\t%s\n' "$repository"
+		printf 'run-id\t%s\n' "$run_id"
+		printf 'run-attempt\t%s\n' "$run_attempt"
+		printf 'event\t%s\n' "$event"
+		printf 'caller-ref\trefs/heads/%s\n' "$head_branch"
+		printf 'caller-sha\t%s\n' "$head_sha"
+		printf 'workflow-path\t%s\n' "$workflow_path"
+		printf 'controller-oid\t%s\n' "$run_controller"
+		printf 'candidate\t%s\n' "$artifact_candidate"
+		printf 'artifact-name\t%s\n' "$artifact_name"
+	} >"$tmp_dir/expected-run"
+	cmp -s "$tmp_dir/expected-run" "$metadata/codex-run" ||
+		die "candidate run metadata does not exactly match the live Actions run"
+
+	verify_inputs --remote origin --base master --codex codex \
+		"$metadata/codex-inputs"
+	git bundle verify "$metadata/codex.bundle" >/dev/null ||
+		die "candidate bundle failed verification"
+	git bundle unbundle "$metadata/codex.bundle" >"$tmp_dir/bundle-heads" ||
+		die "could not import the candidate bundle"
+	printf '%s refs/codex-output/candidate\n' "$artifact_candidate" \
+		>"$tmp_dir/expected-bundle-heads"
+	new_meta=$(awk -F '\t' '$1 == "refs/heads/meta" { print $3 }' \
+		"$metadata/codex-updates")
+	test -n "$new_meta" || die "candidate updates contain no meta state"
+	if test "$new_meta" != "$run_controller"
+	then
+		printf '%s refs/codex-output/meta\n' "$new_meta" \
+			>>"$tmp_dir/expected-bundle-heads"
+	fi
+	LC_ALL=C sort -o "$tmp_dir/bundle-heads" "$tmp_dir/bundle-heads"
+	LC_ALL=C sort -o "$tmp_dir/expected-bundle-heads" \
+		"$tmp_dir/expected-bundle-heads"
+	cmp -s "$tmp_dir/expected-bundle-heads" "$tmp_dir/bundle-heads" ||
+		die "candidate bundle heads do not match the frozen update manifest"
+	verify_output --inputs "$metadata/codex-inputs" \
+		--updates "$metadata/codex-updates" \
+		--result "$metadata/codex-candidate" --require-automation
+
+	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$artifact_candidate&per_page=100"
+	baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
+		'[.workflow_runs[].id] | max // 0') || die "could not record the staging CI baseline"
+	case "$baseline" in
+	''|*[!0-9]*) die "staging CI baseline is not a numeric run ID" ;;
+	esac
+	publisher=$(gh api --hostname github.com user --jq .login) ||
+		die "could not identify the GitHub CLI user"
+	test -n "$publisher" || die "GitHub CLI returned no authenticated user"
+	say "Publishing the prepared candidate with the credentials for origin."
+	say "GitHub API user: $publisher"
+	stage_candidate --remote origin --staging codex-staging \
+		--inputs "$metadata/codex-inputs" \
+		--updates "$metadata/codex-updates" --require-automation
+	wait_for_staging_ci gh "$repository" "$artifact_candidate" "$baseline"
+	promote --remote origin --staging codex-staging \
+		--inputs "$metadata/codex-inputs" \
+		--updates "$metadata/codex-updates" --require-automation
+	say "Published codex candidate $artifact_candidate from Actions run $run_id."
+	say "Generated commits identify $bot_name <$bot_email>; the push uses your configured origin credentials."
+}
+
 resolve_rebase () {
 	remote=origin
 	base_name=master
@@ -2652,11 +2989,12 @@ resolve_rebase () {
 	say "  # Edit the conflicted files."
 	say "  git add <files>"
 	say "  git diff --cached --check"
-	say "  git rebase --continue"
 	say
-	say "Repeat until the rebase completes, then run:"
+	say "Continue the rebase with the canonical Codex committer:"
 	say
 	say "  $(shell_quote "$script_path") continue --worktree ."
+	say
+	say "If another conflict stops, repeat edit/add/check and run that command again."
 }
 
 resolved_rebase_tip () {
@@ -2684,7 +3022,17 @@ continue_rewrite () {
 	require_state_controller "$state"
 	if rebase_in_progress "$worktree"
 	then
-		die "the rebase is still in progress; resolve it and run git rebase --continue"
+		if test -n "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
+		then
+			die "the rebase still has unresolved paths; edit them, git add them, and rerun this command"
+		fi
+		if ! continue_rerere_resolution "$worktree"
+		then
+			say "Another commit conflicts in the current topic."
+			say "Edit the conflicted paths, git add them, and rerun:"
+			say "  $(shell_quote "$script_path") continue --worktree $(shell_quote "$worktree")"
+			return 1
+		fi
 	fi
 	require_clean_worktree "$worktree"
 	failed_old=$(state_value "$state" failed-old)
@@ -2708,7 +3056,7 @@ continue_rewrite () {
 	then
 		owner=$(state_value "$state" failed-owner)
 		say "Another rebase conflict stopped in '$owner'."
-		say "Resolve it with git status, edit, git add, and git rebase --continue."
+		say "Resolve it with git status, edit, git add, and git diff --cached --check."
 		say "Then rerun: $(shell_quote "$script_path") continue --worktree $(shell_quote "$worktree")"
 		return 1
 	fi
@@ -2797,6 +3145,7 @@ verify-inputs) verify_inputs "$@" ;;
 verify-output) verify_output "$@" ;;
 stage) stage_candidate "$@" ;;
 promote) promote "$@" ;;
+publish-run) publish_run "$@" ;;
 resolve) resolve_rebase "$@" ;;
 continue) continue_rewrite "$@" ;;
 publish-topics) publish_topics "$@" ;;

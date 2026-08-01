@@ -117,21 +117,38 @@ Meta/codex refresh --require-automation
 It creates a session below the repository's shared Git directory containing
 the pinned inputs, update manifest, candidate bundle, and conflict report. It
 does not update local or remote refs. The low-level `rewrite`, `stage`, and
-`promote` commands used by Actions are also available through `Meta/codex`,
-but ordinary credentials cannot publish the protected `meta` and `codex`
-refs. Use local refresh for inspection and conflict recovery, then use the
-Action for the approved staging/CI/atomic-publish path.
+`promote` commands are also available through `Meta/codex`. Use local refresh
+for inspection and conflict recovery. Normal publication starts with the
+Action and finishes through the pinned `publish-run` command described below.
 
 ## Refresh `codex`
 
 1. Open **Actions > Refresh codex**.
 2. Choose **Run workflow**, select `codex`, and run it.
+3. When **Rebase topics and assemble codex** succeeds, run the exact command
+   printed in its summary from a clean clone with a current `Meta` worktree:
+
+   ```sh
+   Meta/codex publish-run <run-id>
+   ```
+
+   If the clone does not already have that linked worktree, create it once:
+
+   ```sh
+   git fetch origin '+refs/heads/meta:refs/remotes/origin/meta'
+   git worktree add --detach Meta refs/remotes/origin/meta
+   ```
+
+   An existing `Meta` worktree must be clean and at the controller commit shown
+   in the run summary. When `Meta/` is nested in the caller, the helper permits
+   that one linked-worktree directory but rejects every other caller change.
+   Prepared artifacts expire after seven days.
 
 Always start a fresh dispatch after a preparation, staging, CI, lease, or
 promotion failure. Do not use **Re-run failed jobs** for those failures: a
 retry must snapshot the current refs and stage a fresh candidate.
 
-The reusable controller then:
+The Action:
 
 1. snapshots `meta`, `master`, `codex`, and every active topic;
 2. reads the published boundaries from `meta/codex.config`, infers only new or
@@ -140,25 +157,34 @@ The reusable controller then:
 3. merges the rewritten maximal tips and freezes the result without building
    or executing candidate code, and creates a direct child of the pinned
    `meta` tip that changes only `codex.config`;
-4. waits for approval in the `codex-publish` environment;
-5. uses the repository deploy key to push the exact candidate to the fixed
-   `codex-staging` branch and waits for ordinary full CI on that exact commit;
-   and
-6. revalidates the snapshot, then atomically updates `meta`, every topic, and
-   `codex` with exact leases while deleting `codex-staging`.
+4. uploads the bundle, pinned input snapshot, update manifest, and canonical
+   run metadata as one attempt-specific artifact; and
+5. pushes nothing.
 
-The deploy-key staging push starts ordinary push CI, including when a candidate
-changes a workflow file. Before pushing, the controller records the largest
-matching run ID; it accepts only a newer `main.yml` push run whose branch and
-SHA exactly match the staged candidate. The final push to `codex` starts the
-existing push-triggered release workflow. A release never runs from staging.
-The ordinary CI workflow may reuse its own earlier successful result when the
-commit or tree is identical; that is CI's existing redundancy policy.
+`publish-run` uses the current user's existing `gh` and Git credentials. It
+accepts only a successful `workflow_dispatch` run on `openai/git:codex`, the
+attempt-specific artifact from that run, and the exact reusable controller
+recorded by GitHub for `meta`. It checks the caller SHA against the snapshotted
+`codex`, requires the artifact controller to equal `Meta/HEAD`, validates the
+ZIP allowlist and bundle heads, and revalidates the complete input snapshot.
 
-Until the final push, `meta`, `codex`, and all topic refs remain unchanged. A CI,
-validation, lease, or promotion failure after staging leaves `codex-staging`
-at the candidate for inspection. Successful promotion updates all primary refs
-and deletes staging as one atomic transaction.
+Only then does it record the existing CI run ID and push the exact candidate
+to the fixed `codex-staging` branch. That user-authenticated push starts
+ordinary push CI, including when the candidate changes a workflow file. The
+helper accepts only a newer `main.yml` push run whose branch and SHA exactly
+match the staged candidate, requires that full run and its `config` job to
+succeed, then revalidates the snapshot and atomically updates `meta`, every
+topic, and `codex` with exact leases while deleting `codex-staging`.
+
+The final push to `codex` starts the existing push-triggered release workflow.
+A release never runs from staging. The ordinary CI workflow may reuse its own
+earlier successful result when the commit or tree is identical; that is CI's
+existing redundancy policy.
+
+Until the final push, `meta`, `codex`, and all topic refs remain unchanged. A
+CI, validation, lease, or promotion failure after staging leaves
+`codex-staging` at the candidate for inspection. Successful promotion updates
+all primary refs and deletes staging as one atomic transaction.
 
 Git can place server-side leases only on refs included in the push. The
 controller therefore refetches `meta`, `master`, `codex`, and the complete
@@ -171,8 +197,8 @@ input created in the final fetch-to-push window is handled by the next run.
 compare-only command in the final ref transaction. The controller verifies it
 immediately before the push and checks it again afterward. If `master` moves
 in that narrow interval, the published candidate is still the exact tree that
-passed staging CI, but it is based on the preceding `master`; the job prints a
-warning and the next refresh advances it. Literal atomic comparison of an
+passed staging CI, but it is based on the preceding `master`; the helper prints
+a warning and the next refresh advances it. Literal atomic comparison of an
 unchanged ref would require server-side transaction support.
 
 ## Resolve a rebase conflict
@@ -193,18 +219,20 @@ commit for the failed run:
    # Edit every conflicted file.
    git add <files>
    git diff --cached --check
-   git rebase --continue
+   /path/to/Meta/codex continue --worktree .
    ```
 
-3. Repeat the edit/add/check/continue sequence until the rebase finishes.
-4. Run the exact `Meta/codex continue --worktree ...` command printed by the
-   helper. If another topic conflicts, resolve it the same way and run
-   `continue` again.
-5. Review the rewritten topic tips, then run the printed `publish-topics`
+3. Use the exact `Meta/codex` path printed by `resolve`. If that command reaches
+   another conflict, repeat the edit/add/check sequence and run it again. The
+   helper, not a plain
+   `git rebase --continue`, creates each resolved commit with the canonical
+   Codex committer identity while preserving its original author.
+4. Review the rewritten topic tips, then run the printed `publish-topics`
    command. It rechecks the original snapshot and atomically pushes every
    rewritten topic with an exact lease.
-6. Start a new **Actions > Refresh codex > Run workflow** dispatch to stage the
-   result, wait for ordinary CI, and promote it to `codex`.
+5. Start a new **Actions > Refresh codex > Run workflow** dispatch to prepare
+   a publishable artifact; then run the printed `publish-run` command to stage,
+   verify, and promote it to `codex`.
 
 To abandon recovery, run `git rebase --abort` and delete the disposable
 worktree. Do not use `git rebase --quit`, push only the first conflicted topic,
@@ -219,62 +247,36 @@ merging `codex` into a topic or by maintaining a manual order.
 
 ## Configure publishing
 
-Use one repository-specific SSH deploy key. It is not tied to a person's
-GitHub account and needs no organization-level App or token provisioning.
-A repository admin can complete the one-time setup if the organization or
-enterprise permits deploy keys. If that policy disables new deploy keys, an
-organization owner must enable them first:
+Publishing needs no repository secret, deploy key, GitHub App, or protected
+environment. It uses the publisher's ordinary credentials:
 
-1. Generate a new Ed25519 key pair used only by `openai/git`:
+1. Authenticate `gh` as the publishing user and make sure that account can
+   read Actions runs and artifacts for `openai/git`:
 
    ```sh
-   umask 077
-   ssh-keygen -t ed25519 -N '' \
-     -C 'openai/git Codex branch publisher' \
-     -f codex-branch-publisher
+   gh auth status
    ```
 
-2. Under **Settings > Deploy keys**, add `codex-branch-publisher.pub` as
-   **Codex branch publisher** and select **Allow write access**.
-3. Under **Settings > Environments**, configure `codex-publish` to allow only
-   `codex`, add the desired required reviewers, and add the private key from
-   `codex-branch-publisher` as the environment secret `CODEX_DEPLOY_KEY`. Allow
-   self-review if the person who starts a refresh should also be able to
-   approve it; disable self-review to require a second person.
-4. Update the existing `codex` ruleset and the `meta` ruleset to match the
-   recipes below, adding the deploy-key bypass to both. Import a recipe only
-   when that ruleset does not exist yet.
-5. Delete both local key files after the environment secret is saved. If setup
-   is abandoned, remove any deploy key already added to the repository.
+2. Configure the canonical `origin` with that user's normal Git credentials.
+   `Meta/codex publish-run` accepts only the standard SSH or HTTPS URL for
+   `openai/git`; it never reads a token from the repository or artifact.
+3. In the existing **Protect generated Codex branch** ruleset and the
+   **Protect Codex controller branch** ruleset, add an **always** bypass for
+   each exact human publisher. The checked-in recipes authorize only the
+   `ttaylorr-oai` user (`301000140`) plus the existing organization-admin
+   break-glass actor. Import the `meta` recipe only if that ruleset is absent.
 
-A ruleset can exempt deploy keys only as a class, not by individual key ID.
-Keep this as the repository's only deploy key and review **Settings > Deploy
-keys** when changing the publisher. The key is long-lived, so rotate it by
-replacing both the deploy key and environment secret together.
+The bypass is intentionally personal and visible. The Action cannot publish;
+it only prepares an immutable artifact. Running `publish-run` is the approval
+and Git records the configured user as the pusher. To add or remove a
+publisher, change the exact `User` actor in both rulesets. Do not replace it
+with a broad repository role or a shared long-lived credential.
 
-In the intended flow, only the approved publish job receives the key. It
-verifies the frozen bundle, stages it, waits for CI, and performs the
-exact-lease promotion; it never checks out or executes candidate code. A
-failed CI run leaves `codex-staging` for inspection and removes the private
-key from the runner. A fresh dispatch deletes and recreates an identical
-staging ref so GitHub emits a new push event.
-
-GitHub environments are repository-wide, not restricted to one workflow.
-Treat the `codex-publish` approval as the credential boundary: approve only
-the **Stage, verify, and publish codex** job from an expected **Refresh codex**
-run. Confirm that the run event is `workflow_dispatch`, its ref is `codex`,
-and the controller commit in the preparation summary is the expected `meta`
-tip. Display names alone are not sufficient. Reject any other deployment
-request for that environment.
-
-Granting the deploy key a bypass on `meta` is an explicit tradeoff of keeping
-state beside the controller. GitHub rulesets cannot limit a bypass to
-`codex.config`; possession of the key is technically authority to replace any
-file on `meta`. The pinned controller verifies that its generated successor is
-a direct child changing only a regular `100644` `codex.config`, but that check
-does not constrain a stolen key. Keep the key only in the reviewed environment
-and keep this repository free of other deploy keys. A separate state-only ref
-is the alternative if path-independent controller authority is unacceptable.
+The local helper downloads the artifact through `gh`, but pushes through
+`origin`. Those credentials can theoretically identify different users, so
+the helper prints the authenticated `gh` login before staging. Verify the
+configured Git identity when changing machines or credentials. A failed CI
+run leaves `codex-staging` for inspection; it exposes no publishing secret.
 
 The automation topic is the only topic allowed to change the dispatch
 trampoline. Other topics may change only
@@ -285,12 +287,12 @@ the release topic, including any reusable workflows it calls. The controller
 rejects every other topic-controlled workflow change.
 
 Rebased topic commits preserve their original authors. Generated commits and
-rebase committers use GitHub's standard `github-actions[bot]` identity. GitHub
-records the repository administrator who verified the deploy key when it was
-added as the pusher for deploy-key push events. The deploy key and protected
-environment are the actual publication authority; the workflow does not claim
-to have authenticated as the Codex GitHub App. Integration subjects remain
-`Merge <topic> into codex`.
+rebase committers use
+`ChatGPT Codex Connector <199175422+chatgpt-codex-connector[bot]@users.noreply.github.com>`.
+Generated merge and `meta` state commits use that identity as both author and
+committer. These commits are deliberately unsigned and do not claim verified
+GitHub App authentication. GitHub records the local credential owner as the
+pusher. Integration subjects remain `Merge <topic> into codex`.
 
 ## Repository rulesets
 
@@ -300,21 +302,20 @@ ruleset does not bypass another applicable ruleset. For a missing ruleset, use
 **Settings > Rules > Rulesets > New ruleset > Import a ruleset**.
 
 In `openai/git`, edit the existing **Protect generated Codex branch** ruleset
-to add the deploy-key bypass, keep the existing topic ruleset aligned with its
-recipe, and import only the missing `meta` ruleset. Verify that exactly one
-active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
+to add the exact-user publisher bypass, keep the existing topic ruleset aligned
+with its recipe, and import only the missing `meta` ruleset. Verify that exactly
+one active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
 
 - `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks
   deletion, preserving topic heads after pull-request merges.
 - `.github/rulesets/codex-branch.json` protects `codex` with pull-request,
-  review, deletion, and force-push rules. Its deploy-key bypass permits the
-  approved publisher; the organization-admin entry remains for break-glass
-  access.
-- `.github/rulesets/codex-meta.json` protects the `meta` controller with
-  pull-request, review, deletion, and force-push rules. Its deploy-key bypass
-  permits the same approved atomic publisher to advance only the generated
-  state during normal operation; the organization-admin entry remains for
+  review, deletion, and force-push rules. Its exact `ttaylorr-oai` user bypass
+  permits local publication; the organization-admin entry remains for
   break-glass access.
+- `.github/rulesets/codex-meta.json` protects the `meta` controller with
+  pull-request, review, deletion, and force-push rules. Its matching exact-user
+  bypass lets the same atomic push advance the generated state; the
+  organization-admin entry remains for break-glass access.
 
 Rulesets cannot require a pull request head to match `??/codex/*`; reviewers
 must enforce that convention. Do not require topic heads to be up to date with

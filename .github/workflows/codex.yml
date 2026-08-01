@@ -14,11 +14,6 @@ jobs:
   prepare:
     name: Rebase topics and assemble codex
     runs-on: ubuntu-24.04
-    outputs:
-      artifact-name: ${{ steps.rewrite.outputs.artifact-name }}
-      candidate: ${{ steps.rewrite.outputs.candidate }}
-      controller-oid: ${{ steps.rewrite.outputs.controller-oid }}
-      run-attempt: ${{ steps.rewrite.outputs.run-attempt }}
     steps:
       - name: Check out the pinned controller
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -43,12 +38,7 @@ jobs:
             '+refs/heads/*:refs/remotes/origin/*'
           test "$(git rev-parse refs/remotes/origin/meta)" = "$WORKFLOW_SHA"
           test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
-
-      - name: Configure generated commits
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email \
-            '41898282+github-actions[bot]@users.noreply.github.com'
+          test "$(git rev-parse refs/remotes/origin/codex)" = "$GITHUB_SHA"
 
       - name: Rebase every topic and assemble codex
         id: rewrite
@@ -69,11 +59,22 @@ jobs:
             --failure "$RUNNER_TEMP/codex-conflict.md"
 
           candidate=$(cat "$RUNNER_TEMP/codex-candidate")
-          echo "artifact-name=codex-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            >>"$GITHUB_OUTPUT"
+          artifact_name="codex-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            printf 'repository\t%s\n' "$GITHUB_REPOSITORY"
+            printf 'run-id\t%s\n' "$GITHUB_RUN_ID"
+            printf 'run-attempt\t%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'event\t%s\n' "$GITHUB_EVENT_NAME"
+            printf 'caller-ref\t%s\n' "$GITHUB_REF"
+            printf 'caller-sha\t%s\n' "$GITHUB_SHA"
+            printf 'workflow-path\t%s\n' '.github/workflows/codex.yml'
+            printf 'controller-oid\t%s\n' "$WORKFLOW_SHA"
+            printf 'candidate\t%s\n' "$candidate"
+            printf 'artifact-name\t%s\n' "$artifact_name"
+          } >"$RUNNER_TEMP/codex-run"
+          echo "artifact-name=$artifact_name" >>"$GITHUB_OUTPUT"
           echo "candidate=$candidate" >>"$GITHUB_OUTPUT"
           echo "controller-oid=$WORKFLOW_SHA" >>"$GITHUB_OUTPUT"
-          echo "run-attempt=$GITHUB_RUN_ATTEMPT" >>"$GITHUB_OUTPUT"
 
       - name: Summarize candidate
         env:
@@ -88,6 +89,12 @@ jobs:
             echo "Old codex: \`$old_codex\`"
             echo "Candidate: \`$candidate\`"
             echo "Controller: \`$CONTROLLER_OID\`"
+            echo
+            echo 'Publish this exact prepared run from a clean local clone:'
+            echo
+            echo '```sh'
+            echo "Meta/codex publish-run $GITHUB_RUN_ID"
+            echo '```'
             echo
             echo '| Ref | Old | New |'
             echo '| --- | --- | --- |'
@@ -109,6 +116,7 @@ jobs:
             ${{ runner.temp }}/codex.bundle
             ${{ runner.temp }}/codex-candidate
             ${{ runner.temp }}/codex-inputs
+            ${{ runner.temp }}/codex-run
             ${{ runner.temp }}/codex-updates
           if-no-files-found: error
           retention-days: 7
@@ -120,213 +128,3 @@ jobs:
           then
             cat "$RUNNER_TEMP/codex-conflict.md" >>"$GITHUB_STEP_SUMMARY"
           fi
-
-  publish:
-    name: Stage, verify, and publish codex
-    needs: prepare
-    if: >-
-      needs.prepare.outputs.run-attempt == format('{0}', github.run_attempt)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    environment: codex-publish
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Check out the pinned controller
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Load the candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ${{ needs.prepare.outputs.artifact-name }}
-          path: ${{ runner.temp }}/codex-candidate
-
-      - name: Import and verify the candidate bundle
-        env:
-          CONTROLLER_OID: ${{ needs.prepare.outputs.controller-oid }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: |
-          set -euo pipefail
-          test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
-          metadata="$RUNNER_TEMP/codex-candidate"
-          git bundle verify "$metadata/codex.bundle"
-          git fetch "$metadata/codex.bundle" \
-            '+refs/codex-output/*:refs/codex-import/*'
-          test "$(git rev-parse refs/codex-import/candidate)" = \
-            "$(cat "$metadata/codex-candidate")"
-          expected_meta=$(awk -F '\t' \
-            '$1 == "refs/heads/meta" { print $3 }' \
-            "$metadata/codex-updates")
-          test -n "$expected_meta"
-          test "$(git rev-parse "$expected_meta")" = "$expected_meta"
-
-      - name: Configure the repository deploy key
-        id: publisher
-        env:
-          CODEX_DEPLOY_KEY: ${{ secrets.CODEX_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          test -n "$CODEX_DEPLOY_KEY" || {
-            echo '::error::codex-publish needs the CODEX_DEPLOY_KEY environment secret'
-            exit 1
-          }
-          key_file="$RUNNER_TEMP/codex-deploy-key"
-          known_hosts="$RUNNER_TEMP/github-known-hosts"
-          umask 077
-          printf '%s\n' "$CODEX_DEPLOY_KEY" >"$key_file"
-          ssh-keygen -y -f "$key_file" >/dev/null
-          # Pin GitHub's published Ed25519 host key and fingerprint.
-          printf '%s\n' \
-            'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
-            >"$known_hosts"
-          fingerprint=$(ssh-keygen -lf "$known_hosts" -E sha256 |
-            awk 'NR == 1 { print $2 }')
-          test "$fingerprint" = \
-            'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU'
-          git remote set-url origin git@github.com:openai/git.git
-          echo "key-file=$key_file" >>"$GITHUB_OUTPUT"
-          echo "known-hosts=$known_hosts" >>"$GITHUB_OUTPUT"
-          unset CODEX_DEPLOY_KEY
-
-      - name: Record existing CI for this candidate
-        id: baseline
-        env:
-          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          baseline=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$CANDIDATE&per_page=100" \
-            --jq '[.workflow_runs[].id] | max // 0')
-          case "$baseline" in
-            ''|*[!0-9]*)
-              echo '::error::CI baseline is not a numeric workflow run ID'
-              exit 1
-              ;;
-          esac
-          echo "run-id=$baseline" >>"$GITHUB_OUTPUT"
-
-      - name: Push the exact staging candidate
-        env:
-          CONTROLLER_OID: ${{ needs.prepare.outputs.controller-oid }}
-          GIT_SSH_COMMAND: >-
-            ssh -i ${{ steps.publisher.outputs.key-file }}
-            -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o UserKnownHostsFile=${{ steps.publisher.outputs.known-hosts }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: |
-          set -euo pipefail
-          test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
-          metadata="$RUNNER_TEMP/codex-candidate"
-          sh "$GITHUB_WORKSPACE/codex" stage \
-            --staging codex-staging \
-            --require-automation \
-            --inputs "$metadata/codex-inputs" \
-            --updates "$metadata/codex-updates"
-
-      - name: Wait for CI on the exact staging SHA
-        env:
-          BASELINE_RUN_ID: ${{ steps.baseline.outputs.run-id }}
-          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          workflow_runs="repos/$GITHUB_REPOSITORY/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$CANDIDATE&per_page=100"
-          run_id=
-          for attempt in $(seq 1 60)
-          do
-            run_id=$(gh api "$workflow_runs" --jq \
-              ".workflow_runs | map(select(.id > ($BASELINE_RUN_ID | tonumber) and .head_branch == \"codex-staging\" and .head_sha == \"$CANDIDATE\" and .event == \"push\")) | sort_by(.id) | .[0].id // empty")
-            test -z "$run_id" || break
-            sleep 5
-          done
-          test -n "$run_id" || {
-            echo "::error::no CI run appeared for codex-staging at $CANDIDATE"
-            exit 1
-          }
-
-          conclusion=
-          url=
-          for attempt in $(seq 1 180)
-          do
-            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
-            test "$(jq -r .id <<<"$run")" = "$run_id"
-            test "$(jq -r .event <<<"$run")" = push
-            test "$(jq -r .head_branch <<<"$run")" = codex-staging
-            test "$(jq -r .head_sha <<<"$run")" = "$CANDIDATE"
-            test "$(jq -r .path <<<"$run")" = .github/workflows/main.yml
-            status=$(jq -r .status <<<"$run")
-            conclusion=$(jq -r '.conclusion // empty' <<<"$run")
-            url=$(jq -r .html_url <<<"$run")
-            test "$status" != completed || break
-            sleep 30
-          done
-          test "$status" = completed || {
-            echo "::error::CI run $run_id did not complete before the timeout"
-            exit 1
-          }
-          test "$conclusion" = success || {
-            echo "::error::CI failed for exact staging SHA $CANDIDATE: $url"
-            exit 1
-          }
-
-          jobs=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")
-          config_conclusion=$(jq -r \
-            '[.jobs[] | select(.name == "config")][0].conclusion // empty' \
-            <<<"$jobs")
-          test "$config_conclusion" = success || {
-            echo '::error::CI config did not run successfully on codex-staging'
-            exit 1
-          }
-          {
-            echo '## Staging CI'
-            echo
-            echo "Candidate: \`$CANDIDATE\`"
-            echo "Full CI: [$run_id]($url)"
-          } >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Revalidate and atomically promote
-        env:
-          CONTROLLER_OID: ${{ needs.prepare.outputs.controller-oid }}
-          GIT_SSH_COMMAND: >-
-            ssh -i ${{ steps.publisher.outputs.key-file }}
-            -o IdentitiesOnly=yes
-            -o StrictHostKeyChecking=yes
-            -o UserKnownHostsFile=${{ steps.publisher.outputs.known-hosts }}
-          WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: |
-          set -euo pipefail
-          test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
-          metadata="$RUNNER_TEMP/codex-candidate"
-          sh "$GITHUB_WORKSPACE/codex" promote \
-            --staging codex-staging \
-            --require-automation \
-            --inputs "$metadata/codex-inputs" \
-            --updates "$metadata/codex-updates"
-
-      - name: Summarize promotion
-        run: |
-          candidate=$(cat "$RUNNER_TEMP/codex-candidate/codex-candidate")
-          {
-            echo '## Published codex'
-            echo
-            echo "Promoted: \`$candidate\`"
-            echo 'Deleted: `refs/heads/codex-staging`'
-          } >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Remove the deploy key from the runner
-        if: always()
-        run: |
-          set -euo pipefail
-          rm -f -- \
-            "$RUNNER_TEMP/codex-deploy-key" \
-            "$RUNNER_TEMP/github-known-hosts" \
-            "$RUNNER_TEMP/github-known-hosts.tmp"
