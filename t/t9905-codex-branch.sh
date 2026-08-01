@@ -8,6 +8,7 @@ export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 . ./test-lib.sh
 
 codex_branch=${CODEX_BRANCH:-$TEST_DIRECTORY/../.github/workflows/codex-branch.sh}
+codex_workflow=$(dirname "$codex_branch")/codex.yml
 
 write () {
 	printf '%s\n' "$1" >"$2"
@@ -44,16 +45,6 @@ manifest_has () {
 	' "$4"
 }
 
-tuple_has () {
-	awk -F '\t' -v topic="$1" -v old="$2" -v prerequisite="$3" \
-		-v new="$4" '
-		$1 == topic && $2 == old && $3 == prerequisite && $4 == new {
-			found = 1
-		}
-		END { exit !found }
-	' "$5"
-}
-
 snapshot_without_staging () {
 	snapshot_refs "$1" |
 	sed '/^refs\/heads\/codex-staging[[:space:]]/d'
@@ -66,12 +57,12 @@ write_automation_workflow () {
 	on: workflow_dispatch
 
 	permissions:
+	  actions: read
 	  contents: read
 
 	jobs:
 	  refresh:
 	    uses: openai/git/.github/workflows/codex.yml@meta
-	    secrets: inherit
 	EOF
 }
 
@@ -101,7 +92,22 @@ test_expect_success 'topic names use the two-character namespace' '
 	test_expect_code 1 sh "$codex_branch" check-topic tb/codex/x..y
 '
 
-test_expect_success 'topics cannot change the reusable controller workflow' '
+test_expect_success 'generated commits do not hard-code the Actions bot' '
+	! grep -F "github-actions[bot]" "$codex_branch"
+'
+
+test_expect_success 'refresh has no topic fanout and delegates testing to staging CI' '
+	! grep -F "codex-topic.yml" "$codex_workflow" &&
+	! grep -E "make -C|t9905-codex-branch.sh" "$codex_workflow" &&
+	! grep -E "clone --shared|parallel worker" "$codex_branch" &&
+	! grep -E "CODEX_BRANCH_TOKEN|CODEX_BRANCH_MANAGER_TOKEN|secret-broker|id-token" \
+		"$codex_workflow" &&
+	test_grep "CODEX_DEPLOY_KEY" "$codex_workflow" &&
+	test_grep "environment: codex-publish" "$codex_workflow" &&
+	test_grep "Wait for CI on the exact staging SHA" "$codex_workflow"
+'
+
+test_expect_success 'topics cannot change the meta branch ruleset' '
 	git init --bare control-path.git &&
 	test_create_repo control-path-source &&
 	(
@@ -114,10 +120,10 @@ test_expect_success 'topics cannot change the reusable controller workflow' '
 		git branch codex &&
 
 		git switch -c aa/codex/control-path &&
-		mkdir -p .github/workflows &&
-		write untrusted .github/workflows/codex-topic.yml &&
-		git add .github/workflows/codex-topic.yml &&
-		git commit -m "change controller workflow" &&
+		mkdir -p .github/rulesets &&
+		write untrusted .github/rulesets/codex-meta.json &&
+		git add .github/rulesets/codex-meta.json &&
+		git commit -m "change meta branch ruleset" &&
 
 		git switch master &&
 		write master master-file &&
@@ -187,6 +193,17 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 		git add .github/workflows/codex-release.yml &&
 		git commit -m "publish releases from staging" &&
 
+		git switch -c release-credentials master &&
+		mkdir -p .github/workflows &&
+		write_release_workflow codex \
+			.github/workflows/codex-release.yml &&
+		echo "    'environment': production" \
+			>>.github/workflows/codex-release.yml &&
+		echo "    token: \${{ secrets.NOT_THE_PUBLISHER }}" \
+			>>.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "obtain promotion credentials in release" &&
+
 		git switch -c workflow-extra master &&
 		mkdir -p .github/workflows &&
 		write untrusted .github/workflows/extra.yml &&
@@ -207,6 +224,7 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 			cc/codex/feature automation-bad automation-extra \
 			bb/codex/control:refs/heads/control-invalid \
 			release-staging:refs/heads/release-invalid \
+			release-credentials:refs/heads/release-credentials-invalid \
 			workflow-extra:refs/heads/workflow-invalid
 	) &&
 
@@ -305,6 +323,23 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 			release.err &&
 		git --git-dir=../automation.git update-ref -d \
 			refs/heads/bb/codex/control "$release" &&
+
+		release_credentials=$(git --git-dir=../automation.git \
+			rev-parse refs/heads/release-credentials-invalid) &&
+		git --git-dir=../automation.git update-ref \
+			refs/heads/bb/codex/control "$release_credentials" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result release-credentials-result \
+			--updates release-credentials-updates \
+			--inputs release-credentials-inputs \
+			--failure release-credentials-failure \
+			--require-automation 2>release-credentials.err &&
+		test_grep "must not obtain promotion credentials" \
+			release-credentials.err &&
+		git --git-dir=../automation.git update-ref -d \
+			refs/heads/bb/codex/control "$release_credentials" &&
 
 		extra_workflow=$(git --git-dir=../automation.git \
 			rev-parse refs/heads/workflow-invalid) &&
@@ -420,13 +455,19 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		old_c=$(git rev-parse origin/cc/codex/c) &&
 		master=$(git rev-parse origin/master) &&
 		test "$old_a" = "$(git rev-parse "$old_b^")" &&
+		git config user.name "github-actions[bot]" &&
+		git config user.email \
+			"41898282+github-actions[bot]@users.noreply.github.com" &&
 
-		GIT_COMMITTER_DATE="2002-02-02T00:00:00 +0000" \
-		sh "$codex_branch" rewrite \
-			--remote origin --base master --codex codex \
-			--result result --updates updates \
-			--inputs inputs --topic-tuples tuples \
-			--failure failure &&
+		(
+			unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL &&
+			GIT_COMMITTER_DATE="2002-02-02T00:00:00 +0000" \
+			sh "$codex_branch" rewrite \
+				--remote origin --base master --codex codex \
+				--result result --updates updates \
+				--inputs inputs \
+				--failure failure
+		) >rewrite.out 2>rewrite.err &&
 		candidate=$(cat result) &&
 		new_a=$(find_subject "topic A" "$candidate") &&
 		new_b=$(find_subject "topic B" "$candidate") &&
@@ -442,30 +483,19 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		manifest_has aa/codex/a "$old_a" "$new_a" updates &&
 		manifest_has bb/codex/b "$old_b" "$new_b" updates &&
 		manifest_has cc/codex/c "$old_c" "$new_c" updates &&
-		test 3 = "$(wc -l <tuples | tr -d " ")" &&
-		tuple_has aa/codex/a "$old_a" "$master" "$new_a" tuples &&
-		tuple_has bb/codex/b "$old_b" "$new_a" "$new_b" tuples &&
-		tuple_has cc/codex/c "$old_c" "$master" "$new_c" tuples &&
-		sh "$codex_branch" verify-topic --topic aa/codex/a \
-			--inputs inputs --updates updates --result result &&
-		sh "$codex_branch" verify-topic --topic bb/codex/b \
-			--inputs inputs --updates updates --result result &&
-		sh "$codex_branch" verify-topic --topic cc/codex/c \
-			--inputs inputs --updates updates --result result &&
-		sed "s/$new_b\$/$master/" updates >updates-bad &&
-		sh "$codex_branch" verify-topic --topic aa/codex/a \
-			--inputs inputs --updates updates-bad --result result &&
-		sh "$codex_branch" verify-topic --topic cc/codex/c \
-			--inputs inputs --updates updates-bad --result result &&
-		test_expect_code 1 sh "$codex_branch" verify-topic \
-			--topic bb/codex/b --inputs inputs \
-			--updates updates-bad --result result \
-			2>verify-topic.err &&
-		test_grep "lost prerequisite.*aa/codex/a.*bb/codex/b" \
-			verify-topic.err &&
 
 		last_merge=$(git rev-parse "$candidate") &&
 		first_merge=$(git rev-parse "$last_merge^") &&
+		test "$(git show -s --format=%cn "$new_a")" = \
+			"github-actions[bot]" &&
+		test "$(git show -s --format=%cn "$new_b")" = \
+			"github-actions[bot]" &&
+		test "$(git show -s --format=%cn "$new_c")" = \
+			"github-actions[bot]" &&
+		test "$(git show -s --format=%cn "$first_merge")" = \
+			"github-actions[bot]" &&
+		test "$(git show -s --format=%cn "$last_merge")" = \
+			"github-actions[bot]" &&
 		test "$new_c" = "$(git rev-parse "$last_merge^2")" &&
 		test "$new_b" = "$(git rev-parse "$first_merge^2")" &&
 		test "$master" = "$(git rev-parse "$first_merge^")" &&
@@ -557,12 +587,12 @@ test_expect_success 'shared private history needs a prerequisite topic' '
 	)
 '
 
-test_expect_success 'represented prerequisite siblings rebase in parallel' '
-	git init --bare parallel.git &&
-	test_create_repo parallel-source &&
+test_expect_success 'represented prerequisite siblings rebase sequentially' '
+	git init --bare sequential.git &&
+	test_create_repo sequential-source &&
 	(
-		cd parallel-source &&
-		git remote add origin ../parallel.git &&
+		cd sequential-source &&
+		git remote add origin ../sequential.git &&
 		write base shared &&
 		git add shared &&
 		install_rerere_train &&
@@ -590,43 +620,20 @@ test_expect_success 'represented prerequisite siblings rebase in parallel' '
 		git switch master &&
 		write master master-file &&
 		git add master-file &&
-		git commit -m "new parallel master" &&
+		git commit -m "new sequential master" &&
 		git branch meta master &&
 		git push origin master meta codex \
 			aa/codex/release bb/codex/one cc/codex/two
 	) &&
 
-	git clone parallel.git parallel-runner &&
+	git clone sequential.git sequential-runner &&
 	(
-		cd parallel-runner &&
+		cd sequential-runner &&
 		fetch_all &&
-		real_git=$(command -v git) &&
-		barrier=$PWD/parallel-barrier &&
-		mkdir "$barrier" parallel-bin &&
-		write "#!/bin/sh
-case \" \$* \" in
-*\"/parallel/worker-\"*\"rebase --merge\"*)
-	marker=\"$barrier/\$\$\"
-	: >\"\$marker\"
-	attempts=0
-	while test \"\$(find \"$barrier\" -type f | wc -l | tr -d \" \")\" -lt 2
-	do
-		attempts=\$((attempts + 1))
-		test \"\$attempts\" -lt 6 || exit 97
-		sleep 1
-	done
-	;;
-esac
-exec \"$real_git\" \"\$@\"" parallel-bin/git &&
-		chmod +x parallel-bin/git &&
-
-		env PATH="$PWD/parallel-bin:$PATH" sh "$codex_branch" rewrite \
+		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result result --updates updates --inputs inputs \
 			--failure failure >out 2>err &&
-		test_grep "Rebasing 2 ready topics in parallel" out &&
-		test_grep ! "recreating the wave" err &&
-		test 2 -le "$(find "$barrier" -type f | wc -l | tr -d " ")" &&
 
 		master=$(git rev-parse origin/master) &&
 		old_release=$(git rev-parse origin/aa/codex/release) &&
@@ -857,6 +864,25 @@ test_expect_success 'stage leaves primary refs untouched and promote is atomic' 
 			rev-parse refs/heads/codex-staging)" &&
 		snapshot_without_staging ../promotion.git >after-stage &&
 		test_cmp before-stage after-stage &&
+
+		GIT_TRACE=1 sh "$codex_branch" stage \
+			--remote origin --inputs inputs --updates updates \
+			>restage.out 2>restage.trace &&
+		test 2 = "$(grep -c "push --atomic --porcelain" \
+			restage.trace)" &&
+		grep -F \
+			"force-with-lease=refs/heads/codex-staging:$candidate" \
+			restage.trace &&
+		grep -F ":refs/heads/codex-staging" restage.trace &&
+		grep -F \
+			"force-with-lease=refs/heads/codex-staging:" \
+			restage.trace &&
+		grep -F "$candidate:refs/heads/codex-staging" \
+			restage.trace &&
+		test "$candidate" = "$(git --git-dir=../promotion.git \
+			rev-parse refs/heads/codex-staging)" &&
+		snapshot_without_staging ../promotion.git >after-restage &&
+		test_cmp before-stage after-restage &&
 		while IFS="$(printf '\''\t'\'')" read -r ref old new
 		do
 			test "$old" = "$(git --git-dir=../promotion.git \
@@ -1131,8 +1157,6 @@ test_expect_success 'rewrite conflicts do not write the remote and give a pinned
 			--result result --updates updates \
 			--inputs inputs --failure failure \
 			>rewrite.out 2>rewrite.err &&
-		test_grep "Rebasing 2 ready topics in parallel" rewrite.out &&
-		test_grep "recreating the wave" rewrite.err &&
 		snapshot_refs ../conflict.git >after &&
 		test_cmp before after &&
 		test_path_is_file failure &&
@@ -1293,8 +1317,6 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 			--result result --updates updates \
 			--inputs inputs --failure failure \
 			>rewrite.out 2>rewrite.err &&
-		test_grep "Rebasing 2 ready topics in parallel" rewrite.out &&
-		test_grep ! "recreating the wave" rewrite.err &&
 		candidate=$(cat result) &&
 		new_topic=$(find_subject "rerere topic" "$candidate") &&
 		new_other=$(find_subject "independent rerere sibling" "$candidate") &&

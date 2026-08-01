@@ -36,8 +36,8 @@ their pull requests are merged.
 
 GitHub shows **Run workflow** only for a workflow present on the default
 branch. Exactly one active `??/codex/automation` topic must therefore be based
-directly on `master` and change only `.github/workflows/codex.yml` to this
-exact trampoline:
+directly on `master` and change only `.github/workflows/codex.yml` to this exact
+trampoline:
 
 ```yaml
 name: Refresh codex
@@ -45,12 +45,12 @@ name: Refresh codex
 on: workflow_dispatch
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
   refresh:
     uses: openai/git/.github/workflows/codex.yml@meta
-    secrets: inherit
 ```
 
 The controller enforces that exact file. It remains in each generated `codex`
@@ -62,26 +62,29 @@ custom patches belong on `master`.
 1. Open **Actions > Refresh codex**.
 2. Choose **Run workflow**, select `codex`, and run it.
 
-Always start a fresh dispatch. Do not use **Re-run failed jobs**: a retry must
-snapshot the current refs and stage a fresh candidate.
+Always start a fresh dispatch after a preparation, staging, CI, lease, or
+promotion failure. Do not use **Re-run failed jobs** for those failures: a
+retry must snapshot the current refs and stage a fresh candidate.
 
 The reusable controller then:
 
 1. snapshots `meta`, `master`, `codex`, and every active topic;
-2. infers dependencies from ancestry and rebases ready topics in parallel
-   topological waves, using rerere resolutions learned from the old `codex`;
-3. merges the rewritten maximal tips and runs the controller tests;
-4. uses `CODEX_BRANCH_TOKEN` to push the exact candidate to the fixed
-   `codex-staging` branch;
-5. waits for the ordinary full CI workflow to succeed for that exact staging
-   commit;
-6. fans out one API-only validation square per topic; and
-7. revalidates the snapshot, then atomically updates every topic and `codex`
-   with exact leases while deleting `codex-staging` in the same push.
+2. infers dependencies from ancestry and rebases each topic in dependency
+   order, using rerere resolutions learned from the old `codex`;
+3. merges the rewritten maximal tips and freezes the result without building
+   or executing candidate code;
+4. waits for approval in the `codex-publish` environment;
+5. uses the repository deploy key to push the exact candidate to the fixed
+   `codex-staging` branch and waits for ordinary full CI on that exact commit;
+   and
+6. revalidates the snapshot, then atomically updates every topic and `codex`
+   with exact leases while deleting `codex-staging`.
 
-The topic squares do not check out or execute candidate code. They read refs
-and compare commits through the GitHub API, verifying the live topic tip, its
-rewritten prerequisite, and its containment in the exact staging candidate.
+The deploy-key staging push starts ordinary push CI, including when a candidate
+changes a workflow file. Before pushing, the controller records the largest
+matching run ID; it accepts only a newer `main.yml` push run whose branch and
+SHA exactly match the staged candidate. The final push to `codex` starts the
+existing push-triggered release workflow. A release never runs from staging.
 The ordinary CI workflow may reuse its own earlier successful result when the
 commit or tree is identical; that is CI's existing redundancy policy.
 
@@ -122,8 +125,8 @@ The failed run summary says **No refs were updated** and prints a pinned
 5. Review the rewritten topic tips, then run the printed `publish-topics`
    command. It rechecks the original snapshot and atomically pushes every
    rewritten topic with an exact lease.
-6. Start a new **Actions > Refresh codex > Run workflow** dispatch to stage,
-   test, and promote the resulting `codex`.
+6. Start a new **Actions > Refresh codex > Run workflow** dispatch to stage the
+   result, wait for ordinary CI, and promote it to `codex`.
 
 To abandon recovery, run `git rebase --abort` and delete the disposable
 worktree. Do not use `git rebase --quit`, push only the first conflicted topic,
@@ -138,35 +141,91 @@ merging `codex` into a topic or by maintaining a manual order.
 
 ## Configure publishing
 
-Create a protected environment named `codex-publish`:
+Use one repository-specific SSH deploy key. It is not tied to a person's
+GitHub account and needs no organization-level App or token provisioning.
+A repository admin can complete the one-time setup if the organization or
+enterprise permits deploy keys. If that policy disables new deploy keys, an
+organization owner must enable them first:
 
-1. Restrict deployment branches to `codex`.
-2. Add at least one required reviewer and disable self-review.
-3. Add a repository or organization Actions secret named
-   `CODEX_BRANCH_TOKEN` for an organization-admin bot matching the ruleset
-   bypass actor. Give it **Actions: read**, **Contents: read and write**, and
-   **Workflows: read and write** for this repository.
+1. Generate a new Ed25519 key pair used only by `openai/git`:
 
-The staging job uses the secret to trigger ordinary push CI. The
-`codex-publish` environment gates only the final promotion, so one approval is
-enough. Candidate CI and the API-only topic jobs never receive this token.
-Topics may change only `.github/workflows/codex-release.yml`; its trigger must
-remain exactly a push to `codex`, and it may not reference the publisher token.
-The controller rejects every other topic-controlled workflow change.
+   ```sh
+   umask 077
+   ssh-keygen -t ed25519 -N '' \
+     -C 'openai/git Codex branch publisher' \
+     -f codex-branch-publisher
+   ```
 
-Generated merge commits use GitHub's standard `github-actions[bot]` identity
-and subjects of the form `Merge <topic> into codex`.
+2. Under **Settings > Deploy keys**, add `codex-branch-publisher.pub` as
+   **Codex branch publisher** and select **Allow write access**.
+3. Under **Settings > Environments**, configure `codex-publish` to allow only
+   `codex`, add the desired required reviewers, and add the private key from
+   `codex-branch-publisher` as the environment secret `CODEX_DEPLOY_KEY`. Allow
+   self-review if the person who starts a refresh should also be able to
+   approve it; disable self-review to require a second person.
+4. Update the existing `codex` ruleset to match the recipe below, adding the
+   deploy-key bypass. Import it only if that ruleset does not exist yet.
+5. Delete both local key files after the environment secret is saved. If setup
+   is abandoned, remove any deploy key already added to the repository.
+
+A ruleset can exempt deploy keys only as a class, not by individual key ID.
+Keep this as the repository's only deploy key and review **Settings > Deploy
+keys** when changing the publisher. The key is long-lived, so rotate it by
+replacing both the deploy key and environment secret together.
+
+In the intended flow, only the approved publish job receives the key. It
+verifies the frozen bundle, stages it, waits for CI, and performs the
+exact-lease promotion; it never checks out or executes candidate code. A
+failed CI run leaves `codex-staging` for inspection and removes the private
+key from the runner. A fresh dispatch deletes and recreates an identical
+staging ref so GitHub emits a new push event.
+
+GitHub environments are repository-wide, not restricted to one workflow.
+Treat the `codex-publish` approval as the credential boundary: approve only
+the **Stage, verify, and publish codex** job from an expected **Refresh codex**
+run. Confirm that the run event is `workflow_dispatch`, its ref is `codex`,
+and the controller commit in the preparation summary is the expected `meta`
+tip. Display names alone are not sufficient. Reject any other deployment
+request for that environment.
+
+The automation topic is the only topic allowed to change the dispatch
+trampoline. Other topics may change only
+`.github/workflows/codex-release.yml`, whose trigger must remain exactly a push
+to `codex` and may not mention an environment or the `secrets` context. That
+check is defense in depth, not a sandbox for untrusted workflow code: review
+the release topic, including any reusable workflows it calls. The controller
+rejects every other topic-controlled workflow change.
+
+Rebased topic commits preserve their original authors. Generated commits and
+rebase committers use GitHub's standard `github-actions[bot]` identity. GitHub
+records the repository administrator who verified the deploy key when it was
+added as the pusher for deploy-key push events. The deploy key and protected
+environment are the actual publication authority; the workflow does not claim
+to have authenticated as the Codex GitHub App. Integration subjects remain
+`Merge <topic> into codex`.
 
 ## Repository rulesets
 
-Import both JSON files under **Settings > Rules > Rulesets > New ruleset >
-Import a ruleset**.
+Create or update the repository rulesets to match the three JSON files. Do not
+layer a duplicate over an existing matching ruleset: a bypass in the new
+ruleset does not bypass another applicable ruleset. For a missing ruleset, use
+**Settings > Rules > Rulesets > New ruleset > Import a ruleset**.
+
+In `openai/git`, edit the existing **Protect generated Codex branch** ruleset
+to add the deploy-key bypass, keep the existing topic ruleset aligned with its
+recipe, and import only the missing `meta` ruleset. Verify that exactly one
+active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
 
 - `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks
   deletion, preserving topic heads after pull-request merges.
 - `.github/rulesets/codex-branch.json` protects `codex` with pull-request,
-  review, deletion, and force-push rules while allowing the publisher's
-  organization-admin bot to bypass them.
+  review, deletion, and force-push rules. Its deploy-key bypass permits the
+  approved publisher; the organization-admin entry remains for break-glass
+  access.
+- `.github/rulesets/codex-meta.json` protects the `meta` controller with
+  pull-request, review, deletion, and force-push rules. Its only bypass is the
+  organization-admin break-glass actor. Never grant deploy-key bypass on
+  `meta`.
 
 Rulesets cannot require a pull request head to match `??/codex/*`; reviewers
 must enforce that convention. Do not require topic heads to be up to date with

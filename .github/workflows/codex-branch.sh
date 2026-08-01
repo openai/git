@@ -25,14 +25,12 @@ usage () {
 	   or: codex-branch rewrite [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--rerere-from <branch>]
 		[--result <path>] [--updates <path>] [--inputs <path>]
-		[--bundle <path>] [--topic-tuples <path>] [--failure <path>]
+		[--bundle <path>] [--failure <path>]
 		[--worktree <path>] [--require-automation]
 	   or: codex-branch verify-inputs [--remote <remote>]
 		[--base <branch>] [--codex <branch>] <snapshot>
 	   or: codex-branch verify-output --inputs <path>
 		--updates <path> --result <path> [--require-automation]
-	   or: codex-branch verify-topic --topic <branch> --inputs <path>
-		--updates <path> --result <path>
 	   or: codex-branch stage [--remote <remote>] [--staging <branch>]
 		--inputs <path> --updates <path> [--require-automation]
 	   or: codex-branch promote [--remote <remote>] [--staging <branch>]
@@ -142,6 +140,7 @@ legacy_control_paths_unchanged () (
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
+		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
@@ -155,6 +154,7 @@ meta_control_paths_unchanged () (
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
+		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex-branch.sh \
@@ -174,12 +174,12 @@ write_automation_workflow () {
 	on: workflow_dispatch
 
 	permissions:
+	  actions: read
 	  contents: read
 
 	jobs:
 	  refresh:
 	    uses: openai/git/.github/workflows/codex.yml@meta
-	    secrets: inherit
 	EOF
 }
 
@@ -224,7 +224,11 @@ release_workflow_is_codex_only () {
 	EOF
 	cmp -s "$tmp_dir/expected-release-trigger" \
 		"$tmp_dir/release-trigger" || return 1
-	! grep -F 'CODEX_BRANCH_TOKEN' "$tmp_dir/codex-release.yml" >/dev/null
+	! grep -E \
+		'CODEX_BRANCH_TOKEN|CODEX_BRANCH_MANAGER_TOKEN|CODEX_DEPLOY_KEY|codex-publish|ci-token-gh-installation-token-codex-branch-manager|secret-broker-github-action' \
+		"$tmp_dir/codex-release.yml" >/dev/null &&
+	! grep -F 'environment' "$tmp_dir/codex-release.yml" >/dev/null &&
+	! grep -F 'secrets' "$tmp_dir/codex-release.yml" >/dev/null
 }
 
 collect_topics () (
@@ -487,8 +491,6 @@ continue_rerere_resolution () {
 		test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
 	do
 		if ! GIT_EDITOR=true git -C "$worktree" \
-			-c user.name='github-actions[bot]' \
-			-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 			-c core.hooksPath=/dev/null \
 			-c core.fsmonitor=false \
 			-c commit.gpgSign=false \
@@ -516,8 +518,6 @@ make_topic_sentinel () {
 	message=$(printf 'Codex rewrite sentinel: %s\n\nCodex-Rewrite-Sentinel: %s@%s\n' \
 		"$name" "$name" "$old")
 	printf '%s' "$message" | git -C "$worktree" \
-		-c user.name='github-actions[bot]' \
-		-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 		commit-tree "$tree" -p "$old" ||
 		die "could not create the completion sentinel for '$name'"
 }
@@ -566,8 +566,6 @@ rebase_topic () {
 		>/dev/null 2>&1 ||
 		die "could not check out topic tip $old for rebasing"
 	if GIT_EDITOR=true git -C "$worktree" \
-		-c user.name='github-actions[bot]' \
-		-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
@@ -583,18 +581,6 @@ rebase_topic () {
 	rebase_in_progress "$worktree" ||
 		die "git rebase failed without leaving recoverable state"
 	continue_rerere_resolution "$worktree"
-}
-
-copy_rerere_cache () {
-	source=$1
-	worker=$2
-	source_common=$(git -C "$source" rev-parse --path-format=absolute \
-		--git-common-dir) || die "could not locate the source rerere cache"
-	worker_git=$(git -C "$worker" rev-parse --path-format=absolute \
-		--git-dir) || die "could not locate a worker repository"
-	test -d "$source_common/rr-cache" || return 0
-	cp -R "$source_common/rr-cache" "$worker_git/rr-cache" ||
-		die "could not copy the rerere cache into a parallel worker"
 }
 
 record_rebase_failure () {
@@ -613,7 +599,7 @@ record_rebase_failure () {
 	printf '%s\n' "$failed_commit" >"$state/failed-commit" || return 1
 }
 
-process_wave_sequential () {
+process_ready_topics () {
 	worktree=$1
 	state=$2
 	ready=$3
@@ -635,81 +621,6 @@ process_wave_sequential () {
 			return 1
 		fi
 	done <"$ready"
-}
-
-process_wave_parallel () {
-	worktree=$1
-	state=$2
-	ready=$3
-	wave_root=$state/parallel
-	rm -rf "$wave_root"
-	mkdir -p "$wave_root" || die "could not create parallel worker state"
-	jobs=$wave_root/jobs
-	: >"$jobs"
-	sequence=0
-
-	while IFS="$tab" read -r name old prerequisite old_base new_base
-	do
-		sequence=$((sequence + 1))
-		worker=$wave_root/worker-$sequence
-		git -c core.fsmonitor=false clone --shared --no-checkout --quiet \
-			"$worktree" "$worker" ||
-			die "could not create a private rebase worker for '$name'"
-		copy_rerere_cache "$worktree" "$worker"
-		(
-			if rebase_topic "$worker" "$name" "$old" "$old_base" "$new_base"
-			then
-				completed_topic_tip "$worker" "$name" \
-					"$old" "$new_base" >"$worker/new"
-				new=$(sed -n '1p' "$worker/new")
-				git -C "$worker" -c core.fsmonitor=false \
-					-c advice.detachedHead=false switch --detach "$new" \
-					>/dev/null 2>&1 ||
-					die "could not detach the worker at '$name'"
-				exit 0
-			fi
-			exit 1
-		) >"$worker/rebase.log" 2>&1 &
-		pid=$!
-		printf '%s\t%s\t%s\t%s\n' \
-			"$pid" "$name" "$old" "$worker" >>"$jobs" ||
-			die "could not record a parallel rebase worker"
-	done <"$ready"
-
-	failed=
-	while IFS="$tab" read -r pid name old worker
-	do
-		if ! wait "$pid"
-		then
-			failed=t
-		fi
-	done <"$jobs"
-	if test -n "$failed"
-	then
-		while IFS="$tab" read -r pid name old worker
-		do
-			test ! -s "$worker/rebase.log" || {
-				say "Parallel rebase output for $name:" >&2
-				sed 's/^/  /' "$worker/rebase.log" >&2
-			}
-		done <"$jobs"
-		rm -rf "$wave_root"
-		return 1
-	fi
-
-	while IFS="$tab" read -r pid name old worker
-	do
-		new=$(sed -n '1p' "$worker/new")
-		test -n "$new" || die "parallel worker for '$name' produced no tip"
-		git -C "$worktree" -c core.fsmonitor=false \
-			-c protocol.file.allow=always fetch \
-			--no-tags --quiet "$worker" HEAD ||
-			die "could not import the rebased tip for '$name'"
-		test "$(git -C "$worktree" rev-parse FETCH_HEAD)" = "$new" ||
-			die "parallel worker for '$name' imported the wrong tip"
-		map_record "$state/map" "$old" "$new"
-	done <"$jobs"
-	rm -rf "$wave_root"
 }
 
 train_rerere () (
@@ -766,40 +677,6 @@ write_complete_updates () {
 	rm -f "$output.unsorted"
 }
 
-write_topic_tuples () {
-	state=$1
-	output=$2
-	base_oid=$(state_value "$state" base-oid)
-	: >"$output.unsorted" || die "could not prepare topic tuples"
-	while IFS="$tab" read -r ref old new
-	do
-		name=${ref#refs/heads/}
-		plan_row=$(awk -F '\t' -v old="$old" '$2 == old { print; exit }' \
-			"$state/plan")
-		test -n "$plan_row" ||
-			die "rewrite plan has no range for '$name'"
-		IFS="$tab" read -r canonical_name plan_old prerequisite old_base <<-EOF
-		$plan_row
-		EOF
-		if test "$prerequisite" = master
-		then
-			dependency_new=$base_oid
-		else
-			dependency_new=$(awk -F '\t' -v ref="refs/heads/$prerequisite" \
-				'$1 == ref { print $3 }' "$state/topic-updates")
-			test -n "$dependency_new" ||
-				die "rewritten prerequisite '$prerequisite' is missing"
-		fi
-		printf '%s\t%s\t%s\t%s\n' \
-			"$name" "$old" "$dependency_new" "$new" \
-			>>"$output.unsorted" ||
-			die "could not record topic tuple for '$name'"
-	done <"$state/topic-updates"
-	LC_ALL=C sort "$output.unsorted" >"$output" ||
-		die "could not sort topic tuples"
-	rm -f "$output.unsorted"
-}
-
 process_plan () {
 	worktree=$1
 	state=$2
@@ -842,20 +719,8 @@ process_plan () {
 			die "topic prerequisites contain an ancestry cycle"
 		fi
 
-		count=$(wc -l <"$ready" | tr -d ' ')
-		if test "$count" -gt 1
-		then
-			say "Rebasing $count ready topics in parallel."
-			if ! process_wave_parallel "$worktree" "$state" "$ready"
-			then
-				say "A parallel worker stopped; recreating the wave in the pinned worktree." >&2
-				process_wave_sequential "$worktree" "$state" "$ready" ||
-					return 1
-			fi
-		else
-			process_wave_sequential "$worktree" "$state" "$ready" ||
-				return 1
-		fi
+		process_ready_topics "$worktree" "$state" "$ready" ||
+			return 1
 	done
 
 	finish_updates "$state" || die "could not finish topic updates"
@@ -978,8 +843,6 @@ merge_topic () {
 		"$name" "$name" "$name" "$oid")
 
 	if git -C "$worktree" \
-		-c user.name='github-actions[bot]' \
-		-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
@@ -996,8 +859,6 @@ merge_topic () {
 	git -C "$worktree" -c core.fsmonitor=false diff --cached --check ||
 		return 1
 	git -C "$worktree" \
-		-c user.name='github-actions[bot]' \
-		-c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
@@ -1146,7 +1007,6 @@ rewrite () {
 	updates_file=
 	inputs_file=
 	bundle_file=
-	topic_tuples_file=
 	failure_file=
 	worktree=
 	require_automation=
@@ -1162,7 +1022,6 @@ rewrite () {
 		--updates) require_arg "$@"; updates_file=$2; shift 2 ;;
 		--inputs) require_arg "$@"; inputs_file=$2; shift 2 ;;
 		--bundle) require_arg "$@"; bundle_file=$2; shift 2 ;;
-		--topic-tuples) require_arg "$@"; topic_tuples_file=$2; shift 2 ;;
 		--failure) require_arg "$@"; failure_file=$2; shift 2 ;;
 		--worktree) require_arg "$@"; worktree=$2; shift 2 ;;
 		--require-automation) require_automation=t; shift ;;
@@ -1225,13 +1084,10 @@ rewrite () {
 		candidate=$codex_oid
 	fi
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
-	write_topic_tuples "$state" "$tmp_dir/topic-tuples"
 
 	test -z "$result_file" || printf '%s\n' "$candidate" >"$result_file"
 	test -z "$updates_file" || cp "$tmp_dir/updates" "$updates_file"
 	test -z "$bundle_file" || create_bundle "$bundle_file" "$state" "$candidate"
-	test -z "$topic_tuples_file" ||
-		cp "$tmp_dir/topic-tuples" "$topic_tuples_file"
 	say "rewrote all active topics and assembled codex candidate $candidate"
 }
 
@@ -1298,6 +1154,7 @@ topic_control_paths_unchanged () (
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
+		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
@@ -1330,7 +1187,7 @@ verify_control_paths () {
 	automation_workflow_matches "$candidate" ||
 		die "candidate does not contain the canonical Refresh codex workflow"
 	release_workflow_is_codex_only "$candidate" ||
-		die "candidate release workflow must run only for pushes to codex and must not use CODEX_BRANCH_TOKEN"
+		die "candidate release workflow must run only for pushes to codex and must not obtain promotion credentials"
 
 	automation_count=0
 	while IFS="$tab" read -r ref old new
@@ -1380,100 +1237,6 @@ verify_control_paths () {
 	done <"$updates"
 	test "$automation_count" = 1 ||
 		die "exactly one active ??/codex/automation topic is required"
-}
-
-verify_topic () {
-	topic=
-	inputs=
-	updates=
-	result=
-	while test $# -gt 0
-	do
-		case "$1" in
-		--topic) require_arg "$@"; topic=$2; shift 2 ;;
-		--inputs) require_arg "$@"; inputs=$2; shift 2 ;;
-		--updates) require_arg "$@"; updates=$2; shift 2 ;;
-		--result) require_arg "$@"; result=$2; shift 2 ;;
-		*) die "unknown verify-topic option '$1'" ;;
-		esac
-	done
-	test -n "$topic" || die "verify-topic requires --topic"
-	test -n "$inputs" && test -f "$inputs" || die "verify-topic requires --inputs"
-	test -n "$updates" && test -f "$updates" || die "verify-topic requires --updates"
-	test -n "$result" && test -f "$result" || die "verify-topic requires --result"
-	check_topic "$topic"
-	make_tmp_dir
-	require_full_repository
-
-	LC_ALL=C sort -c "$updates" || die "updates are not canonically sorted"
-	candidate=$(resolve_commit "$(sed -n '1p' "$result")")
-	codex_count=$(awk -F '\t' '$1 == "refs/heads/codex" { count++ }
-		END { print count + 0 }' "$updates")
-	test "$codex_count" = 1 ||
-		die "updates must contain codex exactly once"
-	test "$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
-		"$updates")" = "$candidate" ||
-		die "candidate does not match the codex update"
-	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
-	test -n "$base_oid" || die "input snapshot has no base commit"
-	resolve_commit "$base_oid" >/dev/null
-	git merge-base --is-ancestor "$base_oid" "$candidate" ||
-		die "candidate is not based on the snapshotted master"
-	legacy_control_paths_unchanged "$base_oid" "$candidate" ||
-		die "candidate changes meta-only controller files"
-	graph=$tmp_dir/topic-graph
-	prepare_input_graph "$inputs" "$graph"
-
-	topic_ref=refs/heads/$topic
-	input_count=$(awk -F '\t' -v ref="$topic_ref" \
-		'$1 == "topic" && $2 == ref { count++ } END { print count + 0 }' \
-		"$inputs")
-	update_count=$(awk -F '\t' -v ref="$topic_ref" \
-		'$1 == ref { count++ } END { print count + 0 }' "$updates")
-	test "$input_count" = 1 ||
-		die "input snapshot must contain '$topic_ref' exactly once"
-	test "$update_count" = 1 ||
-		die "updates must contain '$topic_ref' exactly once"
-	old=$(awk -F '\t' -v ref="$topic_ref" '$1 == ref { print $2 }' \
-		"$updates")
-	new=$(awk -F '\t' -v ref="$topic_ref" '$1 == ref { print $3 }' \
-		"$updates")
-	expected_old=$(awk -F '\t' -v ref="$topic_ref" \
-		'$1 == "topic" && $2 == ref { print $3 }' "$inputs")
-	test "$old" = "$expected_old" ||
-		die "old value for '$topic_ref' does not match the input snapshot"
-	resolve_commit "$old" >/dev/null
-	resolve_commit "$new" >/dev/null
-	git merge-base --is-ancestor "$base_oid" "$new" ||
-		die "rewritten '$topic_ref' is not based on master"
-	git merge-base --is-ancestor "$new" "$candidate" ||
-		die "candidate does not contain '$topic_ref'"
-
-	plan_count=$(awk -F '\t' -v old="$old" '$2 == old { count++ }
-		END { print count + 0 }' "$graph/plan")
-	test "$plan_count" = 1 ||
-		die "input graph does not identify one rewrite range for '$topic_ref'"
-	plan_row=$(awk -F '\t' -v old="$old" '$2 == old { print; exit }' \
-		"$graph/plan")
-	IFS="$tab" read -r canonical_name plan_old prerequisite old_base <<-EOF
-	$plan_row
-	EOF
-	if test "$prerequisite" = master
-	then
-		dependency_ref=refs/heads/master
-		dependency_new=$base_oid
-	else
-		dependency_ref=refs/heads/$prerequisite
-		dependency_count=$(awk -F '\t' -v ref="$dependency_ref" \
-			'$1 == ref { count++ } END { print count + 0 }' "$updates")
-		test "$dependency_count" = 1 ||
-			die "updates do not contain prerequisite '$dependency_ref' exactly once"
-		dependency_new=$(awk -F '\t' -v ref="$dependency_ref" \
-			'$1 == ref { print $3 }' "$updates")
-		resolve_commit "$dependency_new" >/dev/null
-	fi
-	git merge-base --is-ancestor "$dependency_new" "$new" ||
-		die "rewrite lost prerequisite '$dependency_ref' -> '$topic_ref'"
 }
 
 verify_output () {
@@ -1628,8 +1391,8 @@ stage_candidate () {
 	ref=$(staging_ref "$staging")
 	old=$(remote_head_oid "$remote" "$ref")
 
-	# A failed CI run intentionally leaves staging behind.  Recreate an
-	# identical ref so a new dispatch still produces a fresh push event.
+	# A failed CI run intentionally leaves staging behind. Recreate an
+	# identical ref so a new deploy-key push starts fresh push CI.
 	if test -n "$old" && test "$old" = "$candidate"
 	then
 		git -c core.hooksPath=/dev/null push --atomic --porcelain \
@@ -1899,7 +1662,6 @@ case "$command" in
 check-topic) check_topic "$@" ;;
 rewrite) rewrite "$@" ;;
 verify-inputs) verify_inputs "$@" ;;
-verify-topic) verify_topic "$@" ;;
 verify-output) verify_output "$@" ;;
 stage) stage_candidate "$@" ;;
 promote) promote "$@" ;;
