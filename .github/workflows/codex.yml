@@ -56,7 +56,7 @@ jobs:
           WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          helper="$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh"
+          helper="$GITHUB_WORKSPACE/codex"
           sh "$helper" rewrite \
             --base master \
             --codex codex \
@@ -157,9 +157,14 @@ jobs:
           metadata="$RUNNER_TEMP/codex-candidate"
           git bundle verify "$metadata/codex.bundle"
           git fetch "$metadata/codex.bundle" \
-            refs/codex-output/candidate:refs/codex-import/candidate
+            '+refs/codex-output/*:refs/codex-import/*'
           test "$(git rev-parse refs/codex-import/candidate)" = \
             "$(cat "$metadata/codex-candidate")"
+          expected_meta=$(awk -F '\t' \
+            '$1 == "refs/heads/meta" { print $3 }' \
+            "$metadata/codex-updates")
+          test -n "$expected_meta"
+          test "$(git rev-parse "$expected_meta")" = "$expected_meta"
 
       - name: Configure the repository deploy key
         id: publisher
@@ -220,7 +225,7 @@ jobs:
           set -euo pipefail
           test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
           metadata="$RUNNER_TEMP/codex-candidate"
-          sh "$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh" stage \
+          sh "$GITHUB_WORKSPACE/codex" stage \
             --staging codex-staging \
             --require-automation \
             --inputs "$metadata/codex-inputs" \
@@ -301,7 +306,7 @@ jobs:
           set -euo pipefail
           test "$WORKFLOW_SHA" = "$CONTROLLER_OID"
           metadata="$RUNNER_TEMP/codex-candidate"
-          sh "$GITHUB_WORKSPACE/.github/workflows/codex-branch.sh" promote \
+          sh "$GITHUB_WORKSPACE/codex" promote \
             --staging codex-staging \
             --require-automation \
             --inputs "$metadata/codex-inputs" \
