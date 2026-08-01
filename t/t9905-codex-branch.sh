@@ -2656,9 +2656,9 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			case "$*" in
 			*referenced_workflows*)
 				case "$*" in
-				*"openai/git/.github/workflows/codex.yml@$FAKE_CONTROLLER"*\
-				*"refs/heads/meta"*\
-				*".sha == "*"$FAKE_CONTROLLER"*) ;;
+				*"openai/git/.github/workflows/codex.yml@meta"*\
+				*".ref == \"refs/heads/meta\""*\
+				*".sha == \"$FAKE_CONTROLLER\""*) ;;
 				*) exit 95 ;;
 				esac
 				if test "${FAKE_GH_MODE:-}" = wrong-controller
@@ -2783,7 +2783,7 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			"$support/publish.out" &&
 		! grep -v "^api --hostname github.com " "$support/gh.log" &&
 		test_grep "actions/artifacts/9001/zip" "$support/gh.log" &&
-		test_grep ".github/workflows/codex.yml@$controller" \
+		test_grep ".github/workflows/codex.yml@meta" \
 			"$support/gh.log" &&
 		test_grep "refs/heads/meta" "$support/gh.log" &&
 		test_grep "actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100" \

@@ -2856,7 +2856,7 @@ publish_run () {
 		die "candidate metadata and update manifest disagree"
 
 	controller_matches=$(gh api --hostname github.com "$endpoint" --jq \
-		"[.referenced_workflows[] | select(.path == \"openai/git/.github/workflows/codex.yml@$run_controller\" and .ref == \"refs/heads/meta\" and .sha == \"$run_controller\")] | length") ||
+		"[.referenced_workflows[] | select(.path == \"openai/git/.github/workflows/codex.yml@meta\" and .ref == \"refs/heads/meta\" and .sha == \"$run_controller\")] | length") ||
 		die "could not verify the reusable controller for Actions run $run_id"
 	test "$controller_matches" = 1 ||
 		die "Actions run $run_id was not executed by the pinned meta controller"
