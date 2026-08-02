@@ -25,7 +25,7 @@ die () {
 usage () {
 	cat <<-\EOF
 	usage: codex-branch check-topic <branch>
-	   or: codex-branch rebuild
+	   or: codex-branch rebuild [--local]
 	   or: codex-branch publish <run-id>
 	   or: codex-branch initialize [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--output <path>] [--require-automation]
@@ -2133,6 +2133,28 @@ initialize_config () {
 	say "review and commit only $meta_config_path on meta before running Refresh codex"
 }
 
+choose_local_rebuild_session () {
+	common_dir=$(git rev-parse --path-format=absolute --git-common-dir) ||
+		die "could not locate the shared repository state"
+	session_parent=$common_dir/codex-refresh
+	mkdir -p "$session_parent" ||
+		die "could not create local refresh storage"
+	attempt=0
+	while test "$attempt" -lt 100
+	do
+		attempt=$((attempt + 1))
+		session_root=$session_parent/session.local.$$.${attempt}
+		if mkdir "$session_root" 2>/dev/null
+		then
+			chmod 700 "$session_root" ||
+				die "could not protect local refresh storage '$session_root'"
+			session=$session_root/artifacts
+			return 0
+		fi
+	done
+	die "could not choose a unique local refresh session path"
+}
+
 local_refresh () {
 	remote=origin
 	base_name=master
@@ -2169,6 +2191,7 @@ local_refresh () {
 		test ! -e "$session" || die "refresh session '$session' already exists"
 		mkdir -p "$session" || die "could not create refresh session '$session'"
 	fi
+	chmod 700 "$session" || die "could not protect refresh session '$session'"
 	set -- --remote "$remote" --base "$base_name" --codex "$codex_name" \
 		--rerere-from "$rerere_name" \
 		--result "$session/codex-candidate" \
@@ -2180,7 +2203,7 @@ local_refresh () {
 	fetch_heads "$remote"
 	rewrite "$@"
 	say "local refresh session: $session"
-	say "no refs were updated; inspect codex-updates and codex.bundle"
+	say "no local branches or remote server refs were updated; inspect codex-updates and codex.bundle"
 }
 
 rewrite () {
@@ -2822,7 +2845,7 @@ refresh_meta_controller () {
 		die "could not update the Meta worktree"
 	test -x "$meta_worktree/rebuild" ||
 		die "updated meta does not contain Meta/rebuild"
-	exec "$meta_worktree/rebuild"
+	exec "$meta_worktree/rebuild" "$@"
 }
 
 read_refresh_run () {
@@ -2879,11 +2902,29 @@ wait_for_refresh_run () (
 )
 
 rebuild_codex () {
-	test $# = 0 || { usage >&2; exit 129; }
+	local_preparation=
+	case $# in
+	0) ;;
+	1)
+		test "$1" = --local || { usage >&2; exit 129; }
+		local_preparation=t
+		;;
+	*) usage >&2; exit 129 ;;
+	esac
 	require_operator_context
-	command -v unzip >/dev/null 2>&1 || die "Meta/rebuild requires unzip"
-	command -v zipinfo >/dev/null 2>&1 || die "Meta/rebuild requires zipinfo"
-	refresh_meta_controller
+	if test -z "$local_preparation"
+	then
+		command -v unzip >/dev/null 2>&1 ||
+			die "Meta/rebuild requires unzip"
+		command -v zipinfo >/dev/null 2>&1 ||
+			die "Meta/rebuild requires zipinfo"
+	fi
+	refresh_meta_controller "$@"
+	if test -n "$local_preparation"
+	then
+		rebuild_codex_locally
+		return
+	fi
 
 	make_tmp_dir
 	repository=openai/git
@@ -3069,6 +3110,176 @@ wait_for_staging_ci () (
 	say "Full staging CI passed."
 )
 
+freeze_local_candidate () {
+	source=$1
+	target=$2
+	mkdir -p "$target" ||
+		die "could not create the frozen local candidate directory"
+	chmod 700 "$target" ||
+		die "could not protect the frozen local candidate directory"
+	for name in codex.bundle codex-candidate codex-inputs codex-updates
+	do
+		test -f "$source/$name" && test ! -L "$source/$name" ||
+			die "local preparation did not produce regular file '$name'"
+		cp "$source/$name" "$target/$name" ||
+			die "could not freeze local candidate file '$name'"
+		chmod 600 "$target/$name" ||
+			die "could not protect frozen local candidate file '$name'"
+	done
+}
+
+verify_candidate_bundle () {
+	bundle=$1
+	candidate=$2
+	updates=$3
+	controller=$4
+
+	git bundle verify "$bundle" >/dev/null ||
+		die "candidate bundle failed verification"
+	git bundle unbundle "$bundle" >"$tmp_dir/bundle-heads" ||
+		die "could not import the candidate bundle"
+	printf '%s refs/codex-output/candidate\n' "$candidate" \
+		>"$tmp_dir/expected-bundle-heads"
+	new_meta=$(awk -F '\t' '$1 == "refs/heads/meta" { print $3 }' \
+		"$updates")
+	test -n "$new_meta" || die "candidate updates contain no meta state"
+	if test "$new_meta" != "$controller"
+	then
+		printf '%s refs/codex-output/meta\n' "$new_meta" \
+			>>"$tmp_dir/expected-bundle-heads"
+	fi
+	LC_ALL=C sort -o "$tmp_dir/bundle-heads" "$tmp_dir/bundle-heads"
+	LC_ALL=C sort -o "$tmp_dir/expected-bundle-heads" \
+		"$tmp_dir/expected-bundle-heads"
+	cmp -s "$tmp_dir/expected-bundle-heads" "$tmp_dir/bundle-heads" ||
+		die "candidate bundle heads do not match the frozen update manifest"
+}
+
+verify_local_candidate () {
+	metadata=$1
+	inputs=$metadata/codex-inputs
+	updates=$metadata/codex-updates
+	result=$metadata/codex-candidate
+	bundle=$metadata/codex.bundle
+
+	test "$(wc -l <"$result" | tr -d ' ')" = 1 ||
+		die "local candidate file must contain exactly one OID"
+	candidate=$(sed -n '1p' "$result")
+	input_controller=$(awk -F '\t' '$1 == "controller" { print $3 }' \
+		"$inputs")
+	test -n "$input_controller" && test "$input_controller" = "$controller_oid" ||
+		die "local candidate input snapshot does not match Meta/HEAD"
+	# Fetch and validate every prerequisite before importing the generated
+	# objects.  The local bundle intentionally excludes the snapshotted
+	# master, codex, and topic tips.
+	verify_inputs --remote origin --base master --codex codex "$inputs"
+	verify_candidate_bundle "$bundle" "$candidate" "$updates" \
+		"$controller_oid"
+	require_full_commit_oid "$candidate"
+	update_candidate=$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
+		"$updates")
+	test "$candidate" = "$update_candidate" ||
+		die "local candidate and update manifest disagree"
+	verify_output --inputs "$inputs" --updates "$updates" \
+		--result "$result" --require-automation
+}
+
+with_isolated_git_environment () (
+	unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR \
+		GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM \
+		GIT_DIR GIT_INDEX_FILE GIT_NAMESPACE GIT_OBJECT_DIRECTORY \
+		GIT_PREFIX GIT_QUARANTINE_PATH GIT_SHALLOW_FILE \
+		GIT_TEMPLATE_DIR GIT_WORK_TREE
+	GIT_CONFIG_NOSYSTEM=1
+	GIT_CONFIG_SYSTEM=/dev/null
+	GIT_CONFIG_GLOBAL=/dev/null
+	GIT_ATTR_NOSYSTEM=1
+	export GIT_CONFIG_NOSYSTEM GIT_CONFIG_SYSTEM GIT_CONFIG_GLOBAL \
+		GIT_ATTR_NOSYSTEM
+	"$@"
+)
+
+prepare_local_candidate () {
+	make_tmp_dir
+	publisher_top=$(git rev-parse --show-toplevel) ||
+		die "could not locate the publisher worktree"
+	frozen_helper=$tmp_dir/pinned-codex-branch.sh
+	expected_helper=$(git rev-parse \
+		"$controller_oid:.github/workflows/codex-branch.sh" 2>/dev/null) ||
+		die "pinned meta $controller_oid has no controller helper"
+	git cat-file blob \
+		"$controller_oid:.github/workflows/codex-branch.sh" \
+		>"$frozen_helper" || die "could not materialize the pinned controller"
+	test "$(git hash-object "$frozen_helper")" = "$expected_helper" ||
+		die "materialized controller does not match pinned meta $controller_oid"
+	chmod 700 "$frozen_helper" ||
+		die "could not protect the pinned controller helper"
+	prepare_repository=$tmp_dir/local-prepare
+	origin_fetch_url=$(git remote get-url --all origin) ||
+		die "could not read the canonical origin fetch URL"
+	origin_push_url=$(git remote get-url --push --all origin) ||
+		die "could not read the canonical origin push URL"
+	with_isolated_git_environment git clone --shared --no-checkout \
+		"$publisher_top" "$prepare_repository" >/dev/null ||
+		die "could not create the isolated local preparation repository"
+	with_isolated_git_environment git -C "$prepare_repository" \
+		remote set-url origin \
+		"$origin_fetch_url" || die "could not set the preparation fetch URL"
+	with_isolated_git_environment git -C "$prepare_repository" \
+		remote set-url --push origin \
+		"$origin_push_url" || die "could not set the preparation push URL"
+	choose_local_rebuild_session
+	say "Local preparation session: $session"
+	(
+		cd "$prepare_repository" || exit 1
+		with_isolated_git_environment \
+			"$frozen_helper" refresh \
+			--session "$session" --remote origin --base master \
+			--codex codex --rerere-from codex --require-automation
+	) || die "local Codex preparation failed; inspect '$session'"
+	local_candidate_dir=$tmp_dir/local-candidate
+	freeze_local_candidate "$session" "$local_candidate_dir"
+}
+
+stage_and_wait_for_ci () {
+	repository=$1
+	candidate=$2
+	inputs=$3
+	updates=$4
+	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100"
+	baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
+		'[.workflow_runs[].id] | max // 0') ||
+		die "could not record the staging CI baseline"
+	case "$baseline" in
+	''|*[!0-9]*) die "staging CI baseline is not a numeric run ID" ;;
+	esac
+	publisher=$(gh api --hostname github.com user --jq .login) ||
+		die "could not identify the GitHub CLI user"
+	test -n "$publisher" || die "GitHub CLI returned no authenticated user"
+	say "Publishing the prepared candidate with the credentials for origin."
+	say "GitHub API user: $publisher"
+	stage_candidate --remote origin --staging codex-staging \
+		--inputs "$inputs" --updates "$updates" --require-automation
+	wait_for_staging_ci gh "$repository" "$candidate" "$baseline"
+}
+
+rebuild_codex_locally () {
+	prepare_local_candidate
+	verify_local_candidate "$local_candidate_dir"
+	candidate=$(sed -n '1p' "$local_candidate_dir/codex-candidate")
+	stage_and_wait_for_ci openai/git "$candidate" \
+		"$local_candidate_dir/codex-inputs" \
+		"$local_candidate_dir/codex-updates"
+	require_operator_context
+	verify_local_candidate "$local_candidate_dir"
+	promote --remote origin --staging codex-staging \
+		--inputs "$local_candidate_dir/codex-inputs" \
+		--updates "$local_candidate_dir/codex-updates" \
+		--require-automation
+	say "Published codex candidate $candidate from local preparation session $session."
+	say "Generated commits identify $bot_name <$bot_email>; the push uses your configured origin credentials."
+}
+
 publish_run () {
 	test $# = 1 || { usage >&2; exit 129; }
 	run_id=$1
@@ -3167,25 +3378,8 @@ publish_run () {
 
 	verify_inputs --remote origin --base master --codex codex \
 		"$metadata/codex-inputs"
-	git bundle verify "$metadata/codex.bundle" >/dev/null ||
-		die "candidate bundle failed verification"
-	git bundle unbundle "$metadata/codex.bundle" >"$tmp_dir/bundle-heads" ||
-		die "could not import the candidate bundle"
-	printf '%s refs/codex-output/candidate\n' "$artifact_candidate" \
-		>"$tmp_dir/expected-bundle-heads"
-	new_meta=$(awk -F '\t' '$1 == "refs/heads/meta" { print $3 }' \
-		"$metadata/codex-updates")
-	test -n "$new_meta" || die "candidate updates contain no meta state"
-	if test "$new_meta" != "$run_controller"
-	then
-		printf '%s refs/codex-output/meta\n' "$new_meta" \
-			>>"$tmp_dir/expected-bundle-heads"
-	fi
-	LC_ALL=C sort -o "$tmp_dir/bundle-heads" "$tmp_dir/bundle-heads"
-	LC_ALL=C sort -o "$tmp_dir/expected-bundle-heads" \
-		"$tmp_dir/expected-bundle-heads"
-	cmp -s "$tmp_dir/expected-bundle-heads" "$tmp_dir/bundle-heads" ||
-		die "candidate bundle heads do not match the frozen update manifest"
+	verify_candidate_bundle "$metadata/codex.bundle" "$artifact_candidate" \
+		"$metadata/codex-updates" "$run_controller"
 	verify_output --inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" \
 		--result "$metadata/codex-candidate" --require-automation
@@ -3193,21 +3387,8 @@ publish_run () {
 	cmp -s "$tmp_dir/run" "$tmp_dir/run-current" ||
 		die "Actions run $run_id changed after artifact validation; start a fresh Meta/rebuild"
 
-	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$artifact_candidate&per_page=100"
-	baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
-		'[.workflow_runs[].id] | max // 0') || die "could not record the staging CI baseline"
-	case "$baseline" in
-	''|*[!0-9]*) die "staging CI baseline is not a numeric run ID" ;;
-	esac
-	publisher=$(gh api --hostname github.com user --jq .login) ||
-		die "could not identify the GitHub CLI user"
-	test -n "$publisher" || die "GitHub CLI returned no authenticated user"
-	say "Publishing the prepared candidate with the credentials for origin."
-	say "GitHub API user: $publisher"
-	stage_candidate --remote origin --staging codex-staging \
-		--inputs "$metadata/codex-inputs" \
-		--updates "$metadata/codex-updates" --require-automation
-	wait_for_staging_ci gh "$repository" "$artifact_candidate" "$baseline"
+	stage_and_wait_for_ci "$repository" "$artifact_candidate" \
+		"$metadata/codex-inputs" "$metadata/codex-updates"
 	read_refresh_run gh "$repository" "$run_id" "$tmp_dir/run-after-ci"
 	cmp -s "$tmp_dir/run" "$tmp_dir/run-after-ci" ||
 		die "Actions run $run_id changed while staging CI ran; start a fresh Meta/rebuild"

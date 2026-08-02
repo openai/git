@@ -125,11 +125,12 @@ Meta/codex refresh --require-automation
 
 It creates a session below the repository's shared Git directory containing
 the pinned inputs, update manifest, candidate bundle, and conflict report. It
-does not update local or remote refs. The low-level `rewrite`, `stage`, and
-`promote` commands are also available through `Meta/codex`. Use local refresh
-for inspection and conflict recovery. Normal publication uses `Meta/rebuild`;
-use `Meta/publish <run-id>` only to finish a preparation started through
-GitHub.
+updates the clone's `origin/*` tracking refs, but it does not update local
+branches or refs on GitHub. The low-level `rewrite`, `stage`, and `promote`
+commands are also available through `Meta/codex`. Use local refresh for
+inspection and conflict recovery. Normal publication uses `Meta/rebuild` or
+`Meta/rebuild --local`; use `Meta/publish <run-id>` only to finish a
+preparation started through GitHub.
 
 ## Refresh `codex`
 
@@ -146,12 +147,48 @@ pushes the candidate to `codex-staging`, reports staging-CI job progress, and
 performs the atomic promotion only after that exact candidate passes. Leave
 the command running until it reports the published candidate.
 
+To do the rebase and assembly on your machine instead of in the preparation
+Action, run:
+
+```sh
+Meta/rebuild --local
+```
+
+This skips only the preparation Action. It fetches the current heads from
+GitHub, prepares the topics, integration commits, `codex`, and the next
+`codex.config` state in an isolated temporary repository, then imports and
+verifies the resulting bundle in the publisher clone. The temporary
+repository has its own rerere cache and Git configuration, so an old local
+resolution, hook, or concurrent local preparation cannot leak through shared
+repository state. The command prints the path of a persistent local session
+containing the input snapshot, update manifest, candidate OID, bundle, and any
+conflict report.
+
+`--local` does not skip CI or make a private local-only publication. After
+preparation, it uses the same user-authenticated `codex-staging` push, waits
+for the same fresh `main.yml` run for the exact candidate SHA, and performs
+the same atomic exact-lease promotion to GitHub. Use `Meta/codex refresh
+--require-automation` when you want only a local preview with no server-side
+ref update.
+
 Create the linked worktree once if it does not exist:
 
 ```sh
 git fetch origin '+refs/heads/meta:refs/remotes/origin/meta'
 git worktree add --detach Meta refs/remotes/origin/meta
 ```
+
+If an older `Meta/rebuild` rejects `--local` before it can refresh itself,
+update the existing `Meta` worktree once:
+
+```sh
+git fetch origin '+refs/heads/meta:refs/remotes/origin/meta'
+git -C Meta switch --detach refs/remotes/origin/meta
+Meta/rebuild --local
+```
+
+After that bootstrap, both rebuild forms refresh `Meta` and re-execute the
+new pinned controller automatically.
 
 Both the publishing worktree and `Meta` must be clean. When `Meta/` is nested
 in the publishing worktree, the helper permits that linked-worktree directory
@@ -170,8 +207,9 @@ The Action summary prints this command. Prepared artifacts expire after seven
 days. `Meta/publish` stays pinned to the controller used by the selected run;
 it does not update the `Meta` worktree underneath that run.
 
-Start a fresh `Meta/rebuild` after a preparation, staging, CI, lease, or
-promotion failure. The manual alternative is a fresh UI dispatch followed by
+Start a fresh `Meta/rebuild` or `Meta/rebuild --local`, using the same mode you
+want for the retry, after a preparation, staging, CI, lease, or promotion
+failure. The manual alternative is a fresh UI dispatch followed by
 `Meta/publish <run-id>`. Do not use **Re-run failed jobs**: a retry must
 snapshot the current refs and stage a fresh candidate.
 
@@ -188,6 +226,16 @@ The Action:
 4. uploads the bundle, pinned input snapshot, update manifest, and canonical
    run metadata as one attempt-specific artifact; and
 5. pushes nothing.
+
+With `Meta/rebuild --local`, those preparation steps run in the isolated local
+repository instead. There is no Actions run, server artifact, or run-attempt
+attestation for that phase. The helper instead pins the exact `Meta` commit,
+materializes the controller from that commit, freezes the local session,
+checks the complete GitHub input snapshot, verifies the bundle and generated
+history, and then relies on the same exact-SHA staging CI and ref leases.
+Generated commit OIDs may differ from an Actions preparation because the
+local Git version and commit timestamps may differ; the staged candidate is
+the exact object that CI verifies.
 
 `Meta/publish` uses the current user's existing `gh` and Git credentials. It
 accepts only a successful `workflow_dispatch` run on `openai/git:codex`, the
@@ -225,6 +273,10 @@ every ref it mutates or deletes in the atomic transaction. The generated
 state can therefore never describe a different published generation. A new
 input created in the final fetch-to-push window is handled by the next run.
 
+Both preparation modes use `refs/remotes/origin/master` after fetching the
+current `openai/git` heads. They do not use the caller's local `master`
+branch, which may be absent or stale.
+
 `master` is a read-only input, so Git's push protocol cannot include it as a
 compare-only command in the final ref transaction. The controller verifies it
 immediately before the push and checks it again afterward. If `master` moves
@@ -235,10 +287,12 @@ unchanged ref would require server-side transaction support.
 
 ## Resolve a rebase conflict
 
-The failed run summary says **No refs were updated** and prints a pinned
-`Meta/codex resolve` command. Start from a clean clone that does not already
-have a `Meta` worktree; the printed commands create one at the exact controller
-commit for the failed run:
+A failed Action summary says **No refs were updated** and prints a pinned
+`Meta/codex resolve` command. A failed `Meta/rebuild --local` prints the
+persistent session path and leaves the same conflict report there. In either
+case, follow the exact commands in that report. For Action preparation, start
+from a clean clone that does not already have a `Meta` worktree; the printed
+commands create one at the exact controller commit for the failed run:
 
 1. Run the exact fetch, detached checkout, and `resolve` commands from the
    summary. The helper verifies the original snapshot, creates a disposable
@@ -262,9 +316,10 @@ commit for the failed run:
 4. Review the rewritten topic tips, then run the printed `publish-topics`
    command. It rechecks the original snapshot and atomically pushes every
    rewritten topic with an exact lease.
-5. Run `Meta/rebuild` to prepare, verify, and publish the repaired graph. The
-   manual alternative is a fresh **Actions > Refresh codex > Run workflow**
-   dispatch followed by its printed `Meta/publish <run-id>` command.
+5. Run `Meta/rebuild` or `Meta/rebuild --local` to prepare, verify, and publish
+   the repaired graph. The manual alternative is a fresh **Actions > Refresh
+   codex > Run workflow** dispatch followed by its printed `Meta/publish
+   <run-id>` command.
 
 To abandon recovery, run `git rebase --abort` and delete the disposable
 worktree. Do not use `git rebase --quit`, push only the first conflicted topic,
@@ -284,16 +339,17 @@ environment. It uses the publisher's ordinary credentials:
 
 1. Authenticate `gh` as the publishing user. `Meta/rebuild` needs permission
    to dispatch Actions; `Meta/publish` needs permission to read the selected
-   run and its artifact:
+   run and its artifact. `Meta/rebuild --local` does neither, but it still
+   reads the exact staging-CI run and jobs:
 
    ```sh
    gh auth status
    ```
 
 2. Configure the canonical `origin` with that user's normal Git credentials.
-   `Meta/rebuild` and `Meta/publish` accept only the standard SSH or HTTPS URL
-   for `openai/git`. Neither command reads a token from the repository or
-   artifact.
+   `Meta/rebuild`, `Meta/rebuild --local`, and `Meta/publish` accept only the
+   standard SSH or HTTPS URL for `openai/git`. None reads a token from the
+   repository, local session, or artifact.
 3. In the existing **Protect generated Codex branch** ruleset and the
    **Protect Codex controller branch** ruleset, add an **always** bypass for
    each exact human publisher. The checked-in recipes authorize only the
@@ -301,15 +357,15 @@ environment. It uses the publisher's ordinary credentials:
    break-glass actor. Import the `meta` recipe only if that ruleset is absent.
 
 The bypass is intentionally personal and visible. The Action cannot publish;
-it only prepares an immutable artifact. Running `Meta/rebuild` or
-`Meta/publish` is the approval, and Git records the configured user as the
-pusher. To add or remove a publisher, change the exact `User` actor in both
-rulesets. Do not replace it
-with a broad repository role or a shared long-lived credential.
+it only prepares an immutable artifact. Running `Meta/rebuild`,
+`Meta/rebuild --local`, or `Meta/publish` is the approval, and Git records the
+configured user as the pusher. To add or remove a publisher, change the exact
+`User` actor in both rulesets. Do not replace it with a broad repository role
+or a shared long-lived credential.
 
-The final push runs from the operator's machine. Actions prepares the candidate
-and CI verifies it, but the operator's existing Git credentials authorize the
-atomic ref update.
+The final push runs from the operator's machine. Preparation runs either in
+Actions or in the isolated local repository; staging CI still runs in Actions.
+The operator's existing Git credentials authorize the atomic ref update.
 
 The built-in `GITHUB_TOKEN` is not a substitute for the local publisher.
 [GitHub suppresses push-triggered workflows for pushes made with that
@@ -320,11 +376,12 @@ outside this controller. Moving publication into Actions therefore requires a
 separate, narrowly scoped GitHub App credential; until one is provisioned, the
 local publisher remains the security and audit boundary.
 
-The local helper downloads the artifact through `gh`, but pushes through
-`origin`. Those credentials can theoretically identify different users, so
-the helper prints the authenticated `gh` login before staging. Verify the
-configured Git identity when changing machines or credentials. A failed CI
-run leaves `codex-staging` for inspection; it exposes no publishing secret.
+For an Actions preparation, the local helper downloads the artifact through
+`gh`, but pushes through `origin`. Those credentials can theoretically
+identify different users, so every publishing path prints the authenticated
+`gh` login before staging. Verify the configured Git identity when changing
+machines or credentials. A failed CI run leaves `codex-staging` for
+inspection; it exposes no publishing secret.
 
 The automation topic is the only topic allowed to change the dispatch
 trampoline. Other topics may change only
