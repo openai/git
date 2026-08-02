@@ -325,8 +325,11 @@ test_expect_success 'convenience wrappers forward to the pinned controller' '
 	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" \
 		"$TRASH_DIRECTORY/wrapper forwarding/Meta/rebuild" &&
 	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" \
+		"$TRASH_DIRECTORY/wrapper forwarding/Meta/rebuild" --local &&
+	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" \
 		"$TRASH_DIRECTORY/wrapper forwarding/Meta/publish" 4242 &&
-	printf "%s\n" rebuild "publish 4242" >wrapper.expect &&
+	printf "%s\n" rebuild "rebuild --local" "publish 4242" \
+		>wrapper.expect &&
 	test_cmp wrapper.expect wrapper.log &&
 	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" WRAPPER_EXIT=17 \
 		test_expect_code 17 \
@@ -336,7 +339,8 @@ test_expect_success 'convenience wrappers forward to the pinned controller' '
 test_expect_success 'refresh only prepares an immutable local-publish artifact' '
 	! grep -F "codex-topic.yml" "$codex_workflow" &&
 	! grep -E "make -C|t9905-codex-branch.sh" "$codex_workflow" &&
-	! grep -E "clone --shared|parallel worker" "$codex_branch" &&
+	! grep -F "parallel worker" "$codex_branch" &&
+	test_grep "clone --shared --no-checkout" "$codex_branch" &&
 	! grep -E "CODEX_BRANCH_TOKEN|CODEX_BRANCH_MANAGER_TOKEN|CODEX_DEPLOY_KEY|secret-broker|id-token" \
 		"$codex_workflow" &&
 	! grep -F "environment: codex-publish" "$codex_workflow" &&
@@ -2700,7 +2704,7 @@ test_expect_success 'Meta/rebuild refreshes and executes a newer meta controller
 	git -C meta-refresh-Meta push origin meta &&
 	cat >meta-refresh-Meta/rebuild <<-\EOF &&
 	#!/bin/sh
-	printf "%s\\n" refreshed >"$META_REFRESH_MARKER"
+	printf "refreshed %s\\n" "$*" >"$META_REFRESH_MARKER"
 	exit 23
 	EOF
 	chmod +x meta-refresh-Meta/rebuild &&
@@ -2728,11 +2732,11 @@ test_expect_success 'Meta/rebuild refreshes and executes a newer meta controller
 		PATH="$TRASH_DIRECTORY/meta-refresh-bin:$PATH" \
 		FAKE_REAL_GIT="$real_git" \
 		META_REFRESH_MARKER="$TRASH_DIRECTORY/meta-refresh.marker" \
-		test_expect_code 23 ../meta-refresh-Meta/rebuild
+		test_expect_code 23 ../meta-refresh-Meta/rebuild --local
 	) &&
 	test "$new_controller" = \
 		"$(git -C meta-refresh-Meta rev-parse HEAD)" &&
-	test_grep refreshed meta-refresh.marker
+	test_grep "refreshed --local" meta-refresh.marker
 '
 
 test_expect_success 'rewrite requires codex.config on meta' '
@@ -3046,6 +3050,16 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		git commit -m "publish-run master" &&
 		git branch meta master &&
 		install_meta_state meta master codex &&
+		git worktree add ../publish-run-controller meta &&
+		cp "$codex_entrypoint" ../publish-run-controller/codex &&
+		cp "$codex_rebuild" ../publish-run-controller/rebuild &&
+		cp "$codex_publish" ../publish-run-controller/publish &&
+		chmod +x ../publish-run-controller/codex \
+			../publish-run-controller/rebuild \
+			../publish-run-controller/publish &&
+		git -C ../publish-run-controller add codex rebuild publish &&
+		git -C ../publish-run-controller commit -m \
+			"install pinned controller entry points" &&
 		git push origin master meta codex aa/codex/automation
 	) &&
 
@@ -3152,6 +3166,54 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		cat >"$support/bin/git" <<-\EOF &&
 		#!/bin/sh
 		printf "%s\\n" "$*" >>"$FAKE_GIT_LOG"
+		if test -n "${FAKE_LOCAL_PREP_ORIGIN:-}" && test "$1" = -C
+		then
+			case "$2" in
+			*/local-prepare)
+				if test "$3" = remote && test "$4" = set-url &&
+					test "$5" = origin
+				then
+					exec "$FAKE_REAL_GIT" -C "$2" remote set-url \
+						origin "$FAKE_LOCAL_PREP_ORIGIN"
+				elif test "$3" = remote && test "$4" = set-url &&
+					test "$5" = --push && test "$6" = origin
+				then
+					exec "$FAKE_REAL_GIT" -C "$2" remote set-url \
+						--push origin "$FAKE_LOCAL_PREP_ORIGIN"
+				fi
+				;;
+			esac
+		fi
+		if test "${FAKE_ASSERT_BUNDLE_IMPORT:-}" = 1 &&
+			test "$1" = bundle && test "$2" = verify
+		then
+			bundle_candidate=$("$FAKE_REAL_GIT" bundle list-heads "$3" |
+				sed -n "s/ refs\\/codex-output\\/candidate\$//p") ||
+				exit 92
+			test -n "$bundle_candidate" || exit 92
+			if test ! -f "$FAKE_BUNDLE_ABSENT_MARKER"
+			then
+				! "$FAKE_REAL_GIT" cat-file -e \
+					"$bundle_candidate^{commit}" 2>/dev/null || exit 91
+				printf "%s\\n" "$bundle_candidate" \
+					>"$FAKE_BUNDLE_ABSENT_MARKER"
+			else
+				test "$bundle_candidate" = \
+					"$(sed -n "1p" "$FAKE_BUNDLE_ABSENT_MARKER")" ||
+					exit 91
+			fi
+		fi
+		if test "${FAKE_ASSERT_BUNDLE_IMPORT:-}" = 1 &&
+			test "$1" = bundle && test "$2" = unbundle
+		then
+			"$FAKE_REAL_GIT" "$@" || exit
+			bundle_candidate=$(sed -n "1p" \
+				"$FAKE_BUNDLE_ABSENT_MARKER")
+			"$FAKE_REAL_GIT" cat-file -e \
+				"$bundle_candidate^{commit}" || exit 90
+			: >"$FAKE_BUNDLE_IMPORTED_MARKER"
+			exit 0
+		fi
 		case "$*" in
 		"remote get-url --all origin")
 			printf "%s\\n" https://github.com/openai/git
@@ -3257,6 +3319,13 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			esac
 			;;
 		repos/openai/git/actions/runs/101)
+			ci_candidate=$FAKE_CANDIDATE
+			if test "${FAKE_DYNAMIC_CANDIDATE:-}" = 1
+			then
+				ci_candidate=$("$FAKE_REAL_GIT" \
+					--git-dir="$FAKE_LOCAL_PREP_ORIGIN" \
+					rev-parse refs/heads/codex-staging) || exit 98
+			fi
 			count=$(cat "$FAKE_GH_STATE" 2>/dev/null || :)
 			count=${count:-0}
 			count=$((count + 1))
@@ -3286,7 +3355,7 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 				;;
 			esac
 			printf "101\\tpush\\tcodex-staging\\t%s\\t.github/workflows/main.yml\\t%s\\t%s\\thttps://example/ci/101\\n" \
-				"$FAKE_CANDIDATE" "$status" "$conclusion"
+				"$ci_candidate" "$status" "$conclusion"
 			;;
 		repos/openai/git/actions/runs/101/jobs?per_page=100)
 			case "$*" in
@@ -3347,25 +3416,37 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		chmod +x "$support/bin/sleep" &&
 
 		git worktree add --detach Meta "$controller" &&
+		local_origin=$(cd ../publish-run.git && pwd) &&
 		git status --porcelain >"$support/nested-status" &&
 		test_line_count = 1 "$support/nested-status" &&
 		test_grep "?? Meta/" "$support/nested-status" &&
 		run_prepared () {
 			artifact=$1 &&
 			shift &&
+			active_controller=$(git -C Meta rev-parse HEAD) &&
 			rm -f "$support/gh.state" &&
 			rm -f "$support/gh.state.after-ci" &&
 			env PATH="$support/bin:$PATH" GH_HOST=attacker.example \
-				CODEX_CONTROLLER_OID="$controller" \
+				CODEX_CONTROLLER_OID="$active_controller" \
 				CODEX_META_WORKTREE="$PWD/Meta" \
 				FAKE_REAL_GIT="$real_git" \
 				FAKE_GIT_LOG="$support/git.log" \
 				FAKE_GH_LOG="$support/gh.log" \
 				FAKE_GH_STATE="$support/gh.state" \
 				FAKE_ARTIFACT_ZIP="$artifact" \
-				FAKE_CONTROLLER="$controller" \
+				FAKE_CONTROLLER="$active_controller" \
 				FAKE_OLD_CODEX="$old_codex" \
 				FAKE_CANDIDATE="$candidate" \
+				FAKE_DYNAMIC_CANDIDATE="${FAKE_DYNAMIC_CANDIDATE:-}" \
+				FAKE_LOCAL_PREP_ORIGIN="$local_origin" \
+				FAKE_ASSERT_BUNDLE_IMPORT="${FAKE_ASSERT_BUNDLE_IMPORT:-}" \
+				FAKE_BUNDLE_ABSENT_MARKER="$support/bundle-absent" \
+				FAKE_BUNDLE_IMPORTED_MARKER="$support/bundle-imported" \
+				FAKE_HOOK_MARKER="$support/inherited-hook-ran" \
+				FAKE_ZIP_MARKER="${FAKE_ZIP_MARKER:-}" \
+				GIT_CONFIG_COUNT="${FAKE_GIT_CONFIG_COUNT:-0}" \
+				GIT_CONFIG_KEY_0=core.hooksPath \
+				GIT_CONFIG_VALUE_0="$support/hooks" \
 				FAKE_MULTIPLE_PUSHURLS="${FAKE_MULTIPLE_PUSHURLS:-}" \
 				FAKE_GH_MODE="${FAKE_GH_MODE:-}" \
 				sh "$codex_branch" "$@"
@@ -3546,6 +3627,98 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			test "$new" = "$(git --git-dir=../publish-run.git \
 				rev-parse "$ref")" || return 1
 		done <"$support/codex-updates" &&
+		test_must_fail git --git-dir=../publish-run.git show-ref --verify \
+			refs/heads/codex-staging &&
+
+		# Local preparation must use its isolated repository, not the
+		# rerere cache, hooks, temporary refs, or ZIP tooling in the
+		# publisher clone.
+		# Advance master only on the remote so it also has to import
+		# a genuinely new candidate from the local bundle.
+		git fetch --force origin \
+			"+refs/heads/meta:refs/remotes/origin/meta" &&
+		git -C Meta -c advice.detachedHead=false switch --detach \
+			refs/remotes/origin/meta &&
+		(
+			cd ../publish-run-source &&
+			git switch master &&
+			write advanced local-master-update &&
+			git add local-master-update &&
+			git commit -m "advance master for local preparation" &&
+			git push origin master
+		) &&
+		advanced_master=$(git --git-dir=../publish-run.git \
+			rev-parse refs/heads/master) &&
+		snapshot_refs ../publish-run.git >"$support/before-local" &&
+		common_dir=$(git rev-parse --path-format=absolute \
+			--git-common-dir) &&
+		mkdir -p "$common_dir/rr-cache" "$support/hooks" &&
+		write preserved "$common_dir/rr-cache/publisher-sentinel" &&
+		cp "$common_dir/rr-cache/publisher-sentinel" \
+			"$support/publisher-sentinel.before" &&
+		cat >"$support/hooks/post-checkout" <<-\EOF &&
+		#!/bin/sh
+		: >"$FAKE_HOOK_MARKER"
+		exit 89
+		EOF
+		chmod +x "$support/hooks/post-checkout" &&
+		cat >"$support/bin/unzip" <<-\EOF &&
+		#!/bin/sh
+		: >"$FAKE_ZIP_MARKER"
+		exit 89
+		EOF
+		cp "$support/bin/unzip" "$support/bin/zipinfo" &&
+		chmod +x "$support/bin/unzip" "$support/bin/zipinfo" &&
+		rm -f "$support/bundle-absent" \
+			"$support/bundle-imported" \
+			"$support/inherited-hook-ran" \
+			"$support/zip-tool-ran" &&
+		: >"$support/gh.log" &&
+		FAKE_DYNAMIC_CANDIDATE=1 \
+		FAKE_ASSERT_BUNDLE_IMPORT=1 \
+		FAKE_GIT_CONFIG_COUNT=1 \
+		FAKE_ZIP_MARKER="$support/zip-tool-ran" \
+			run_prepared "$support/good.zip" rebuild --local \
+			>"$support/local.out" 2>"$support/local.err" &&
+		local_candidate=$(git --git-dir=../publish-run.git \
+			rev-parse refs/heads/codex) &&
+		test "$local_candidate" != "$candidate" &&
+		test "$advanced_master" = "$(git --git-dir=../publish-run.git \
+			rev-parse refs/heads/master)" &&
+		test_grep "Local preparation session:" "$support/local.out" &&
+		test_grep "Published codex candidate $local_candidate from local preparation session" \
+			"$support/local.out" &&
+		! grep -F "Refresh codex run" "$support/local.out" &&
+		! grep -F "actions/workflows/codex.yml/dispatches" \
+			"$support/gh.log" &&
+		! grep -F "/artifacts" "$support/gh.log" &&
+		test_grep "actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$local_candidate" \
+			"$support/gh.log" &&
+		test_grep "actions/runs/101/jobs" "$support/gh.log" &&
+		test "$local_candidate" = "$(cat "$support/bundle-absent")" &&
+		test_path_is_file "$support/bundle-imported" &&
+		test_path_is_missing "$support/inherited-hook-ran" &&
+		test_path_is_missing "$support/zip-tool-ran" &&
+		test_cmp "$support/publisher-sentinel.before" \
+			"$common_dir/rr-cache/publisher-sentinel" &&
+		local_session=$(sed -n \
+			"s/^Local preparation session: //p" \
+			"$support/local.out") &&
+		test -n "$local_session" &&
+		test_line_count = 1 "$support/bundle-absent" &&
+		for name in codex.bundle codex-candidate codex-inputs codex-updates
+		do
+			test_path_is_file "$local_session/$name" || return 1
+		done &&
+		test_path_is_missing "$local_session/codex-run" &&
+		while IFS="$(printf "\t")" read -r ref old new
+		do
+			test "$new" = "$(git --git-dir=../publish-run.git \
+				rev-parse "$ref")" || return 1
+		done <"$local_session/codex-updates" &&
+		test_must_fail git show-ref --verify \
+			refs/codex-output/candidate &&
+		test_must_fail git show-ref --verify refs/codex-output/meta &&
 		test_must_fail git --git-dir=../publish-run.git show-ref --verify \
 			refs/heads/codex-staging
 	)
