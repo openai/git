@@ -17,6 +17,15 @@ are independent topics” after their current tips stop sharing ancestry. This
 is what makes amending, dropping, or replacing an already-published commit
 safe without relying on a runner's local reflogs.
 
+The generated `codex` history contains one explicit two-parent integration
+commit for every active topic, including prerequisites, fast-forwardable
+topics, and empty topics. Prerequisites are integrated before their dependents;
+lexical order only breaks ties among topics that are ready at the same time.
+This order makes the history deterministic but does not add semantic edges to
+the topic graph. When the first topic is empty because its tip equals the base,
+the controller first creates a tree-identical `Begin codex integration` commit
+so that topic can still have two distinct parents.
+
 ## Topic branches and pull requests
 
 Create a topic from `master`, or from the topic it depends on:
@@ -118,35 +127,53 @@ It creates a session below the repository's shared Git directory containing
 the pinned inputs, update manifest, candidate bundle, and conflict report. It
 does not update local or remote refs. The low-level `rewrite`, `stage`, and
 `promote` commands are also available through `Meta/codex`. Use local refresh
-for inspection and conflict recovery. Normal publication starts with the
-Action and finishes through the pinned `publish-run` command described below.
+for inspection and conflict recovery. Normal publication uses `Meta/rebuild`;
+use `Meta/publish <run-id>` only to finish a preparation started through
+GitHub.
 
 ## Refresh `codex`
 
-1. Open **Actions > Refresh codex**.
-2. Choose **Run workflow**, select `codex`, and run it.
-3. When **Rebase topics and assemble codex** succeeds, run the exact command
-   printed in its summary from a clean clone with a current `Meta` worktree:
+From a clean, complete clone with a linked `Meta` worktree, run:
 
-   ```sh
-   Meta/codex publish-run <run-id>
-   ```
+```sh
+Meta/rebuild
+```
 
-   If the clone does not already have that linked worktree, create it once:
+`Meta/rebuild` updates the clean `Meta` worktree to current `origin/meta`,
+dispatches **Refresh codex**, and prints the exact run ID and URL returned by
+GitHub. It reports preparation status, validates the successful artifact,
+pushes the candidate to `codex-staging`, reports staging-CI job progress, and
+performs the atomic promotion only after that exact candidate passes. Leave
+the command running until it reports the published candidate.
 
-   ```sh
-   git fetch origin '+refs/heads/meta:refs/remotes/origin/meta'
-   git worktree add --detach Meta refs/remotes/origin/meta
-   ```
+Create the linked worktree once if it does not exist:
 
-   An existing `Meta` worktree must be clean and at the controller commit shown
-   in the run summary. When `Meta/` is nested in the caller, the helper permits
-   that one linked-worktree directory but rejects every other caller change.
-   Prepared artifacts expire after seven days.
+```sh
+git fetch origin '+refs/heads/meta:refs/remotes/origin/meta'
+git worktree add --detach Meta refs/remotes/origin/meta
+```
 
-Always start a fresh dispatch after a preparation, staging, CI, lease, or
-promotion failure. Do not use **Re-run failed jobs** for those failures: a
-retry must snapshot the current refs and stage a fresh candidate.
+Both the publishing worktree and `Meta` must be clean. When `Meta/` is nested
+in the publishing worktree, the helper permits that linked-worktree directory
+but rejects every other change.
+
+To start preparation in the GitHub UI instead, open **Actions > Refresh
+codex**, select `codex`, and choose **Run workflow**. After **Rebase topics and
+assemble codex** succeeds, finish that exact run from the same kind of clean
+clone:
+
+```sh
+Meta/publish <run-id>
+```
+
+The Action summary prints this command. Prepared artifacts expire after seven
+days. `Meta/publish` stays pinned to the controller used by the selected run;
+it does not update the `Meta` worktree underneath that run.
+
+Start a fresh `Meta/rebuild` after a preparation, staging, CI, lease, or
+promotion failure. The manual alternative is a fresh UI dispatch followed by
+`Meta/publish <run-id>`. Do not use **Re-run failed jobs**: a retry must
+snapshot the current refs and stage a fresh candidate.
 
 The Action:
 
@@ -154,14 +181,15 @@ The Action:
 2. reads the published boundaries from `meta/codex.config`, infers only new or
    explicitly restacked edges, and rebases topics sequentially in dependency
    order, using rerere resolutions learned from the old `codex`;
-3. merges the rewritten maximal tips and freezes the result without building
-   or executing candidate code, and creates a direct child of the pinned
-   `meta` tip that changes only `codex.config`;
+3. integrates every active topic at its rewritten tip with an explicit merge
+   commit and freezes the result without building or executing candidate code,
+   and, when state changed, creates a direct child of the pinned `meta` tip
+   that changes only `codex.config`;
 4. uploads the bundle, pinned input snapshot, update manifest, and canonical
    run metadata as one attempt-specific artifact; and
 5. pushes nothing.
 
-`publish-run` uses the current user's existing `gh` and Git credentials. It
+`Meta/publish` uses the current user's existing `gh` and Git credentials. It
 accepts only a successful `workflow_dispatch` run on `openai/git:codex`, the
 attempt-specific artifact from that run, and the exact reusable controller
 recorded by GitHub for `meta`. It checks the caller SHA against the snapshotted
@@ -171,15 +199,19 @@ ZIP allowlist and bundle heads, and revalidates the complete input snapshot.
 Only then does it record the existing CI run ID and push the exact candidate
 to the fixed `codex-staging` branch. That user-authenticated push starts
 ordinary push CI, including when the candidate changes a workflow file. The
-helper accepts only a newer `main.yml` push run whose branch and SHA exactly
-match the staged candidate, requires that full run and its `config` job to
-succeed, then revalidates the snapshot and atomically updates `meta`, every
-topic, and `codex` with exact leases while deleting `codex-staging`.
+helper binds to a newer `main.yml` push run whose branch and SHA exactly match
+the staged candidate. While it waits, it prints the run URL and reports changes
+in status, completed-job count, and failure count, plus a heartbeat every five
+minutes when those values do not change. After the full run and its unique
+`config` job succeed, it revalidates the snapshot and atomically updates
+`meta`, every topic, and `codex` with exact leases while deleting
+`codex-staging`.
 
-The final push to `codex` starts the existing push-triggered release workflow.
-A release never runs from staging. The ordinary CI workflow may reuse its own
-earlier successful result when the commit or tree is identical; that is CI's
-existing redundancy policy.
+When promotion advances `codex`, the final push starts the existing
+push-triggered release workflow. A canonical no-op reuses the existing
+`codex` and `meta` tips. A release never runs from staging. The ordinary CI
+workflow may reuse its own earlier successful result when the commit or tree
+is identical; that is CI's existing redundancy policy.
 
 Until the final push, `meta`, `codex`, and all topic refs remain unchanged. A
 CI, validation, lease, or promotion failure after staging leaves
@@ -230,36 +262,38 @@ commit for the failed run:
 4. Review the rewritten topic tips, then run the printed `publish-topics`
    command. It rechecks the original snapshot and atomically pushes every
    rewritten topic with an exact lease.
-5. Start a new **Actions > Refresh codex > Run workflow** dispatch to prepare
-   a publishable artifact; then run the printed `publish-run` command to stage,
-   verify, and promote it to `codex`.
+5. Run `Meta/rebuild` to prepare, verify, and publish the repaired graph. The
+   manual alternative is a fresh **Actions > Refresh codex > Run workflow**
+   dispatch followed by its printed `Meta/publish <run-id>` command.
 
 To abandon recovery, run `git rebase --abort` and delete the disposable
 worktree. Do not use `git rebase --quit`, push only the first conflicted topic,
 add `+` to a failed push, or use an unqualified force push. If a lease fails,
 start again from a fresh dispatch.
 
-If maximal topics conflict while the controller assembles `codex`, the topics
-were declared independent by ancestry but are not independent in practice.
-Rebase the conflicting topic and its descendants onto the real prerequisite,
-push that coherent graph, and start a fresh dispatch. Do not fix this by
-merging `codex` into a topic or by maintaining a manual order.
+If topics conflict while the controller assembles `codex`, the graph declared
+them independent at that integration point when they are not independent in
+practice. Rebase the conflicting topic and its descendants onto the real
+prerequisite, push that coherent graph, and start a fresh dispatch. Do not fix
+this by merging `codex` into a topic or by maintaining a manual order.
 
 ## Configure publishing
 
 Publishing needs no repository secret, deploy key, GitHub App, or protected
 environment. It uses the publisher's ordinary credentials:
 
-1. Authenticate `gh` as the publishing user and make sure that account can
-   read Actions runs and artifacts for `openai/git`:
+1. Authenticate `gh` as the publishing user. `Meta/rebuild` needs permission
+   to dispatch Actions; `Meta/publish` needs permission to read the selected
+   run and its artifact:
 
    ```sh
    gh auth status
    ```
 
 2. Configure the canonical `origin` with that user's normal Git credentials.
-   `Meta/codex publish-run` accepts only the standard SSH or HTTPS URL for
-   `openai/git`; it never reads a token from the repository or artifact.
+   `Meta/rebuild` and `Meta/publish` accept only the standard SSH or HTTPS URL
+   for `openai/git`. Neither command reads a token from the repository or
+   artifact.
 3. In the existing **Protect generated Codex branch** ruleset and the
    **Protect Codex controller branch** ruleset, add an **always** bypass for
    each exact human publisher. The checked-in recipes authorize only the
@@ -267,10 +301,15 @@ environment. It uses the publisher's ordinary credentials:
    break-glass actor. Import the `meta` recipe only if that ruleset is absent.
 
 The bypass is intentionally personal and visible. The Action cannot publish;
-it only prepares an immutable artifact. Running `publish-run` is the approval
-and Git records the configured user as the pusher. To add or remove a
-publisher, change the exact `User` actor in both rulesets. Do not replace it
+it only prepares an immutable artifact. Running `Meta/rebuild` or
+`Meta/publish` is the approval, and Git records the configured user as the
+pusher. To add or remove a publisher, change the exact `User` actor in both
+rulesets. Do not replace it
 with a broad repository role or a shared long-lived credential.
+
+The final push runs from the operator's machine. Actions prepares the candidate
+and CI verifies it, but the operator's existing Git credentials authorize the
+atomic ref update.
 
 The built-in `GITHUB_TOKEN` is not a substitute for the local publisher.
 [GitHub suppresses push-triggered workflows for pushes made with that

@@ -11,6 +11,8 @@ codex_branch=${CODEX_BRANCH:-$TEST_DIRECTORY/../.github/workflows/codex-branch.s
 codex_workflow=${CODEX_WORKFLOW:-$(dirname "$codex_branch")/codex.yml}
 codex_root=$(CDPATH= cd "$(dirname "$codex_branch")/../.." && pwd)
 codex_entrypoint=${CODEX_ENTRYPOINT:-$codex_root/codex}
+codex_rebuild=${CODEX_REBUILD:-$codex_root/rebuild}
+codex_publish=${CODEX_PUBLISH:-$codex_root/publish}
 codex_bot_name='chatgpt-codex-connector[bot]'
 codex_bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
@@ -240,6 +242,55 @@ has_same_author () (
 		"$(git show -s --format="%an <%ae>" "$new")"
 )
 
+make_test_integration () (
+	name=$1
+	oid=$2
+	first_parent=$3
+	tree=$4
+	message=$(printf 'Merge %s into codex\n\nIntegrate the current %s topic into the internally distributed codex branch.\n\nCodex-Integration: %s@%s' \
+		"$name" "$name" "$name" "$oid") &&
+	printf '%s\n' "$message" |
+	GIT_AUTHOR_NAME=$codex_bot_name GIT_AUTHOR_EMAIL=$codex_bot_email \
+	GIT_COMMITTER_NAME=$codex_bot_name \
+	GIT_COMMITTER_EMAIL=$codex_bot_email \
+	git -c commit.gpgSign=false commit-tree "$tree" \
+		-p "$first_parent" -p "$oid"
+)
+
+write_test_output_tuple () (
+	valid_meta=$1
+	old_meta=$2
+	valid_candidate=$3
+	candidate=$4
+	valid_updates=$5
+	prefix=$6
+
+	git show "$valid_meta:codex.config" |
+		sed "s/output-tip = $valid_candidate/output-tip = $candidate/" \
+			>"$prefix.config" &&
+	test_grep "output-tip = $candidate" "$prefix.config" &&
+	blob=$(git hash-object -w "$prefix.config") &&
+	index=$PWD/$prefix.index &&
+	rm -f "$index" &&
+	GIT_INDEX_FILE=$index git read-tree "$old_meta^{tree}" &&
+	GIT_INDEX_FILE=$index git update-index --add --cacheinfo \
+		100644,"$blob",codex.config &&
+	tree=$(GIT_INDEX_FILE=$index git write-tree) &&
+	meta=$(printf '%s\n' "meta: test alternate integration history" |
+		GIT_AUTHOR_NAME=$codex_bot_name \
+		GIT_AUTHOR_EMAIL=$codex_bot_email \
+		GIT_COMMITTER_NAME=$codex_bot_name \
+		GIT_COMMITTER_EMAIL=$codex_bot_email \
+		git -c commit.gpgSign=false commit-tree "$tree" -p "$old_meta") &&
+	awk -F "$(printf '\t')" -v OFS="$(printf '\t')" \
+		-v meta="$meta" -v candidate="$candidate" '
+		$1 == "refs/heads/meta" { $3=meta }
+		$1 == "refs/heads/codex" { $3=candidate }
+		{ print }
+	' "$valid_updates" >"$prefix.updates" &&
+	printf '%s\n' "$candidate" >"$prefix.result"
+)
+
 test_expect_success 'topic names use the two-character namespace' '
 	sh "$codex_branch" check-topic tb/codex/release &&
 	test_expect_code 1 sh "$codex_branch" check-topic t/codex/release &&
@@ -259,6 +310,29 @@ test_expect_success 'generated commits use the Codex connector identity' '
 	grep -F "$codex_bot_email" "$codex_branch"
 '
 
+test_expect_success 'convenience wrappers forward to the pinned controller' '
+	test -x "$codex_rebuild" &&
+	test -x "$codex_publish" &&
+	mkdir -p "wrapper forwarding/Meta" &&
+	cp "$codex_rebuild" "wrapper forwarding/Meta/rebuild" &&
+	cp "$codex_publish" "wrapper forwarding/Meta/publish" &&
+	cat >"wrapper forwarding/Meta/codex" <<-\EOF &&
+	#!/bin/sh
+	printf "%s\\n" "$*" >>"$WRAPPER_LOG"
+	exit "${WRAPPER_EXIT:-0}"
+	EOF
+	chmod +x "wrapper forwarding/Meta/codex" &&
+	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" \
+		"$TRASH_DIRECTORY/wrapper forwarding/Meta/rebuild" &&
+	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" \
+		"$TRASH_DIRECTORY/wrapper forwarding/Meta/publish" 4242 &&
+	printf "%s\n" rebuild "publish 4242" >wrapper.expect &&
+	test_cmp wrapper.expect wrapper.log &&
+	WRAPPER_LOG="$TRASH_DIRECTORY/wrapper.log" WRAPPER_EXIT=17 \
+		test_expect_code 17 \
+		"$TRASH_DIRECTORY/wrapper forwarding/Meta/publish" 9999
+'
+
 test_expect_success 'refresh only prepares an immutable local-publish artifact' '
 	! grep -F "codex-topic.yml" "$codex_workflow" &&
 	! grep -E "make -C|t9905-codex-branch.sh" "$codex_workflow" &&
@@ -273,7 +347,7 @@ test_expect_success 'refresh only prepares an immutable local-publish artifact' 
 	test_grep "actions/upload-artifact" "$codex_workflow" &&
 	test_grep "runner.temp }}/codex-run" "$codex_workflow" &&
 	test_grep "GITHUB_RUN_ATTEMPT" "$codex_workflow" &&
-	test_grep "Meta/codex publish-run" "$codex_workflow" &&
+	test_grep "Meta/publish" "$codex_workflow" &&
 	sed -n "/^          path: |$/,/^          if-no-files-found:/p" \
 		"$codex_workflow" |
 	sed -n "s,.*runner.temp }}/\\(codex[^ ]*\\)$,\\1,p" |
@@ -329,6 +403,65 @@ test_expect_success 'topics cannot change the meta branch ruleset' '
 			2>rewrite.err &&
 		test_grep "meta-only controller files" rewrite.err &&
 		snapshot_refs ../control-path.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'topics cannot change the convenience wrappers' '
+	git init --bare wrapper-control-path.git &&
+	test_create_repo wrapper-control-path-source &&
+	(
+		cd wrapper-control-path-source &&
+		git remote add origin ../wrapper-control-path.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch meta &&
+		install_meta_state meta master codex &&
+
+		git switch -c aa/codex/rebuild-control master &&
+		write untrusted rebuild &&
+		git add rebuild &&
+		git commit -m "change rebuild wrapper" &&
+		git push origin master meta codex aa/codex/rebuild-control
+	) &&
+	git clone wrapper-control-path.git wrapper-control-path-runner &&
+	(
+		cd wrapper-control-path-runner &&
+		fetch_all &&
+		snapshot_refs ../wrapper-control-path.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates \
+			--inputs inputs --failure failure \
+			2>rebuild.err &&
+		test_grep "meta-only controller files" rebuild.err &&
+		snapshot_refs ../wrapper-control-path.git >after &&
+		test_cmp before after
+	) &&
+	git --git-dir=wrapper-control-path.git update-ref -d \
+		refs/heads/aa/codex/rebuild-control &&
+	(
+		cd wrapper-control-path-source &&
+		git switch -c aa/codex/publish-control master &&
+		write untrusted publish &&
+		git add publish &&
+		git commit -m "change publish wrapper" &&
+		git push origin aa/codex/publish-control
+	) &&
+	(
+		cd wrapper-control-path-runner &&
+		fetch_all &&
+		snapshot_refs ../wrapper-control-path.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates \
+			--inputs inputs --failure failure \
+			2>publish.err &&
+		test_grep "meta-only controller files" publish.err &&
+		snapshot_refs ../wrapper-control-path.git >after &&
 		test_cmp before after
 	)
 '
@@ -394,6 +527,16 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 		git add .github/workflows/extra.yml &&
 		git commit -m "add another workflow" &&
 
+		git switch -c rebuild-control master &&
+		write untrusted rebuild &&
+		git add rebuild &&
+		git commit -m "change rebuild wrapper" &&
+
+		git switch -c publish-control master &&
+		write untrusted publish &&
+		git add publish &&
+		git commit -m "change publish wrapper" &&
+
 		git switch -c cc/codex/feature master &&
 		write feature feature-file &&
 		git add feature-file &&
@@ -410,7 +553,9 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 			bb/codex/control:refs/heads/control-invalid \
 			release-staging:refs/heads/release-invalid \
 			release-credentials:refs/heads/release-credentials-invalid \
-			workflow-extra:refs/heads/workflow-invalid
+			workflow-extra:refs/heads/workflow-invalid \
+			rebuild-control:refs/heads/rebuild-invalid \
+			publish-control:refs/heads/publish-invalid
 	) &&
 
 	git clone automation.git automation-runner &&
@@ -493,6 +638,28 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 		test_grep "protected controller or CI file" control.err &&
 		git --git-dir=../automation.git update-ref -d \
 			refs/heads/bb/codex/control "$control" &&
+
+		for wrapper in rebuild publish
+		do
+			wrapper_oid=$(git --git-dir=../automation.git \
+				rev-parse "refs/heads/$wrapper-invalid") &&
+			git --git-dir=../automation.git update-ref \
+				"refs/heads/bb/codex/$wrapper-control" \
+				"$wrapper_oid" &&
+			fetch_all &&
+			test_expect_code 1 sh "$codex_branch" rewrite \
+				--remote origin --base master --codex codex \
+				--result "$wrapper-result" \
+				--updates "$wrapper-updates" \
+				--inputs "$wrapper-inputs" \
+				--failure "$wrapper-failure" \
+				--require-automation 2>"$wrapper.err" &&
+			test_grep "protected controller or CI file" \
+				"$wrapper.err" &&
+			git --git-dir=../automation.git update-ref -d \
+				"refs/heads/bb/codex/$wrapper-control" \
+				"$wrapper_oid" || return 1
+		done &&
 
 		release=$(git --git-dir=../automation.git \
 			rev-parse refs/heads/release-invalid) &&
@@ -596,7 +763,7 @@ test_expect_success 'rewrite rebases one root topic onto current master' '
 	)
 '
 
-test_expect_success 'rewrite preserves dependencies and merges maximal tips in name order' '
+test_expect_success 'rewrite keeps canonical integrations when merge.log is enabled' '
 	git init --bare graph.git &&
 	test_create_repo graph-source &&
 	(
@@ -644,6 +811,7 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		test "$old_a" = "$(git rev-parse "$old_b^")" &&
 		git config user.name "Configured Local User" &&
 		git config user.email "configured-local-user@example.com" &&
+		git config merge.log true &&
 
 		(
 			unset GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL &&
@@ -673,22 +841,47 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 		has_same_author "$old_b" "$new_b" &&
 		has_same_author "$old_c" "$new_c" &&
 
-		last_merge=$(git rev-parse "$candidate") &&
-		first_merge=$(git rev-parse "$last_merge^") &&
+		git rev-list --first-parent --reverse "$master..$candidate" \
+			>integration-commits &&
+		test_line_count = 3 integration-commits &&
+		first_merge=$(sed -n "1p" integration-commits) &&
+		second_merge=$(sed -n "2p" integration-commits) &&
+		last_merge=$(sed -n "3p" integration-commits) &&
 		new_meta=$(updated_tip meta updates) &&
 		has_codex_bot_committer "$new_a" &&
 		has_codex_bot_committer "$new_b" &&
 		has_codex_bot_committer "$new_c" &&
 		has_codex_bot_committer "$first_merge" &&
+		has_codex_bot_committer "$second_merge" &&
 		has_codex_bot_committer "$last_merge" &&
 		has_codex_bot_committer "$new_meta" &&
 		has_codex_bot_author "$first_merge" &&
+		has_codex_bot_author "$second_merge" &&
 		has_codex_bot_author "$last_merge" &&
 		has_codex_bot_author "$new_meta" &&
+		test "Merge aa/codex/a into codex" = \
+			"$(git show -s --format=%s "$first_merge")" &&
+		test "Merge bb/codex/b into codex" = \
+			"$(git show -s --format=%s "$second_merge")" &&
+		test "Merge cc/codex/c into codex" = \
+			"$(git show -s --format=%s "$last_merge")" &&
+		test "aa/codex/a@$new_a" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$first_merge")" &&
+		test "bb/codex/b@$new_b" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$second_merge")" &&
+		test "cc/codex/c@$new_c" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$last_merge")" &&
+		test "$master" = "$(git rev-parse "$first_merge^1")" &&
+		test "$first_merge" = "$(git rev-parse "$second_merge^1")" &&
+		test "$second_merge" = "$(git rev-parse "$last_merge^1")" &&
+		test "$new_a" = "$(git rev-parse "$first_merge^2")" &&
+		test "$new_b" = "$(git rev-parse "$second_merge^2")" &&
 		test "$new_c" = "$(git rev-parse "$last_merge^2")" &&
-		test "$new_b" = "$(git rev-parse "$first_merge^2")" &&
-		test "$master" = "$(git rev-parse "$first_merge^")" &&
-		test 2 = "$(git rev-list --count --merges "$master..$candidate")" &&
+		test 3 = "$(git rev-list --count --first-parent --merges \
+			"$master..$candidate")" &&
 
 		sh "$codex_branch" verify-inputs \
 			--remote origin --base master --codex codex inputs &&
@@ -721,6 +914,95 @@ test_expect_success 'rewrite preserves dependencies and merges maximal tips in n
 			refs/heads/aa/codex/a "$old_b" "$old_a" &&
 		test_expect_code 1 sh "$codex_branch" verify-inputs \
 			--remote origin --base master --codex codex inputs
+	)
+'
+
+test_expect_success 'tree-same legacy codex is canonicalized once' '
+	git init --bare legacy-integrations.git &&
+	test_create_repo legacy-integrations-source &&
+	(
+		cd legacy-integrations-source &&
+		git remote add origin ../legacy-integrations.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/a &&
+		write A a &&
+		git add a &&
+		git commit -m "legacy topic A" &&
+
+		git switch -c bb/codex/b &&
+		write B b &&
+		git add b &&
+		git commit -m "legacy topic B" &&
+
+		git switch -c cc/codex/c master &&
+		write C c &&
+		git add c &&
+		git commit -m "legacy topic C" &&
+
+		git switch -c codex master &&
+		git merge --no-ff bb/codex/b -m "legacy maximal merge B" &&
+		git merge --no-ff cc/codex/c -m "legacy maximal merge C" &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git push origin master meta codex \
+			aa/codex/a bb/codex/b cc/codex/c
+	) &&
+
+	git clone legacy-integrations.git legacy-integrations-runner &&
+	(
+		cd legacy-integrations-runner &&
+		fetch_all &&
+		legacy=$(git rev-parse origin/codex) &&
+		master=$(git rev-parse origin/master) &&
+		old_a=$(git rev-parse origin/aa/codex/a) &&
+		old_b=$(git rev-parse origin/bb/codex/b) &&
+		old_c=$(git rev-parse origin/cc/codex/c) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		test "$legacy" != "$candidate" &&
+		test "$(git rev-parse "$legacy^{tree}")" = \
+			"$(git rev-parse "$candidate^{tree}")" &&
+		git rev-list --first-parent --reverse "$master..$candidate" \
+			>integration-commits &&
+		test_line_count = 3 integration-commits &&
+		first_merge=$(sed -n "1p" integration-commits) &&
+		second_merge=$(sed -n "2p" integration-commits) &&
+		last_merge=$(sed -n "3p" integration-commits) &&
+		test "aa/codex/a@$old_a" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$first_merge")" &&
+		test "bb/codex/b@$old_b" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$second_merge")" &&
+		test "cc/codex/c@$old_c" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$last_merge")" &&
+		set -- git push --atomic --force origin &&
+		while IFS="$(printf "\t")" read -r ref old new
+		do
+			set -- "$@" "$new:$ref" || return 1
+		done <updates &&
+		"$@"
+	) &&
+
+	git clone legacy-integrations.git legacy-integrations-noop &&
+	(
+		cd legacy-integrations-noop &&
+		fetch_all &&
+		published=$(git rev-parse origin/codex) &&
+		snapshot_refs ../legacy-integrations.git >before &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		test "$published" = "$(cat result)" &&
+		snapshot_refs ../legacy-integrations.git >after &&
+		test_cmp before after
 	)
 '
 
@@ -941,9 +1223,28 @@ test_expect_success 'a topic already in master still produces a valid bundle' '
 			--base master --codex codex --result result \
 			--updates updates --inputs inputs \
 			--bundle candidate.bundle --failure failure &&
-		test "$(git rev-parse origin/master)" = "$(cat result)" &&
-		git bundle verify candidate.bundle &&
 		candidate=$(cat result) &&
+		master=$(git rev-parse origin/master) &&
+		test "$master" != "$candidate" &&
+		test "$master" = "$(git rev-parse "$candidate^2")" &&
+		anchor=$(git rev-parse "$candidate^1") &&
+		test "$master" = "$(git rev-parse "$anchor^1")" &&
+		test "Begin codex integration" = \
+			"$(git show -s --format=%s "$anchor")" &&
+		test "Merge aa/codex/done into codex" = \
+			"$(git show -s --format=%s "$candidate")" &&
+		test "aa/codex/done@$master" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$candidate")" &&
+		test "$(git rev-parse "$master^{tree}")" = \
+			"$(git rev-parse "$candidate^{tree}")" &&
+		test 1 = "$(git rev-list --count --first-parent --merges \
+			"$master..$candidate")" &&
+		has_codex_bot_author "$anchor" &&
+		has_codex_bot_committer "$anchor" &&
+		has_codex_bot_author "$candidate" &&
+		has_codex_bot_committer "$candidate" &&
+		git bundle verify candidate.bundle &&
 		meta=$(updated_tip meta updates) &&
 		test "$candidate" = "$(git bundle list-heads candidate.bundle |
 			awk '\''$2 == "refs/codex-output/candidate" { print $1 }'\'')" &&
@@ -1904,11 +2205,38 @@ test_expect_success 'an empty dependent follows its rewritten equal-tip parent' 
 		sh "$codex_branch" rewrite --remote origin \
 			--base master --codex codex --result result \
 			--updates updates --inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		master=$(git rev-parse origin/master) &&
 		new_parent=$(updated_tip aa/codex/parent updates) &&
 		new_empty=$(updated_tip bb/codex/empty updates) &&
 		test "$old_empty" != "$new_empty" &&
 		test "$new_parent" = "$new_empty" &&
-		test replacement = "$(git show "$new_empty:parent-file")"
+		test replacement = "$(git show "$new_empty:parent-file")" &&
+		git rev-list --first-parent --reverse "$master..$candidate" \
+			>integration-commits &&
+		test_line_count = 2 integration-commits &&
+		parent_merge=$(sed -n "1p" integration-commits) &&
+		empty_merge=$(sed -n "2p" integration-commits) &&
+		test "Merge aa/codex/parent into codex" = \
+			"$(git show -s --format=%s "$parent_merge")" &&
+		test "Merge bb/codex/empty into codex" = \
+			"$(git show -s --format=%s "$empty_merge")" &&
+		test "aa/codex/parent@$new_parent" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$parent_merge")" &&
+		test "bb/codex/empty@$new_empty" = "$(git show -s \
+			--format="%(trailers:key=Codex-Integration,valueonly)" \
+			"$empty_merge")" &&
+		test "$master" = "$(git rev-parse "$parent_merge^1")" &&
+		test "$parent_merge" = "$(git rev-parse "$empty_merge^1")" &&
+		test "$new_parent" = "$(git rev-parse "$parent_merge^2")" &&
+		test "$new_empty" = "$(git rev-parse "$empty_merge^2")" &&
+		test "$(git rev-parse "$parent_merge^{tree}")" = \
+			"$(git rev-parse "$empty_merge^{tree}")" &&
+		has_codex_bot_author "$parent_merge" &&
+		has_codex_bot_committer "$parent_merge" &&
+		has_codex_bot_author "$empty_merge" &&
+		has_codex_bot_committer "$empty_merge"
 	)
 '
 
@@ -2281,7 +2609,7 @@ test_expect_success 'a coherent restack can swap a published dependency' '
 	)
 '
 
-test_expect_success 'Meta/codex pins both controller files to Meta HEAD' '
+test_expect_success 'Meta/codex pins every controller file to Meta HEAD' '
 	test_create_repo wrapper-pin &&
 	(
 		cd wrapper-pin &&
@@ -2293,11 +2621,15 @@ test_expect_success 'Meta/codex pins both controller files to Meta HEAD' '
 	git -C wrapper-pin worktree add ../wrapper-pin-Meta meta &&
 	mkdir -p wrapper-pin-Meta/.github/workflows &&
 	cp "$codex_entrypoint" wrapper-pin-Meta/codex &&
+	cp "$codex_rebuild" wrapper-pin-Meta/rebuild &&
+	cp "$codex_publish" wrapper-pin-Meta/publish &&
 	cp "$codex_branch" \
 		wrapper-pin-Meta/.github/workflows/codex-branch.sh &&
-	chmod +x wrapper-pin-Meta/codex \
+	chmod +x wrapper-pin-Meta/codex wrapper-pin-Meta/rebuild \
+		wrapper-pin-Meta/publish \
 		wrapper-pin-Meta/.github/workflows/codex-branch.sh &&
-	git -C wrapper-pin-Meta add codex .github/workflows/codex-branch.sh &&
+	git -C wrapper-pin-Meta add codex rebuild publish \
+		.github/workflows/codex-branch.sh &&
 	git -C wrapper-pin-Meta commit -m "install pinned controller" &&
 	(
 		cd wrapper-pin &&
@@ -2312,6 +2644,22 @@ test_expect_success 'Meta/codex pins both controller files to Meta HEAD' '
 	test_grep ".github/workflows/codex-branch.sh must match Meta/HEAD" \
 		dirty-helper.err &&
 	git -C wrapper-pin-Meta restore .github/workflows/codex-branch.sh &&
+	write dirty wrapper-pin-Meta/rebuild &&
+	(
+		cd wrapper-pin &&
+		test_expect_code 1 ../wrapper-pin-Meta/codex \
+			check-topic aa/codex/topic 2>../dirty-rebuild.err
+	) &&
+	test_grep "rebuild must match Meta/HEAD" dirty-rebuild.err &&
+	git -C wrapper-pin-Meta restore rebuild &&
+	write dirty wrapper-pin-Meta/publish &&
+	(
+		cd wrapper-pin &&
+		test_expect_code 1 ../wrapper-pin-Meta/codex \
+			check-topic aa/codex/topic 2>../dirty-publish.err
+	) &&
+	test_grep "publish must match Meta/HEAD" dirty-publish.err &&
+	git -C wrapper-pin-Meta restore publish &&
 	printf "\n# dirty\n" >>wrapper-pin-Meta/codex &&
 	(
 		cd wrapper-pin &&
@@ -2319,6 +2667,69 @@ test_expect_success 'Meta/codex pins both controller files to Meta HEAD' '
 			check-topic aa/codex/topic 2>../dirty-wrapper.err
 	) &&
 	test_grep "codex must match Meta/HEAD" dirty-wrapper.err
+'
+
+test_expect_success 'Meta/rebuild refreshes and executes a newer meta controller' '
+	git init --bare meta-refresh.git &&
+	test_create_repo meta-refresh-source &&
+	(
+		cd meta-refresh-source &&
+		git remote add origin ../meta-refresh.git &&
+		write base tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git branch meta
+	) &&
+	git -C meta-refresh-source worktree add ../meta-refresh-Meta meta &&
+	mkdir -p meta-refresh-Meta/.github/workflows &&
+	cp "$codex_entrypoint" meta-refresh-Meta/codex &&
+	cp "$codex_rebuild" meta-refresh-Meta/rebuild &&
+	cp "$codex_publish" meta-refresh-Meta/publish &&
+	cp "$codex_branch" \
+		meta-refresh-Meta/.github/workflows/codex-branch.sh &&
+	chmod +x meta-refresh-Meta/codex meta-refresh-Meta/rebuild \
+		meta-refresh-Meta/publish \
+		meta-refresh-Meta/.github/workflows/codex-branch.sh &&
+	git -C meta-refresh-Meta add codex rebuild publish \
+		.github/workflows/codex-branch.sh &&
+	git -C meta-refresh-Meta commit -m "install controller A" &&
+	old_controller=$(git -C meta-refresh-Meta rev-parse HEAD) &&
+	git -C meta-refresh-Meta push origin meta &&
+	cat >meta-refresh-Meta/rebuild <<-\EOF &&
+	#!/bin/sh
+	printf "%s\\n" refreshed >"$META_REFRESH_MARKER"
+	exit 23
+	EOF
+	chmod +x meta-refresh-Meta/rebuild &&
+	git -C meta-refresh-Meta add rebuild &&
+	git -C meta-refresh-Meta commit -m "install controller B" &&
+	new_controller=$(git -C meta-refresh-Meta rev-parse HEAD) &&
+	test "$old_controller" != "$new_controller" &&
+	git -C meta-refresh-Meta push origin meta &&
+	git -C meta-refresh-Meta switch --detach "$old_controller" &&
+	mkdir meta-refresh-bin &&
+	real_git=$(command -v git) &&
+	cat >meta-refresh-bin/git <<-\EOF &&
+	#!/bin/sh
+	case "$*" in
+	"remote get-url --all origin"|"remote get-url --push --all origin")
+		printf "%s\\n" https://github.com/openai/git
+		exit 0
+		;;
+	esac
+	exec "$FAKE_REAL_GIT" "$@"
+	EOF
+	chmod +x meta-refresh-bin/git &&
+	(
+		cd meta-refresh-source &&
+		PATH="$TRASH_DIRECTORY/meta-refresh-bin:$PATH" \
+		FAKE_REAL_GIT="$real_git" \
+		META_REFRESH_MARKER="$TRASH_DIRECTORY/meta-refresh.marker" \
+		test_expect_code 23 ../meta-refresh-Meta/rebuild
+	) &&
+	test "$new_controller" = \
+		"$(git -C meta-refresh-Meta rev-parse HEAD)" &&
+	test_grep refreshed meta-refresh.marker
 '
 
 test_expect_success 'rewrite requires codex.config on meta' '
@@ -2497,6 +2908,117 @@ test_expect_success 'verify-output rejects malformed generated meta commits' '
 	)
 '
 
+test_expect_success 'verify-output rejects alternate integration histories' '
+	git init --bare integration-output.git &&
+	test_create_repo integration-output-source &&
+	(
+		cd integration-output-source &&
+		git remote add origin ../integration-output.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c aa/codex/a &&
+		write A a &&
+		git add a &&
+		git commit -m "output topic A" &&
+
+		git switch -c bb/codex/b &&
+		write B b &&
+		git add b &&
+		git commit -m "output topic B" &&
+
+		git switch -c cc/codex/c master &&
+		write C c &&
+		git add c &&
+		git commit -m "output topic C" &&
+
+		git switch master &&
+		git branch meta &&
+		install_meta_state meta master codex &&
+		git push origin master meta codex \
+			aa/codex/a bb/codex/b cc/codex/c
+	) &&
+
+	git clone integration-output.git integration-output-runner &&
+	(
+		cd integration-output-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result valid.result \
+			--updates valid.updates --inputs inputs --failure failure &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates valid.updates --result valid.result &&
+
+		base=$(git rev-parse origin/master) &&
+		topic_a=$(updated_tip aa/codex/a valid.updates) &&
+		topic_b=$(updated_tip bb/codex/b valid.updates) &&
+		topic_c=$(updated_tip cc/codex/c valid.updates) &&
+		old_meta=$(git rev-parse origin/meta) &&
+		valid_meta=$(updated_tip meta valid.updates) &&
+		valid_candidate=$(cat valid.result) &&
+		valid_tree=$(git rev-parse "$valid_candidate^{tree}") &&
+
+		missing_b=$(printf "%s\n" "Legacy maximal merge B" |
+			GIT_AUTHOR_NAME=$codex_bot_name \
+			GIT_AUTHOR_EMAIL=$codex_bot_email \
+			GIT_COMMITTER_NAME=$codex_bot_name \
+			GIT_COMMITTER_EMAIL=$codex_bot_email \
+			git -c commit.gpgSign=false commit-tree \
+				"$topic_b^{tree}" -p "$base" -p "$topic_b") &&
+		missing=$(printf "%s\n" "Legacy maximal merge C" |
+			GIT_AUTHOR_NAME=$codex_bot_name \
+			GIT_AUTHOR_EMAIL=$codex_bot_email \
+			GIT_COMMITTER_NAME=$codex_bot_name \
+			GIT_COMMITTER_EMAIL=$codex_bot_email \
+			git -c commit.gpgSign=false commit-tree \
+				"$valid_tree" -p "$missing_b" -p "$topic_c") &&
+		test "$valid_tree" = "$(git rev-parse "$missing^{tree}")" &&
+		write_test_output_tuple "$valid_meta" "$old_meta" \
+			"$valid_candidate" "$missing" valid.updates missing &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates missing.updates \
+			--result missing.result >missing.out 2>missing.err &&
+		test_grep "one canonical integration merge per topic" missing.err &&
+
+		c_merge=$(make_test_integration cc/codex/c "$topic_c" \
+			"$base" "$topic_c^{tree}") &&
+		ac_tree=$(git merge-tree --write-tree "$c_merge" "$topic_a") &&
+		a_merge=$(make_test_integration aa/codex/a "$topic_a" \
+			"$c_merge" "$ac_tree") &&
+		acb_tree=$(git merge-tree --write-tree "$a_merge" "$topic_b") &&
+		reordered=$(make_test_integration bb/codex/b "$topic_b" \
+			"$a_merge" "$acb_tree") &&
+		test "$valid_tree" = "$(git rev-parse "$reordered^{tree}")" &&
+		write_test_output_tuple "$valid_meta" "$old_meta" \
+			"$valid_candidate" "$reordered" valid.updates reordered &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates reordered.updates \
+			--result reordered.result >reordered.out 2>reordered.err &&
+		test_grep "one canonical integration merge per topic" reordered.err &&
+
+		before_c=$(git rev-parse "$valid_candidate^1") &&
+		forged_message=$(printf "Merge cc/codex/c into codex\n\nIntegrate the current cc/codex/c topic into the internally distributed codex branch.\n\nCodex-Integration: cc/codex/c@%s" \
+			"$topic_b") &&
+		forged=$(printf "%s\n" "$forged_message" |
+			GIT_AUTHOR_NAME=$codex_bot_name \
+			GIT_AUTHOR_EMAIL=$codex_bot_email \
+			GIT_COMMITTER_NAME=$codex_bot_name \
+			GIT_COMMITTER_EMAIL=$codex_bot_email \
+			git -c commit.gpgSign=false commit-tree "$valid_tree" \
+				-p "$before_c" -p "$topic_c") &&
+		test "$valid_tree" = "$(git rev-parse "$forged^{tree}")" &&
+		write_test_output_tuple "$valid_meta" "$old_meta" \
+			"$valid_candidate" "$forged" valid.updates forged &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates forged.updates \
+			--result forged.result >forged.out 2>forged.err &&
+		test_grep "one canonical integration merge per topic" forged.err
+	)
+'
+
 test_expect_success PYTHON 'publish-run authenticates the artifact and promotes its exact candidate' '
 	git init --bare publish-run.git &&
 	test_create_repo publish-run-source &&
@@ -2647,11 +3169,37 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		cat >"$support/bin/gh" <<-\EOF &&
 		#!/bin/sh
 		printf "%s\\n" "$*" >>"$FAKE_GH_LOG"
+		if test "$1" = api && test "$2" = --hostname &&
+			test "$3" = github.com && test "$4" = --method
+		then
+			test "$5" = POST || exit 96
+			case "$*" in
+			*"--header X-GitHub-Api-Version: 2026-03-10"*\
+			*"--raw-field ref=codex"*\
+			*"repos/openai/git/actions/workflows/codex.yml/dispatches"*) ;;
+			*) exit 95 ;;
+			esac
+			test "${FAKE_GH_MODE:-}" != dispatch-error || exit 94
+			if test "${FAKE_GH_MODE:-}" = dispatch-malformed
+			then
+				printf "4242\\thttps://api.github.com/repos/openai/git/actions/runs/9999\\thttps://github.com/openai/git/actions/runs/4242\\n"
+			else
+				printf "4242\\thttps://api.github.com/repos/openai/git/actions/runs/4242\\thttps://github.com/openai/git/actions/runs/4242\\n"
+			fi
+			exit
+		fi
 		test "$1" = api &&
 		test "$2" = --hostname &&
 		test "$3" = github.com || exit 96
-		endpoint=$4
-		shift 4
+		shift 3
+		slurp=
+		while test "$1" = --paginate || test "$1" = --slurp
+		do
+			test "$1" != --slurp || slurp=t
+			shift
+		done
+		endpoint=$1
+		shift
 		case "$endpoint" in
 		repos/openai/git/actions/runs/4242)
 			case "$*" in
@@ -2672,8 +3220,25 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			*)
 				api_id=4242
 				test "${FAKE_GH_MODE:-}" != wrong-run || api_id=9999
-				printf "%s\\t1\\tcompleted\\tsuccess\\tworkflow_dispatch\\tcodex\\t%s\\t.github/workflows/codex.yml\\topenai/git\\thttps://example/run/4242\\n" \
-					"$api_id" "$FAKE_OLD_CODEX"
+				run_attempt=1
+				status=completed
+				conclusion=success
+				if test "${FAKE_GH_MODE:-}" = post-ci-rerun &&
+					test -f "$FAKE_GH_STATE.after-ci"
+				then
+					run_attempt=2
+				fi
+				case "${FAKE_GH_MODE:-}" in
+				preparation-failure) conclusion=failure ;;
+				preparation-rerun) run_attempt=2 ;;
+				preparation-timeout)
+					status=in_progress
+					conclusion=-
+					;;
+				esac
+				printf "%s\\t%s\\t%s\\t%s\\tworkflow_dispatch\\tcodex\\t%s\\t.github/workflows/codex.yml\\topenai/git\\thttps://example/run/4242\\n" \
+					"$api_id" "$run_attempt" "$status" "$conclusion" \
+					"$FAKE_OLD_CODEX"
 				;;
 			esac
 			;;
@@ -2690,11 +3255,62 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			esac
 			;;
 		repos/openai/git/actions/runs/101)
-			printf "101\\tpush\\tcodex-staging\\t%s\\t.github/workflows/main.yml\\tcompleted\\tsuccess\\thttps://example/ci/101\\n" \
-				"$FAKE_CANDIDATE"
+			count=$(cat "$FAKE_GH_STATE" 2>/dev/null || :)
+			count=${count:-0}
+			count=$((count + 1))
+			printf "%s\\n" "$count" >"$FAKE_GH_STATE"
+			case "${FAKE_GH_MODE:-}" in
+			staging-failure)
+				status=completed
+				conclusion=failure
+				;;
+			post-ci-rerun)
+				if test "$count" -le 11
+				then
+					status=in_progress
+					conclusion=-
+				else
+					status=completed
+					conclusion=success
+					: >"$FAKE_GH_STATE.after-ci"
+				fi
+				;;
+			*)
+				case "$count" in
+				1|2) status=queued; conclusion=- ;;
+				3|4) status=in_progress; conclusion=- ;;
+				*) status=completed; conclusion=success ;;
+				esac
+				;;
+			esac
+			printf "101\\tpush\\tcodex-staging\\t%s\\t.github/workflows/main.yml\\t%s\\t%s\\thttps://example/ci/101\\n" \
+				"$FAKE_CANDIDATE" "$status" "$conclusion"
 			;;
 		repos/openai/git/actions/runs/101/jobs?per_page=100)
-			printf "success\\n"
+			if test -n "$slurp"
+			then
+				count=$(cat "$FAKE_GH_STATE")
+				if test "${FAKE_GH_MODE:-}" = staging-failure
+				then
+					printf "2\\t2\\t1\\n"
+				elif test "${FAKE_GH_MODE:-}" = post-ci-rerun
+				then
+					case "$count" in
+					1|2|3|4|5|6|7|8|9|10|11)
+						printf "2\\t1\\t0\\n"
+						;;
+					*) printf "2\\t2\\t0\\n" ;;
+					esac
+				else
+					case "$count" in
+					1|2) printf "2\\t0\\t0\\n" ;;
+					3) printf "2\\t1\\t0\\n" ;;
+					*) printf "2\\t2\\t0\\n" ;;
+					esac
+				fi
+			else
+				printf "success\\n"
+			fi
 			;;
 		user)
 			printf "test-publisher\\n"
@@ -2706,26 +3322,41 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		esac
 		EOF
 		chmod +x "$support/bin/gh" &&
+		cat >"$support/bin/sleep" <<-\EOF &&
+		#!/bin/sh
+		exit 0
+		EOF
+		chmod +x "$support/bin/sleep" &&
 
 		git worktree add --detach Meta "$controller" &&
 		git status --porcelain >"$support/nested-status" &&
 		test_line_count = 1 "$support/nested-status" &&
 		test_grep "?? Meta/" "$support/nested-status" &&
-		publish_prepared () {
+		run_prepared () {
 			artifact=$1 &&
+			shift &&
+			rm -f "$support/gh.state" &&
+			rm -f "$support/gh.state.after-ci" &&
 			env PATH="$support/bin:$PATH" GH_HOST=attacker.example \
 				CODEX_CONTROLLER_OID="$controller" \
 				CODEX_META_WORKTREE="$PWD/Meta" \
 				FAKE_REAL_GIT="$real_git" \
 				FAKE_GIT_LOG="$support/git.log" \
 				FAKE_GH_LOG="$support/gh.log" \
+				FAKE_GH_STATE="$support/gh.state" \
 				FAKE_ARTIFACT_ZIP="$artifact" \
 				FAKE_CONTROLLER="$controller" \
 				FAKE_OLD_CODEX="$old_codex" \
 				FAKE_CANDIDATE="$candidate" \
 				FAKE_MULTIPLE_PUSHURLS="${FAKE_MULTIPLE_PUSHURLS:-}" \
 				FAKE_GH_MODE="${FAKE_GH_MODE:-}" \
-				sh "$codex_branch" publish-run 4242
+				sh "$codex_branch" "$@"
+		} &&
+		publish_prepared () {
+			run_prepared "$1" publish-run 4242
+		} &&
+		rebuild_prepared () {
+			run_prepared "$1" rebuild
 		} &&
 		snapshot_refs ../publish-run.git >"$support/before" &&
 
@@ -2744,6 +3375,42 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		test_grep "origin must have exactly one push URL" \
 			"$support/pushurl.err" &&
 		test_must_be_empty "$support/gh.log" &&
+
+		FAKE_GH_MODE=dispatch-error test_expect_code 1 \
+			rebuild_prepared "$support/good.zip" \
+			>"$support/dispatch-error.out" \
+			2>"$support/dispatch-error.err" &&
+		test_grep "could not dispatch Refresh codex" \
+			"$support/dispatch-error.err" &&
+		FAKE_GH_MODE=dispatch-malformed test_expect_code 1 \
+			rebuild_prepared "$support/good.zip" \
+			>"$support/dispatch-malformed.out" \
+			2>"$support/dispatch-malformed.err" &&
+		test_grep "dispatch returned unexpected run URLs" \
+			"$support/dispatch-malformed.err" &&
+		FAKE_GH_MODE=preparation-failure test_expect_code 1 \
+			rebuild_prepared "$support/good.zip" \
+			>"$support/preparation-failure.out" \
+			2>"$support/preparation-failure.err" &&
+		test_grep "Preparation: failure: https://example/run/4242" \
+			"$support/preparation-failure.out" &&
+		test_grep "finished with .failure." \
+			"$support/preparation-failure.err" &&
+		FAKE_GH_MODE=preparation-rerun test_expect_code 1 \
+			rebuild_prepared "$support/good.zip" \
+			>"$support/preparation-rerun.out" \
+			2>"$support/preparation-rerun.err" &&
+		test_grep "no longer identifies the dispatched Refresh codex attempt" \
+			"$support/preparation-rerun.err" &&
+		FAKE_GH_MODE=preparation-timeout test_expect_code 1 \
+			rebuild_prepared "$support/good.zip" \
+			>"$support/preparation-timeout.out" \
+			2>"$support/preparation-timeout.err" &&
+		test_grep "did not complete before the timeout" \
+			"$support/preparation-timeout.err" &&
+		snapshot_refs ../publish-run.git >"$support/after-dispatch-rejections" &&
+		test_cmp "$support/before" \
+			"$support/after-dispatch-rejections" &&
 
 		FAKE_GH_MODE=wrong-run test_expect_code 1 \
 			publish_prepared "$support/good.zip" \
@@ -2777,12 +3444,60 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		snapshot_refs ../publish-run.git >"$support/after-rejections" &&
 		test_cmp "$support/before" "$support/after-rejections" &&
 
+		FAKE_GH_MODE=staging-failure test_expect_code 1 \
+			run_prepared "$support/good.zip" publish 4242 \
+			>"$support/staging-failure.out" \
+			2>"$support/staging-failure.err" &&
+		test_grep "Waiting for staging CI for $candidate" \
+			"$support/staging-failure.out" &&
+		test_grep "Staging CI run 101: https://example/ci/101" \
+			"$support/staging-failure.out" &&
+		test_grep "Staging CI: failure (2/2 jobs complete; 1 failed)" \
+			"$support/staging-failure.out" &&
+		test_grep "CI failed for exact staging SHA $candidate" \
+			"$support/staging-failure.err" &&
+		test "$candidate" = "$(git --git-dir=../publish-run.git \
+			rev-parse refs/heads/codex-staging)" &&
+		snapshot_without_staging ../publish-run.git \
+			>"$support/after-staging-failure" &&
+		test_cmp "$support/before" "$support/after-staging-failure" &&
+		git --git-dir=../publish-run.git update-ref -d \
+			refs/heads/codex-staging "$candidate" &&
+
+		FAKE_GH_MODE=post-ci-rerun test_expect_code 1 \
+			run_prepared "$support/good.zip" publish 4242 \
+			>"$support/post-ci-rerun.out" \
+			2>"$support/post-ci-rerun.err" &&
+		grep -F "Staging CI: still in_progress after 5 minutes (1/2 jobs complete; 0 failed)" \
+			"$support/post-ci-rerun.out" \
+			>"$support/staging-heartbeat" &&
+		test_line_count = 1 "$support/staging-heartbeat" &&
+		test_grep "Actions run 4242 changed while staging CI ran" \
+			"$support/post-ci-rerun.err" &&
+		test "$candidate" = "$(git --git-dir=../publish-run.git \
+			rev-parse refs/heads/codex-staging)" &&
+		snapshot_without_staging ../publish-run.git \
+			>"$support/after-post-ci-rerun" &&
+		test_cmp "$support/before" "$support/after-post-ci-rerun" &&
+		git --git-dir=../publish-run.git update-ref -d \
+			refs/heads/codex-staging "$candidate" &&
+
 		: >"$support/gh.log" &&
-		publish_prepared "$support/good.zip" \
+		rebuild_prepared "$support/good.zip" \
 			>"$support/publish.out" 2>"$support/publish.err" &&
+		test_grep "Refresh codex run 4242: https://github.com/openai/git/actions/runs/4242" \
+			"$support/publish.out" &&
+		test_grep "Preparation: success: https://example/run/4242" \
+			"$support/publish.out" &&
 		test_grep "Published codex candidate $candidate from Actions run 4242" \
 			"$support/publish.out" &&
-		! grep -v "^api --hostname github.com " "$support/gh.log" &&
+		test_grep "api --hostname github.com --method POST" \
+			"$support/gh.log" &&
+		test_grep "X-GitHub-Api-Version: 2026-03-10" \
+			"$support/gh.log" &&
+		test_grep "raw-field ref=codex" "$support/gh.log" &&
+		! grep -F "actions/workflows/codex.yml/runs" \
+			"$support/gh.log" &&
 		test_grep "actions/artifacts/9001/zip" "$support/gh.log" &&
 		test_grep ".github/workflows/codex.yml@meta" \
 			"$support/gh.log" &&
@@ -2790,6 +3505,22 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		test_grep "actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100" \
 			"$support/gh.log" &&
 		test_grep "actions/runs/101/jobs" "$support/gh.log" &&
+		grep -F "Staging CI run 101: https://example/ci/101" \
+			"$support/publish.out" >"$support/staging-url" &&
+		test_line_count = 1 "$support/staging-url" &&
+		grep -F "Staging CI: queued (0/2 jobs complete; 0 failed)" \
+			"$support/publish.out" >"$support/staging-queued" &&
+		test_line_count = 1 "$support/staging-queued" &&
+		grep -F "Staging CI: in_progress (1/2 jobs complete; 0 failed)" \
+			"$support/publish.out" >"$support/staging-one" &&
+		test_line_count = 1 "$support/staging-one" &&
+		grep -F "Staging CI: in_progress (2/2 jobs complete; 0 failed)" \
+			"$support/publish.out" >"$support/staging-two" &&
+		test_line_count = 1 "$support/staging-two" &&
+		grep -F "Staging CI: success (2/2 jobs complete; 0 failed): https://example/ci/101" \
+			"$support/publish.out" >"$support/staging-success" &&
+		test_line_count = 1 "$support/staging-success" &&
+		test_grep "Full staging CI passed." "$support/publish.out" &&
 		while IFS="$(printf "\t")" read -r ref old new
 		do
 			test "$new" = "$(git --git-dir=../publish-run.git \
