@@ -11,7 +11,7 @@ test "$meta_common_dir" = "$caller_common_dir" || {
   echo >&2 'Meta/codex must be a linked worktree of the repository being refreshed'
   exit 1
 }
-for control_path in codex .github/workflows/codex-branch.sh
+for control_path in codex rebuild publish .github/workflows/codex-branch.sh
 do
   expected=$(git -C "$meta_dir" rev-parse "HEAD:$control_path" 2>/dev/null) || {
     echo >&2 "Meta/HEAD does not contain $control_path"

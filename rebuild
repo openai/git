@@ -1,0 +1,6 @@
+#!/bin/sh
+
+set -eu
+
+meta_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
+exec "$meta_dir/codex" rebuild "$@"

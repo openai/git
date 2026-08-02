@@ -93,7 +93,7 @@ jobs:
             echo 'Publish this exact prepared run from a clean local clone:'
             echo
             echo '```sh'
-            echo "Meta/codex publish-run $GITHUB_RUN_ID"
+            echo "Meta/publish $GITHUB_RUN_ID"
             echo '```'
             echo
             echo '| Ref | Old | New |'

@@ -25,6 +25,8 @@ die () {
 usage () {
 	cat <<-\EOF
 	usage: codex-branch check-topic <branch>
+	   or: codex-branch rebuild
+	   or: codex-branch publish <run-id>
 	   or: codex-branch initialize [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--output <path>] [--require-automation]
 	   or: codex-branch refresh [--session <directory>]
@@ -43,7 +45,6 @@ usage () {
 		--inputs <path> --updates <path> [--require-automation]
 	   or: codex-branch promote [--remote <remote>] [--staging <branch>]
 		--inputs <path> --updates <path> [--require-automation]
-	   or: codex-branch publish-run <run-id>
 	   or: codex-branch resolve [--remote <remote>] [--base <branch>]
 		[--codex <branch>] --inputs-oid <oid> [--worktree <path>]
 	   or: codex-branch continue --worktree <path>
@@ -204,6 +205,8 @@ legacy_control_paths_unchanged () (
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
 		codex \
+		publish \
+		rebuild \
 		codex.config \
 		t/t9905-codex-branch.sh
 )
@@ -220,6 +223,8 @@ meta_control_paths_unchanged () (
 		.github/workflows/codex-branch.sh \
 		.github/workflows/main.yml \
 		codex \
+		publish \
+		rebuild \
 		codex.config \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
@@ -1657,8 +1662,8 @@ write_integration_failure () {
 	{
 		say "## No refs were updated"
 		say
-		say "The rewritten maximal topic \`$failed_name\` at \`$failed_oid\`"
-		say "conflicts with the maximal topics already merged into the candidate."
+		say "The rewritten topic \`$failed_name\` at \`$failed_oid\`"
+		say "conflicts with the topics already merged into the candidate."
 		say "Input snapshot: \`$inputs_oid\`."
 		say
 		say "This is an integration conflict, not a stopped rebase. Do not merge"
@@ -1669,7 +1674,7 @@ write_integration_failure () {
 		if test -s "$state/integration-merged"
 		then
 			say
-			say "Maximal topics already merged, in order:"
+			say "Topics already merged, in order:"
 			sed 's/^/- `/' "$state/integration-merged" | sed 's/$/`/'
 		fi
 		if test -n "$(git -C "$worktree" -c core.fsmonitor=false \
@@ -1688,10 +1693,41 @@ merge_topic () {
 	worktree=$1
 	name=$2
 	oid=$3
+	before=$(git -C "$worktree" rev-parse HEAD) ||
+		die "could not resolve the candidate before integrating '$name'"
 	message=$(printf 'Merge %s into codex\n\nIntegrate the current %s topic into the internally distributed codex branch.\n\nCodex-Integration: %s@%s' \
 		"$name" "$name" "$name" "$oid")
 
-	if GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+	if git -C "$worktree" merge-base --is-ancestor "$oid" "$before"
+	then
+		if test "$before" = "$oid"
+		then
+			tree=$(git -C "$worktree" rev-parse "$before^{tree}") ||
+				die "could not resolve the integration base tree"
+			anchor_message=$(printf 'Begin codex integration\n\nCreate a distinct first parent for explicit topic integration commits.\n')
+			anchor=$(printf '%s' "$anchor_message" | \
+				GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+				GIT_COMMITTER_NAME=$bot_name \
+				GIT_COMMITTER_EMAIL=$bot_email \
+				git -C "$worktree" -c commit.gpgSign=false \
+				commit-tree "$tree" -p "$before") ||
+				die "could not create the codex integration base"
+			git -C "$worktree" reset --hard "$anchor" >/dev/null ||
+				die "could not check out the codex integration base"
+			before=$anchor
+		fi
+		tree=$(git -C "$worktree" rev-parse "$before^{tree}") ||
+			die "could not resolve the candidate tree for '$name'"
+		after=$(printf '%s\n' "$message" | \
+			GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+			GIT_COMMITTER_NAME=$bot_name \
+			GIT_COMMITTER_EMAIL=$bot_email \
+			git -C "$worktree" -c commit.gpgSign=false \
+			commit-tree "$tree" -p "$before" -p "$oid") ||
+			die "could not create the explicit integration for '$name'"
+		git -C "$worktree" reset --hard "$after" >/dev/null ||
+			die "could not check out the integration for '$name'"
+	elif GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
 		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
 		git -C "$worktree" \
 		-c core.hooksPath=/dev/null \
@@ -1699,58 +1735,124 @@ merge_topic () {
 		-c commit.gpgSign=false \
 		-c rerere.enabled=true \
 		-c rerere.autoupdate=true \
-		merge --no-ff --no-edit --no-gpg-sign -m "$message" "$oid" >&2
+		merge --no-ff --no-log --no-edit --no-gpg-sign \
+		-m "$message" "$oid" >&2
 	then
-		return 0
+		:
+	else
+		git -C "$worktree" rev-parse --verify -q MERGE_HEAD >/dev/null &&
+			test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)" ||
+			return 1
+		git -C "$worktree" -c core.fsmonitor=false diff --cached --check ||
+			return 1
+		GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+			GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+			git -C "$worktree" \
+			-c core.hooksPath=/dev/null \
+			-c core.fsmonitor=false \
+			-c commit.gpgSign=false \
+			commit --no-edit --no-gpg-sign >&2 || return 1
 	fi
 
-	git -C "$worktree" rev-parse --verify -q MERGE_HEAD >/dev/null &&
-		test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)" ||
-		return 1
-	git -C "$worktree" -c core.fsmonitor=false diff --cached --check ||
-		return 1
-	GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
-		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
-		git -C "$worktree" \
-		-c core.hooksPath=/dev/null \
-		-c core.fsmonitor=false \
-		-c commit.gpgSign=false \
-		commit --no-edit --no-gpg-sign >&2
+	after=$(git -C "$worktree" rev-parse HEAD) ||
+		die "could not resolve the integration commit for '$name'"
+	set -- $(git -C "$worktree" show -s --format=%P "$after")
+	test $# = 2 && test "$1" = "$before" && test "$2" = "$oid" ||
+		die "integration for '$name' is not an explicit two-parent merge"
+	marker=$(git -C "$worktree" show -s \
+		--format='%(trailers:key=Codex-Integration,valueonly)' "$after") ||
+		die "could not inspect the integration marker for '$name'"
+	test "$marker" = "$name@$oid" ||
+		die "integration for '$name' has the wrong marker"
 }
+
+integration_name_recorded () (
+	file=$1
+	name=$2
+	awk -F '\t' -v name="$name" '$1 == name { found=1 }
+		END { exit !found }' "$file"
+)
+
+write_integration_topics () {
+	state=$1
+	base_name=$(state_value "$state" base-name)
+	plan=$state/integration-plan
+	ready=$state/integration-ready
+	merged=$state/integration-topics
+	LC_ALL=C sort -t "$tab" -k1,1 "$state/plan" >"$plan" ||
+		die "could not sort topics for integration"
+	: >"$merged" || die "could not prepare the topic integration order"
+	total=$(wc -l <"$plan" | tr -d ' ')
+	while test "$(wc -l <"$merged" | tr -d ' ')" -lt "$total"
+	do
+		: >"$ready"
+		while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
+		do
+			integration_name_recorded "$merged" "$name" && continue
+			if test "$prerequisite" != "$base_name" &&
+				! integration_name_recorded "$merged" "$prerequisite"
+			then
+				continue
+			fi
+			oid=$(result_lookup "$state/results" "$name")
+			test -n "$oid" || die "topic '$name' has no rewritten tip"
+			printf '%s\t%s\n' "$name" "$oid" >>"$ready" ||
+				die "could not record ready integration topic '$name'"
+		done <"$plan"
+		test -s "$ready" || die "topic integrations contain a dependency cycle"
+		LC_ALL=C sort -t "$tab" -k1,1 -o "$ready" "$ready" ||
+			die "could not sort ready integration topics"
+		sed -n '1p' "$ready" >>"$merged" ||
+			die "could not extend the topic integration order"
+	done
+}
+
+codex_has_expected_integrations () (
+	state=$1
+	head_oid=$2
+	base_oid=$(state_value "$state" base-oid)
+	expected=$state/expected-integrations
+	actual=$state/actual-integrations
+	: >"$expected"
+	while IFS="$tab" read -r name oid
+	do
+		printf '%s@%s\t%s\tMerge %s into codex\t%s\t%s\t%s\t%s\n' \
+			"$name" "$oid" "$oid" "$name" \
+			"$bot_name" "$bot_email" "$bot_name" "$bot_email" \
+			>>"$expected" || return 1
+	done <"$state/integration-topics"
+	: >"$actual"
+	git rev-list --first-parent --reverse "$base_oid..$head_oid" |
+	while read -r commit
+	do
+		marker=$(git show -s \
+			--format='%(trailers:key=Codex-Integration,valueonly)' \
+			"$commit") || exit 1
+		test -n "$marker" || continue
+		set -- $(git show -s --format=%P "$commit")
+		test $# = 2 || exit 1
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$marker" "$2" "$(git show -s --format=%s "$commit")" \
+			"$(git show -s --format=%an "$commit")" \
+			"$(git show -s --format=%ae "$commit")" \
+			"$(git show -s --format=%cn "$commit")" \
+			"$(git show -s --format=%ce "$commit")" \
+			>>"$actual" || exit 1
+	done || return 1
+	cmp -s "$expected" "$actual"
+)
 
 assemble_candidate () {
 	worktree=$1
 	state=$2
 	base_oid=$(state_value "$state" base-oid)
-	unique=$state/unique-topics
-	maximal=$state/maximal-topics
 	rm -f "$state/integration-failed-name" \
 		"$state/integration-failed-oid" ||
 		die "could not clear old integration state"
 	: >"$state/integration-merged" ||
 		die "could not prepare integration progress"
 
-	awk -F '\t' '!seen[$3]++ { print }' "$state/topic-updates" >"$unique" ||
-		die "could not collect unique topic tips"
-	: >"$maximal" || die "could not prepare maximal topic list"
-	while IFS="$tab" read -r ref old oid
-	do
-		dominated=
-		while IFS="$tab" read -r other_ref other_old other_oid
-		do
-			test "$oid" = "$other_oid" && continue
-			if git merge-base --is-ancestor "$oid" "$other_oid"
-			then
-				dominated=t
-				break
-			fi
-		done <"$unique"
-		if test -z "$dominated"
-		then
-			printf '%s\t%s\n' "${ref#refs/heads/}" "$oid" >>"$maximal" ||
-				die "could not record maximal topic '$ref'"
-		fi
-	done <"$unique"
+	write_integration_topics "$state"
 
 	git -C "$worktree" -c core.fsmonitor=false \
 		-c advice.detachedHead=false switch --detach "$base_oid" >/dev/null ||
@@ -1767,7 +1869,7 @@ assemble_candidate () {
 		fi
 		printf '%s\n' "$name" >>"$state/integration-merged" ||
 			die "could not record integration progress"
-	done <"$maximal"
+	done <"$state/integration-topics"
 
 	while IFS="$tab" read -r ref old oid
 	do
@@ -1776,6 +1878,8 @@ assemble_candidate () {
 	done <"$state/topic-updates"
 	candidate=$(git -C "$worktree" rev-parse HEAD) ||
 		die "could not resolve the codex candidate"
+	codex_has_expected_integrations "$state" "$candidate" ||
+		die "candidate does not contain one canonical integration merge per topic"
 	require_automation=$(state_value "$state" require-automation)
 	if ! test -f "$state/initializing"
 	then
@@ -2160,7 +2264,8 @@ rewrite () {
 	done <"$state/topic-updates"
 	if test -n "$contained" &&
 		test "$(git rev-parse "$candidate^{tree}")" = \
-		"$(git rev-parse "$codex_oid^{tree}")"
+		"$(git rev-parse "$codex_oid^{tree}")" &&
+		codex_has_expected_integrations "$state" "$codex_oid"
 	then
 		candidate=$codex_oid
 	fi
@@ -2254,6 +2359,8 @@ topic_control_paths_unchanged () (
 		.github/workflows/codex-branch.sh \
 		.github/workflows/main.yml \
 		codex \
+		publish \
+		rebuild \
 		codex.config \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
@@ -2482,6 +2589,26 @@ verify_output () {
 		git merge-base --is-ancestor "$new_prerequisite" "$new" ||
 			die "rewrite lost configured dependency '$prerequisite' -> '$name'"
 	done <"$tmp_dir/topic-graph/plan"
+
+	# Reconstruct the canonical integration order independently from the
+	# artifact producer.  The source trees alone cannot prove that every topic
+	# has its own explicit merge, because contained and empty topics make no
+	# tree change.
+	printf '%s\n' "$base_name" >"$tmp_dir/topic-graph/base-name" ||
+		die "could not prepare integration verification"
+	: >"$tmp_dir/topic-graph/results" ||
+		die "could not prepare rewritten topic verification"
+	while IFS="$tab" read -r name old
+	do
+		ref=refs/heads/$name
+		new=$(awk -F '\t' -v ref="$ref" '$1 == ref { print $3 }' \
+			"$updates")
+		test -n "$new" || die "updates contain no rewritten tip for '$name'"
+		result_record "$tmp_dir/topic-graph/results" "$name" "$new"
+	done <"$tmp_dir/topic-graph/topics"
+	write_integration_topics "$tmp_dir/topic-graph"
+	codex_has_expected_integrations "$tmp_dir/topic-graph" "$candidate" ||
+		die "candidate does not contain one canonical integration merge per topic"
 }
 
 push_updates () {
@@ -2663,6 +2790,126 @@ require_openai_git_origin () (
 	done
 )
 
+require_operator_context () {
+	controller_oid=${CODEX_CONTROLLER_OID:-}
+	test -n "$controller_oid" ||
+		die "run this command through a pinned Meta entry point"
+	meta_worktree=${CODEX_META_WORKTREE:-}
+	test -n "$meta_worktree" && test -d "$meta_worktree" ||
+		die "this command requires its pinned Meta worktree"
+	require_full_commit_oid "$controller_oid"
+	test "$(git -C "$meta_worktree" rev-parse --verify HEAD^{commit})" = \
+		"$controller_oid" || die "Meta/HEAD does not match the pinned controller"
+	require_full_repository
+	require_clean_publish_worktrees "$meta_worktree"
+	require_openai_git_origin
+	command -v gh >/dev/null 2>&1 || die "this command requires the GitHub CLI (gh)"
+}
+
+refresh_meta_controller () {
+	git fetch --force origin \
+		'+refs/heads/meta:refs/remotes/origin/meta' >/dev/null ||
+		die "could not refresh the meta controller"
+	current_meta=$(git rev-parse --verify refs/remotes/origin/meta^{commit}) ||
+		die "origin/meta is not a commit"
+	test "$current_meta" != "$controller_oid" || return 0
+
+	say "Updating Meta from $controller_oid to $current_meta."
+	git -C "$meta_worktree" -c advice.detachedHead=false \
+		switch --detach "$current_meta" >/dev/null ||
+		die "could not update the Meta worktree"
+	test -x "$meta_worktree/rebuild" ||
+		die "updated meta does not contain Meta/rebuild"
+	exec "$meta_worktree/rebuild"
+}
+
+read_refresh_run () {
+	gh_command=$1
+	repository=$2
+	run_id=$3
+	output=$4
+	"$gh_command" api --hostname github.com \
+		"repos/$repository/actions/runs/$run_id" --jq \
+		'[.id, .run_attempt, .status, (.conclusion // "-"), .event, .head_branch, .head_sha, .path, .repository.full_name, .html_url] | @tsv' \
+		>"$output" || die "could not inspect Refresh codex run $run_id"
+	test "$(wc -l <"$output" | tr -d ' ')" = 1 ||
+		die "Refresh codex run $run_id returned malformed metadata"
+}
+
+wait_for_refresh_run () (
+	gh_command=$1
+	repository=$2
+	run_id=$3
+	expected_attempt=$4
+	attempt=0
+	previous=
+	while test "$attempt" -lt 180
+	do
+		attempt=$((attempt + 1))
+		read_refresh_run "$gh_command" "$repository" "$run_id" \
+			"$tmp_dir/rebuild-run"
+		IFS="$tab" read -r actual_id run_attempt status conclusion event \
+			branch sha path api_repository url <"$tmp_dir/rebuild-run"
+		test "$actual_id" = "$run_id" &&
+			test "$run_attempt" = "$expected_attempt" &&
+			test "$event" = workflow_dispatch && test "$branch" = codex &&
+			test "$path" = .github/workflows/codex.yml &&
+			test "$api_repository" = "$repository" ||
+			die "run $run_id no longer identifies the dispatched Refresh codex attempt"
+		current=$status:$conclusion
+		if test "$current" != "$previous"
+		then
+			if test "$status" = completed
+			then
+				say "Preparation: $conclusion: $url"
+			else
+				say "Preparation: $status: $url"
+			fi
+			previous=$current
+		fi
+		test "$status" != completed || break
+		sleep 10
+	done
+	test "$status" = completed ||
+		die "Refresh codex run $run_id did not complete before the timeout"
+	test "$conclusion" = success ||
+		die "Refresh codex run $run_id finished with '$conclusion'; start a fresh Meta/rebuild: $url"
+)
+
+rebuild_codex () {
+	test $# = 0 || { usage >&2; exit 129; }
+	require_operator_context
+	command -v unzip >/dev/null 2>&1 || die "Meta/rebuild requires unzip"
+	command -v zipinfo >/dev/null 2>&1 || die "Meta/rebuild requires zipinfo"
+	refresh_meta_controller
+
+	make_tmp_dir
+	repository=openai/git
+	endpoint="repos/$repository/actions/workflows/codex.yml/dispatches"
+	gh api --hostname github.com --method POST \
+		--header 'Accept: application/vnd.github+json' \
+		--header 'X-GitHub-Api-Version: 2026-03-10' \
+		--raw-field ref=codex "$endpoint" --jq \
+		'[.workflow_run_id, .run_url, .html_url] | @tsv' \
+		>"$tmp_dir/dispatch" || die "could not dispatch Refresh codex"
+	test "$(wc -l <"$tmp_dir/dispatch" | tr -d ' ')" = 1 ||
+		die "Refresh codex dispatch returned malformed metadata"
+	IFS="$tab" read -r run_id run_url html_url <"$tmp_dir/dispatch"
+	case "$run_id" in
+	''|*[!0-9]*) die "Refresh codex dispatch returned no numeric run ID" ;;
+	esac
+	test "$run_url" = \
+		"https://api.github.com/repos/$repository/actions/runs/$run_id" &&
+		test "$html_url" = \
+		"https://github.com/$repository/actions/runs/$run_id" ||
+		die "Refresh codex dispatch returned unexpected run URLs"
+	say "Refresh codex run $run_id: $html_url"
+	wait_for_refresh_run gh "$repository" "$run_id" 1
+	CODEX_EXPECTED_RUN_ATTEMPT=1
+	export CODEX_EXPECTED_RUN_ATTEMPT
+	publish_run "$run_id"
+}
+
 artifact_value () (
 	key=$1
 	file=$2
@@ -2718,6 +2965,7 @@ wait_for_staging_ci () (
 	baseline=$4
 	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100"
 
+	say "Waiting for staging CI for $candidate..."
 	run_id=
 	attempt=0
 	while test "$attempt" -lt 60
@@ -2739,12 +2987,13 @@ wait_for_staging_ci () (
 	status=
 	conclusion=
 	url=
+	previous=
 	while test "$attempt" -lt 180
 	do
 		attempt=$((attempt + 1))
 		"$gh_command" api --hostname github.com \
 			"repos/$repository/actions/runs/$run_id" --jq \
-			'[.id, .event, .head_branch, .head_sha, .path, .status, (.conclusion // ""), .html_url] | @tsv' \
+			'[.id, .event, .head_branch, .head_sha, .path, .status, (.conclusion // "-"), .html_url] | @tsv' \
 			>"$tmp_dir/ci-run" || die "could not inspect staging CI run $run_id"
 		test "$(wc -l <"$tmp_dir/ci-run" | tr -d ' ')" = 1 ||
 			die "staging CI returned malformed run metadata"
@@ -2754,6 +3003,46 @@ wait_for_staging_ci () (
 			test "$branch" = codex-staging && test "$sha" = "$candidate" &&
 			test "$path" = .github/workflows/main.yml ||
 			die "staging CI run $run_id no longer identifies the exact candidate"
+		"$gh_command" api --hostname github.com --paginate --slurp \
+			"repos/$repository/actions/runs/$run_id/jobs?per_page=100" --jq '
+			[.[] | .jobs[]] as $jobs |
+			[
+			  ($jobs | length),
+			  ($jobs | map(select(.status == "completed")) | length),
+			  ($jobs | map(select(
+			    .status == "completed" and
+			    (.conclusion != "success" and
+			     .conclusion != "skipped" and
+			     .conclusion != "neutral")
+			  )) | length)
+			] | @tsv' >"$tmp_dir/ci-jobs" ||
+			die "could not inspect jobs for staging CI run $run_id"
+		test "$(wc -l <"$tmp_dir/ci-jobs" | tr -d ' ')" = 1 ||
+			die "staging CI returned malformed job progress"
+		IFS="$tab" read -r total completed failed <"$tmp_dir/ci-jobs"
+		case "$total:$completed:$failed" in
+		*[!0-9:]*) die "staging CI returned invalid job progress" ;;
+		esac
+		current=$status:$total:$completed:$failed
+		if test "$current" != "$previous"
+		then
+			if test -z "$previous"
+			then
+				say "Staging CI run $run_id: $url"
+			fi
+			if test "$status" = completed
+			then
+				say "Staging CI: $conclusion ($completed/$total jobs complete; $failed failed): $url"
+			else
+				say "Staging CI: $status ($completed/$total jobs complete; $failed failed)"
+			fi
+			previous=$current
+		elif test "$attempt" -gt 1 &&
+			test $(((attempt - 1) % 10)) = 0
+		then
+			minutes=$(((attempt - 1) / 2))
+			say "Staging CI: still $status after $minutes minutes ($completed/$total jobs complete; $failed failed)"
+		fi
 		test "$status" != completed || break
 		sleep 30
 	done
@@ -2762,37 +3051,26 @@ wait_for_staging_ci () (
 	test "$conclusion" = success ||
 		die "CI failed for exact staging SHA $candidate: $url"
 
-	config_conclusion=$("$gh_command" api --hostname github.com \
+	config_conclusion=$("$gh_command" api --hostname github.com --paginate \
 		"repos/$repository/actions/runs/$run_id/jobs?per_page=100" --jq \
-		'[.jobs[] | select(.name == "config") | .conclusion] | if length == 1 then .[0] else "" end') ||
+		'.jobs[] | select(.name == "config") | .conclusion') ||
 		die "could not inspect jobs for staging CI run $run_id"
-	test "$config_conclusion" = success ||
+	test "$(printf '%s\n' "$config_conclusion" | sed '/^$/d' | wc -l | tr -d ' ')" = 1 &&
+		test "$config_conclusion" = success ||
 		die "CI config did not run successfully on codex-staging"
-	say "Full staging CI passed: $url"
+	say "Full staging CI passed."
 )
 
 publish_run () {
 	test $# = 1 || { usage >&2; exit 129; }
 	run_id=$1
 	case "$run_id" in
-	''|*[!0-9]*) die "publish-run requires a numeric Actions run ID" ;;
+	''|*[!0-9]*) die "Meta/publish requires a numeric Actions run ID" ;;
 	esac
 
-	controller_oid=${CODEX_CONTROLLER_OID:-}
-	test -n "$controller_oid" ||
-		die "run publish-run through the pinned Meta/codex entry point"
-	meta_worktree=${CODEX_META_WORKTREE:-}
-	test -n "$meta_worktree" && test -d "$meta_worktree" ||
-		die "publish-run requires its pinned Meta worktree"
-	require_full_commit_oid "$controller_oid"
-	test "$(git -C "$meta_worktree" rev-parse --verify HEAD^{commit})" = \
-		"$controller_oid" || die "Meta/HEAD does not match the pinned controller"
-	require_full_repository
-	require_clean_publish_worktrees "$meta_worktree"
-	require_openai_git_origin
-	command -v gh >/dev/null 2>&1 || die "publish-run requires the GitHub CLI (gh)"
-	command -v unzip >/dev/null 2>&1 || die "publish-run requires unzip"
-	command -v zipinfo >/dev/null 2>&1 || die "publish-run requires zipinfo"
+	require_operator_context
+	command -v unzip >/dev/null 2>&1 || die "Meta/publish requires unzip"
+	command -v zipinfo >/dev/null 2>&1 || die "Meta/publish requires zipinfo"
 
 	make_tmp_dir
 	repository=openai/git
@@ -2809,6 +3087,10 @@ publish_run () {
 	case "$run_attempt" in
 	''|*[!0-9]*) die "Actions run has an invalid attempt" ;;
 	esac
+	expected_run_attempt=${CODEX_EXPECTED_RUN_ATTEMPT:-}
+	test -z "$expected_run_attempt" ||
+		test "$run_attempt" = "$expected_run_attempt" ||
+		die "Actions run $run_id moved from expected attempt $expected_run_attempt to attempt $run_attempt; start a fresh Meta/rebuild"
 	test "$status" = completed && test "$conclusion" = success ||
 		die "Actions run $run_id has not completed successfully"
 	test "$event" = workflow_dispatch && test "$head_branch" = codex &&
@@ -2899,6 +3181,9 @@ publish_run () {
 	verify_output --inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" \
 		--result "$metadata/codex-candidate" --require-automation
+	read_refresh_run gh "$repository" "$run_id" "$tmp_dir/run-current"
+	cmp -s "$tmp_dir/run" "$tmp_dir/run-current" ||
+		die "Actions run $run_id changed after artifact validation; start a fresh Meta/rebuild"
 
 	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$artifact_candidate&per_page=100"
 	baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
@@ -2915,6 +3200,9 @@ publish_run () {
 		--inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" --require-automation
 	wait_for_staging_ci gh "$repository" "$artifact_candidate" "$baseline"
+	read_refresh_run gh "$repository" "$run_id" "$tmp_dir/run-after-ci"
+	cmp -s "$tmp_dir/run" "$tmp_dir/run-after-ci" ||
+		die "Actions run $run_id changed while staging CI ran; start a fresh Meta/rebuild"
 	promote --remote origin --staging codex-staging \
 		--inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" --require-automation
@@ -3138,6 +3426,8 @@ command=$1
 shift
 case "$command" in
 check-topic) check_topic "$@" ;;
+rebuild) rebuild_codex "$@" ;;
+publish) publish_run "$@" ;;
 initialize) initialize_config "$@" ;;
 refresh) local_refresh "$@" ;;
 rewrite) rewrite "$@" ;;
@@ -3145,7 +3435,7 @@ verify-inputs) verify_inputs "$@" ;;
 verify-output) verify_output "$@" ;;
 stage) stage_candidate "$@" ;;
 promote) promote "$@" ;;
-publish-run) publish_run "$@" ;;
+publish-run) publish_run "$@" ;; # compatibility for previously printed commands
 resolve) resolve_rebase "$@" ;;
 continue) continue_rewrite "$@" ;;
 publish-topics) publish_topics "$@" ;;
