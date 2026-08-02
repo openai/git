@@ -2596,6 +2596,8 @@ verify_output () {
 	# tree change.
 	printf '%s\n' "$base_name" >"$tmp_dir/topic-graph/base-name" ||
 		die "could not prepare integration verification"
+	printf '%s\n' "$base_oid" >"$tmp_dir/topic-graph/base-oid" ||
+		die "could not prepare integration base verification"
 	: >"$tmp_dir/topic-graph/results" ||
 		die "could not prepare rewritten topic verification"
 	while IFS="$tab" read -r name old
@@ -3003,20 +3005,26 @@ wait_for_staging_ci () (
 			test "$branch" = codex-staging && test "$sha" = "$candidate" &&
 			test "$path" = .github/workflows/main.yml ||
 			die "staging CI run $run_id no longer identifies the exact candidate"
-		"$gh_command" api --hostname github.com --paginate --slurp \
-			"repos/$repository/actions/runs/$run_id/jobs?per_page=100" --jq '
-			[.[] | .jobs[]] as $jobs |
-			[
-			  ($jobs | length),
-			  ($jobs | map(select(.status == "completed")) | length),
-			  ($jobs | map(select(
-			    .status == "completed" and
-			    (.conclusion != "success" and
-			     .conclusion != "skipped" and
-			     .conclusion != "neutral")
-			  )) | length)
-			] | @tsv' >"$tmp_dir/ci-jobs" ||
+		"$gh_command" api --hostname github.com --paginate \
+			"repos/$repository/actions/runs/$run_id/jobs?per_page=100" --jq \
+			'.jobs[] | [.status, (.conclusion // "-")] | @tsv' \
+			>"$tmp_dir/ci-job-rows" ||
 			die "could not inspect jobs for staging CI run $run_id"
+		awk -F '\t' '
+			{
+				total++
+				if ($1 == "completed") {
+					completed++
+					if ($2 != "success" && $2 != "skipped" &&
+					    $2 != "neutral")
+						failed++
+				}
+			}
+			END {
+				printf "%d\t%d\t%d\n", total, completed, failed
+			}
+		' "$tmp_dir/ci-job-rows" >"$tmp_dir/ci-jobs" ||
+			die "could not summarize jobs for staging CI run $run_id"
 		test "$(wc -l <"$tmp_dir/ci-jobs" | tr -d ' ')" = 1 ||
 			die "staging CI returned malformed job progress"
 		IFS="$tab" read -r total completed failed <"$tmp_dir/ci-jobs"
