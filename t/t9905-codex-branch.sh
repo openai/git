@@ -1191,10 +1191,13 @@ test_expect_success 'rewrite bundle transfers the exact output over pinned input
 			"+refs/codex-output/*:refs/codex-output/*" &&
 		test "$(cat ../bundle-builder/result)" = \
 			"$(git rev-parse refs/codex-output/candidate)" &&
+		git switch --detach refs/codex-output/candidate &&
 		sh "$codex_branch" verify-output \
 			--inputs ../bundle-builder/inputs \
 			--updates ../bundle-builder/updates \
-			--result ../bundle-builder/result
+			--result ../bundle-builder/result \
+			>verify.out 2>verify.err &&
+		test_must_be_empty verify.err
 	)
 '
 
@@ -3192,10 +3195,9 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		test "$2" = --hostname &&
 		test "$3" = github.com || exit 96
 		shift 3
-		slurp=
 		while test "$1" = --paginate || test "$1" = --slurp
 		do
-			test "$1" != --slurp || slurp=t
+			test "$1" != --slurp || exit 93
 			shift
 		done
 		endpoint=$1
@@ -3287,30 +3289,46 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 				"$FAKE_CANDIDATE" "$status" "$conclusion"
 			;;
 		repos/openai/git/actions/runs/101/jobs?per_page=100)
-			if test -n "$slurp"
-			then
+			case "$*" in
+			*"@tsv"*)
 				count=$(cat "$FAKE_GH_STATE")
 				if test "${FAKE_GH_MODE:-}" = staging-failure
 				then
-					printf "2\\t2\\t1\\n"
+					printf "completed\\tsuccess\\n"
+					printf "completed\\tfailure\\n"
 				elif test "${FAKE_GH_MODE:-}" = post-ci-rerun
 				then
 					case "$count" in
 					1|2|3|4|5|6|7|8|9|10|11)
-						printf "2\\t1\\t0\\n"
+						printf "completed\\tsuccess\\n"
+						printf "in_progress\\t-\\n"
 						;;
-					*) printf "2\\t2\\t0\\n" ;;
+					*)
+						printf "completed\\tsuccess\\n"
+						printf "completed\\tsuccess\\n"
+						;;
 					esac
 				else
 					case "$count" in
-					1|2) printf "2\\t0\\t0\\n" ;;
-					3) printf "2\\t1\\t0\\n" ;;
-					*) printf "2\\t2\\t0\\n" ;;
+					1|2)
+						printf "queued\\t-\\n"
+						printf "queued\\t-\\n"
+						;;
+					3)
+						printf "completed\\tsuccess\\n"
+						printf "in_progress\\t-\\n"
+						;;
+					*)
+						printf "completed\\tsuccess\\n"
+						printf "completed\\tsuccess\\n"
+						;;
 					esac
 				fi
-			else
+				;;
+			*)
 				printf "success\\n"
-			fi
+				;;
+			esac
 			;;
 		user)
 			printf "test-publisher\\n"
@@ -3505,6 +3523,8 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		test_grep "actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100" \
 			"$support/gh.log" &&
 		test_grep "actions/runs/101/jobs" "$support/gh.log" &&
+		! grep -F -- "--slurp" "$support/gh.log" &&
+		! grep -F "rewrite state is missing" "$support/publish.err" &&
 		grep -F "Staging CI run 101: https://example/ci/101" \
 			"$support/publish.out" >"$support/staging-url" &&
 		test_line_count = 1 "$support/staging-url" &&
