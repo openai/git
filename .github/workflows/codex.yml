@@ -1,0 +1,11 @@
+name: Refresh codex
+
+on: workflow_dispatch
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  refresh:
+    uses: openai/git/.github/workflows/codex.yml@meta
