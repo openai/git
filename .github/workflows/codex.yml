@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: codex-branch-refresh
@@ -43,6 +44,7 @@ jobs:
       - name: Rebase every topic and assemble codex
         id: rewrite
         env:
+          GH_TOKEN: ${{ github.token }}
           WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail

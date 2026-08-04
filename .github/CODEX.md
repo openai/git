@@ -4,12 +4,18 @@
 controller, reusable workflows, tests, documentation, and ruleset recipes.
 Never merge `meta` into `master` or `codex`.
 
-The active inputs are every branch matching `??/codex/*`, where `??` is a
-two-character owner name. A `-wip` or `-stale` suffix makes a branch inactive.
-The generated `codex.config` on `meta` records one prerequisite and the last
-published tip for each active topic. The prerequisite edges form a partial
-order; there is no global topic order. Rows are sorted only so the generated
-file has a stable representation.
+Topics use branches named `??/codex/*`, where `??` is a two-character owner
+name. The existing rows in `meta:codex.config` stay enrolled. After this
+migration, a new branch becomes an active input only after its reviewed pull
+request has merged into `codex` and the controller has enrolled it there.
+Merely pushing a matching branch never includes it in a build. The `-wip`,
+`-stale`, and reserved `-unstable` suffixes cannot enter the production
+branch.
+
+The generated `codex.config` records each enrolled topic's prerequisite and
+last published tip. Those prerequisite edges form a partial order; there is
+no global topic order. Rows are sorted only so the generated file has a
+stable representation.
 
 The saved tips are rebase boundaries, not another copy of the patches. They
 let a fresh runner distinguish “the prerequisite was rewritten” from “these
@@ -36,6 +42,26 @@ git switch -c tb/codex/my-topic origin/master
 git push -u origin HEAD
 ```
 
+Pushing this branch does not change `codex`. To include it:
+
+1. Open a pull request from the topic to `codex` and obtain the required
+   approval.
+2. Select **Merge when ready**. The merge queue admits one reviewed topic at
+   a time and creates a normal two-parent merge commit.
+3. Run `Meta/rebuild` or `Meta/rebuild --local`. The controller verifies the
+   merged pull request, enrolls its exact retained topic head, runs staging
+   CI, and publishes the rebuilt branch.
+
+The pull request merge leaves `codex` temporarily **pending**: its tip no
+longer matches the output recorded in `meta:codex.config`. Release builds are
+skipped, and another topic cannot pass the merge queue until the controller
+atomically publishes the rebuilt `codex` and its matching `meta` state. The
+pending commit remains visible to anyone fetching `codex` directly.
+
+Already enrolled topics remain active across rebuilds. You may push an update
+and run the controller directly, or use another reviewed topic pull request
+before rebuilding.
+
 Keep topic history linear. Rebase a dependent topic onto its prerequisite;
 never merge `codex` into a topic or use GitHub's **Update branch** button on
 these pull requests.
@@ -57,17 +83,18 @@ reordering signal; patch similarity and lexical branch order are never used.
 Before making a prerequisite inactive, first restack every child onto a
 surviving topic or current `master`. The controller refuses to guess whether
 the retired topic's commits should be discarded or transferred to a child.
+Deleting or renaming an enrolled active ref explicitly retires it on the next
+rebuild; because topic refs are protected against deletion, this requires an
+authorized ruleset bypass. Creating a separate `-stale` copy without removing
+the enrolled active ref does not retire it.
 
-A topic may be the head of a pull request whose base is `codex`. Use a
-same-repository `??/codex/*` head. The topic ruleset keeps these branches after
-their pull requests are merged. Run a refresh before force-rewriting a topic
-whose pull request was merged directly into `codex`: commits above the last
-recorded output must still be reachable from an active topic. A clean merge or
-fast-forward from a retained topic is accepted; squash commits, unrelated
-direct commits, octopus merges, and merge-only edits must first be extracted
-into an active topic.
+Every admission pull request must have a same-repository `??/codex/*` head
+and target `codex`. The topic ruleset retains that head after the merge. Do
+not delete, force-rewrite, or otherwise change the reviewed head before the
+controller rebuilds it. The controller rejects squash commits, unrelated
+direct commits, multiple pending merges, octopus merges, and merge-only edits.
 
-## Keep the dispatch workflow on `codex`
+## Keep the dispatch and admission workflows on `codex`
 
 GitHub shows **Run workflow** only for a workflow present on the default
 branch. Exactly one active `??/codex/automation` topic must therefore be based
@@ -77,20 +104,46 @@ trampoline:
 ```yaml
 name: Refresh codex
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - codex
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  merge_group:
+    types:
+      - checks_requested
 
 permissions:
   actions: read
   contents: read
+  pull-requests: read
 
 jobs:
   refresh:
+    if: github.event_name == 'workflow_dispatch'
     uses: openai/git/.github/workflows/codex.yml@meta
+  admission:
+    name: Codex admission
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: openai/git/.github/workflows/codex-admission.yml@meta
 ```
 
-The controller enforces that exact file. It remains in each generated `codex`
-tree, while the implementation stays on orphan `meta`. No controller files or
-custom patches belong on `master`.
+The admission job handles both ordinary pull-request checks and merge-group
+checks. It accepts a queued merge only while the published output and `meta`
+agree, verifies that the group introduces exactly one eligible reviewed topic,
+and rejects changes to the trusted dispatch or release workflows. The
+controller accepts the old dispatch-only trampoline during rollout; once the
+updated automation topic is published, this exact file remains in every
+generated `codex` tree. Both implementations stay on orphan `meta`. No
+controller files or custom patches belong on `master`.
 
 ## Initialize the published topology once
 
@@ -215,8 +268,10 @@ snapshot the current refs and stage a fresh candidate.
 
 The Action:
 
-1. snapshots `meta`, `master`, `codex`, and every active topic;
-2. reads the published boundaries from `meta/codex.config`, infers only new or
+1. reads the published enrollment from `meta/codex.config`, verifies any one
+   pending reviewed pull-request merge, and snapshots `meta`, `master`,
+   `codex`, the enrolled topics, and the newly admitted topic if present;
+2. reads the published boundaries, infers only a newly admitted topic or
    explicitly restacked edges, and rebases topics sequentially in dependency
    order, using rerere resolutions learned from the old `codex`;
 3. integrates every active topic at its rewritten tip with an explicit merge
@@ -255,11 +310,15 @@ minutes when those values do not change. After the full run and its unique
 `meta`, every topic, and `codex` with exact leases while deleting
 `codex-staging`.
 
-When promotion advances `codex`, the final push starts the existing
-push-triggered release workflow. A canonical no-op reuses the existing
-`codex` and `meta` tips. A release never runs from staging. The ordinary CI
-workflow may reuse its own earlier successful result when the commit or tree
-is identical; that is CI's existing redundancy policy.
+Every push to `codex` starts the inexpensive release-publication check. The
+expensive build and release jobs proceed only when the triggering SHA is the
+output recorded on the current `meta` branch. A reviewed pull-request merge
+therefore publishes no release; the controller's atomic `codex`/`meta`
+promotion does. The check does not require that SHA to remain the live
+`codex` tip, so a later pending merge cannot suppress a release that the
+controller already triggered. A canonical no-op reuses the existing tips, and
+staging never releases. Ordinary CI may reuse its own earlier successful
+result when the commit or tree is identical.
 
 Until the final push, `meta`, `codex`, and all topic refs remain unchanged. A
 CI, validation, lease, or promotion failure after staging leaves
@@ -383,13 +442,15 @@ identify different users, so every publishing path prints the authenticated
 machines or credentials. A failed CI run leaves `codex-staging` for
 inspection; it exposes no publishing secret.
 
-The automation topic is the only topic allowed to change the dispatch
-trampoline. Other topics may change only
-`.github/workflows/codex-release.yml`, whose trigger must remain exactly a push
-to `codex` and may not mention an environment or the `secrets` context. That
-check is defense in depth, not a sandbox for untrusted workflow code: review
-the release topic, including any reusable workflows it calls. The controller
-rejects every other topic-controlled workflow change.
+The automation topic is the only topic allowed to change the dispatch and
+admission trampoline. A directly merged topic pull request may change neither
+that trampoline nor `.github/workflows/codex-release.yml`; otherwise it could
+bypass the release guard before the controller runs. Update the enrolled
+automation and release topics through a normal controller rebuild instead.
+The release trigger remains exactly a push to `codex`, and its workflow may
+not mention an environment or the `secrets` context. These checks are not a
+sandbox for untrusted build code: review the release topic and its reusable
+workflows. The controller rejects other topic-controlled workflow changes.
 
 Rebased topic commits preserve their original authors. Generated commits and
 rebase committers use
@@ -414,14 +475,33 @@ one active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
 - `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks
   deletion, preserving topic heads after pull-request merges.
 - `.github/rulesets/codex-branch.json` protects `codex` with pull-request,
-  review, deletion, and force-push rules. Its exact `ttaylorr-oai` user bypass
-  permits local publication; the organization-admin entry remains for
-  break-glass access.
+  review, deletion, force-push, one-at-a-time merge-queue, and trusted
+  admission-check rules. Its exact `ttaylorr-oai` user bypass permits local
+  publication; the organization-admin entry remains for break-glass access.
 - `.github/rulesets/codex-meta.json` protects the `meta` controller with
   pull-request, review, deletion, and force-push rules. Its matching exact-user
   bypass lets the same atomic push advance the generated state; the
   organization-admin entry remains for break-glass access.
 
-Rulesets cannot require a pull request head to match `??/codex/*`; reviewers
-must enforce that convention. Do not require topic heads to be up to date with
-`codex`, because that would copy the generated aggregate into an input.
+The trusted admission check verifies that the pull-request head matches the
+eligible `??/codex/*` namespace. Do not require topic heads to be up to date
+with `codex`: the merge queue checks the proposed merge against the current
+base without copying the generated aggregate into a topic. An actor with an
+explicit ruleset bypass can still override the queue; keep publisher bypasses
+narrow and reserve organization-admin access for emergencies.
+
+The required check is pinned to the GitHub Actions App, but a repository
+ruleset cannot pin the source workflow file. SCM review is therefore still the
+boundary for a topic that changes GitHub Actions files. If hostile writers with
+workflow-editing access are in scope, add an organization-level required
+workflow rule or use a dedicated admission App before enabling this flow.
+
+Deploy these changes in order:
+
+1. Merge the new controller and admission workflow into `meta`.
+2. Update the enrolled automation and release topics, then run
+   `Meta/rebuild --local` once to publish the new trampoline and release guard.
+3. Update the existing `codex` ruleset from its checked-in recipe to require
+   the one-at-a-time merge queue and trusted admission check.
+
+Do not merge a new topic pull request before all three steps are complete.

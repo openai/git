@@ -170,6 +170,13 @@ is_active_topic_name () (
 	esac
 )
 
+is_stable_topic_name () (
+	is_active_topic_name "$1" || return 1
+	case "$1" in
+	*-unstable) return 1 ;;
+	esac
+)
+
 check_topic () {
 	test $# = 1 || {
 		usage >&2
@@ -201,6 +208,7 @@ legacy_control_paths_unchanged () (
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
+		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
@@ -219,6 +227,7 @@ meta_control_paths_unchanged () (
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
+		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex-branch.sh \
 		.github/workflows/main.yml \
@@ -238,6 +247,43 @@ write_automation_workflow () {
 	cat <<-'EOF'
 	name: Refresh codex
 
+	on:
+	  workflow_dispatch:
+	  pull_request:
+	    branches:
+	      - codex
+	    types:
+	      - opened
+	      - reopened
+	      - synchronize
+	      - ready_for_review
+	  merge_group:
+	    types:
+	      - checks_requested
+
+	permissions:
+	  actions: read
+	  contents: read
+	  pull-requests: read
+
+	jobs:
+	  refresh:
+	    if: github.event_name == 'workflow_dispatch'
+	    uses: openai/git/.github/workflows/codex.yml@meta
+	  admission:
+	    name: Codex admission
+	    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+	    permissions:
+	      contents: read
+	      pull-requests: read
+	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+	EOF
+}
+
+write_legacy_automation_workflow () {
+	cat <<-'EOF'
+	name: Refresh codex
+
 	on: workflow_dispatch
 
 	permissions:
@@ -250,12 +296,23 @@ write_automation_workflow () {
 	EOF
 }
 
-automation_workflow_matches () {
+automation_workflow_is_current () {
 	head_oid=$1
 	make_tmp_dir
-	write_automation_workflow >"$tmp_dir/expected-automation.yml"
 	git show "$head_oid:.github/workflows/codex.yml" \
 		>"$tmp_dir/actual-automation.yml" 2>/dev/null || return 1
+	write_automation_workflow >"$tmp_dir/expected-automation.yml"
+	cmp -s "$tmp_dir/expected-automation.yml" \
+		"$tmp_dir/actual-automation.yml"
+}
+
+automation_workflow_matches () {
+	head_oid=$1
+	if automation_workflow_is_current "$head_oid"
+	then
+		return 0
+	fi
+	write_legacy_automation_workflow >"$tmp_dir/expected-automation.yml"
 	cmp -s "$tmp_dir/expected-automation.yml" \
 		"$tmp_dir/actual-automation.yml"
 }
@@ -298,24 +355,267 @@ release_workflow_is_codex_only () {
 	! grep -F 'secrets' "$tmp_dir/codex-release.yml" >/dev/null
 }
 
+extract_release_job () (
+	workflow=$1
+	name=$2
+	output=$3
+	awk -v name="$name" '
+		$0 == "  " name ":" {
+			if (found++) exit 1
+			active = 1
+		}
+		active && $0 ~ /^  [^[:space:]]/ &&
+			$0 != "  " name ":" { active = 0 }
+		active { print }
+		END { if (found != 1) exit 1 }
+	' "$workflow" >"$output"
+)
+
+release_publication_controls_preserved () (
+	published=$1
+	candidate=$2
+	make_tmp_dir
+	old_workflow=$tmp_dir/published-release.yml
+	new_workflow=$tmp_dir/candidate-release.yml
+	if ! git show "$published:.github/workflows/codex-release.yml" \
+		>"$old_workflow" 2>/dev/null
+	then
+		return 0
+	fi
+	if ! grep -F -x '  publication:' "$old_workflow" >/dev/null
+	then
+		return 0
+	fi
+	git show "$candidate:.github/workflows/codex-release.yml" \
+		>"$new_workflow" 2>/dev/null || return 1
+	extract_release_job "$old_workflow" publication \
+		"$tmp_dir/published-publication" || return 1
+	extract_release_job "$new_workflow" publication \
+		"$tmp_dir/candidate-publication" || return 1
+	cmp -s "$tmp_dir/published-publication" \
+		"$tmp_dir/candidate-publication" || return 1
+	extract_release_job "$old_workflow" version \
+		"$tmp_dir/published-version" || return 1
+	extract_release_job "$new_workflow" version \
+		"$tmp_dir/candidate-version" || return 1
+	for workflow in "$tmp_dir/published-version" \
+		"$tmp_dir/candidate-version"
+	do
+		test "$(grep -c '^    needs:' "$workflow")" = 1 || return 1
+		test "$(grep -c '^    if:' "$workflow")" = 1 || return 1
+		test "$(grep -F -x -c '    needs: publication' "$workflow")" = 1 ||
+			return 1
+		test "$(grep -F -x -c \
+			"    if: needs.publication.outputs.published == 'true'" \
+			"$workflow")" = 1 || return 1
+	done
+)
+
+authenticate_pending_codex_merge () (
+	remote=$1
+	published=$2
+	current=$3
+	output=$4
+	snapshot_head=${5:-}
+	state=$output.state
+	mkdir -p "$state" || die "could not prepare Codex admission verification"
+
+	git merge-base --is-ancestor "$published" "$current" ||
+		die "current codex no longer contains the output recorded by $meta_config_path"
+	git rev-list --first-parent "$published..$current" >"$state/delta" ||
+		die "could not inspect pending Codex pull-request merges"
+	count=$(wc -l <"$state/delta" | tr -d ' ')
+	test "$count" -le 1 ||
+		die "more than one pending Codex pull-request merge"
+	test "$count" = 1 ||
+		die "could not authenticate the merged Codex pull request"
+	merge=$(sed -n '1p' "$state/delta")
+	test "$merge" = "$current" ||
+		die "could not authenticate the merged Codex pull request"
+	parents=$(git show -s --format=%P "$merge") ||
+		die "could not inspect the pending Codex pull-request merge"
+	set -- $parents
+	test $# = 2 && test "$1" = "$published" ||
+		die "pending Codex merge is not a normal two-parent merge"
+	head=$2
+	if ! git merge-tree --write-tree "$published" "$head" \
+		>"$state/merge-tree" 2>/dev/null
+	then
+		die "pending Codex merge contains an unreviewed conflict resolution"
+	fi
+	test "$(wc -l <"$state/merge-tree" | tr -d ' ')" = 1 &&
+		test "$(sed -n '1p' "$state/merge-tree")" = \
+		"$(git rev-parse "$merge^{tree}")" ||
+		die "pending Codex merge contains changes outside its reviewed topic"
+
+	if ! gh api --hostname github.com --paginate \
+		"repos/openai/git/commits/$merge/pulls?per_page=100" \
+		--jq '.[] | [.number, .state, (.merged_at // "-"),
+			(.merge_commit_sha // "-"), (.base.repo.full_name // "-"),
+			.base.ref, (.head.repo.full_name // "-"), .head.ref,
+			.head.sha, (.draft | tostring), (.user.login // "-")] | @tsv' \
+		>"$state/pull-requests"
+	then
+		die "could not authenticate the merged Codex pull request"
+	fi
+	awk -F '\t' -v merge="$merge" -v head="$head" '
+		NF == 11 && $1 ~ /^[0-9]+$/ && $2 == "closed" &&
+		$3 != "-" && $4 == merge && $5 == "openai/git" &&
+		$6 == "codex" && $7 == "openai/git" && $9 == head &&
+		$10 == "false" && $11 != "-" { print }
+	' "$state/pull-requests" >"$state/matching-pull-requests" ||
+		die "could not authenticate the merged Codex pull request"
+	test "$(wc -l <"$state/matching-pull-requests" | tr -d ' ')" = 1 ||
+		die "could not authenticate the merged Codex pull request"
+	IFS="$tab" read -r number pr_state merged_at merge_oid \
+		base_repository base_name head_repository name head_oid draft author \
+		<"$state/matching-pull-requests" ||
+		die "could not authenticate the merged Codex pull request"
+	is_stable_topic_name "$name" ||
+		die "could not authenticate the merged Codex pull request"
+	if test "$remote" = -
+	then
+		current_head=$snapshot_head
+	else
+		current_head=$(git rev-parse --verify \
+			"$(remote_ref "$remote" "$name")^{commit}" 2>/dev/null) ||
+			die "could not authenticate the merged Codex pull request"
+	fi
+	test "$current_head" = "$head" ||
+		die "could not authenticate the merged Codex pull request"
+
+	if ! gh api --hostname github.com --paginate \
+		"repos/openai/git/pulls/$number/reviews?per_page=100" \
+		--jq '.[] | [.user.login, .state, (.commit_id // "-"),
+			.author_association] | @tsv' >"$state/reviews"
+	then
+		die "could not authenticate the merged Codex pull request"
+	fi
+	awk -F '\t' -v author="$author" -v head="$head" '
+		NF == 4 && $2 ~ /^(APPROVED|CHANGES_REQUESTED|DISMISSED)$/ {
+			state[$1] = $2
+			commit[$1] = $3
+			association[$1] = $4
+		}
+		END {
+			for (reviewer in state)
+				if (reviewer != author &&
+					state[reviewer] == "APPROVED" &&
+					commit[reviewer] == head &&
+					association[reviewer] ~ /^(OWNER|MEMBER|COLLABORATOR)$/)
+					approved++
+			exit !approved
+		}
+	' "$state/reviews" ||
+		die "pending Codex pull request has no qualifying approval"
+	printf '%s\t%s\t%s\t%s\n' "$name" "$head" "$number" "$merge" \
+		>"$output" || die "could not record the reviewed Codex admission"
+)
+
 collect_topics () (
 	remote=$1
 	output=$2
+	published_state=$3
+	codex_oid=$4
+	base_oid=$5
 	root=refs/remotes/$remote/
+	admission=$output.admission
+	: >"$admission"
 
-	: >"$output"
+	if test -z "$published_state"
+	then
+		git for-each-ref --format='%(objectname)%09%(refname)' "$root" |
+		while IFS="$tab" read -r oid ref
+		do
+			name=${ref#"$root"}
+			if is_stable_topic_name "$name"
+			then
+				printf '%s\t%s\n' "$name" "$oid"
+			fi
+		done | LC_ALL=C sort >"$output"
+		test -s "$output" ||
+			die "no active ??/codex/* topic branches were found"
+		exit 0
+	fi
+
+	published=$published_state/published-topics
+	published_codex=$(state_value "$published_state" published-codex-oid)
+	if test "$published_codex" != "$codex_oid"
+	then
+		authenticate_pending_codex_merge "$remote" "$published_codex" \
+			"$codex_oid" "$admission"
+	fi
+
+	: >"$output.unsorted"
+	while IFS="$tab" read -r name published_tip prerequisite
+	do
+		ref=$(remote_ref "$remote" "$name")
+		if oid=$(git rev-parse --verify "$ref^{commit}" 2>/dev/null)
+		then
+			printf '%s\t%s\n' "$name" "$oid" >>"$output.unsorted" ||
+				die "could not collect enrolled Codex topic '$name'"
+		fi
+	done <"$published"
+	if test -s "$admission"
+	then
+		IFS="$tab" read -r name oid number merge <"$admission" ||
+			die "could not inspect the reviewed Codex admission"
+		if ! awk -F '\t' -v name="$name" '$1 == name { found=1 }
+			END { exit !found }' "$output.unsorted"
+		then
+			printf '%s\t%s\n' "$name" "$oid" >>"$output.unsorted" ||
+				die "could not collect reviewed Codex topic '$name'"
+		fi
+	fi
+	LC_ALL=C sort "$output.unsorted" >"$output" ||
+		die "could not sort enrolled Codex topics"
+	test -s "$output" ||
+		die "all enrolled Codex topics were removed"
+
+	reject_unadmitted_topic_history "$remote" "$output" \
+		"$published_codex" "$base_oid"
+)
+
+reject_unadmitted_topic_history () (
+	remote=$1
+	topics=$2
+	published_codex=$3
+	base_oid=$4
+	root=refs/remotes/$remote/
+	state=$topics.unadmitted-history
+	mkdir -p "$state" ||
+		die "could not prepare unadmitted Codex topic verification"
 	git for-each-ref --format='%(objectname)%09%(refname)' "$root" |
 	while IFS="$tab" read -r oid ref
 	do
 		name=${ref#"$root"}
-		if is_active_topic_name "$name"
+		is_topic_name "$name" || continue
+		if awk -F '\t' -v name="$name" '$1 == name { found=1 }
+			END { exit !found }' "$topics"
 		then
-			printf '%s\t%s\n' "$name" "$oid"
+			continue
 		fi
-	done | LC_ALL=C sort >"$output"
-
-	test -s "$output" ||
-		die "no active ??/codex/* topic branches were found"
+		if git merge-base --is-ancestor "$oid" "$published_codex" ||
+			git merge-base --is-ancestor "$oid" "$base_oid"
+		then
+			continue
+		fi
+		while IFS="$tab" read -r selected selected_oid
+		do
+			test "$oid" = "$selected_oid" && continue
+			git merge-base --all "$oid" "$selected_oid" \
+				>"$state/merge-bases" ||
+				die "could not compare unadmitted Codex topic '$name' with '$selected'"
+			while read -r shared
+			do
+				if ! git merge-base --is-ancestor "$shared" "$published_codex" &&
+					! git merge-base --is-ancestor "$shared" "$base_oid"
+				then
+					die "unadmitted Codex topic '$name' is an unmerged prerequisite of '$selected'"
+				fi
+			done <"$state/merge-bases"
+		done <"$topics"
+	done
 )
 
 fetch_heads () {
@@ -332,11 +632,19 @@ write_input_snapshot () (
 	codex_oid=$5
 	topics=$6
 	output=$7
+	admission=$8
 
 	{
 		printf 'controller\trefs/heads/meta\t%s\n' "$controller_oid"
 		printf 'base\trefs/heads/%s\t%s\n' "$base_name" "$base_oid"
 		printf 'codex\trefs/heads/%s\t%s\n' "$codex_name" "$codex_oid"
+		if test -s "$admission"
+		then
+			IFS="$tab" read -r name oid number merge <"$admission" ||
+				die "could not inspect the reviewed Codex admission"
+			printf 'admission\trefs/heads/%s\t%s\t%s\t%s\n' \
+				"$name" "$oid" "$number" "$merge"
+		fi
 		while IFS="$tab" read -r name oid
 		do
 			printf 'topic\trefs/heads/%s\t%s\n' "$name" "$oid"
@@ -363,9 +671,20 @@ snapshot_inputs () {
 		die "current meta does not match the pinned controller"
 	base_oid=$(resolve_commit "$(remote_ref "$remote" "$base_name")")
 	codex_oid=$(resolve_commit "$(remote_ref "$remote" "$codex_name")")
-	collect_topics "$remote" "$topics_output"
+	published_state=
+	if git cat-file -e "$controller_oid:$meta_config_path" 2>/dev/null
+	then
+		published_state=$topics_output.published-state
+		mkdir -p "$published_state" ||
+			die "could not prepare published Codex membership"
+		read_meta_config "$controller_oid" "$base_name" "$codex_name" \
+			"$published_state"
+	fi
+	collect_topics "$remote" "$topics_output" "$published_state" \
+		"$codex_oid" "$base_oid"
 	write_input_snapshot "$controller_oid" "$base_name" "$base_oid" \
-		"$codex_name" "$codex_oid" "$topics_output" "$output"
+		"$codex_name" "$codex_oid" "$topics_output" "$output" \
+		"$topics_output.admission"
 }
 
 input_oid () {
@@ -550,7 +869,7 @@ read_meta_config () (
 	do
 		name=${key#branch.}
 		name=${name%.codex-tip}
-		is_active_topic_name "$name" ||
+		is_stable_topic_name "$name" ||
 			die "$meta_config_path records invalid topic '$name'"
 		remote=$(config_get_one "$config" "branch.$name.remote")
 		merge=$(config_get_one "$config" "branch.$name.merge")
@@ -560,7 +879,7 @@ read_meta_config () (
 		"refs/heads/$base_name") prerequisite=$base_name ;;
 		refs/heads/*)
 			prerequisite=${merge#refs/heads/}
-			is_active_topic_name "$prerequisite" ||
+			is_stable_topic_name "$prerequisite" ||
 				die "$meta_config_path gives '$name' invalid prerequisite '$merge'"
 			;;
 		*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
@@ -627,45 +946,33 @@ validate_live_codex_delta () (
 	test "$published" != "$current" || return 0
 	git merge-base --is-ancestor "$published" "$current" ||
 		die "current codex no longer contains the output recorded by $meta_config_path"
-	git rev-list --first-parent --reverse "$published..$current" \
+	git rev-list --first-parent "$published..$current" \
 		>"$state/codex-first-parent-delta" ||
 		die "could not inspect commits added directly to codex"
-	previous=$published
-	while read -r commit
-	do
-		parents=$(git show -s --format=%P "$commit") ||
-			die "could not inspect codex commit $commit"
-		set -- $parents
-		test $# -ge 1 && test "$1" = "$previous" ||
-			die "codex first-parent history is not based on its recorded output"
-		case "$#" in
-		1)
-			topic_contains_commit "$topics" "$commit" ||
-				die "codex commit $commit is not represented by an active ??/codex/* topic"
-			;;
-		2)
-			second=$2
-			topic_contains_commit "$topics" "$second" ||
-				die "codex merge $commit has no active ??/codex/* topic containing its second parent"
-			if ! git merge-tree --write-tree "$previous" "$second" \
-				>"$state/codex-merge-tree" 2>/dev/null
-			then
-				die "codex merge $commit contains a conflict resolution not represented by a topic; extract it into an active topic before refreshing"
-			fi
-			test "$(wc -l <"$state/codex-merge-tree" | tr -d ' ')" = 1 ||
-				die "could not verify the tree of codex merge $commit"
-			expected_tree=$(sed -n '1p' "$state/codex-merge-tree")
-			actual_tree=$(git rev-parse "$commit^{tree}") ||
-				die "could not inspect the tree of codex merge $commit"
-			test "$expected_tree" = "$actual_tree" ||
-				die "codex merge $commit contains changes not represented by its topic"
-			;;
-		*)
-			die "codex commit $commit is an octopus merge; reconstruct it from one-prerequisite topics before refreshing"
-			;;
-		esac
-		previous=$commit
-	done <"$state/codex-first-parent-delta"
+	test "$(wc -l <"$state/codex-first-parent-delta" | tr -d ' ')" = 1 ||
+		die "more than one pending Codex pull-request merge"
+	commit=$(sed -n '1p' "$state/codex-first-parent-delta")
+	parents=$(git show -s --format=%P "$commit") ||
+		die "could not inspect codex commit $commit"
+	set -- $parents
+	test $# = 2 && test "$1" = "$published" ||
+		die "pending Codex merge is not a normal two-parent merge"
+	second=$2
+	awk -F '\t' -v oid="$second" '$2 == oid { found=1 }
+		END { exit !found }' "$topics" ||
+		die "could not authenticate the merged Codex pull request"
+	if ! git merge-tree --write-tree "$published" "$second" \
+		>"$state/codex-merge-tree" 2>/dev/null
+	then
+		die "pending Codex merge contains an unreviewed conflict resolution"
+	fi
+	test "$(wc -l <"$state/codex-merge-tree" | tr -d ' ')" = 1 ||
+		die "could not verify the tree of codex merge $commit"
+	expected_tree=$(sed -n '1p' "$state/codex-merge-tree")
+	actual_tree=$(git rev-parse "$commit^{tree}") ||
+		die "could not inspect the tree of codex merge $commit"
+	test "$expected_tree" = "$actual_tree" ||
+		die "pending Codex merge contains changes outside its reviewed topic"
 )
 
 prepare_plan () {
@@ -2341,6 +2648,18 @@ prepare_input_graph () {
 	inputs=$1
 	graph=$2
 	mkdir -p "$graph" || die "could not prepare input graph verification"
+	awk -F '\t' '
+		$1 == "controller" || $1 == "base" || $1 == "codex" ||
+		$1 == "topic" { if (NF != 3) exit 1; next }
+		$1 == "admission" { if (NF != 5) exit 1; next }
+		{ exit 1 }
+	' "$inputs" || die "input snapshot contains an invalid record"
+	for kind in controller base codex
+	do
+		test "$(awk -F '\t' -v kind="$kind" '$1 == kind { count++ }
+			END { print count + 0 }' "$inputs")" = 1 ||
+			die "input snapshot must contain exactly one '$kind' record"
+	done
 	awk -F '\t' '$1 == "topic" {
 		name=$2
 		sub("^refs/heads/", "", name)
@@ -2348,10 +2667,14 @@ prepare_input_graph () {
 	}' "$inputs" | LC_ALL=C sort >"$graph/topics" ||
 		die "could not read topics from the input snapshot"
 	test -s "$graph/topics" || die "input snapshot contains no topics"
+	test "$(cut -f1 "$graph/topics" | sort -u | wc -l | tr -d ' ')" = \
+		"$(wc -l <"$graph/topics" | tr -d ' ')" ||
+		die "input snapshot contains duplicate Codex topics"
 	while IFS="$tab" read -r name oid
 	do
-		is_active_topic_name "$name" ||
+		is_stable_topic_name "$name" ||
 			die "input snapshot contains invalid active topic '$name'"
+		require_full_commit_oid "$oid"
 	done <"$graph/topics"
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 	test -n "$base_oid" || die "input snapshot has no base commit"
@@ -2364,7 +2687,74 @@ prepare_input_graph () {
 	codex_name=${codex_ref#refs/heads/}
 	read_meta_config "$controller_oid" "$base_name" "$codex_name" "$graph"
 	codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
-	validate_live_codex_delta "$(state_value "$graph" published-codex-oid)" \
+	published_codex=$(state_value "$graph" published-codex-oid)
+	awk -F '\t' '$1 == "admission" { print }' "$inputs" \
+		>"$graph/snapshot-admissions" ||
+		die "could not inspect reviewed Codex admissions"
+	if test "$published_codex" = "$codex_oid"
+	then
+		test ! -s "$graph/snapshot-admissions" ||
+			die "input snapshot records an admission without a pending Codex merge"
+		admitted_name=
+	else
+		test "$(wc -l <"$graph/snapshot-admissions" | tr -d ' ')" = 1 ||
+			die "input snapshot does not contain exactly one reviewed Codex admission"
+		IFS="$tab" read -r kind admitted_ref admitted_oid admitted_number \
+			admitted_merge <"$graph/snapshot-admissions" ||
+			die "could not inspect the reviewed Codex admission"
+		admitted_name=${admitted_ref#refs/heads/}
+		test "$admitted_ref" = "refs/heads/$admitted_name" &&
+			is_stable_topic_name "$admitted_name" &&
+			test "$admitted_merge" = "$codex_oid" ||
+			die "input snapshot contains an invalid reviewed Codex admission"
+		snapshot_head=$(awk -F '\t' -v name="$admitted_name" \
+			'$1 == name { print $2 }' "$graph/topics")
+		test "$snapshot_head" = "$admitted_oid" ||
+			die "input snapshot contains an invalid reviewed Codex admission"
+		authenticate_pending_codex_merge - "$published_codex" \
+			"$codex_oid" "$graph/verified-admission" "$snapshot_head"
+		printf '%s\t%s\t%s\t%s\n' "$admitted_name" "$admitted_oid" \
+			"$admitted_number" "$admitted_merge" \
+			>"$graph/expected-admission"
+		cmp -s "$graph/expected-admission" "$graph/verified-admission" ||
+			die "input snapshot does not match the reviewed Codex admission"
+	fi
+	while IFS="$tab" read -r name oid
+	do
+		if ! awk -F '\t' -v name="$name" '$1 == name { found=1 }
+			END { exit !found }' "$graph/published-topics" &&
+			test "$name" != "$admitted_name"
+		then
+			die "input snapshot contains unadmitted Codex topic '$name'"
+		fi
+	done <"$graph/topics"
+	graph_remote=
+	git remote >"$graph/remotes" ||
+		die "could not inspect remotes for the snapshotted Codex graph"
+	while IFS= read -r candidate_remote
+	do
+		remote_controller=$(git rev-parse --verify \
+			"$(remote_ref "$candidate_remote" meta)^{commit}" \
+			2>/dev/null || :)
+		remote_base=$(git rev-parse --verify \
+			"$(remote_ref "$candidate_remote" "$base_name")^{commit}" \
+			2>/dev/null || :)
+		remote_codex=$(git rev-parse --verify \
+			"$(remote_ref "$candidate_remote" "$codex_name")^{commit}" \
+			2>/dev/null || :)
+		if test "$remote_controller" = "$controller_oid" &&
+			test "$remote_base" = "$base_oid" &&
+			test "$remote_codex" = "$codex_oid"
+		then
+			graph_remote=$candidate_remote
+			break
+		fi
+	done <"$graph/remotes"
+	test -n "$graph_remote" ||
+		die "could not locate the snapshotted Codex remote"
+	reject_unadmitted_topic_history "$graph_remote" "$graph/topics" \
+		"$published_codex" "$base_oid"
+	validate_live_codex_delta "$published_codex" \
 		"$codex_oid" "$graph/topics" "$graph"
 	prepare_stateful_plan "$base_name" "$base_oid" "$graph/topics" "$graph"
 }
@@ -2377,6 +2767,7 @@ topic_control_paths_unchanged () (
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
+		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
@@ -2399,6 +2790,18 @@ verify_control_paths () {
 	graph=$4
 	require_automation=$5
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
+	if test -f "$graph/published-codex-oid"
+	then
+		published_codex=$(state_value "$graph" published-codex-oid)
+		release_publication_controls_preserved "$published_codex" \
+			"$candidate" ||
+			die "candidate changes the controller-only release publication guard"
+		if automation_workflow_is_current "$published_codex" &&
+			! automation_workflow_is_current "$candidate"
+		then
+			die "candidate downgrades the canonical Codex admission workflow"
+		fi
+	fi
 
 	if test -z "$require_automation"
 	then
@@ -2576,7 +2979,8 @@ verify_output () {
 	while IFS="$tab" read -r ref old new
 	do
 		git check-ref-format "$ref" >/dev/null || die "invalid update ref '$ref'"
-		expected_old=$(awk -F '\t' -v ref="$ref" '$2 == ref { print $3 }' \
+		expected_old=$(awk -F '\t' -v ref="$ref" \
+			'$1 != "admission" && $2 == ref { print $3 }' \
 			"$inputs")
 		test "$old" = "$expected_old" ||
 			die "old value for '$ref' does not match the input snapshot"

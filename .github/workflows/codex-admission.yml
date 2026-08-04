@@ -1,0 +1,284 @@
+name: Codex topic admission
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Verify reviewed topic
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify one reviewed topic against the published Codex state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EVENT_ACTION: ${{ github.event.action }}
+          GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PULL_NUMBER: ${{ github.event.pull_request.number }}
+          PULL_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PULL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PULL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PULL_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PULL_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+
+          die () {
+            printf 'codex-admission: %s\n' "$*" >&2
+            exit 1
+          }
+
+          api () {
+            gh api "$@"
+          }
+
+          test "$GITHUB_REPOSITORY" = openai/git ||
+            die "unexpected repository '$GITHUB_REPOSITORY'"
+          test "$WORKFLOW_REPOSITORY" = openai/git ||
+            die "unexpected controller repository '$WORKFLOW_REPOSITORY'"
+
+          meta_oid=$(api "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+            --jq '.object.sha') || die 'could not resolve the meta controller'
+          test "$meta_oid" = "$WORKFLOW_SHA" ||
+            die 'the meta controller changed while admission was starting'
+
+          codex_oid=$(api "repos/$GITHUB_REPOSITORY/git/ref/heads/codex" \
+            --jq '.object.sha') || die 'could not resolve the codex branch'
+          config=$(api \
+            "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta_oid" \
+            -H 'Accept: application/vnd.github.raw+json') ||
+            die 'could not read published codex.config'
+          published_oid=$(printf '%s\n' "$config" |
+            git config --no-includes --file /dev/stdin \
+              --get codex.output-tip) ||
+            die 'published codex.config has no codex.output-tip'
+
+          case "$GITHUB_EVENT_NAME" in
+          pull_request)
+            test "$PULL_BASE_REF" = codex ||
+              die "pull request targets '$PULL_BASE_REF', not codex"
+            test "$PULL_BASE_SHA" = "$codex_oid" ||
+              die 'the pull request base no longer matches published codex'
+            test "$PULL_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ||
+              die 'the pull request topic must belong to openai/git'
+            test "$PULL_DRAFT" = false ||
+              die 'draft pull requests cannot enter the Codex merge queue'
+            case "$PULL_NUMBER" in
+            ''|*[!0-9]*) die 'the pull request number is invalid' ;;
+            esac
+            topic_name=$PULL_HEAD_REF
+            topic_oid=$PULL_HEAD_SHA
+            pull_number=$PULL_NUMBER
+            ;;
+          merge_group)
+            test "$EVENT_ACTION" = checks_requested ||
+              die "unexpected merge-group action '$EVENT_ACTION'"
+            test "$GROUP_BASE_REF" = refs/heads/codex ||
+              die "merge group targets '$GROUP_BASE_REF', not codex"
+            test "$codex_oid" = "$published_oid" ||
+              die 'codex already contains a pending topic; run Meta/rebuild first'
+            test "$GROUP_BASE_SHA" = "$codex_oid" ||
+              die 'merge group does not start at the published codex tip'
+            test "$GROUP_HEAD_SHA" = "$GITHUB_SHA" ||
+              die 'merge-group event does not describe its checked commit'
+            case "$GROUP_HEAD_REF" in
+            refs/heads/gh-readonly-queue/codex/*) ;;
+            *) die "unexpected merge-group ref '$GROUP_HEAD_REF'" ;;
+            esac
+            ;;
+          *)
+            die "unexpected event '$GITHUB_EVENT_NAME'"
+            ;;
+          esac
+
+          read -r candidate_oid parent_count first_parent second_parent <<<"$(
+            api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" \
+              --jq '[.sha, (.parents | length),
+                     (.parents[0].sha // "-"),
+                     (.parents[1].sha // "-")] | @tsv'
+          )" || die 'could not inspect the candidate integration commit'
+          test "$candidate_oid" = "$GITHUB_SHA" ||
+            die 'the inspected candidate does not match the workflow commit'
+          test "$parent_count" = 2 ||
+            die 'Codex admission requires exactly one explicit topic merge'
+          test "$first_parent" = "$codex_oid" ||
+            die 'the integration does not start at the published codex tip'
+
+          if test "$GITHUB_EVENT_NAME" = merge_group
+          then
+            associated=$(api --paginate \
+              "repos/$GITHUB_REPOSITORY/commits/$second_parent/pulls?per_page=100" \
+              --jq '.[] | select(.state == "open" and
+                                 .base.ref == "codex" and
+                                 .head.sha == "'"$second_parent"'" and
+                                 .head.repo.full_name == "'"$GITHUB_REPOSITORY"'" and
+                                 .draft == false) |
+                    [.number, .head.ref, .head.sha] | @tsv') ||
+              die 'could not identify the pull request in the merge group'
+            matching=0
+            while IFS=$'\t' read -r number name oid
+            do
+              test -n "$number" || continue
+              matching=$((matching + 1))
+              pull_number=$number
+              topic_name=$name
+              topic_oid=$oid
+            done <<<"$associated"
+            test "$matching" = 1 ||
+              die "merge group has $matching eligible pull requests; expected one"
+
+            review_decision=$(gh pr view "$pull_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json reviewDecision --jq '.reviewDecision') ||
+              die "could not inspect reviews for pull request #$pull_number"
+            test "$review_decision" = APPROVED ||
+              die "pull request #$pull_number is not approved"
+          fi
+
+          test "$second_parent" = "$topic_oid" ||
+            die 'the integration does not merge the reviewed topic tip'
+          case "$topic_name" in
+          ??/codex/?*) ;;
+          *) die "topic '$topic_name' does not match ??/codex/*" ;;
+          esac
+          case "${topic_name#??/codex/}" in
+          */*) die "topic '$topic_name' contains another namespace component" ;;
+          esac
+          case "$topic_name" in
+          *-unstable|*-wip|*-stale)
+            die "topic '$topic_name' is not eligible for production codex"
+            ;;
+          esac
+
+          current_topic_oid=$(api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/$topic_name" \
+            --jq '.object.sha') ||
+            die "could not resolve the topic branch '$topic_name'"
+          test "$current_topic_oid" = "$topic_oid" ||
+            die "topic '$topic_name' changed after its reviewed commit"
+
+          for protected_path in \
+            .github/workflows/codex.yml \
+            .github/workflows/codex-release.yml
+          do
+            published_blob=$(api \
+              "repos/$GITHUB_REPOSITORY/contents/$protected_path?ref=$codex_oid" \
+              --jq '.sha') ||
+              die "published codex is missing '$protected_path'"
+            candidate_blob=$(api \
+              "repos/$GITHUB_REPOSITORY/contents/$protected_path?ref=$GITHUB_SHA" \
+              --jq '.sha') ||
+              die "the candidate removes '$protected_path'"
+            test "$published_blob" = "$candidate_blob" ||
+              die "the candidate modifies protected workflow '$protected_path'"
+          done
+
+          published_workflows=$(api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$codex_oid" \
+            --jq '[.[] | select(.type == "file" and
+                                 (.name | test("\\.ya?ml$"))) |
+                   [.name, .sha]] | sort | @json') ||
+            die 'could not inspect the published workflow directory'
+          candidate_workflows=$(api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$GITHUB_SHA" \
+            --jq '[.[] | select(.type == "file" and
+                                 (.name | test("\\.ya?ml$"))) |
+                   [.name, .sha]] | sort | @json') ||
+            die 'could not inspect the candidate workflow directory'
+          test "$published_workflows" = "$candidate_workflows" ||
+            die 'the candidate adds, removes, or modifies a GitHub Actions workflow'
+
+          automation=$(api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/codex.yml?ref=$codex_oid" \
+            -H 'Accept: application/vnd.github.raw+json') ||
+            die 'could not read the published automation trampoline'
+          grep -Fxq '  pull_request:' <<<"$automation" &&
+          grep -Fxq '  merge_group:' <<<"$automation" &&
+          grep -Fxq \
+            '    uses: openai/git/.github/workflows/codex.yml@meta' \
+            <<<"$automation" &&
+          grep -Fxq \
+            '    uses: openai/git/.github/workflows/codex-admission.yml@meta' \
+            <<<"$automation" ||
+            die 'published codex does not contain the canonical admission trampoline'
+
+          release=$(api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/codex-release.yml?ref=$codex_oid" \
+            -H 'Accept: application/vnd.github.raw+json') ||
+            die 'could not read the published release workflow'
+          grep -Fxq '  publication:' <<<"$release" &&
+          grep -Eq \
+            '^[[:space:]]+published:[[:space:]]+\$\{\{[[:space:]]*steps\.verify\.outputs\.published[[:space:]]*\}\}[[:space:]]*$' \
+            <<<"$release" &&
+          grep -Fxq '    needs: publication' <<<"$release" &&
+          grep -Fxq \
+            "    if: needs.publication.outputs.published == 'true'" \
+            <<<"$release" &&
+          grep -Fq 'git/ref/heads/meta' <<<"$release" &&
+          grep -Fq 'codex.output-tip' <<<"$release" ||
+            die 'published codex has no intact controller-only release guard'
+
+          topics=$(api --paginate \
+            "repos/$GITHUB_REPOSITORY/branches?per_page=100" \
+            --jq '.[] | select(.name | test("^[^/]{2}/codex/[^/]+$")) |
+                   [.name, .commit.sha] | @tsv') ||
+            die 'could not inspect Codex topic prerequisites'
+          while IFS=$'\t' read -r other_name other_oid
+          do
+            test -n "$other_name" || continue
+            test "$other_name" != "$topic_name" || continue
+            test "$other_oid" != "$topic_oid" || continue
+            if printf '%s\n' "$config" |
+               git config --no-includes --file /dev/stdin \
+                 --get "branch.$other_name.codex-tip" >/dev/null
+            then
+              continue
+            fi
+
+            shared_base=$(api \
+              "repos/$GITHUB_REPOSITORY/compare/$other_oid...$topic_oid" \
+              --jq '.merge_base_commit.sha // empty') ||
+              die "could not inspect prerequisite '$other_name'"
+            test -n "$shared_base" ||
+              die "prerequisite '$other_name' has no common base"
+
+            published_relationship=$(api \
+              "repos/$GITHUB_REPOSITORY/compare/$published_oid...$shared_base" \
+              --jq '.status') ||
+              die "could not inspect published prerequisite '$other_name'"
+            case "$published_relationship" in
+            behind|identical) ;;
+            *)
+              upstream_relationship=$(api \
+                "repos/$GITHUB_REPOSITORY/compare/master...$shared_base" \
+                --jq '.status') ||
+                die "could not inspect upstream prerequisite '$other_name'"
+              case "$upstream_relationship" in
+              behind|identical) ;;
+              *)
+                die "topic '$topic_name' shares unenrolled history with '$other_name'"
+                ;;
+              esac
+              ;;
+            esac
+          done <<<"$topics"
+
+          current_codex_oid=$(api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/codex" \
+            --jq '.object.sha') ||
+            die 'could not recheck the codex branch'
+          test "$current_codex_oid" = "$codex_oid" ||
+            die 'codex changed while its topic admission was being verified'
+
+          printf 'Approved pull request #%s: %s at %s\n' \
+            "$pull_number" "$topic_name" "$topic_oid"
