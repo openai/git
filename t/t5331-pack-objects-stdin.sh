@@ -368,7 +368,8 @@ test_expect_success '--stdin-packs does not perform backfill fetch' '
 	git -C remote config set --local uploadpack.allowfilter 1 &&
 	git -C remote config set --local uploadpack.allowanysha1inwant 1 &&
 
-	git clone --filter=tree:0 "file://$(pwd)/remote" client &&
+	git -c maintenance.auto=false clone --filter=tree:0 \
+		"file://$(pwd)/remote" client &&
 	(
 		cd client &&
 		ls .git/objects/pack/*.promisor | sed "s|.*/||; s/\.promisor$/.pack/" >packs &&
