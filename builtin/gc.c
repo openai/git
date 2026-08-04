@@ -1649,7 +1649,7 @@ static int geometric_repack_auto_condition(struct gc_config *cfg UNUSED)
 	 * When we'd merge at least two packs with one another we always
 	 * perform the repack.
 	 */
-	if (geometry.split) {
+	if (geometry.split || geometry.promisor_split) {
 		ret = 1;
 		goto out;
 	}
