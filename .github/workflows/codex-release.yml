@@ -13,8 +13,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  publication:
+    name: Verify controller publication
+    runs-on: ubuntu-24.04
+    outputs:
+      published: ${{ steps.verify.outputs.published }}
+    steps:
+      - name: Check the published controller output
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          meta=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+            --jq '.object.sha')
+          recorded=$(gh api \
+            "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta" \
+            -H 'Accept: application/vnd.github.raw+json' |
+            git config --no-includes --file /dev/stdin \
+              --get codex.output-tip)
+
+          if test "$GITHUB_SHA" = "$recorded"
+          then
+            printf 'published=true\n' >>"$GITHUB_OUTPUT"
+            printf 'Releasing controller-published commit %s.\n' "$GITHUB_SHA"
+          else
+            printf 'published=false\n' >>"$GITHUB_OUTPUT"
+            printf 'Skipping non-controller publication %s.\n' "$GITHUB_SHA"
+          fi
+
   version:
     name: Determine version
+    needs: publication
+    if: needs.publication.outputs.published == 'true'
     runs-on: ubuntu-24.04
     outputs:
       describe: ${{ steps.version.outputs.describe }}
