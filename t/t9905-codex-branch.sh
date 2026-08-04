@@ -2209,6 +2209,84 @@ test_expect_success 'represented prerequisite siblings rebase sequentially' '
 	)
 '
 
+test_expect_success 'an advanced published prerequisite still owns both children' '
+	git init --bare advanced-parent.git &&
+	test_create_repo advanced-parent-source &&
+	(
+		cd advanced-parent-source &&
+		git remote add origin ../advanced-parent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+
+		git switch -c aa/codex/parent &&
+		write parent-zero parent-file &&
+		git add parent-file &&
+		git commit -m "published parent" &&
+
+		git switch -c bb/codex/one &&
+		write one child-one &&
+		git add child-one &&
+		git commit -m "first published child" &&
+
+		git switch -c cc/codex/two aa/codex/parent &&
+		write two child-two &&
+		git add child-two &&
+		git commit -m "second published child" &&
+
+		git switch -c codex master &&
+		git merge --no-ff aa/codex/parent \
+			-m "Merge aa/codex/parent into codex" &&
+		git merge --no-ff bb/codex/one \
+			-m "Merge bb/codex/one into codex" &&
+		git merge --no-ff cc/codex/two \
+			-m "Merge cc/codex/two into codex" &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch aa/codex/parent &&
+		write parent-one parent-new-file &&
+		git add parent-new-file &&
+		git commit -m "advance published parent" &&
+		git push origin master meta codex \
+			aa/codex/parent bb/codex/one cc/codex/two
+	) &&
+
+	git clone advanced-parent.git advanced-parent-runner &&
+	(
+		cd advanced-parent-runner &&
+		fetch_all &&
+		snapshot_refs ../advanced-parent.git >before &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates updates --result result &&
+
+		new_parent=$(updated_tip aa/codex/parent updates) &&
+		new_one=$(updated_tip bb/codex/one updates) &&
+		new_two=$(updated_tip cc/codex/two updates) &&
+		test "$new_parent" = "$(git rev-parse "$new_one^")" &&
+		test "$new_parent" = "$(git rev-parse "$new_two^")" &&
+		test parent-one = "$(git show "$new_one:parent-new-file")" &&
+		test parent-one = "$(git show "$new_two:parent-new-file")" &&
+		test one = "$(git show "$new_one:child-one")" &&
+		test two = "$(git show "$new_two:child-two")" &&
+		new_meta=$(updated_tip meta updates) &&
+		git show "$new_meta:codex.config" >next.config &&
+		test refs/heads/aa/codex/parent = \
+			"$(git config --file next.config \
+				--get branch.bb/codex/one.merge)" &&
+		test refs/heads/aa/codex/parent = \
+			"$(git config --file next.config \
+				--get branch.cc/codex/two.merge)" &&
+		snapshot_refs ../advanced-parent.git >after &&
+		test_cmp before after
+	)
+'
+
 test_expect_success 'rewrite bundle transfers the exact output over pinned inputs' '
 	git init --bare bundle.git &&
 	test_create_repo bundle-source &&

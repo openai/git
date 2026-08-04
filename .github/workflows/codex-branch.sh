@@ -1119,6 +1119,26 @@ published_depends_on () (
 	die "$meta_config_path contains a dependency cycle"
 )
 
+published_shared_prerequisite () (
+	published=$1
+	graph=$2
+	topics=$3
+	left=$4
+	right=$5
+	shared=$6
+	while IFS="$tab" read -r name tip prerequisite
+	do
+		test "$tip" = "$shared" || continue
+		test -n "$(current_topic_tip "$topics" "$name")" || continue
+		if published_depends_on "$graph" "$left" "$name" &&
+			published_depends_on "$graph" "$right" "$name"
+		then
+			return 0
+		fi
+	done <"$published"
+	return 1
+)
+
 current_topic_tip () (
 	topics=$1
 	name=$2
@@ -1291,7 +1311,9 @@ prepare_stateful_plan () (
 		shared=$(sed -n '1p' "$state/shared-bases")
 		if git merge-base --is-ancestor "$shared" "$base_oid" ||
 			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
-				END { exit !found }' "$topics"
+				END { exit !found }' "$topics" ||
+			published_shared_prerequisite "$published" "$published" \
+				"$topics" "$left_name" "$right_name" "$shared"
 		then
 			continue
 		fi
@@ -1521,7 +1543,9 @@ prepare_stateful_plan () (
 		shared=$(sed -n '1p' "$state/final-shared-bases")
 		if git merge-base --is-ancestor "$shared" "$base_oid" ||
 			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
-				END { exit !found }' "$topics"
+				END { exit !found }' "$topics" ||
+			published_shared_prerequisite "$published" "$plan" \
+				"$topics" "$left_name" "$right_name" "$shared"
 		then
 			continue
 		fi
