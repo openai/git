@@ -13,6 +13,7 @@ codex_root=$(CDPATH= cd "$(dirname "$codex_branch")/../.." && pwd)
 codex_entrypoint=${CODEX_ENTRYPOINT:-$codex_root/codex}
 codex_rebuild=${CODEX_REBUILD:-$codex_root/rebuild}
 codex_publish=${CODEX_PUBLISH:-$codex_root/publish}
+codex_admission_workflow=$codex_root/.github/workflows/codex-admission.yml
 codex_bot_name='chatgpt-codex-connector[bot]'
 codex_bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
@@ -72,6 +73,43 @@ write_automation_workflow () {
 	EOF
 }
 
+write_reviewed_automation_workflow () {
+	cat >"$1" <<-'EOF'
+	name: Refresh codex
+
+	on:
+	  workflow_dispatch:
+	  pull_request:
+	    branches:
+	      - codex
+	    types:
+	      - opened
+	      - reopened
+	      - synchronize
+	      - ready_for_review
+	  merge_group:
+	    types:
+	      - checks_requested
+
+	permissions:
+	  actions: read
+	  contents: read
+	  pull-requests: read
+
+	jobs:
+	  refresh:
+	    if: github.event_name == 'workflow_dispatch'
+	    uses: openai/git/.github/workflows/codex.yml@meta
+	  admission:
+	    name: Codex admission
+	    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+	    permissions:
+	      contents: read
+	      pull-requests: read
+	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+	EOF
+}
+
 write_release_workflow () {
 	cat >"$2" <<-EOF
 	name: Codex Git release
@@ -84,6 +122,384 @@ write_release_workflow () {
 	permissions:
 	  contents: read
 	EOF
+}
+
+write_guarded_release_workflow () {
+	write_release_workflow codex "$1" &&
+	cat >>"$1" <<-'EOF'
+
+	jobs:
+	  publication:
+	    name: Verify controller publication
+	    runs-on: ubuntu-24.04
+	    outputs:
+	      published: ${{ steps.verify.outputs.published }}
+	    steps:
+	      - id: verify
+	        run: echo publication
+
+	  version:
+	    needs: publication
+	    if: needs.publication.outputs.published == 'true'
+	    runs-on: ubuntu-24.04
+	    steps:
+	      - run: echo version
+	EOF
+}
+
+install_admission_gh () {
+	directory=$1 &&
+	mkdir -p "$directory" &&
+	cat >"$directory/gh" <<-'EOF' &&
+	#!/bin/sh
+
+	set -eu
+
+	test "${1:-}" = api || exit 90
+	shift
+	endpoint=
+	while test $# -gt 0
+	do
+		case "$1" in
+		repos/openai/git/commits/*/pulls*) endpoint=pulls ;;
+		repos/openai/git/pulls/*/reviews*) endpoint=reviews ;;
+		esac
+		shift
+	done
+	test -n "$endpoint" || exit 91
+	test -z "${FAKE_ADMISSION_LOG:-}" ||
+		printf '%s\n' "$endpoint" >>"$FAKE_ADMISSION_LOG"
+	test "${FAKE_ADMISSION_MODE:-}" != api-failure || exit 92
+
+	if test "$endpoint" = pulls
+	then
+		test "${FAKE_ADMISSION_MODE:-}" != no-pull-request || exit 0
+		number=${FAKE_ADMISSION_NUMBER:-42}
+		state=closed
+		merged_at=2026-08-04T00:00:00Z
+		merge=$FAKE_ADMISSION_MERGE
+		base_repository=openai/git
+		base=codex
+		head_repository=openai/git
+		head_ref=$FAKE_ADMISSION_BRANCH
+		head=$FAKE_ADMISSION_HEAD
+		draft=false
+		author=${FAKE_ADMISSION_AUTHOR:-topic-author}
+		case "${FAKE_ADMISSION_MODE:-}" in
+		open-pull-request) state=open ;;
+		unmerged-pull-request) merged_at=- ;;
+		wrong-merge) merge=$FAKE_ADMISSION_OTHER ;;
+		wrong-base-repository) base_repository=attacker/git ;;
+		wrong-base) base=master ;;
+		wrong-head-repository) head_repository=attacker/git ;;
+		wrong-head-ref) head_ref=cc/codex/unreviewed ;;
+		wrong-head) head=$FAKE_ADMISSION_OTHER ;;
+		draft-pull-request) draft=true ;;
+		esac
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$number" "$state" "$merged_at" "$merge" \
+			"$base_repository" "$base" "$head_repository" \
+			"$head_ref" "$head" "$draft" "$author"
+		if test "${FAKE_ADMISSION_MODE:-}" = duplicate-pull-request
+		then
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				43 "$state" "$merged_at" "$merge" \
+				"$base_repository" "$base" "$head_repository" \
+				"$head_ref" "$head" "$draft" "$author"
+		fi
+		exit 0
+	fi
+
+	test "${FAKE_ADMISSION_MODE:-}" != review-api-failure || exit 93
+	test "${FAKE_ADMISSION_MODE:-}" != no-review || exit 0
+	reviewer=trusted-reviewer
+	review_state=APPROVED
+	review_commit=$FAKE_ADMISSION_HEAD
+	association=MEMBER
+	case "${FAKE_ADMISSION_MODE:-}" in
+	self-review) reviewer=${FAKE_ADMISSION_AUTHOR:-topic-author} ;;
+	outsider-review) association=NONE ;;
+	stale-review) review_commit=$FAKE_ADMISSION_OTHER ;;
+	rejected-review) review_state=CHANGES_REQUESTED ;;
+	esac
+	printf '%s\t%s\t%s\t%s\n' \
+		"$reviewer" "$review_state" "$review_commit" "$association"
+	if test "${FAKE_ADMISSION_MODE:-}" = revoked-review
+	then
+		printf '%s\t%s\t%s\t%s\n' \
+			"$reviewer" CHANGES_REQUESTED "$review_commit" "$association"
+	elif test "${FAKE_ADMISSION_MODE:-}" = dismissed-review
+	then
+		printf '%s\t%s\t%s\t%s\n' \
+			"$reviewer" DISMISSED "$review_commit" "$association"
+	elif test "${FAKE_ADMISSION_MODE:-}" = commented-review
+	then
+		printf '%s\t%s\t%s\t%s\n' \
+			"$reviewer" COMMENTED "$review_commit" "$association"
+	fi
+	EOF
+	chmod +x "$directory/gh"
+}
+
+install_admission_gate_gh () {
+	directory=$1 &&
+	mkdir -p "$directory" &&
+	cat >"$directory/gh" <<-'EOF_ADMISSION_GATE' &&
+	#!/bin/sh
+
+	set -eu
+
+	if test "${1:-}" = pr
+	then
+		if test "${FAKE_GATE_MODE:-}" = unapproved
+		then
+			printf '%s\n' REVIEW_REQUIRED
+		else
+			printf '%s\n' APPROVED
+		fi
+		exit 0
+	fi
+	test "${1:-}" = api || exit 90
+	shift
+	endpoint=
+	raw=
+	while test $# -gt 0
+	do
+		case "$1" in
+		repos/openai/git/*) endpoint=$1 ;;
+		*application/vnd.github.raw+json*) raw=t ;;
+		esac
+		shift
+	done
+	test -n "$endpoint" || exit 91
+
+	case "$endpoint" in
+	repos/openai/git/git/ref/heads/meta)
+		printf '%s\n' "$FAKE_GATE_META"
+		;;
+	repos/openai/git/git/ref/heads/codex)
+		printf '%s\n' "$FAKE_GATE_CODEX"
+		;;
+	repos/openai/git/git/ref/heads/??/codex/*)
+		if test "${FAKE_GATE_MODE:-}" = changed-topic
+		then
+			printf '%s\n' "$FAKE_GATE_OTHER"
+		else
+			printf '%s\n' "$FAKE_GATE_TOPIC"
+		fi
+		;;
+	repos/openai/git/contents/codex.config\?ref=*)
+		published=$FAKE_GATE_CODEX
+		test "${FAKE_GATE_MODE:-}" != pending ||
+			published=$FAKE_GATE_OTHER
+		printf '[codex]\n\toutput-tip = %s\n' "$published"
+		;;
+	repos/openai/git/git/commits/*)
+		first=$FAKE_GATE_CODEX
+		test "${FAKE_GATE_MODE:-}" != wrong-parent ||
+			first=$FAKE_GATE_OTHER
+		printf '%s\t%s\t%s\t%s\n' \
+			"$FAKE_GATE_CANDIDATE" 2 "$first" "$FAKE_GATE_TOPIC"
+		;;
+	repos/openai/git/commits/*/pulls*)
+		printf '%s\t%s\t%s\n' 42 "$FAKE_GATE_BRANCH" \
+			"$FAKE_GATE_TOPIC"
+		if test "${FAKE_GATE_MODE:-}" = multiple-pulls
+		then
+			printf '%s\t%s\t%s\n' 43 "$FAKE_GATE_BRANCH" \
+				"$FAKE_GATE_TOPIC"
+		fi
+		;;
+	repos/openai/git/contents/.github/workflows/codex.yml\?ref=*)
+		if test -n "$raw"
+		then
+			cat <<-'EOF_AUTOMATION'
+			  pull_request:
+			  merge_group:
+			    uses: openai/git/.github/workflows/codex.yml@meta
+			    uses: openai/git/.github/workflows/codex-admission.yml@meta
+			EOF_AUTOMATION
+		else
+			case "${FAKE_GATE_MODE:-}:$endpoint" in
+			changed-workflow:*"$FAKE_GATE_CANDIDATE")
+				printf '%s\n' changed-automation
+				;;
+			*) printf '%s\n' trusted-automation ;;
+			esac
+		fi
+		;;
+	repos/openai/git/contents/.github/workflows/codex-release.yml\?ref=*)
+		if test -n "$raw"
+		then
+			cat <<-'EOF_RELEASE'
+			  publication:
+			    published: ${{ steps.verify.outputs.published }}
+			    needs: publication
+			    if: needs.publication.outputs.published == 'true'
+			    git/ref/heads/meta
+			    codex.output-tip
+			EOF_RELEASE
+		else
+			printf '%s\n' trusted-release
+		fi
+		;;
+	repos/openai/git/contents/.github/workflows\?ref=*)
+		printf '%s\n' trusted-workflow-directory
+		;;
+	repos/openai/git/branches\?per_page=100)
+		printf '%s\t%s\n' "$FAKE_GATE_BRANCH" "$FAKE_GATE_TOPIC"
+		case "${FAKE_GATE_MODE:-}" in
+		hidden-prerequisite|newer-master)
+			printf '%s\t%s\n' cc/codex/private-parent \
+				"$FAKE_GATE_OTHER"
+			;;
+		hidden-wip|hidden-stale|hidden-unstable)
+			suffix=${FAKE_GATE_MODE#hidden-}
+			printf '%s\t%s\n' "cc/codex/private-parent-$suffix" \
+				"$FAKE_GATE_OTHER"
+			;;
+		same-tip-alias)
+			printf '%s\t%s\n' cc/codex/same-tip \
+				"$FAKE_GATE_TOPIC"
+			;;
+		esac
+		;;
+	repos/openai/git/compare/*)
+		case "$endpoint" in
+		*"$FAKE_GATE_OTHER...$FAKE_GATE_TOPIC")
+			printf '%s\n' "$FAKE_GATE_SHARED"
+			;;
+		*"master...$FAKE_GATE_SHARED")
+			if test "${FAKE_GATE_MODE:-}" = newer-master
+			then
+				printf '%s\n' behind
+			else
+				printf '%s\n' ahead
+			fi
+			;;
+		*"...$FAKE_GATE_SHARED")
+			printf '%s\n' ahead
+			;;
+		*) exit 92 ;;
+		esac
+		;;
+	*)
+		printf 'unexpected admission endpoint: %s\n' "$endpoint" >&2
+		exit 93
+		;;
+	esac
+	EOF_ADMISSION_GATE
+	chmod +x "$directory/gh"
+}
+
+run_admission_gate () {
+	mode=$1 &&
+	event=$2 &&
+	branch=${3:-bb/codex/reviewed} &&
+	directory=$TRASH_DIRECTORY/admission-gate-bin &&
+	meta=1111111111111111111111111111111111111111 &&
+	codex=2222222222222222222222222222222222222222 &&
+	topic=3333333333333333333333333333333333333333 &&
+	candidate=4444444444444444444444444444444444444444 &&
+	other=5555555555555555555555555555555555555555 &&
+	shared=6666666666666666666666666666666666666666 &&
+	env PATH="$directory:$PATH" GH_TOKEN=not-a-real-token \
+		GITHUB_REPOSITORY=openai/git GITHUB_EVENT_NAME="$event" \
+		GITHUB_SHA="$candidate" WORKFLOW_REPOSITORY=openai/git \
+		WORKFLOW_SHA="$meta" EVENT_ACTION=checks_requested \
+		GROUP_BASE_REF=refs/heads/codex GROUP_BASE_SHA="$codex" \
+		GROUP_HEAD_REF=refs/heads/gh-readonly-queue/codex/pr-42 \
+		GROUP_HEAD_SHA="$candidate" PULL_NUMBER=42 \
+		PULL_BASE_REF=codex PULL_BASE_SHA="$codex" \
+		PULL_HEAD_REF="$branch" PULL_HEAD_SHA="$topic" \
+		PULL_HEAD_REPOSITORY=openai/git PULL_DRAFT=false \
+		FAKE_GATE_MODE="$mode" FAKE_GATE_META="$meta" \
+		FAKE_GATE_CODEX="$codex" FAKE_GATE_TOPIC="$topic" \
+		FAKE_GATE_CANDIDATE="$candidate" FAKE_GATE_OTHER="$other" \
+		FAKE_GATE_SHARED="$shared" FAKE_GATE_BRANCH="$branch" \
+		bash "$TRASH_DIRECTORY/admission-gate.sh"
+}
+
+setup_pending_admission () (
+	fixture=$1
+	topic=${2:-bb/codex/reviewed}
+	style=${3:-merge}
+
+	git init --bare "$fixture.git" &&
+	test_create_repo "$fixture-source" &&
+	(
+		cd "$fixture-source" &&
+		git remote add origin "../$fixture.git" &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "admission base" &&
+		git switch -c aa/codex/enrolled master &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "already enrolled topic" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		if git show-ref --verify --quiet "refs/heads/$topic"
+		then
+			git switch "$topic"
+		else
+			git switch -c "$topic" master
+		fi &&
+		write reviewed reviewed-file &&
+		git add reviewed-file &&
+		git commit -m "reviewed topic" &&
+		git switch codex &&
+		case "$style" in
+		merge)
+			git merge --no-ff "$topic" \
+				-m "Merge pull request #42 from openai/$topic"
+			;;
+		squash)
+			git merge --squash "$topic" &&
+			git commit -m "squash an unadmitted topic"
+			;;
+		*) return 1 ;;
+		esac &&
+		if test "$topic" = aa/codex/enrolled
+		then
+			git push origin master meta codex "$topic"
+		else
+			git push origin master meta codex aa/codex/enrolled "$topic"
+		fi
+	) &&
+	git clone "$fixture.git" "$fixture-runner" &&
+	install_admission_gh "$TRASH_DIRECTORY/$fixture-bin"
+)
+
+admission_command () {
+	fixture=$1 &&
+	mode=${2:-success} &&
+	shift 2 &&
+	branch=${ADMISSION_TOPIC:-bb/codex/reviewed} &&
+	merge=$(git rev-parse refs/remotes/origin/codex) &&
+	head=$(git rev-parse "refs/remotes/origin/$branch") &&
+	other=$(git rev-parse refs/remotes/origin/master) &&
+	env PATH="$TRASH_DIRECTORY/$fixture-bin:$PATH" \
+		FAKE_ADMISSION_MERGE="$merge" \
+		FAKE_ADMISSION_HEAD="$head" \
+		FAKE_ADMISSION_OTHER="$other" \
+		FAKE_ADMISSION_BRANCH="$branch" \
+		FAKE_ADMISSION_MODE="$mode" \
+		FAKE_ADMISSION_LOG="$TRASH_DIRECTORY/$fixture-gh.log" \
+		sh "$codex_branch" "$@"
+}
+
+admission_rewrite () {
+	fixture=$1 &&
+	mode=${2:-success} &&
+	shift 2 &&
+	admission_command "$fixture" "$mode" \
+		rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure "$@"
 }
 
 install_meta_state () {
@@ -106,11 +522,17 @@ install_meta_state () {
 		*) continue ;;
 		esac
 		case "$name" in
-		*-wip|*-stale|??/codex/*/*) continue ;;
+		*-wip|*-stale|*-unstable|??/codex/*/*) continue ;;
 		esac
 		if git merge-base --is-ancestor "$oid" "$output_tip"
 		then
 			printf "%s\t%s\n" "$name" "$oid"
+		else
+			# Older graph fixtures start with a topic that has already been
+			# enrolled but has grown since its last publication. Record its
+			# published boundary, not its as-yet-unmerged current tip.
+			published=$(git merge-base "$oid" "$output_tip") || exit 1
+			printf "%s\t%s\n" "$name" "$published"
 		fi
 	done | LC_ALL=C sort >"$state_topics" &&
 	set -- git merge-base --all --octopus "$base_branch" "$output_tip" &&
@@ -129,6 +551,7 @@ install_meta_state () {
 		while IFS="$(printf '\t')" read -r other_name other_oid
 		do
 			test "$name" = "$other_name" && continue
+			test "$oid" = "$other_oid" && continue
 			if git merge-base --is-ancestor "$other_oid" "$oid" &&
 				git merge-base --is-ancestor "$prerequisite_tip" "$other_oid"
 			then
@@ -368,6 +791,529 @@ test_expect_success 'refresh only prepares an immutable local-publish artifact' 
 	done
 '
 
+test_expect_success 'reviewed admission requires one app-authenticated queue entry' '
+	test -f "$codex_admission_workflow" &&
+	test_grep "name: Verify reviewed topic" \
+		"$codex_admission_workflow" &&
+	test_grep "pull_request)" "$codex_admission_workflow" &&
+	test_grep "merge_group)" "$codex_admission_workflow" &&
+	test_grep "codex.output-tip" "$codex_admission_workflow" &&
+	test_grep "refs/heads/gh-readonly-queue/codex/" \
+		"$codex_admission_workflow" &&
+	test_grep "pull-requests: read" "$codex_admission_workflow" &&
+	! grep -E "contents: write|pull-requests: write|statuses: write|id-token|actions/checkout|git push" \
+		"$codex_admission_workflow" &&
+	test_grep "  pull_request:" "$codex_branch" &&
+	test_grep "  merge_group:" "$codex_branch" &&
+	test_grep "codex-admission.yml@meta" "$codex_branch" &&
+	jq -e "
+		(.rules[] | select(.type == \"merge_queue\") |
+		 .parameters.merge_method == \"MERGE\" and
+		 .parameters.grouping_strategy == \"ALLGREEN\" and
+		 .parameters.max_entries_to_build == 1 and
+		 .parameters.max_entries_to_merge == 1 and
+		 .parameters.min_entries_to_merge == 1) and
+		(.rules[] | select(.type == \"required_status_checks\") |
+		 .parameters.strict_required_status_checks_policy == false and
+		 .parameters.required_status_checks == [{
+		   \"context\": \"Codex admission / Verify reviewed topic\",
+		   \"integration_id\": 15368
+		 }])
+	" "$codex_root/.github/rulesets/codex-branch.json" &&
+	if test -n "${CODEX_AUTOMATION_TOPIC:-}"
+	then
+		test_grep "  pull_request:" "$CODEX_AUTOMATION_TOPIC" &&
+		test_grep "  merge_group:" "$CODEX_AUTOMATION_TOPIC" &&
+		test_grep "codex-admission.yml@meta" "$CODEX_AUTOMATION_TOPIC"
+	fi &&
+	if test -n "${CODEX_RELEASE_TOPIC:-}"
+	then
+		test_grep "  publication:" "$CODEX_RELEASE_TOPIC" &&
+		test_grep "    needs: publication" "$CODEX_RELEASE_TOPIC" &&
+		test_grep "codex.output-tip" "$CODEX_RELEASE_TOPIC" &&
+		! grep -F "git/ref/heads/codex" "$CODEX_RELEASE_TOPIC" &&
+		test_grep "git/ref/heads/meta" "$CODEX_RELEASE_TOPIC"
+	fi
+'
+
+test_expect_success 'admission workflow executes both pull-request and queue checks' '
+	install_admission_gate_gh "$TRASH_DIRECTORY/admission-gate-bin" &&
+	sed -n "/^        run: |\$/,/^        [^ ]/p" \
+		"$codex_admission_workflow" |
+	sed "1d; s/^          //" >"$TRASH_DIRECTORY/admission-gate.sh" &&
+	test_grep "set -euo pipefail" "$TRASH_DIRECTORY/admission-gate.sh" &&
+	bash -n "$TRASH_DIRECTORY/admission-gate.sh" &&
+	run_admission_gate success pull_request >pull.out &&
+	test_grep "Approved pull request #42" pull.out &&
+	run_admission_gate pending pull_request >pending-pull.out &&
+	test_grep "Approved pull request #42" pending-pull.out &&
+	run_admission_gate success merge_group >queue.out &&
+	test_grep "Approved pull request #42" queue.out &&
+	run_admission_gate same-tip-alias merge_group >alias.out &&
+	test_grep "Approved pull request #42" alias.out &&
+	run_admission_gate newer-master merge_group >newer-master.out &&
+	test_grep "Approved pull request #42" newer-master.out &&
+	for mode in pending wrong-parent unapproved multiple-pulls \
+		changed-topic changed-workflow hidden-prerequisite \
+		hidden-wip hidden-stale hidden-unstable
+	do
+		test_expect_code 1 run_admission_gate "$mode" merge_group \
+			>"queue-$mode.out" 2>"queue-$mode.err" || return 1
+	done &&
+	test_grep "pending topic" queue-pending.err &&
+	test_grep "unenrolled history" queue-hidden-prerequisite.err &&
+	test_expect_code 1 \
+		run_admission_gate success pull_request \
+			bb/codex/reviewed-unstable \
+		>unstable-pull.out 2>unstable-pull.err &&
+	test_grep "not eligible for production codex" unstable-pull.err
+'
+
+test_expect_success 'an unmerged topic is invisible to an enrolled rebuild' '
+	setup_pending_admission ignored-topic &&
+	previous=$(git --git-dir=ignored-topic.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=ignored-topic.git update-ref \
+		refs/heads/codex "$previous" &&
+	(
+		cd ignored-topic-runner &&
+		fetch_all &&
+		: >"$TRASH_DIRECTORY/ignored-topic-gh.log" &&
+		snapshot_refs ../ignored-topic.git >before &&
+		admission_rewrite ignored-topic api-failure &&
+		candidate=$(cat result) &&
+		git show origin/meta:codex.config >published.config &&
+		test "$previous" = "$(git config --file published.config \
+			codex.output-tip)" &&
+		test "$(git rev-parse "$previous^{tree}")" = \
+			"$(git rev-parse "$candidate^{tree}")" &&
+		test enrolled = "$(git show "$candidate:enrolled-file")" &&
+		test_must_fail git cat-file -e "$candidate:reviewed-file" &&
+		! grep -F "bb/codex/reviewed" inputs &&
+		! grep -F "bb/codex/reviewed" updates &&
+		test_must_be_empty "$TRASH_DIRECTORY/ignored-topic-gh.log" &&
+		snapshot_refs ../ignored-topic.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'an already-enrolled topic continues to track new commits' '
+	setup_pending_admission enrolled-update &&
+	previous=$(git --git-dir=enrolled-update.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=enrolled-update.git update-ref \
+		refs/heads/codex "$previous" &&
+	(
+		cd enrolled-update-source &&
+		git switch aa/codex/enrolled &&
+		write grown existing-topic-update &&
+		git add existing-topic-update &&
+		git commit -m "grow an enrolled topic" &&
+		git push origin aa/codex/enrolled
+	) &&
+	(
+		cd enrolled-update-runner &&
+		fetch_all &&
+		: >"$TRASH_DIRECTORY/enrolled-update-gh.log" &&
+		admission_rewrite enrolled-update api-failure &&
+		candidate=$(cat result) &&
+		test grown = "$(git show "$candidate:existing-topic-update")" &&
+		test_grep "refs/heads/aa/codex/enrolled" updates &&
+		! grep -F "bb/codex/reviewed" updates &&
+		test_must_be_empty "$TRASH_DIRECTORY/enrolled-update-gh.log"
+	)
+'
+
+test_expect_success 'an enrolled topic cannot smuggle an unadmitted prerequisite' '
+	setup_pending_admission hidden-prerequisite &&
+	previous=$(git --git-dir=hidden-prerequisite.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=hidden-prerequisite.git update-ref \
+		refs/heads/codex "$previous" &&
+	(
+		cd hidden-prerequisite-source &&
+		git switch -c cc/codex/private-parent master &&
+		write secret private-parent-file &&
+		git add private-parent-file &&
+		git commit -m "unadmitted prerequisite" &&
+		git rebase --onto cc/codex/private-parent master \
+			aa/codex/enrolled &&
+		git switch cc/codex/private-parent &&
+		write advanced private-parent-tip &&
+		git add private-parent-tip &&
+		git commit -m "advance beyond the hidden prerequisite" &&
+		git push origin cc/codex/private-parent &&
+		git push --force origin aa/codex/enrolled
+	) &&
+	(
+		cd hidden-prerequisite-runner &&
+		fetch_all &&
+		test_expect_code 1 \
+			admission_rewrite hidden-prerequisite api-failure \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "unadmitted Codex topic" rewrite.err
+	)
+'
+
+test_expect_success 'inactive topic names cannot hide unreviewed shared history' '
+	for suffix in wip stale unstable
+	do
+		fixture="hidden-$suffix" &&
+		setup_pending_admission "$fixture" &&
+		previous=$(git --git-dir="$fixture.git" \
+			rev-parse refs/heads/aa/codex/enrolled) &&
+		git --git-dir="$fixture.git" update-ref \
+			refs/heads/codex "$previous" &&
+		(
+			cd "$fixture-source" &&
+			private="cc/codex/private-parent-$suffix" &&
+			git switch -c "$private" master &&
+			write hidden "hidden-$suffix" &&
+			git add "hidden-$suffix" &&
+			git commit -m "inactive private ancestor" &&
+			git rebase --onto "$private" master aa/codex/enrolled &&
+			git switch "$private" &&
+			write advanced "advanced-$suffix" &&
+			git add "advanced-$suffix" &&
+			git commit -m "advance inactive private topic" &&
+			git push origin "$private" &&
+			git push --force origin aa/codex/enrolled
+		) &&
+		(
+			cd "$fixture-runner" &&
+			fetch_all &&
+			test_expect_code 1 \
+				admission_rewrite "$fixture" api-failure \
+				>rewrite.out 2>rewrite.err &&
+			test_grep "unadmitted Codex topic" rewrite.err
+		) || return 1
+	done
+'
+
+test_expect_success 'an exact topic alias is not mistaken for a prerequisite' '
+	setup_pending_admission same-topic-alias &&
+	enrolled=$(git --git-dir=same-topic-alias.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=same-topic-alias.git update-ref \
+		refs/heads/codex "$enrolled" &&
+	git --git-dir=same-topic-alias.git update-ref \
+		refs/heads/cc/codex/alias "$enrolled" &&
+	(
+		cd same-topic-alias-runner &&
+		fetch_all &&
+		admission_rewrite same-topic-alias api-failure &&
+		! grep -F "cc/codex/alias" updates &&
+		test enrolled = "$(git show "$(cat result):enrolled-file")"
+	)
+'
+
+test_expect_success 'shared current-master ancestry does not imply admission' '
+	setup_pending_admission newer-master-ancestry &&
+	enrolled=$(git --git-dir=newer-master-ancestry.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=newer-master-ancestry.git update-ref \
+		refs/heads/codex "$enrolled" &&
+	(
+		cd newer-master-ancestry-source &&
+		old_master=$(git rev-parse master) &&
+		git switch master &&
+		write upstream upstream-file &&
+		git add upstream-file &&
+		git commit -m "advance upstream master" &&
+		git switch -c cc/codex/unrelated master &&
+		write private unrelated-file &&
+		git add unrelated-file &&
+		git commit -m "unadmitted independent topic" &&
+		git rebase --onto master "$old_master" aa/codex/enrolled &&
+		git push origin master cc/codex/unrelated &&
+		git push --force origin aa/codex/enrolled
+	) &&
+	(
+		cd newer-master-ancestry-runner &&
+		fetch_all &&
+		admission_rewrite newer-master-ancestry api-failure &&
+		candidate=$(cat result) &&
+		test upstream = "$(git show "$candidate:upstream-file")" &&
+		test enrolled = "$(git show "$candidate:enrolled-file")" &&
+		test_must_fail git cat-file -e "$candidate:unrelated-file" &&
+		! grep -F "cc/codex/unrelated" updates
+	)
+'
+
+test_expect_success 'an unstable-looking branch cannot enter the stable lane' '
+	setup_pending_admission ignored-unstable &&
+	previous=$(git --git-dir=ignored-unstable.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=ignored-unstable.git update-ref \
+		refs/heads/codex "$previous" &&
+	(
+		cd ignored-unstable-source &&
+		git switch -c cc/codex/preview-unstable master &&
+		write preview unstable-file &&
+		git add unstable-file &&
+		git commit -m "unadmitted unstable preview" &&
+		git push origin cc/codex/preview-unstable
+	) &&
+	(
+		cd ignored-unstable-runner &&
+		fetch_all &&
+		admission_rewrite ignored-unstable api-failure &&
+		candidate=$(cat result) &&
+		test_must_fail git cat-file -e "$candidate:unstable-file" &&
+		! grep -F "cc/codex/preview-unstable" inputs &&
+		! grep -F "cc/codex/preview-unstable" updates
+	)
+'
+
+test_expect_success 'a reviewed merge enrolls exactly its retained topic' '
+	setup_pending_admission reviewed-topic &&
+	(
+		cd reviewed-topic-runner &&
+		fetch_all &&
+		: >"$TRASH_DIRECTORY/reviewed-topic-gh.log" &&
+		snapshot_refs ../reviewed-topic.git >before &&
+		admission_rewrite reviewed-topic success &&
+		candidate=$(cat result) &&
+		test reviewed = "$(git show "$candidate:reviewed-file")" &&
+		test enrolled = "$(git show "$candidate:enrolled-file")" &&
+		test_grep "refs/heads/bb/codex/reviewed" inputs &&
+		test_grep "refs/heads/bb/codex/reviewed" updates &&
+		awk -F "$(printf "\t")" \
+			"\$1 == \"admission\" && \$2 == \"refs/heads/bb/codex/reviewed\" && \$4 == 42 { found=1 } END { exit !found }" \
+			inputs &&
+		new_meta=$(updated_tip meta updates) &&
+		git show "$new_meta:codex.config" >next.config &&
+		test "$(updated_tip bb/codex/reviewed updates)" = \
+			"$(git config --file next.config \
+				--get branch.bb/codex/reviewed.codex-tip)" &&
+		test_grep pulls "$TRASH_DIRECTORY/reviewed-topic-gh.log" &&
+		test_grep reviews "$TRASH_DIRECTORY/reviewed-topic-gh.log" &&
+		snapshot_refs ../reviewed-topic.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'a reviewed merge of an enrolled topic is normalized once' '
+	setup_pending_admission reviewed-enrolled aa/codex/enrolled &&
+	(
+		cd reviewed-enrolled-runner &&
+		fetch_all &&
+		ADMISSION_TOPIC=aa/codex/enrolled \
+			admission_rewrite reviewed-enrolled success &&
+		candidate=$(cat result) &&
+		test reviewed = "$(git show "$candidate:reviewed-file")" &&
+		new_meta=$(updated_tip meta updates) &&
+		git show "$new_meta:codex.config" >next.config &&
+		git config --file next.config --get-regexp \
+			"^branch\\..*\\.codex-tip$" >registered &&
+		test_line_count = 1 registered &&
+		test_grep "branch.aa/codex/enrolled.codex-tip" registered
+	)
+'
+
+test_expect_success 'a pending merge requires one authentic merged pull request' '
+	setup_pending_admission rejected-provenance &&
+	(
+		cd rejected-provenance-runner &&
+		fetch_all &&
+		snapshot_refs ../rejected-provenance.git >before &&
+		for mode in no-pull-request duplicate-pull-request \
+			open-pull-request unmerged-pull-request \
+			wrong-merge wrong-base-repository wrong-base \
+			wrong-head-repository wrong-head-ref wrong-head \
+			draft-pull-request api-failure
+		do
+			test_expect_code 1 \
+				admission_rewrite rejected-provenance "$mode" \
+				>"$mode.out" 2>"$mode.err" || return 1
+		done &&
+		snapshot_refs ../rejected-provenance.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'a pending merge needs a current independent trusted review' '
+	setup_pending_admission rejected-review &&
+	(
+		cd rejected-review-runner &&
+		fetch_all &&
+		snapshot_refs ../rejected-review.git >before &&
+		for mode in no-review self-review outsider-review stale-review \
+			rejected-review revoked-review dismissed-review \
+			review-api-failure
+		do
+			test_expect_code 1 \
+				admission_rewrite rejected-review "$mode" \
+				>"$mode.out" 2>"$mode.err" || return 1
+		done &&
+		snapshot_refs ../rejected-review.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'comments do not invalidate an otherwise current approval' '
+	setup_pending_admission commented-approval &&
+	(
+		cd commented-approval-runner &&
+		fetch_all &&
+		admission_rewrite commented-approval commented-review &&
+		candidate=$(cat result) &&
+		test reviewed = "$(git show "$candidate:reviewed-file")"
+	)
+'
+
+test_expect_success 'a reviewed topic cannot advance after its pull request merged' '
+	setup_pending_admission changed-reviewed-head &&
+	(
+		cd changed-reviewed-head-source &&
+		git switch bb/codex/reviewed &&
+		write unreviewed unreviewed-file &&
+		git add unreviewed-file &&
+		git commit -m "advance after review" &&
+		git push origin bb/codex/reviewed
+	) &&
+	(
+		cd changed-reviewed-head-runner &&
+		fetch_all &&
+		snapshot_refs ../changed-reviewed-head.git >before &&
+		test_expect_code 1 \
+			admission_rewrite changed-reviewed-head success \
+			>rewrite.out 2>rewrite.err &&
+		snapshot_refs ../changed-reviewed-head.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'a squash cannot enroll a topic without a merge parent' '
+	setup_pending_admission squashed-admission bb/codex/reviewed squash &&
+	(
+		cd squashed-admission-runner &&
+		fetch_all &&
+		test_expect_code 1 \
+			admission_rewrite squashed-admission success \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "normal two-parent merge" rewrite.err
+	)
+'
+
+test_expect_success 'a merged unstable topic cannot enroll in stable codex' '
+	setup_pending_admission unstable-admission \
+		bb/codex/reviewed-unstable &&
+	(
+		cd unstable-admission-runner &&
+		fetch_all &&
+		ADMISSION_TOPIC=bb/codex/reviewed-unstable \
+			test_expect_code 1 \
+			admission_rewrite unstable-admission success \
+			>rewrite.out 2>rewrite.err
+	)
+'
+
+test_expect_success 'two pending pull-request merges cannot share one rebuild' '
+	setup_pending_admission double-admission &&
+	(
+		cd double-admission-source &&
+		git switch -c cc/codex/second master &&
+		write second second-file &&
+		git add second-file &&
+		git commit -m "second unadmitted topic" &&
+		git switch codex &&
+		git merge --no-ff cc/codex/second \
+			-m "Merge pull request #43 from openai/cc/codex/second" &&
+		git push origin codex cc/codex/second
+	) &&
+	(
+		cd double-admission-runner &&
+		fetch_all &&
+		test_expect_code 1 \
+			admission_rewrite double-admission success \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "more than one pending Codex pull-request merge" \
+			rewrite.err
+	)
+'
+
+test_expect_success 'retiring the final enrolled topic fails closed' '
+	setup_pending_admission missing-final-topic &&
+	previous=$(git --git-dir=missing-final-topic.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=missing-final-topic.git update-ref \
+		refs/heads/codex "$previous" &&
+	git --git-dir=missing-final-topic.git update-ref -d \
+		refs/heads/aa/codex/enrolled &&
+	(
+		cd missing-final-topic-runner &&
+		fetch_all &&
+		test_expect_code 1 \
+			admission_rewrite missing-final-topic api-failure \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "enrolled Codex topics were removed" rewrite.err
+	)
+'
+
+test_expect_success 'retiring an enrolled leaf never adopts its replacement' '
+	setup_pending_admission retired-leaf &&
+	(
+		cd retired-leaf-source &&
+		install_meta_state meta master codex &&
+		git push origin meta &&
+		git switch -c cc/codex/replacement master &&
+		write replacement replacement-file &&
+		git add replacement-file &&
+		git commit -m "unreviewed replacement topic" &&
+		git push origin cc/codex/replacement
+	) &&
+	git --git-dir=retired-leaf.git update-ref -d \
+		refs/heads/bb/codex/reviewed &&
+	(
+		cd retired-leaf-runner &&
+		fetch_all &&
+		ADMISSION_TOPIC=aa/codex/enrolled \
+			admission_rewrite retired-leaf api-failure &&
+		candidate=$(cat result) &&
+		test enrolled = "$(git show "$candidate:enrolled-file")" &&
+		test_must_fail git cat-file -e "$candidate:reviewed-file" &&
+		test_must_fail git cat-file -e "$candidate:replacement-file" &&
+		! grep -F "bb/codex/reviewed" updates &&
+		! grep -F "cc/codex/replacement" updates &&
+		new_meta=$(updated_tip meta updates) &&
+		git show "$new_meta:codex.config" >next.config &&
+		! grep -F "bb/codex/reviewed" next.config &&
+		! grep -F "cc/codex/replacement" next.config
+	)
+'
+
+test_expect_success 'verified reviewed admission cannot survive a topic race' '
+	setup_pending_admission admission-race &&
+	(
+		cd admission-race-runner &&
+		fetch_all &&
+		admission_rewrite admission-race success &&
+		admission_command admission-race success \
+			verify-output --inputs inputs --updates updates \
+			--result result &&
+		awk -F "$(printf "\t")" -v OFS="$(printf "\t")" \
+			"\$1 == \"admission\" { \$4 = 43 } { print }" \
+			inputs >forged-inputs &&
+		test_expect_code 1 \
+			admission_command admission-race success \
+			verify-output --inputs forged-inputs --updates updates \
+			--result result >forged.out 2>forged.err &&
+		(
+			cd ../admission-race-source &&
+			git switch bb/codex/reviewed &&
+			write later raced-review &&
+			git add raced-review &&
+			git commit -m "race the frozen reviewed head" &&
+			git push origin bb/codex/reviewed
+		) &&
+		test_expect_code 1 \
+			admission_command admission-race success \
+			verify-inputs --remote origin inputs \
+			>race.out 2>race.err
+	)
+'
+
 test_expect_success 'topics cannot change the meta branch ruleset' '
 	git init --bare control-path.git &&
 	test_create_repo control-path-source &&
@@ -423,12 +1369,12 @@ test_expect_success 'topics cannot change the convenience wrappers' '
 		git commit -m base &&
 		git branch codex &&
 		git branch meta &&
-		install_meta_state meta master codex &&
 
 		git switch -c aa/codex/rebuild-control master &&
 		write untrusted rebuild &&
 		git add rebuild &&
 		git commit -m "change rebuild wrapper" &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/rebuild-control
 	) &&
 	git clone wrapper-control-path.git wrapper-control-path-runner &&
@@ -453,7 +1399,9 @@ test_expect_success 'topics cannot change the convenience wrappers' '
 		write untrusted publish &&
 		git add publish &&
 		git commit -m "change publish wrapper" &&
-		git push origin aa/codex/publish-control
+		git branch -D aa/codex/rebuild-control &&
+		install_meta_state meta master codex &&
+		git push origin meta aa/codex/publish-control
 	) &&
 	(
 		cd wrapper-control-path-runner &&
@@ -468,6 +1416,128 @@ test_expect_success 'topics cannot change the convenience wrappers' '
 		snapshot_refs ../wrapper-control-path.git >after &&
 		test_cmp before after
 	)
+'
+
+test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
+	for direction in upgrade downgrade
+	do
+		fixture="automation-$direction" &&
+		git init --bare "$fixture.git" &&
+		test_create_repo "$fixture-source" &&
+		(
+			cd "$fixture-source" &&
+			git remote add origin "../$fixture.git" &&
+			write base shared &&
+			git add shared &&
+			install_rerere_train &&
+			git commit -m "automation migration base" &&
+			git switch -c aa/codex/automation master &&
+			mkdir -p .github/workflows &&
+			if test "$direction" = upgrade
+			then
+				write_automation_workflow \
+					.github/workflows/codex.yml
+			else
+				write_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+			fi &&
+			git add .github/workflows/codex.yml &&
+			git commit -m "published automation" &&
+			git branch codex &&
+			git branch meta master &&
+			install_meta_state meta master codex &&
+			if test "$direction" = upgrade
+			then
+				write_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+			else
+				write_automation_workflow \
+					.github/workflows/codex.yml
+			fi &&
+			git add .github/workflows/codex.yml &&
+			git commit -m "change automation generation" &&
+			git push origin master meta codex aa/codex/automation
+		) &&
+		git clone "$fixture.git" "$fixture-runner" &&
+		(
+			cd "$fixture-runner" &&
+			fetch_all &&
+			if test "$direction" = upgrade
+			then
+				sh "$codex_branch" rewrite --remote origin \
+					--base master --codex codex \
+					--result result --updates updates \
+					--inputs inputs --failure failure \
+					--require-automation &&
+				git show "$(cat result):.github/workflows/codex.yml" \
+					>candidate-workflow &&
+				test_grep "  merge_group:" candidate-workflow
+			else
+				test_expect_code 1 \
+					sh "$codex_branch" rewrite --remote origin \
+						--base master --codex codex \
+						--result result --updates updates \
+						--inputs inputs --failure failure \
+						--require-automation \
+						>rewrite.out 2>rewrite.err &&
+				test_grep "downgrades the canonical Codex admission workflow" \
+					rewrite.err
+			fi
+		) || return 1
+	done
+'
+
+test_expect_success 'published release provenance gates cannot be removed' '
+	for change in publication version
+	do
+		fixture="release-guard-$change" &&
+		git init --bare "$fixture.git" &&
+		test_create_repo "$fixture-source" &&
+		(
+			cd "$fixture-source" &&
+			git remote add origin "../$fixture.git" &&
+			write base shared &&
+			git add shared &&
+			install_rerere_train &&
+			git commit -m "release guard base" &&
+			git switch -c aa/codex/release master &&
+			mkdir -p .github/workflows &&
+			write_guarded_release_workflow \
+				.github/workflows/codex-release.yml &&
+			git add .github/workflows/codex-release.yml &&
+			git commit -m "publish guarded release workflow" &&
+			git branch codex &&
+			git branch meta master &&
+			install_meta_state meta master codex &&
+			if test "$change" = publication
+			then
+				write_release_workflow codex \
+					.github/workflows/codex-release.yml
+			else
+				sed "/needs.publication.outputs.published/d" \
+					.github/workflows/codex-release.yml \
+					>release-without-gate &&
+				mv release-without-gate \
+					.github/workflows/codex-release.yml
+			fi &&
+			git add .github/workflows/codex-release.yml &&
+			git commit -m "remove controller-only release guard" &&
+			git push origin master meta codex aa/codex/release
+		) &&
+		git clone "$fixture.git" "$fixture-runner" &&
+		(
+			cd "$fixture-runner" &&
+			fetch_all &&
+			test_expect_code 1 \
+				sh "$codex_branch" rewrite --remote origin \
+					--base master --codex codex \
+					--result result --updates updates \
+					--inputs inputs --failure failure \
+					>rewrite.out 2>rewrite.err &&
+			test_grep "controller-only release publication guard" \
+				rewrite.err
+		) || return 1
+	done
 '
 
 test_expect_success 'required automation is the exact isolated trampoline' '
@@ -593,12 +1663,12 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 		git --git-dir=../automation.git update-ref \
 			refs/heads/dd/codex/automation "$good" &&
 		fetch_all &&
-		test_expect_code 1 sh "$codex_branch" rewrite \
+		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result duplicate-result --updates duplicate-updates \
 			--inputs duplicate-inputs --failure duplicate-failure \
 			--require-automation 2>duplicate.err &&
-		test_grep "exactly one active.*automation topic" duplicate.err &&
+		! grep -F "dd/codex/automation" duplicate-updates &&
 		git --git-dir=../automation.git update-ref -d \
 			refs/heads/dd/codex/automation "$good" &&
 
@@ -648,7 +1718,7 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 			wrapper_oid=$(git --git-dir=../automation.git \
 				rev-parse "refs/heads/$wrapper-invalid") &&
 			git --git-dir=../automation.git update-ref \
-				"refs/heads/bb/codex/$wrapper-control" \
+				refs/heads/bb/codex/control \
 				"$wrapper_oid" &&
 			fetch_all &&
 			test_expect_code 1 sh "$codex_branch" rewrite \
@@ -661,7 +1731,7 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 			test_grep "protected controller or CI file" \
 				"$wrapper.err" &&
 			git --git-dir=../automation.git update-ref -d \
-				"refs/heads/bb/codex/$wrapper-control" \
+				refs/heads/bb/codex/control \
 				"$wrapper_oid" || return 1
 		done &&
 
@@ -893,6 +1963,7 @@ test_expect_success 'rewrite keeps canonical integrations when merge.log is enab
 			"${new_a}:refs/heads/aa/codex/a" \
 			"${new_b}:refs/heads/bb/codex/b" \
 			"${new_c}:refs/heads/cc/codex/c" \
+			"${new_meta}:refs/heads/meta" \
 			"${candidate}:refs/heads/codex"
 	) &&
 
@@ -1217,8 +2288,8 @@ test_expect_success 'a topic already in master still produces a valid bundle' '
 		git commit -m base &&
 		git branch codex &&
 		git branch meta &&
-		install_meta_state meta master codex &&
 		git branch aa/codex/done &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/done
 	) &&
 
@@ -1788,7 +2859,6 @@ test_expect_success 'integration conflicts identify the missing dependency' '
 		git commit -m base &&
 		git branch codex &&
 		git branch meta &&
-		install_meta_state meta master codex &&
 
 		git switch -c aa/codex/a &&
 		write A shared &&
@@ -1799,6 +2869,7 @@ test_expect_success 'integration conflicts identify the missing dependency' '
 		write B shared &&
 		git add shared &&
 		git commit -m "integration topic B" &&
+		install_meta_state meta master codex &&
 		git push origin master meta codex aa/codex/a bb/codex/b
 	) &&
 
@@ -2281,13 +3352,13 @@ test_expect_success 'an unexplained commit added directly to codex is rejected' 
 			--base master --codex codex --result result \
 			--updates updates --inputs inputs --failure failure \
 			>out 2>err &&
-		test_grep "not represented by an active" err &&
+		test_grep "normal two-parent merge" err &&
 		snapshot_refs ../direct-codex.git >after &&
 		test_cmp before after
 	)
 '
 
-test_expect_success 'a clean topic merge above recorded codex is accepted' '
+test_expect_success 'a reviewed merge of an existing topic remains supported' '
 	git init --bare merged-codex.git &&
 	test_create_repo merged-codex-source &&
 	(
@@ -2314,12 +3385,12 @@ test_expect_success 'a clean topic merge above recorded codex is accepted' '
 	) &&
 
 	git clone merged-codex.git merged-codex-runner &&
+	install_admission_gh "$TRASH_DIRECTORY/merged-codex-bin" &&
 	(
 		cd merged-codex-runner &&
 		fetch_all &&
-		sh "$codex_branch" rewrite --remote origin \
-			--base master --codex codex --result result \
-			--updates updates --inputs inputs --failure failure &&
+		ADMISSION_TOPIC=aa/codex/topic \
+			admission_rewrite merged-codex success &&
 		candidate=$(cat result) &&
 		test "$(git rev-parse "$candidate^{tree}")" = \
 			"$(git rev-parse origin/codex^{tree})" &&
