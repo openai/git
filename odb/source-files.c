@@ -559,7 +559,7 @@ bool odb_source_files_optimize_required(struct odb_source *source,
 		 * When we'd merge at least two packs with one another we always
 		 * perform the repack.
 		 */
-		if (geometry.split) {
+		if (geometry.split || geometry.promisor_split) {
 			ret = true;
 			goto out;
 		}
