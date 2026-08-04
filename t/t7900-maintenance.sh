@@ -601,6 +601,13 @@ run_and_verify_geometric_pack () {
 	test_must_be_empty orphaned-idx
 }
 
+pack_promisor () {
+	packdir=.git/objects/pack &&
+	pack="$(echo "$@" | git pack-objects --revs "$packdir/pack")" &&
+	touch "$packdir/pack-$pack.promisor" &&
+	echo "$pack"
+}
+
 test_expect_success 'geometric repacking task' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
@@ -674,6 +681,41 @@ test_expect_success 'geometric repacking task' '
 		test_line_count = 2 packs &&
 		ls .git/objects/pack/*.mtimes >cruft &&
 		test_line_count = 1 cruft
+	)
+'
+
+test_expect_success 'geometric repacking task handles promisor packs' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		git config set maintenance.auto false &&
+		git remote add promisor garbage &&
+		git config set remote.promisor.promisor true &&
+
+		for n in $(test_seq 6)
+		do
+			test_commit $n || return 1
+		done &&
+
+		A="$(pack_promisor 1)" &&
+		B="$(pack_promisor 1..2)" &&
+		pack_promisor 2..6 >/dev/null &&
+		git prune-packed &&
+
+		ls .git/objects/pack/*.promisor | sort >promisors.before &&
+		GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
+			git maintenance run --quiet --task=geometric-repack &&
+		ls .git/objects/pack/*.promisor | sort >promisors.after &&
+
+		test_subcommand git repack -d -l -q --geometric=2 \
+			--write-midx <trace2.txt &&
+		test_line_count = 2 promisors.after &&
+
+		printf ".git/objects/pack/pack-%s.promisor\n" "$A" "$B" |
+			sort >expect &&
+		comm -23 promisors.before promisors.after >actual &&
+		test_cmp expect actual
 	)
 '
 
