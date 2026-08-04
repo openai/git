@@ -200,6 +200,7 @@ legacy_control_paths_unchanged () (
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
+		.github/rulesets/codex-meta-linear.json \
 		.github/rulesets/codex-topics.json \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
@@ -218,6 +219,7 @@ meta_control_paths_unchanged () (
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
+		.github/rulesets/codex-meta-linear.json \
 		.github/rulesets/codex-topics.json \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex-branch.sh \
@@ -2376,6 +2378,7 @@ topic_control_paths_unchanged () (
 		.github/CODEX.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
+		.github/rulesets/codex-meta-linear.json \
 		.github/rulesets/codex-topics.json \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \

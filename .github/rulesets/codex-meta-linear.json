@@ -1,0 +1,20 @@
+{
+  "name": "Keep Codex controller history linear",
+  "target": "branch",
+  "source_type": "Repository",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "refs/heads/meta"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "required_linear_history"
+    }
+  ],
+  "bypass_actors": []
+}
