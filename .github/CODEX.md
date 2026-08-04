@@ -60,10 +60,12 @@ the retired topic's commits should be discarded or transferred to a child.
 
 A topic may be the head of a pull request whose base is `codex`. Use a
 same-repository `??/codex/*` head. The topic ruleset keeps these branches after
-their pull requests are merged. Run a refresh before force-rewriting a topic
-whose pull request was merged directly into `codex`: commits above the last
-recorded output must still be reachable from an active topic. A clean merge or
-fast-forward from a retained topic is accepted; squash commits, unrelated
+their pull requests are merged. For ordinary pull-request merges, the `codex`
+ruleset permits only the normal merge method, so each pull request contributes
+a two-parent merge commit. Run a refresh before force-rewriting a topic whose
+pull request was merged directly into `codex`: commits above the last recorded
+output must still be reachable from an active topic. The controller accepts a
+clean merge or fast-forward from a retained topic; squash commits, unrelated
 direct commits, octopus merges, and merge-only edits must first be extracted
 into an active topic.
 
@@ -401,26 +403,37 @@ pusher. Integration subjects remain `Merge <topic> into codex`.
 
 ## Repository rulesets
 
-Create or update the repository rulesets to match the three JSON files. Do not
+Create or update the repository rulesets to match the four JSON files. Do not
 layer a duplicate over an existing matching ruleset: a bypass in the new
-ruleset does not bypass another applicable ruleset. For a missing ruleset, use
-**Settings > Rules > Rulesets > New ruleset > Import a ruleset**.
+ruleset does not bypass another applicable ruleset. The separate linear-history
+ruleset for `meta` is intentional. For a missing ruleset, use **Settings >
+Rules > Rulesets > New ruleset > Import a ruleset**.
 
-In `openai/git`, edit the existing **Protect generated Codex branch** ruleset
-to add the exact-user publisher bypass, keep the existing topic ruleset aligned
-with its recipe, and import only the missing `meta` ruleset. Verify that exactly
-one active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
+In `openai/git`, update the existing **Protect generated Codex branch** and
+**Protect Codex controller branch** rulesets to match their recipes, keep the
+existing topic ruleset aligned with its recipe, and import only the missing
+**Keep Codex controller history linear** ruleset. Verify that exactly one
+policy ruleset covers each of `codex`, `??/codex/*`, and `meta`, plus the
+separate linear-history ruleset on `meta`.
 
 - `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks
   deletion, preserving topic heads after pull-request merges.
 - `.github/rulesets/codex-branch.json` protects `codex` with pull-request,
-  review, deletion, and force-push rules. Its exact `ttaylorr-oai` user bypass
-  permits local publication; the organization-admin entry remains for
-  break-glass access.
+  review, deletion, and force-push rules, and permits only normal merge commits
+  for pull requests. Its exact `ttaylorr-oai` user bypass permits local
+  publication; the organization-admin entry remains for break-glass access.
 - `.github/rulesets/codex-meta.json` protects the `meta` controller with
-  pull-request, review, deletion, and force-push rules. Its matching exact-user
-  bypass lets the same atomic push advance the generated state; the
-  organization-admin entry remains for break-glass access.
+  pull-request, review, deletion, and force-push rules, and permits only rebase
+  merges. Its matching exact-user bypass lets the same atomic push advance the
+  generated state; the organization-admin entry remains for break-glass
+  access.
+- `.github/rulesets/codex-meta-linear.json` rejects merge commits on `meta`.
+  It has no bypass because generated state updates are already linear.
+
+The merge-method restrictions govern ordinary pull-request merges. A listed
+bypass actor can override them. The separate, bypass-free linear-history rule
+still prevents every actor from introducing a merge commit on `meta`; a bypass
+actor could nevertheless choose a linear squash rather than a rebase.
 
 Rulesets cannot require a pull request head to match `??/codex/*`; reviewers
 must enforce that convention. Do not require topic heads to be up to date with

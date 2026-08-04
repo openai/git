@@ -365,10 +365,22 @@ test_expect_success 'refresh only prepares an immutable local-publish artifact' 
 		test 1 = "$(grep -c "301000140" "$rules")" &&
 		test_grep "\"actor_type\": \"User\"" "$rules" &&
 		! grep -F "DeployKey" "$rules" || return 1
-	done
+	done &&
+	branch_rules="$codex_root/.github/rulesets/codex-branch.json" &&
+	test 1 = "$(grep -c "\"merge\"" "$branch_rules")" &&
+	test 0 = "$(grep -c "\"squash\"" "$branch_rules")" &&
+	test 0 = "$(grep -c "\"rebase\"" "$branch_rules")" &&
+	meta_rules="$codex_root/.github/rulesets/codex-meta.json" &&
+	test 0 = "$(grep -c "\"merge\"" "$meta_rules")" &&
+	test 0 = "$(grep -c "\"squash\"" "$meta_rules")" &&
+	test 1 = "$(grep -c "\"rebase\"" "$meta_rules")" &&
+	linear="$codex_root/.github/rulesets/codex-meta-linear.json" &&
+	test_grep "\"type\": \"required_linear_history\"" "$linear" &&
+	test_grep "\"bypass_actors\": \[\]" "$linear" &&
+	! grep -F "actor_type" "$linear"
 '
 
-test_expect_success 'topics cannot change the meta branch ruleset' '
+test_expect_success 'topics cannot change the meta linear-history ruleset' '
 	git init --bare control-path.git &&
 	test_create_repo control-path-source &&
 	(
@@ -382,9 +394,9 @@ test_expect_success 'topics cannot change the meta branch ruleset' '
 
 		git switch -c aa/codex/control-path &&
 		mkdir -p .github/rulesets &&
-		write untrusted .github/rulesets/codex-meta.json &&
-		git add .github/rulesets/codex-meta.json &&
-		git commit -m "change meta branch ruleset" &&
+		write untrusted .github/rulesets/codex-meta-linear.json &&
+		git add .github/rulesets/codex-meta-linear.json &&
+		git commit -m "change meta linear-history ruleset" &&
 
 		git switch master &&
 		write master master-file &&
