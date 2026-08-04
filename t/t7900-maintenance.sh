@@ -774,6 +774,29 @@ test_expect_success 'geometric repacking with --auto' '
 	)
 '
 
+test_expect_success 'geometric repacking with --auto handles promisor packs' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		git config set maintenance.auto false &&
+		git remote add promisor garbage &&
+		git config set remote.promisor.promisor true &&
+
+		for n in $(test_seq 6)
+		do
+			test_commit $n || return 1
+		done &&
+
+		pack_promisor 1 >/dev/null &&
+		pack_promisor 1..2 >/dev/null &&
+		pack_promisor 2..6 >/dev/null &&
+		git prune-packed &&
+
+		test_geometric_repack_needed true auto=9000
+	)
+'
+
 test_expect_success 'geometric repacking honors configured split factor' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
