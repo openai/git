@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex
+      - codex-unstable
 
 permissions:
   contents: read
@@ -16,6 +17,7 @@ jobs:
   publication:
     name: Verify controller publication
     runs-on: ubuntu-24.04
+    if: github.event.deleted == false
     outputs:
       published: ${{ steps.verify.outputs.published }}
     steps:
@@ -26,6 +28,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          case "$GITHUB_REF" in
+          refs/heads/codex)
+            output_key=codex.output-tip
+            ;;
+          refs/heads/codex-unstable)
+            output_key=codex-unstable.output-tip
+            ;;
+          *)
+            printf 'unexpected release ref: %s\n' "$GITHUB_REF" >&2
+            exit 1
+            ;;
+          esac
 
           meta=$(gh api \
             "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
@@ -34,7 +48,7 @@ jobs:
             "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta" \
             -H 'Accept: application/vnd.github.raw+json' |
             git config --no-includes --file /dev/stdin \
-              --get codex.output-tip)
+              --get "$output_key")
 
           if test "$GITHUB_SHA" = "$recorded"
           then
