@@ -307,9 +307,64 @@ jobs:
           grep -Fxq \
             "    if: needs.publication.outputs.published == 'true'" \
             <<<"$release" &&
-          grep -Fq 'git/ref/heads/meta' <<<"$release" &&
-          grep -Fq 'codex.output-tip' <<<"$release" ||
-            die 'published codex has no intact controller-only release guard'
+          grep -Fq 'git/ref/heads/meta' <<<"$release" ||
+            die 'published Codex lane has no intact controller-only release guard'
+          release_trigger=$(awk '
+            $0 == "on:" && !found {
+              found = 1
+              active = 1
+            }
+            active && $0 == "" { exit }
+            active {
+              if (seen && $0 !~ /^[[:space:]]/) exit
+              print
+              seen = 1
+            }
+            END { if (!found) exit 1 }
+          ' <<<"$release") ||
+            die 'published Codex lane has no intact controller-only release guard'
+          stable_trigger=$(printf '%s\n' \
+            'on:' '  push:' '    branches:' '      - codex')
+          dual_trigger=$(printf '%s\n' \
+            'on:' '  push:' '    branches:' '      - codex' \
+            '      - codex-unstable')
+          if test "$release_trigger" = "$stable_trigger" &&
+             grep -Fq -- '--get codex.output-tip)' <<<"$release"
+          then
+            : # Accept the production-only guard during the release migration.
+          elif test "$release_trigger" = "$dual_trigger"
+          then
+            release_ref_case=$(awk '
+              $0 == "          case \"$GITHUB_REF\" in" && !found {
+                found = 1
+                active = 1
+              }
+              active { print }
+              active && $0 == "          esac" { complete = 1; exit }
+              END { if (!found || !complete) exit 1 }
+            ' <<<"$release") ||
+              die 'published Codex lane has no intact controller-only release guard'
+            expected_ref_case=$(printf '%s\n' \
+              '          case "$GITHUB_REF" in' \
+              '          refs/heads/codex)' \
+              '            output_key=codex.output-tip' \
+              '            ;;' \
+              '          refs/heads/codex-unstable)' \
+              '            output_key=codex-unstable.output-tip' \
+              '            ;;' \
+              '          *)' \
+              "            printf 'unexpected release ref: %s\\n' \"\$GITHUB_REF\" >&2" \
+              '            exit 1' \
+              '            ;;' \
+              '          esac')
+            test "$release_ref_case" = "$expected_ref_case" &&
+            grep -Fxq '    if: github.event.deleted == false' \
+              <<<"$release" &&
+            grep -Fq -- '--get "$output_key")' <<<"$release" ||
+              die 'published Codex lane has no intact controller-only release guard'
+          else
+            die 'published Codex lane has no intact controller-only release guard'
+          fi
 
           topics=$(api --paginate \
             "repos/$GITHUB_REPOSITORY/branches?per_page=100" \

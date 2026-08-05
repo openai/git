@@ -178,6 +178,21 @@ write_release_workflow () {
 	EOF
 }
 
+write_dual_release_workflow () {
+	cat >"$1" <<-'EOF'
+	name: Codex Git release
+
+	on:
+	  push:
+	    branches:
+	      - codex
+	      - codex-unstable
+
+	permissions:
+	  contents: read
+	EOF
+}
+
 write_guarded_release_workflow () {
 	write_release_workflow codex "$1" &&
 	cat >>"$1" <<-'EOF'
@@ -189,8 +204,86 @@ write_guarded_release_workflow () {
 	    outputs:
 	      published: ${{ steps.verify.outputs.published }}
 	    steps:
-	      - id: verify
-	        run: echo publication
+	      - name: Check the published controller output
+	        id: verify
+	        shell: bash
+	        env:
+	          GH_TOKEN: ${{ github.token }}
+	        run: |
+	          set -euo pipefail
+
+	          meta=$(gh api \
+	            "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+	            --jq '.object.sha')
+	          recorded=$(gh api \
+	            "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta" \
+	            -H 'Accept: application/vnd.github.raw+json' |
+	            git config --no-includes --file /dev/stdin \
+	              --get codex.output-tip)
+
+	          if test "$GITHUB_SHA" = "$recorded"
+	          then
+	            printf 'published=true\n' >>"$GITHUB_OUTPUT"
+	          else
+	            printf 'published=false\n' >>"$GITHUB_OUTPUT"
+	          fi
+
+	  version:
+	    needs: publication
+	    if: needs.publication.outputs.published == 'true'
+	    runs-on: ubuntu-24.04
+	    steps:
+	      - run: echo version
+	EOF
+}
+
+write_dual_guarded_release_workflow () {
+	write_dual_release_workflow "$1" &&
+	cat >>"$1" <<-'EOF'
+
+	jobs:
+	  publication:
+	    name: Verify controller publication
+	    runs-on: ubuntu-24.04
+	    if: github.event.deleted == false
+	    outputs:
+	      published: ${{ steps.verify.outputs.published }}
+	    steps:
+	      - name: Check the published controller output
+	        id: verify
+	        shell: bash
+	        env:
+	          GH_TOKEN: ${{ github.token }}
+	        run: |
+	          set -euo pipefail
+	          case "$GITHUB_REF" in
+	          refs/heads/codex)
+	            output_key=codex.output-tip
+	            ;;
+	          refs/heads/codex-unstable)
+	            output_key=codex-unstable.output-tip
+	            ;;
+	          *)
+	            printf 'unexpected release ref: %s\n' "$GITHUB_REF" >&2
+	            exit 1
+	            ;;
+	          esac
+
+	          meta=$(gh api \
+	            "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+	            --jq '.object.sha')
+	          recorded=$(gh api \
+	            "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta" \
+	            -H 'Accept: application/vnd.github.raw+json' |
+	            git config --no-includes --file /dev/stdin \
+	              --get "$output_key")
+
+	          if test "$GITHUB_SHA" = "$recorded"
+	          then
+	            printf 'published=true\n' >>"$GITHUB_OUTPUT"
+	          else
+	            printf 'published=false\n' >>"$GITHUB_OUTPUT"
+	          fi
 
 	  version:
 	    needs: publication
@@ -406,14 +499,71 @@ install_admission_gate_gh () {
 	repos/openai/git/contents/.github/workflows/codex-release.yml\?ref=*)
 		if test -n "$raw"
 		then
-			cat <<-'EOF_RELEASE'
-			  publication:
-			    published: ${{ steps.verify.outputs.published }}
-			    needs: publication
-			    if: needs.publication.outputs.published == 'true'
-			    git/ref/heads/meta
-			    codex.output-tip
-			EOF_RELEASE
+			if test "${FAKE_GATE_MODE:-}" = legacy-release
+			then
+				cat <<-'EOF_RELEASE'
+				on:
+				  push:
+				    branches:
+				      - codex
+
+				  publication:
+				    published: ${{ steps.verify.outputs.published }}
+				    needs: publication
+				    if: needs.publication.outputs.published == 'true'
+				    git/ref/heads/meta
+				              --get codex.output-tip)
+				EOF_RELEASE
+			else
+				cat <<-'EOF_RELEASE'
+				on:
+				  push:
+				    branches:
+				      - codex
+				      - codex-unstable
+
+				  publication:
+				    published: ${{ steps.verify.outputs.published }}
+				    needs: publication
+				    if: needs.publication.outputs.published == 'true'
+				    git/ref/heads/meta
+				EOF_RELEASE
+				if test "${FAKE_GATE_MODE:-}" = dual-release-legacy-guard
+				then
+					printf '%s\n' \
+						'              --get codex.output-tip)'
+				else
+					if test "${FAKE_GATE_MODE:-}" != dual-release-no-delete
+					then
+						printf '%s\n' \
+							'    if: github.event.deleted == false'
+					fi
+					cat <<-'EOF_RELEASE'
+				          case "$GITHUB_REF" in
+				          refs/heads/codex)
+				            output_key=codex.output-tip
+				            ;;
+				          refs/heads/codex-unstable)
+				EOF_RELEASE
+					if test "${FAKE_GATE_MODE:-}" = dual-release-wrong-key
+					then
+						printf '%s\n' \
+							'            output_key=codex.output-tip'
+					else
+						printf '%s\n' \
+							'            output_key=codex-unstable.output-tip'
+					fi
+					cat <<-'EOF_RELEASE'
+				            ;;
+				          *)
+				            printf 'unexpected release ref: %s\n' "$GITHUB_REF" >&2
+				            exit 1
+				            ;;
+				          esac
+				              --get "$output_key")
+				EOF_RELEASE
+				fi
+			fi
 		else
 			printf '%s\n' trusted-release
 		fi
@@ -559,6 +709,51 @@ run_admission_gate () {
 		FAKE_GATE_SHARED="$shared" FAKE_GATE_FIRST="$first" \
 		FAKE_GATE_MERGE="$merge" FAKE_GATE_BRANCH="$branch" \
 		bash "$TRASH_DIRECTORY/admission-gate.sh"
+}
+
+install_release_gate_gh () {
+	directory=$1 &&
+	mkdir -p "$directory" &&
+	cat >"$directory/gh" <<-'EOF' &&
+	#!/bin/sh
+
+	set -eu
+	test "$1" = api
+	endpoint=$2
+	case "$endpoint" in
+	repos/openai/git/git/ref/heads/meta)
+		test "${FAKE_RELEASE_MODE:-}" != api-failure
+		printf '%s\n' meta-oid
+		;;
+	repos/openai/git/contents/codex.config\?ref=*)
+		printf '[codex]\n\toutput-tip = %s\n' "$FAKE_RELEASE_STABLE"
+		if test "${FAKE_RELEASE_MODE:-}" != missing-unstable
+		then
+			printf '[codex-unstable]\n\toutput-tip = %s\n' \
+				"$FAKE_RELEASE_UNSTABLE"
+		fi
+		;;
+	*) exit 2 ;;
+	esac
+	EOF
+	chmod +x "$directory/gh"
+}
+
+run_release_gate () {
+	mode=$1 &&
+	ref=$2 &&
+	sha=$3 &&
+	output=$4 &&
+	: >"$output" &&
+	env PATH="$TRASH_DIRECTORY/release-gate-bin:$PATH" \
+		FAKE_RELEASE_MODE="$mode" \
+		FAKE_RELEASE_STABLE=stable-oid \
+		FAKE_RELEASE_UNSTABLE=unstable-oid \
+		GITHUB_OUTPUT="$output" \
+		GITHUB_REF="$ref" \
+		GITHUB_REPOSITORY=openai/git \
+		GITHUB_SHA="$sha" \
+		bash "$TRASH_DIRECTORY/release-gate.sh"
 }
 
 setup_pending_admission () (
@@ -1131,6 +1326,9 @@ test_expect_success 'reviewed admission requires one app-authenticated queue ent
 	test_grep "pull_request)" "$codex_admission_workflow" &&
 	test_grep "merge_group)" "$codex_admission_workflow" &&
 	test_grep "codex.output-tip" "$codex_admission_workflow" &&
+	test_grep "codex-unstable.output-tip" "$codex_admission_workflow" &&
+	test_grep "case \\\"\\\$GITHUB_REF\\\" in" \
+		"$codex_admission_workflow" &&
 	test_grep "refs/heads/gh-readonly-queue/" \
 		"$codex_admission_workflow" &&
 	test_grep "pull-requests: read" "$codex_admission_workflow" &&
@@ -1165,7 +1363,16 @@ test_expect_success 'reviewed admission requires one app-authenticated queue ent
 		test_grep "    needs: publication" "$CODEX_RELEASE_TOPIC" &&
 		test_grep "codex.output-tip" "$CODEX_RELEASE_TOPIC" &&
 		! grep -F "git/ref/heads/codex" "$CODEX_RELEASE_TOPIC" &&
-		test_grep "git/ref/heads/meta" "$CODEX_RELEASE_TOPIC"
+		test_grep "git/ref/heads/meta" "$CODEX_RELEASE_TOPIC" &&
+		if grep -F "codex-unstable" "$CODEX_RELEASE_TOPIC" >/dev/null
+		then
+			test_grep "codex-unstable.output-tip" \
+				"$CODEX_RELEASE_TOPIC" &&
+			test_grep "case \\\"\\\$GITHUB_REF\\\" in" \
+				"$CODEX_RELEASE_TOPIC" &&
+			test_grep "github.event.deleted == false" \
+				"$CODEX_RELEASE_TOPIC"
+		fi
 	fi
 '
 
@@ -1178,6 +1385,8 @@ test_expect_success 'admission workflow executes both pull-request and queue che
 	bash -n "$TRASH_DIRECTORY/admission-gate.sh" &&
 	run_admission_gate success pull_request >pull.out &&
 	test_grep "Approved pull request #42" pull.out &&
+	run_admission_gate legacy-release pull_request >legacy-release.out &&
+	test_grep "Approved pull request #42" legacy-release.out &&
 	run_admission_gate pending pull_request >pending-pull.out &&
 	test_grep "Approved pull request #42" pending-pull.out &&
 	run_admission_gate success merge_group >queue.out &&
@@ -1195,11 +1404,57 @@ test_expect_success 'admission workflow executes both pull-request and queue che
 	done &&
 	test_grep "pending topic" queue-pending.err &&
 	test_grep "unenrolled history" queue-hidden-prerequisite.err &&
+	for mode in dual-release-legacy-guard dual-release-no-delete \
+		dual-release-wrong-key
+	do
+		test_expect_code 1 run_admission_gate "$mode" merge_group \
+			>"$mode.out" 2>"$mode.err" &&
+		test_grep "controller-only release guard" "$mode.err" || return 1
+	done &&
 	test_expect_code 1 \
 		run_admission_gate success pull_request \
 			bb/codex/reviewed-unstable \
 		>unstable-pull.out 2>unstable-pull.err &&
 	test_grep "not eligible for production codex" unstable-pull.err
+'
+
+test_expect_success 'dual-lane release gate selects only the exact published output' '
+	write_dual_guarded_release_workflow \
+		"$TRASH_DIRECTORY/codex-release.yml" &&
+	test_grep "github.event.deleted == false" \
+		"$TRASH_DIRECTORY/codex-release.yml" &&
+	printf "%s\n" "on:" "  push:" "    branches:" "      - codex" \
+		"      - codex-unstable" "" >release-trigger.expect &&
+	sed -n "/^on:$/,/^$/p" "$TRASH_DIRECTORY/codex-release.yml" \
+		>release-trigger.actual &&
+	test_cmp release-trigger.expect release-trigger.actual &&
+	sed -n "/^        run: |\$/,/^  version:/p" \
+		"$TRASH_DIRECTORY/codex-release.yml" |
+	sed "1d; \$d; s/^          //" \
+		>"$TRASH_DIRECTORY/release-gate.sh" &&
+	bash -n "$TRASH_DIRECTORY/release-gate.sh" &&
+	install_release_gate_gh "$TRASH_DIRECTORY/release-gate-bin" &&
+
+	run_release_gate success refs/heads/codex stable-oid stable.out &&
+	printf "published=true\n" >published.expect &&
+	test_cmp published.expect stable.out &&
+	run_release_gate success refs/heads/codex-unstable unstable-oid \
+		unstable.out &&
+	test_cmp published.expect unstable.out &&
+	run_release_gate success refs/heads/codex pending-oid pending.out &&
+	printf "published=false\n" >unpublished.expect &&
+	test_cmp unpublished.expect pending.out &&
+	run_release_gate success refs/heads/codex unstable-oid cross-lane.out &&
+	test_cmp unpublished.expect cross-lane.out &&
+	test_expect_code 1 run_release_gate success refs/heads/master \
+		stable-oid unknown.out &&
+	test_must_be_empty unknown.out &&
+	test_expect_code 1 run_release_gate missing-unstable \
+		refs/heads/codex-unstable unstable-oid missing.out &&
+	test_must_be_empty missing.out &&
+	test_expect_code 1 run_release_gate api-failure refs/heads/codex \
+		stable-oid api.out &&
+	test_must_be_empty api.out
 '
 
 test_expect_success 'an unmerged topic is invisible to an enrolled rebuild' '
@@ -1887,6 +2142,198 @@ test_expect_success 'published release provenance gates cannot be removed' '
 	done
 '
 
+test_expect_success 'release publication guard has one exact dual-lane upgrade' '
+	git init --bare release-upgrade.git &&
+	test_create_repo release-upgrade-source &&
+	(
+		cd release-upgrade-source &&
+		git remote add origin ../release-upgrade.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "release upgrade base" &&
+		git switch -c aa/codex/release master &&
+		mkdir -p .github/workflows &&
+		write_guarded_release_workflow \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "publish stable release guard" &&
+		legacy=$(git rev-parse HEAD) &&
+		git branch codex &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+
+		git switch -c dual-valid "$legacy" &&
+		write_dual_guarded_release_workflow \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "publish dual release guard" &&
+
+		git switch -c dual-old-guard "$legacy" &&
+		awk '\''
+			{ print }
+			$0 == "      - codex" { print "      - codex-unstable" }
+		'\'' .github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "trigger preview with stable guard" &&
+
+		git switch -c dual-no-delete dual-valid &&
+		sed "/github.event.deleted == false/d" \
+			.github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "release deleted preview refs" &&
+
+		git switch -c dual-wrong-key dual-valid &&
+		sed \
+			"s/output_key=codex-unstable.output-tip/output_key=codex.output-tip/" \
+			.github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "read stable state for preview releases" &&
+
+		git push origin master meta codex codex-unstable \
+			dual-valid:aa/codex/release \
+			dual-valid dual-old-guard dual-no-delete dual-wrong-key
+	) &&
+	git clone release-upgrade.git release-upgrade-runner &&
+	(
+		cd release-upgrade-runner &&
+		fetch_all &&
+		snapshot_refs ../release-upgrade.git >before &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates \
+			--inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		write_dual_guarded_release_workflow expected-release.yml &&
+		git show "$candidate:.github/workflows/codex-release.yml" \
+			>actual-release.yml &&
+		test_cmp expected-release.yml actual-release.yml &&
+		stable_release=$(git rev-parse \
+			"$candidate:.github/workflows/codex-release.yml") &&
+		unstable_release=$(git rev-parse \
+			"$unstable:.github/workflows/codex-release.yml") &&
+		test "$stable_release" = "$unstable_release" &&
+		snapshot_refs ../release-upgrade.git >after &&
+		test_cmp before after &&
+		for variant in dual-old-guard dual-no-delete dual-wrong-key
+		do
+			oid=$(git rev-parse "origin/$variant") &&
+			git --git-dir=../release-upgrade.git update-ref \
+				refs/heads/aa/codex/release "$oid" &&
+			fetch_all &&
+			snapshot_refs ../release-upgrade.git >"$variant.before" &&
+			test_expect_code 1 sh "$codex_branch" rewrite \
+				--remote origin --base master --codex codex \
+				--result "$variant.result" \
+				--updates "$variant.updates" \
+				--inputs "$variant.inputs" \
+				--failure "$variant.failure" \
+				>"$variant.out" 2>"$variant.err" &&
+			test_grep "controller-only release publication guard" \
+				"$variant.err" &&
+			test_path_is_missing "$variant.result" &&
+			snapshot_refs ../release-upgrade.git >"$variant.after" &&
+			test_cmp "$variant.before" "$variant.after" || return 1
+		done
+	)
+'
+
+test_expect_success 'published dual-lane release guard cannot be changed' '
+	git init --bare release-downgrade.git &&
+	test_create_repo release-downgrade-source &&
+	(
+		cd release-downgrade-source &&
+		git remote add origin ../release-downgrade.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "release downgrade base" &&
+		git switch -c aa/codex/release master &&
+		mkdir -p .github/workflows &&
+		write_dual_guarded_release_workflow \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "publish dual release guard" &&
+		dual=$(git rev-parse HEAD) &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+
+		git switch -c post-dual-no-delete "$dual" &&
+		sed "/github.event.deleted == false/d" \
+			.github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "remove deleted-ref guard" &&
+
+		git switch -c post-dual-wrong-key "$dual" &&
+		sed \
+			"s/output_key=codex-unstable.output-tip/output_key=codex.output-tip/" \
+			.github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "read stable state for preview releases" &&
+
+		git switch -c post-dual-extra-trigger "$dual" &&
+		awk '\''
+			{ print }
+			$0 == "      - codex-unstable" { print "      - master" }
+		'\'' .github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "release from an extra branch" &&
+
+		git switch aa/codex/release &&
+		write_guarded_release_workflow \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "restore production-only release guard" &&
+		git push origin master meta codex aa/codex/release \
+			post-dual-no-delete post-dual-wrong-key \
+			post-dual-extra-trigger
+	) &&
+	git clone release-downgrade.git release-downgrade-runner &&
+	(
+		cd release-downgrade-runner &&
+		fetch_all &&
+		snapshot_refs ../release-downgrade.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates \
+			--inputs inputs --failure failure >out 2>err &&
+		test_grep "controller-only release publication guard" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../release-downgrade.git >after &&
+		test_cmp before after &&
+		for variant in post-dual-no-delete post-dual-wrong-key \
+			post-dual-extra-trigger
+		do
+			oid=$(git rev-parse "origin/$variant") &&
+			git --git-dir=../release-downgrade.git update-ref \
+				refs/heads/aa/codex/release "$oid" &&
+			fetch_all &&
+			snapshot_refs ../release-downgrade.git >"$variant.before" &&
+			test_expect_code 1 sh "$codex_branch" rewrite \
+				--remote origin --base master --codex codex \
+				--result "$variant.result" \
+				--updates "$variant.updates" \
+				--inputs "$variant.inputs" \
+				--failure "$variant.failure" \
+				>"$variant.out" 2>"$variant.err" &&
+			test_grep "controller-only release publication guard" \
+				"$variant.err" &&
+			test_path_is_missing "$variant.result" &&
+			snapshot_refs ../release-downgrade.git >"$variant.after" &&
+			test_cmp "$variant.before" "$variant.after" || return 1
+		done
+	)
+'
+
 test_expect_success 'required automation is the exact isolated trampoline' '
 	git init --bare automation.git &&
 	test_create_repo automation-source &&
@@ -2092,7 +2539,7 @@ test_expect_success 'required automation is the exact isolated trampoline' '
 			--result release-result --updates release-updates \
 			--inputs release-inputs --failure release-failure \
 			--require-automation 2>release.err &&
-		test_grep "release workflow must run only for pushes to codex" \
+		test_grep "reviewed Codex branch triggers" \
 			release.err &&
 		git --git-dir=../automation.git update-ref -d \
 			refs/heads/bb/codex/control "$release" &&
@@ -6495,7 +6942,7 @@ test_expect_success 'stable DAG topics cannot hide workflow changes behind a sec
 	)
 '
 
-test_expect_success 'unstable topics cannot redirect or delete the production release workflow' '
+test_expect_success 'unstable topics cannot redirect or delete the shared release workflow' '
 	git init --bare unstable-release.git &&
 	test_create_repo unstable-release-source &&
 	(
@@ -6503,7 +6950,7 @@ test_expect_success 'unstable topics cannot redirect or delete the production re
 		git remote add origin ../unstable-release.git &&
 		write base shared &&
 		mkdir -p .github/workflows &&
-		write_release_workflow codex .github/workflows/codex-release.yml &&
+		write_dual_release_workflow .github/workflows/codex-release.yml &&
 		git add shared .github/workflows/codex-release.yml &&
 		install_rerere_train &&
 		git commit -m base &&
@@ -6513,13 +6960,13 @@ test_expect_success 'unstable topics cannot redirect or delete the production re
 		write_release_workflow codex-unstable \
 			.github/workflows/codex-release.yml &&
 		git add .github/workflows/codex-release.yml &&
-		git commit -m "release untrusted preview builds" &&
+		git commit -m "redirect preview releases" &&
 		git branch codex-unstable &&
 		git branch meta master &&
 		install_unstable_meta_state meta master codex codex-unstable &&
 		git switch -c release-deleted codex &&
 		git rm .github/workflows/codex-release.yml &&
-		git commit -m "delete production release workflow" &&
+		git commit -m "delete shared release workflow" &&
 		git push origin master meta codex codex-unstable \
 			aa/codex/stable bb/codex/release-unstable release-deleted
 	) &&

@@ -2,8 +2,9 @@
 
 `master` stays equivalent to upstream. `codex` is the production integration
 branch distributed with Codex. When enabled, `codex-unstable` starts at that
-exact production commit and adds reviewed preview topics; it never publishes a
-production release. The orphan `meta` branch contains the controller, reusable
+exact production commit and adds reviewed preview topics. Each lane may publish
+an OpenAI Git prerelease, but only from the exact output recorded for that lane
+by the controller. The orphan `meta` branch contains the controller, reusable
 workflows, tests, documentation, and ruleset recipes. Never merge `meta` into
 `master`, `codex`, or `codex-unstable`.
 
@@ -85,6 +86,9 @@ exactly the same contents.
 Enabling and disabling are explicit, local-only operations; dispatching the
 ordinary GitHub Action cannot change whether the lane exists. Once enabled,
 both `Meta/rebuild` and `Meta/rebuild --local` maintain the preview lane.
+When the dual-lane release workflow is active, enabling the lane publishes a
+preview prerelease for the empty sentinel. Its tree matches production, but its
+commit and version are distinct. Deleting the lane publishes nothing.
 
 ## Add a preview topic
 
@@ -109,6 +113,10 @@ queue. Production and preview admission are tracked independently; a single
 controller run can consume one pending merge from each lane. An unreviewed
 preview branch, including a whole preexisting stack of matching branches,
 remains excluded until its own pull request is merged.
+
+The pending preview merge also fails the release-publication check. Its build
+matrix starts only after the controller records and atomically publishes that
+exact `codex-unstable` output.
 
 Production topics may never depend on preview topics. Root preview topics are
 based on `codex`; their prerequisites, when present, must be other enrolled
@@ -417,16 +425,19 @@ revalidates the snapshot and atomically updates `meta`, every enrolled topic,
 deleting both staging refs. A failed preview build cannot publish production;
 a failed production build cannot publish preview.
 
-Every push to `codex` starts the inexpensive release-publication check. The
-expensive build and release jobs proceed only when the triggering SHA is the
-output recorded on the current `meta` branch. A reviewed pull-request merge
-therefore publishes no release; the controller's atomic `codex`/`meta`
-promotion does. The check does not require that SHA to remain the live
-`codex` tip, so a later pending merge cannot suppress a release that the
-controller already triggered. A canonical no-op reuses the existing tips, and
-staging never releases. `codex-unstable` also never releases: the release
-workflow listens only for pushes to `codex`. Ordinary CI may reuse its own
-earlier successful result when the commit or tree is identical.
+Every push to `codex` or `codex-unstable` starts the inexpensive
+release-publication check. The job skips branch-deletion events, maps the exact
+event ref to either `codex.output-tip` or `codex-unstable.output-tip`, and reads
+that value from the current `meta` branch. The expensive build and release jobs
+proceed only when the triggering SHA matches the selected lane's recorded
+output. A reviewed pull-request merge therefore publishes no release; the
+controller's atomic output/state promotion does. The check does not require
+that SHA to remain the live lane tip, so a later pending merge cannot suppress
+a release that the controller already triggered. A canonical no-op reuses the
+existing tips, and neither staging branch releases. An atomic promotion that
+advances both outputs intentionally starts one release matrix per lane.
+Ordinary CI may reuse its own earlier successful result when the commit or tree
+is identical.
 
 Until the final push, `meta`, both generated outputs, and all topic refs remain
 unchanged. A CI, validation, lease, or promotion failure after staging leaves
@@ -565,10 +576,21 @@ admission trampoline. A directly merged topic pull request may change neither
 that trampoline nor `.github/workflows/codex-release.yml`; otherwise it could
 bypass the release guard before the controller runs. Update the enrolled
 automation and release topics through a normal controller rebuild instead.
-The release trigger remains exactly a push to `codex`, and its workflow may
-not mention an environment or the `secrets` context. These checks are not a
-sandbox for untrusted build code: review the release topic and its reusable
-workflows. The controller rejects other topic-controlled workflow changes.
+During migration, the reviewed release trigger may remain exactly `codex`.
+After the canonical topic upgrade, it contains exactly `codex` and
+`codex-unstable`, skips deletion events, and selects the recorded output from
+the exact event ref. Its workflow may not mention an environment or the
+`secrets` context. The controller permits the existing production-only
+publication job to make that one exact upgrade; afterward it again preserves
+the published job byte for byte. These checks are not a sandbox for untrusted
+build code: review the release topic, its reusable workflows, and the preview
+source it builds. The controller rejects other topic-controlled workflow
+changes.
+
+Once the dual-lane guard is published, the controller deliberately rejects a
+return to the production-only trigger. Disabling an empty preview lane stops
+future preview releases and its branch-deletion event publishes nothing, but
+changing the release trigger again requires a controller change first.
 
 Rebased topic commits preserve their original authors. Generated commits and
 rebase committers use
@@ -623,14 +645,26 @@ Deploy these changes in order:
 
 1. Merge the controller, lane-aware trusted admission workflow, and ruleset
    recipe into `meta` without creating a merge commit there.
-2. Update the already-enrolled automation topic, then run
+2. Verify that the already-enrolled automation topic contains the canonical
+   two-lane trampoline, and update the release topic. The release workflow must
+   add the exact `codex-unstable` trigger, skip deleted refs, and map
+   `refs/heads/codex` and `refs/heads/codex-unstable` to their respective
+   recorded output keys.
+3. Run
    `Meta/rebuild --local` once to publish the exact two-lane trampoline while
-   preserving the production release guard and stable merge-queue settings.
-3. Update the existing **Protect generated unstable Codex branch** ruleset
+   upgrading the release guard and preserving stable merge-queue settings.
+4. Update the existing **Protect generated unstable Codex branch** ruleset
    from its recipe, including its separate required check and serial queue.
-4. Run `Meta/rebuild --local --enable-unstable` to create the protected,
-   strictly-ahead preview target without enrolling any preexisting topic.
-5. Open reviewed `*-unstable` pull requests against `codex-unstable`, merge
+5. If `codex.config` is still version 1 and `codex-unstable` does not exist,
+   run `Meta/rebuild --local --enable-unstable` to create the protected,
+   strictly-ahead preview target without enrolling any preexisting topic. If
+   version 2 state and the preview branch already exist, skip this step and use
+   the ordinary rebuild from step 3; `--enable-unstable` must not be repeated.
+6. Open reviewed `*-unstable` pull requests against `codex-unstable`, merge
    them through its queue, and run the controller to publish each generation.
 
-Do not merge a preview pull request until all four setup steps are complete.
+Before handing a preview release to a consumer, verify that the production and
+preview release checks each selected their lane-specific SHA from the promoted
+`codex.config`, and that each prerelease targets that exact commit. Do not merge
+a preview pull request until the controller and topic updates, rebuild,
+ruleset update, and any required lane creation are complete.
