@@ -1,21 +1,26 @@
-# Maintaining `codex`
+# Maintaining `codex` and `codex-unstable`
 
-`master` stays equivalent to upstream. The orphan `meta` branch contains the
-controller, reusable workflows, tests, documentation, and ruleset recipes.
-Never merge `meta` into `master` or `codex`.
+`master` stays equivalent to upstream. `codex` is the production integration
+branch distributed with Codex. When enabled, `codex-unstable` starts at that
+exact production commit and adds reviewed preview topics; it never publishes a
+production release. The orphan `meta` branch contains the controller, reusable
+workflows, tests, documentation, and ruleset recipes. Never merge `meta` into
+`master`, `codex`, or `codex-unstable`.
 
 Topics use branches named `??/codex/*`, where `??` is a two-character owner
-name. The existing rows in `meta:codex.config` stay enrolled. After this
-migration, a new branch becomes an active input only after its reviewed pull
-request has merged into `codex` and the controller has enrolled it there.
-Merely pushing a matching branch never includes it in a build. The `-wip`,
-`-stale`, and reserved `-unstable` suffixes cannot enter the production
-branch.
+name. A topic ending in `-unstable` belongs only in `codex-unstable`; other
+active topics belong in `codex`. The existing rows in `meta:codex.config` stay
+enrolled. A new topic enters either lane only after its reviewed pull request
+merges into that lane and the controller enrolls its retained head. Merely
+pushing a matching branch, including an `-unstable` branch, never includes it
+in a build. The `-wip` and `-stale` suffixes are inactive.
 
 The generated `codex.config` records each enrolled topic's prerequisite and
-last published tip. Those prerequisite edges form a partial order; there is
-no global topic order. Rows are sorted only so the generated file has a
-stable representation.
+last published tip. When the preview lane is enabled, it also records the exact
+production commit underlying `codex-unstable` and its published preview tip.
+Prerequisite edges form a partial order within each lane; there is no global
+topic order. Rows are sorted only to give the generated file a stable
+representation.
 
 The saved tips are rebase boundaries, not another copy of the patches. They
 let a fresh runner distinguish “the prerequisite was rewritten” from “these
@@ -24,15 +29,16 @@ is what makes amending, dropping, or replacing an already-published commit
 safe without relying on a runner's local reflogs.
 
 The generated `codex` history contains one explicit two-parent integration
-commit for every active topic, including prerequisites, fast-forwardable
-topics, and empty topics. Prerequisites are integrated before their dependents;
-lexical order only breaks ties among topics that are ready at the same time.
-This order makes the history deterministic but does not add semantic edges to
-the topic graph. When the first topic is empty because its tip equals the base,
-the controller first creates a tree-identical `Begin codex integration` commit
-so that topic can still have two distinct parents.
+commit for every production topic, including prerequisites, fast-forwardable
+topics, and empty topics. `codex-unstable` starts at the exact generated
+`codex` commit and adds one explicit integration merge per enrolled preview
+topic. It remains strictly ahead even before its first topic because enabling
+it creates a tree-identical bootstrap commit. Prerequisites are integrated
+before their dependents; lexical order only breaks ties among topics that are
+ready at the same time. This makes the history deterministic without inventing
+semantic dependencies.
 
-## Topic branches and pull requests
+## Add a production topic
 
 Create a topic from `master`, or from the topic it depends on:
 
@@ -58,43 +64,111 @@ skipped, and another topic cannot pass the merge queue until the controller
 atomically publishes the rebuilt `codex` and its matching `meta` state. The
 pending commit remains visible to anyone fetching `codex` directly.
 
+## Enable the preview lane
+
+After deploying the updated controller, automation trampoline, and unstable
+branch ruleset, initialize `codex-unstable` explicitly:
+
+```sh
+Meta/rebuild --local --enable-unstable
+```
+
+The controller creates a tree-identical `Initialize codex-unstable` commit
+directly on top of `codex`, records the enabled lane in `meta:codex.config`,
+and publishes both changes together. The production tip does not change, and
+no existing `*-unstable` branch is enrolled. The preview branch now exists as
+a pull-request target, is strictly ahead of production, and initially has
+exactly the same contents.
+
+Enabling and disabling are explicit, local-only operations; dispatching the
+ordinary GitHub Action cannot change whether the lane exists. Once enabled,
+both `Meta/rebuild` and `Meta/rebuild --local` maintain the preview lane.
+
+## Add a preview topic
+
+Create the topic from the published `codex`, or from another enrolled preview
+topic it depends on:
+
+```sh
+git switch -c tb/codex/my-topic-unstable origin/codex
+# Edit, test, and commit.
+git push -u origin HEAD
+```
+
+Pushing this branch does not change `codex-unstable`. Open a pull request from
+the topic to `codex-unstable`, obtain the required approval, and select
+**Merge when ready**. Its separate one-at-a-time merge queue accepts only a
+same-repository `??/codex/*-unstable` topic. Run `Meta/rebuild` or
+`Meta/rebuild --local` to authenticate the reviewed merge, enroll the exact
+topic head, run staging CI, and publish the rebuilt generation.
+
+While a preview merge is pending, another preview topic cannot pass its merge
+queue. Production and preview admission are tracked independently; a single
+controller run can consume one pending merge from each lane. An unreviewed
+preview branch, including a whole preexisting stack of matching branches,
+remains excluded until its own pull request is merged.
+
+Production topics may never depend on preview topics. Root preview topics are
+based on `codex`; their prerequisites, when present, must be other enrolled
+preview topics. Update, rebase, replace, or reorder a preview topic using the
+same ancestry rules as a production topic, substituting `codex` for `master`.
+Before retiring a preview prerequisite, restack its children onto a surviving
+preview topic or `codex`.
+
+When the lane is no longer needed, first retire every enrolled preview topic,
+then explicitly remove the generated branch and its recorded state:
+
+```sh
+Meta/rebuild --local --disable-unstable
+```
+
+Topic-branch deletion still requires an authorized bypass of the topic ruleset.
+Creating a separate inactive copy without removing the enrolled ref does not
+retire that topic.
+
+## Update, reorder, or remove a topic
+
 Already enrolled topics remain active across rebuilds. You may push an update
 and run the controller directly, or use another reviewed topic pull request
 before rebuilding.
 
 Keep topic history linear. Rebase a dependent topic onto its prerequisite;
-never merge `codex` into a topic or use GitHub's **Update branch** button on
-these pull requests.
+never merge either generated branch into a topic or use GitHub's **Update
+branch** button on these pull requests.
 
-For a new topic, the controller infers one prerequisite: its nearest active
-topic-tip ancestor, or `master` for a root topic. After publication it keeps
-that recorded edge across prerequisite rewrites. If sibling topics share
-private commits, create an active topic at that shared prefix and base both
-siblings on it. Otherwise the controller rejects the ambiguous overlap.
+For a new topic, the controller infers one prerequisite: its nearest enrolled
+same-lane topic-tip ancestor, or that lane's root. The production root is
+`master`; the preview root is the exact generated `codex`. After publication
+it keeps that recorded edge across prerequisite rewrites. If sibling topics
+share private commits, create an enrolled topic at that shared prefix and base
+both siblings on it. Otherwise the controller rejects the ambiguous overlap.
 
 You may append, amend, reorder, or drop commits on an existing topic. If it
 has dependents, you may leave them at the last published prerequisite tip; the
 controller uses the recorded boundary to restack them. To change a topic's
 prerequisite, rebase it so the new topic's exact current tip is in its history.
-To make it a root topic, rebase it onto current `master` and remove the old
-private prerequisite from its history. Those exact ancestry changes are the
-reordering signal; patch similarity and lexical branch order are never used.
+To make it a root topic, rebase it onto the current `master` or `codex`, as
+appropriate, and remove the old private prerequisite from its history. Those
+exact ancestry changes are the reordering signal; patch similarity and
+lexical branch order are never used.
 
 Before making a prerequisite inactive, first restack every child onto a
-surviving topic or current `master`. The controller refuses to guess whether
-the retired topic's commits should be discarded or transferred to a child.
+surviving topic in the same lane or that lane's root. The controller refuses
+to guess whether the retired topic's commits should be discarded or
+transferred to a child.
 Deleting or renaming an enrolled active ref explicitly retires it on the next
 rebuild; because topic refs are protected against deletion, this requires an
 authorized ruleset bypass. Creating a separate `-stale` copy without removing
 the enrolled active ref does not retire it.
 
-Every admission pull request must have a same-repository `??/codex/*` head
-and target `codex`. The topic ruleset retains that head after the merge. Do
+Every admission pull request must have a same-repository `??/codex/*` head and
+target the matching lane: ordinary topics go to `codex`; `-unstable` topics go
+to `codex-unstable`. The topic ruleset retains that head after the merge. Do
 not delete, force-rewrite, or otherwise change the reviewed head before the
-controller rebuilds it. The controller rejects squash commits, unrelated
-direct commits, multiple pending merges, octopus merges, and merge-only edits.
+controller rebuilds it. Each lane rejects squash commits, unrelated direct
+commits, multiple pending merges, octopus merges, and merge-only edits.
 
-## Keep the dispatch and admission workflows on `codex`
+## Keep dispatch and admission on the generated branches
 
 GitHub shows **Run workflow** only for a workflow present on the default
 branch. Exactly one active `??/codex/automation` topic must therefore be based
@@ -109,6 +183,7 @@ on:
   pull_request:
     branches:
       - codex
+      - codex-unstable
     types:
       - opened
       - reopened
@@ -129,20 +204,35 @@ jobs:
     uses: openai/git/.github/workflows/codex.yml@meta
   admission:
     name: Codex admission
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.base.ref == 'codex') ||
+      (github.event_name == 'merge_group' &&
+       github.event.merge_group.base_ref == 'refs/heads/codex')
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: openai/git/.github/workflows/codex-admission.yml@meta
+  unstable_admission:
+    name: Codex unstable admission
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.base.ref == 'codex-unstable') ||
+      (github.event_name == 'merge_group' &&
+       github.event.merge_group.base_ref == 'refs/heads/codex-unstable')
     permissions:
       contents: read
       pull-requests: read
     uses: openai/git/.github/workflows/codex-admission.yml@meta
 ```
 
-The admission job handles both ordinary pull-request checks and merge-group
-checks. It accepts a queued merge only while the published output and `meta`
-agree, verifies that the group introduces exactly one eligible reviewed topic,
-and rejects changes to the trusted dispatch or release workflows. The
-controller accepts the old dispatch-only trampoline during rollout; once the
-updated automation topic is published, this exact file remains in every
-generated `codex` tree. Both implementations stay on orphan `meta`. No
+Each lane's admission job handles both ordinary pull-request checks and
+merge-group checks. It accepts a queued merge only while that lane's published
+output and `meta` agree, verifies that the group introduces exactly one
+eligible reviewed topic, and rejects changes to every GitHub Actions workflow.
+The production and preview jobs have separate required-check names. Once the
+updated automation topic is published, this exact file remains in both
+generated branch trees. The implementations stay on orphan `meta`; no
 controller files or custom patches belong on `master`.
 
 ## Initialize the published topology once
@@ -185,7 +275,7 @@ inspection and conflict recovery. Normal publication uses `Meta/rebuild` or
 `Meta/rebuild --local`; use `Meta/publish <run-id>` only to finish a
 preparation started through GitHub.
 
-## Refresh `codex`
+## Refresh the enabled branches
 
 From a clean, complete clone with a linked `Meta` worktree, run:
 
@@ -195,10 +285,11 @@ Meta/rebuild
 
 `Meta/rebuild` updates the clean `Meta` worktree to current `origin/meta`,
 dispatches **Refresh codex**, and prints the exact run ID and URL returned by
-GitHub. It reports preparation status, validates the successful artifact,
-pushes the candidate to `codex-staging`, reports staging-CI job progress, and
-performs the atomic promotion only after that exact candidate passes. Leave
-the command running until it reports the published candidate.
+GitHub. It reports preparation status, validates the successful artifact, and
+stages each generated candidate separately: `codex-staging` for production
+and, when enabled, `codex-unstable-staging` for preview. It reports staging-CI
+job progress and performs one atomic promotion only after every exact
+candidate passes. Leave the command running until it reports publication.
 
 To do the rebase and assembly on your machine instead of in the preparation
 Action, run:
@@ -208,19 +299,19 @@ Meta/rebuild --local
 ```
 
 This skips only the preparation Action. It fetches the current heads from
-GitHub, prepares the topics, integration commits, `codex`, and the next
-`codex.config` state in an isolated temporary repository, then imports and
-verifies the resulting bundle in the publisher clone. The temporary
-repository has its own rerere cache and Git configuration, so an old local
-resolution, hook, or concurrent local preparation cannot leak through shared
-repository state. The command prints the path of a persistent local session
-containing the input snapshot, update manifest, candidate OID, bundle, and any
-conflict report.
+GitHub, prepares the topics, integration commits, enabled output branches,
+and the next `codex.config` state in an isolated temporary repository, then
+imports and verifies the resulting bundle in the publisher clone. The
+temporary repository has its own rerere cache and Git configuration, so an
+old local resolution, hook, or concurrent local preparation cannot leak
+through shared repository state. The command prints the path of a persistent
+local session containing the input snapshot, update manifest, candidate OID,
+bundle, and any conflict report.
 
 `--local` does not skip CI or make a private local-only publication. After
-preparation, it uses the same user-authenticated `codex-staging` push, waits
-for the same fresh `main.yml` run for the exact candidate SHA, and performs
-the same atomic exact-lease promotion to GitHub. Use `Meta/codex refresh
+preparation, it uses the same user-authenticated staging pushes, waits for a
+fresh `main.yml` run for each exact candidate SHA, and performs the same
+atomic exact-lease promotion to GitHub. Use `Meta/codex refresh
 --require-automation` when you want only a local preview with no server-side
 ref update.
 
@@ -249,8 +340,8 @@ but rejects every other change.
 
 To start preparation in the GitHub UI instead, open **Actions > Refresh
 codex**, select `codex`, and choose **Run workflow**. After **Rebase topics and
-assemble codex** succeeds, finish that exact run from the same kind of clean
-clone:
+assemble Codex branches** succeeds, finish that exact run from the same kind
+of clean clone:
 
 ```sh
 Meta/publish <run-id>
@@ -268,14 +359,16 @@ snapshot the current refs and stage a fresh candidate.
 
 The Action:
 
-1. reads the published enrollment from `meta/codex.config`, verifies any one
-   pending reviewed pull-request merge, and snapshots `meta`, `master`,
-   `codex`, the enrolled topics, and the newly admitted topic if present;
+1. reads the published enrollment from `meta/codex.config`, verifies at most
+   one pending reviewed pull-request merge per enabled lane, and snapshots
+   `meta`, `master`, both outputs, their enrolled topics, and any newly
+   admitted heads;
 2. reads the published boundaries, infers only a newly admitted topic or
    explicitly restacked edges, and rebases topics sequentially in dependency
    order, using rerere resolutions learned from the old `codex`;
-3. integrates every active topic at its rewritten tip with an explicit merge
-   commit and freezes the result without building or executing candidate code,
+3. integrates each enrolled production topic with an explicit merge, then
+   integrates enrolled preview topics on top of the exact generated `codex`
+   commit; freezes both results without building or executing candidate code;
    and, when state changed, creates a direct child of the pinned `meta` tip
    that changes only `codex.config`;
 4. uploads the bundle, pinned input snapshot, update manifest, and canonical
@@ -299,16 +392,20 @@ recorded by GitHub for `meta`. It checks the caller SHA against the snapshotted
 `codex`, requires the artifact controller to equal `Meta/HEAD`, validates the
 ZIP allowlist and bundle heads, and revalidates the complete input snapshot.
 
-Only then does it record the existing CI run ID and push the exact candidate
-to the fixed `codex-staging` branch. That user-authenticated push starts
-ordinary push CI, including when the candidate changes a workflow file. The
-helper binds to a newer `main.yml` push run whose branch and SHA exactly match
-the staged candidate. While it waits, it prints the run URL and reports changes
+Only then does it record the existing CI run IDs and push the exact production
+candidate to `codex-staging`. When preview is enabled, it also stages the
+exact preview candidate at `codex-unstable-staging`. Each user-authenticated
+push starts ordinary CI, including when its candidate changes a workflow file.
+The helper binds each candidate to a newer `main.yml` push run whose branch and
+SHA match exactly. While waiting, it prints each run URL and reports changes
 in status, completed-job count, and failure count, plus a heartbeat every five
-minutes when those values do not change. After the full run and its unique
-`config` job succeed, it revalidates the snapshot and atomically updates
-`meta`, every topic, and `codex` with exact leases while deleting
-`codex-staging`.
+minutes when those values do not change.
+
+After every required run and its unique `config` job succeeds, the helper
+revalidates the snapshot and atomically updates `meta`, every enrolled topic,
+`codex`, and the enabled `codex-unstable` branch with exact leases while
+deleting both staging refs. A failed preview build cannot publish production;
+a failed production build cannot publish preview.
 
 Every push to `codex` starts the inexpensive release-publication check. The
 expensive build and release jobs proceed only when the triggering SHA is the
@@ -317,20 +414,23 @@ therefore publishes no release; the controller's atomic `codex`/`meta`
 promotion does. The check does not require that SHA to remain the live
 `codex` tip, so a later pending merge cannot suppress a release that the
 controller already triggered. A canonical no-op reuses the existing tips, and
-staging never releases. Ordinary CI may reuse its own earlier successful
-result when the commit or tree is identical.
+staging never releases. `codex-unstable` also never releases: the release
+workflow listens only for pushes to `codex`. Ordinary CI may reuse its own
+earlier successful result when the commit or tree is identical.
 
-Until the final push, `meta`, `codex`, and all topic refs remain unchanged. A
-CI, validation, lease, or promotion failure after staging leaves
-`codex-staging` at the candidate for inspection. Successful promotion updates
-all primary refs and deletes staging as one atomic transaction.
+Until the final push, `meta`, both generated outputs, and all topic refs remain
+unchanged. A CI, validation, lease, or promotion failure after staging leaves
+the affected staging refs available for inspection. Successful promotion
+updates all primary refs and deletes every staging ref as one atomic
+transaction.
 
 Git can place server-side leases only on refs included in the push. The
-controller therefore refetches `meta`, `master`, `codex`, and the complete
-topic namespace immediately before promotion, then places exact leases on
-every ref it mutates or deletes in the atomic transaction. The generated
-state can therefore never describe a different published generation. A new
-input created in the final fetch-to-push window is handled by the next run.
+controller therefore refetches `meta`, `master`, both enabled outputs, and the
+complete topic namespace immediately before promotion, then places exact
+leases on every ref it mutates or deletes in the atomic transaction. The
+generated state can therefore never describe a different published generation.
+A newly created but unadmitted topic remains excluded; a newly merged topic is
+handled by the next verified snapshot.
 
 Both preparation modes use `refs/remotes/origin/master` after fetching the
 current `openai/git` heads. They do not use the caller's local `master`
@@ -346,8 +446,8 @@ unchanged ref would require server-side transaction support.
 
 ## Resolve a rebase conflict
 
-A failed Action summary says **No refs were updated** and prints a pinned
-`Meta/codex resolve` command. A failed `Meta/rebuild --local` prints the
+A production-topic conflict leaves every published ref unchanged and prints a
+pinned `Meta/codex resolve` command. A failed `Meta/rebuild --local` prints the
 persistent session path and leaves the same conflict report there. In either
 case, follow the exact commands in that report. For Action preparation, start
 from a clean clone that does not already have a `Meta` worktree; the printed
@@ -391,6 +491,13 @@ practice. Rebase the conflicting topic and its descendants onto the real
 prerequisite, push that coherent graph, and start a fresh dispatch. Do not fix
 this by merging `codex` into a topic or by maintaining a manual order.
 
+A preview-topic conflict also leaves every published ref unchanged, but the
+production-only `resolve`, `continue`, and `publish-topics` commands do not
+reconstruct the nested preview lane. Manually restack the affected
+`*-unstable` topic and its descendants onto their current prerequisite, push
+that coherent topic graph atomically with exact leases, and run
+`Meta/rebuild` or `Meta/rebuild --local` again.
+
 ## Configure publishing
 
 Publishing needs no repository secret, deploy key, GitHub App, or protected
@@ -409,18 +516,19 @@ environment. It uses the publisher's ordinary credentials:
    `Meta/rebuild`, `Meta/rebuild --local`, and `Meta/publish` accept only the
    standard SSH or HTTPS URL for `openai/git`. None reads a token from the
    repository, local session, or artifact.
-3. In the existing **Protect generated Codex branch** ruleset and the
-   **Protect Codex controller branch** ruleset, add an **always** bypass for
-   each exact human publisher. The checked-in recipes authorize only the
+3. In **Protect generated Codex branch**, **Protect generated unstable Codex
+   branch**, and **Protect Codex controller branch**, add an **always** bypass
+   for each exact human publisher. The checked-in recipes authorize only the
    `ttaylorr-oai` user (`301000140`) plus the existing organization-admin
-   break-glass actor. Import the `meta` recipe only if that ruleset is absent.
+   break-glass actor. Update existing rulesets; import a recipe only when its
+   matching ruleset is absent.
 
 The bypass is intentionally personal and visible. The Action cannot publish;
 it only prepares an immutable artifact. Running `Meta/rebuild`,
 `Meta/rebuild --local`, or `Meta/publish` is the approval, and Git records the
 configured user as the pusher. To add or remove a publisher, change the exact
-`User` actor in both rulesets. Do not replace it with a broad repository role
-or a shared long-lived credential.
+`User` actor in each generated-output and controller ruleset. Do not replace
+it with a broad repository role or a shared long-lived credential.
 
 The final push runs from the operator's machine. Preparation runs either in
 Actions or in the isolated local repository; staging CI still runs in Actions.
@@ -439,8 +547,8 @@ For an Actions preparation, the local helper downloads the artifact through
 `gh`, but pushes through `origin`. Those credentials can theoretically
 identify different users, so every publishing path prints the authenticated
 `gh` login before staging. Verify the configured Git identity when changing
-machines or credentials. A failed CI run leaves `codex-staging` for
-inspection; it exposes no publishing secret.
+machines or credentials. A failed CI run leaves its production or preview
+staging branch for inspection; neither exposes a publishing secret.
 
 The automation topic is the only topic allowed to change the dispatch and
 admission trampoline. A directly merged topic pull request may change neither
@@ -458,19 +566,19 @@ rebase committers use
 Generated merge and `meta` state commits use that identity as both author and
 committer. These commits are deliberately unsigned and do not claim verified
 GitHub App authentication. GitHub records the local credential owner as the
-pusher. Integration subjects remain `Merge <topic> into codex`.
+pusher. Integration subjects are `Merge <topic> into codex` or
+`Merge <topic> into codex-unstable`.
 
 ## Repository rulesets
 
-Create or update the repository rulesets to match the three JSON files. Do not
-layer a duplicate over an existing matching ruleset: a bypass in the new
+Create or update the repository rulesets to match the checked-in JSON files.
+Do not layer a duplicate over an existing matching ruleset: a bypass in one
 ruleset does not bypass another applicable ruleset. For a missing ruleset, use
 **Settings > Rules > Rulesets > New ruleset > Import a ruleset**.
 
-In `openai/git`, edit the existing **Protect generated Codex branch** ruleset
-to add the exact-user publisher bypass, keep the existing topic ruleset aligned
-with its recipe, and import only the missing `meta` ruleset. Verify that exactly
-one active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
+In `openai/git`, update the existing production, preview, topic, and controller
+rulesets in place. Verify that exactly one active policy ruleset covers each
+of `codex`, `codex-unstable`, `??/codex/*`, and `meta`.
 
 - `.github/rulesets/codex-topics.json` matches `??/codex/*` and blocks
   deletion, preserving topic heads after pull-request merges.
@@ -478,17 +586,22 @@ one active ruleset covers each of `codex`, `??/codex/*`, and `meta`.
   review, deletion, force-push, one-at-a-time merge-queue, and trusted
   admission-check rules. Its exact `ttaylorr-oai` user bypass permits local
   publication; the organization-admin entry remains for break-glass access.
+- `.github/rulesets/codex-unstable-branch.json` gives `codex-unstable` the
+  same review and one-at-a-time merge-queue protections, but requires the
+  distinct **Codex unstable admission / Verify reviewed topic** check. It
+  retains the same narrowly scoped publication bypasses.
 - `.github/rulesets/codex-meta.json` protects the `meta` controller with
   pull-request, review, deletion, and force-push rules. Its matching exact-user
   bypass lets the same atomic push advance the generated state; the
   organization-admin entry remains for break-glass access.
 
-The trusted admission check verifies that the pull-request head matches the
-eligible `??/codex/*` namespace. Do not require topic heads to be up to date
-with `codex`: the merge queue checks the proposed merge against the current
-base without copying the generated aggregate into a topic. An actor with an
-explicit ruleset bypass can still override the queue; keep publisher bypasses
-narrow and reserve organization-admin access for emergencies.
+Each trusted admission check verifies that the pull-request head matches the
+eligible `??/codex/*` namespace and belongs to its target lane. Do not require
+topic heads to be up to date with either generated branch: the merge queue
+checks the proposed merge against the current base without copying the
+aggregate into a topic. An actor with an explicit ruleset bypass can still
+override the queue; keep publisher bypasses narrow and reserve
+organization-admin access for emergencies.
 
 The required check is pinned to the GitHub Actions App, but a repository
 ruleset cannot pin the source workflow file. SCM review is therefore still the
@@ -498,10 +611,16 @@ workflow rule or use a dedicated admission App before enabling this flow.
 
 Deploy these changes in order:
 
-1. Merge the new controller and admission workflow into `meta`.
-2. Update the enrolled automation and release topics, then run
-   `Meta/rebuild --local` once to publish the new trampoline and release guard.
-3. Update the existing `codex` ruleset from its checked-in recipe to require
-   the one-at-a-time merge queue and trusted admission check.
+1. Merge the controller, lane-aware trusted admission workflow, and ruleset
+   recipe into `meta` without creating a merge commit there.
+2. Update the already-enrolled automation topic, then run
+   `Meta/rebuild --local` once to publish the exact two-lane trampoline while
+   preserving the production release guard and stable merge-queue settings.
+3. Update the existing **Protect generated unstable Codex branch** ruleset
+   from its recipe, including its separate required check and serial queue.
+4. Run `Meta/rebuild --local --enable-unstable` to create the protected,
+   strictly-ahead preview target without enrolling any preexisting topic.
+5. Open reviewed `*-unstable` pull requests against `codex-unstable`, merge
+   them through its queue, and run the controller to publish each generation.
 
-Do not merge a new topic pull request before all three steps are complete.
+Do not merge a preview pull request until all four setup steps are complete.
