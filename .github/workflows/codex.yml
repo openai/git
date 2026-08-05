@@ -5,6 +5,7 @@ on:
   pull_request:
     branches:
       - codex
+      - codex-unstable
     types:
       - opened
       - reopened
@@ -25,7 +26,22 @@ jobs:
     uses: openai/git/.github/workflows/codex.yml@meta
   admission:
     name: Codex admission
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.base.ref == 'codex') ||
+      (github.event_name == 'merge_group' &&
+       github.event.merge_group.base_ref == 'refs/heads/codex')
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: openai/git/.github/workflows/codex-admission.yml@meta
+  unstable_admission:
+    name: Codex unstable admission
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.base.ref == 'codex-unstable') ||
+      (github.event_name == 'merge_group' &&
+       github.event.merge_group.base_ref == 'refs/heads/codex-unstable')
     permissions:
       contents: read
       pull-requests: read
