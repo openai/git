@@ -437,6 +437,21 @@ install_admission_gate_gh () {
 			printf '%s\t%s\n' cc/codex/private-parent-unstable \
 				"$FAKE_GATE_OTHER"
 			;;
+		reviewed-shared-helper|reviewed-unstable-helper|\
+		linear-shared-helper|ancestor-shared-helper|helper-api-failure)
+			case "$FAKE_GATE_LANE:$FAKE_GATE_MODE" in
+			codex:reviewed-unstable-helper)
+				other_name=cc/codex/private-parent-unstable
+				;;
+			codex:*)
+				other_name=cc/codex/private-parent
+				;;
+			*)
+				other_name=cc/codex/private-parent-unstable
+				;;
+			esac
+			printf '%s\t%s\n' "$other_name" "$FAKE_GATE_OTHER"
+			;;
 		descendant-checkpoint)
 			printf '%s\t%s\n' cc/codex/checkpoint-unstable \
 				"$FAKE_GATE_OTHER"
@@ -449,13 +464,38 @@ install_admission_gate_gh () {
 		;;
 	repos/openai/git/compare/*)
 		case "$endpoint" in
+		*"$FAKE_GATE_BASE...$FAKE_GATE_TOPIC?per_page=100")
+			case "${FAKE_GATE_MODE:-}" in
+			reviewed-shared-helper|reviewed-unstable-helper)
+				printf '%s\t%s\t%s\n' "$FAKE_GATE_MERGE" \
+					"$FAKE_GATE_FIRST" "$FAKE_GATE_SHARED"
+				;;
+			helper-api-failure) exit 95 ;;
+			*) : ;;
+			esac
+			;;
 		*"$FAKE_GATE_OTHER...$FAKE_GATE_TOPIC")
 			if test "${FAKE_GATE_MODE:-}" = descendant-checkpoint
 			then
 				printf '%s\n' "$FAKE_GATE_TOPIC"
+			elif test "${FAKE_GATE_MODE:-}" = ancestor-shared-helper
+			then
+				printf '%s\n' "$FAKE_GATE_OTHER"
 			else
 				printf '%s\n' "$FAKE_GATE_SHARED"
 			fi
+			;;
+		*"$FAKE_GATE_FIRST...$FAKE_GATE_SHARED")
+			printf '%s\n' diverged
+			;;
+		*"$FAKE_GATE_SHARED...$FAKE_GATE_SHARED")
+			printf '%s\n' identical
+			;;
+		*"master...$FAKE_GATE_OTHER")
+			printf '%s\n' ahead
+			;;
+		*"...$FAKE_GATE_OTHER")
+			printf '%s\n' ahead
 			;;
 		*"master...$FAKE_GATE_SHARED")
 			if test "${FAKE_GATE_MODE:-}" = newer-master
@@ -493,6 +533,8 @@ run_admission_gate () {
 	candidate=4444444444444444444444444444444444444444 &&
 	other=5555555555555555555555555555555555555555 &&
 	shared=6666666666666666666666666666666666666666 &&
+	first=8888888888888888888888888888888888888888 &&
+	merge=9999999999999999999999999999999999999999 &&
 	if test "$lane" = codex-unstable
 	then
 		base=$unstable
@@ -512,8 +554,10 @@ run_admission_gate () {
 		FAKE_GATE_MODE="$mode" FAKE_GATE_META="$meta" \
 		FAKE_GATE_LANE="$lane" FAKE_GATE_CODEX="$codex" \
 		FAKE_GATE_UNSTABLE="$unstable" FAKE_GATE_TOPIC="$topic" \
+		FAKE_GATE_BASE="$base" \
 		FAKE_GATE_CANDIDATE="$candidate" FAKE_GATE_OTHER="$other" \
-		FAKE_GATE_SHARED="$shared" FAKE_GATE_BRANCH="$branch" \
+		FAKE_GATE_SHARED="$shared" FAKE_GATE_FIRST="$first" \
+		FAKE_GATE_MERGE="$merge" FAKE_GATE_BRANCH="$branch" \
 		bash "$TRASH_DIRECTORY/admission-gate.sh"
 }
 
@@ -945,6 +989,21 @@ make_test_integration () (
 	first_parent=$3
 	tree=$4
 	message=$(printf 'Merge %s into codex\n\nIntegrate the current %s topic into the internally distributed codex branch.\n\nCodex-Integration: %s@%s' \
+		"$name" "$name" "$name" "$oid") &&
+	printf '%s\n' "$message" |
+	GIT_AUTHOR_NAME=$codex_bot_name GIT_AUTHOR_EMAIL=$codex_bot_email \
+	GIT_COMMITTER_NAME=$codex_bot_name \
+	GIT_COMMITTER_EMAIL=$codex_bot_email \
+	git -c commit.gpgSign=false commit-tree "$tree" \
+		-p "$first_parent" -p "$oid"
+)
+
+make_test_unstable_integration () (
+	name=$1
+	oid=$2
+	first_parent=$3
+	tree=$4
+	message=$(printf 'Merge %s into codex-unstable\n\nIntegrate the current %s topic into the internally distributed codex-unstable branch.\n\nCodex-Integration: %s@%s' \
 		"$name" "$name" "$name" "$oid") &&
 	printf '%s\n' "$message" |
 	GIT_AUTHOR_NAME=$codex_bot_name GIT_AUTHOR_EMAIL=$codex_bot_email \
@@ -3324,7 +3383,7 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 	)
 '
 
-test_expect_success 'rewrite rejects a private merge in a topic' '
+test_expect_success 'rewrite preserves a merge in an enrolled stable topic' '
 	git init --bare private.git &&
 	test_create_repo private-source &&
 	(
@@ -3348,6 +3407,10 @@ test_expect_success 'rewrite rejects a private merge in a topic' '
 		git merge --no-ff private-side -m "private merge" &&
 		git branch meta master &&
 		install_meta_state meta master codex &&
+		git switch master &&
+		write advance advanced-base &&
+		git add advanced-base &&
+		git commit -m "advance master under private merge" &&
 		git push origin master meta codex aa/codex/merged
 	) &&
 
@@ -3356,12 +3419,26 @@ test_expect_success 'rewrite rejects a private merge in a topic' '
 		cd private-runner &&
 		fetch_all &&
 		snapshot_refs ../private.git >before &&
-		test_expect_code 1 sh "$codex_branch" rewrite \
+		old_merge=$(git rev-list --grep="^private merge$" \
+			origin/master..origin/aa/codex/merged | sed -n 1p) &&
+		sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result result --updates updates \
 			--inputs inputs --failure failure \
 			>out 2>err &&
-		test_grep -i merge err &&
+		candidate=$(cat result) &&
+		merged=$(updated_tip aa/codex/merged updates) &&
+		new_merge=$(git rev-list --grep="^private merge$" \
+			origin/master..$merged | sed -n 1p) &&
+		test -n "$new_merge" &&
+		test "$new_merge" != "$old_merge" &&
+		test 2 = "$(git show -s --format=%P "$new_merge" |
+			wc -w | tr -d " ")" &&
+		test topic = "$(git show "$merged:topic-file")" &&
+		test private = "$(git show "$merged:private-file")" &&
+		git merge-base --is-ancestor "$merged" "$candidate" &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates updates --result result &&
 		snapshot_refs ../private.git >after &&
 		test_cmp before after
 	)
@@ -3840,6 +3917,50 @@ test_expect_success 'initialize emits canonical tree-same state and rejects a mi
 	)
 '
 
+test_expect_success 'initialize records a stable merge DAG' '
+	git init --bare initialize-stable-dag.git &&
+	test_create_repo initialize-stable-dag-source &&
+	(
+		cd initialize-stable-dag-source &&
+		git remote add origin ../initialize-stable-dag.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/a &&
+		write a a-file &&
+		git add a-file &&
+		git commit -m "initialize stable DAG parent A" &&
+		git switch -c bb/codex/b master &&
+		write b b-file &&
+		git add b-file &&
+		git commit -m "initialize stable DAG parent B" &&
+		git switch -c cc/codex/fan aa/codex/a &&
+		git merge --no-ff bb/codex/b \
+			-m "Merge initialize stable DAG parents" &&
+		write fan fan-file &&
+		git add fan-file &&
+		git commit -m "initialize stable DAG payload" &&
+		git branch codex &&
+		git branch meta master &&
+		git push origin master meta codex \
+			aa/codex/a bb/codex/b cc/codex/fan
+	) &&
+
+	git clone initialize-stable-dag.git initialize-stable-dag-runner &&
+	(
+		cd initialize-stable-dag-runner &&
+		fetch_all &&
+		sh "$codex_branch" initialize --remote origin \
+			--base master --codex codex --output initialized.config &&
+		git config --no-includes -f initialized.config --get-all \
+			branch.cc/codex/fan.merge >actual-prerequisites &&
+		printf "%s\n" refs/heads/aa/codex/a \
+			refs/heads/bb/codex/b >expected-prerequisites &&
+		test_cmp expected-prerequisites actual-prerequisites
+	)
+'
+
 test_expect_success 'a partially advanced root uses its intermediate master boundary' '
 	git init --bare partial-master.git &&
 	test_create_repo partial-master-source &&
@@ -4243,9 +4364,26 @@ test_expect_success 'rewrite rejects malformed and noncanonical codex.config' '
 		git add codex.config &&
 		git commit -m "noncanonical codex state" &&
 		git branch noncanonical-state &&
+
+		git switch --detach "$valid_meta" &&
+		git show "$valid_meta:codex.config" >codex.config &&
+		git config --file codex.config --add \
+			branch.aa/codex/topic.merge refs/heads/master &&
+		git add codex.config &&
+		git commit -m "duplicate stable prerequisite" &&
+		git branch duplicate-merge-state &&
+
+		git switch --detach "$valid_meta" &&
+		git show "$valid_meta:codex.config" >codex.config &&
+		git config --file codex.config --add \
+			branch.aa/codex/topic.merge refs/heads/bb/codex/other &&
+		git add codex.config &&
+		git commit -m "mixed stable prerequisites" &&
+		git branch mixed-merge-state &&
 		git branch -f meta "$malformed" &&
 		git push origin master meta codex aa/codex/topic \
-			malformed-state noncanonical-state
+			malformed-state noncanonical-state \
+			duplicate-merge-state mixed-merge-state
 	) &&
 
 	git clone invalid-state.git invalid-state-runner &&
@@ -4274,7 +4412,33 @@ test_expect_success 'rewrite rejects malformed and noncanonical codex.config' '
 			>noncanonical.out 2>noncanonical.err &&
 		test_grep "codex.config is not in canonical form" noncanonical.err &&
 		snapshot_refs ../invalid-state.git >after-noncanonical &&
-		test_cmp before-noncanonical after-noncanonical
+		test_cmp before-noncanonical after-noncanonical &&
+
+		duplicate=$(git rev-parse origin/duplicate-merge-state) &&
+		git --git-dir=../invalid-state.git update-ref refs/heads/meta \
+			"$duplicate" "$noncanonical" &&
+		fetch_all &&
+		snapshot_refs ../invalid-state.git >before-duplicate &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result duplicate-result \
+			--updates duplicate-updates --inputs duplicate-inputs \
+			--failure duplicate-failure >duplicate.out 2>duplicate.err &&
+		test_grep "repeats prerequisite.*master" duplicate.err &&
+		snapshot_refs ../invalid-state.git >after-duplicate &&
+		test_cmp before-duplicate after-duplicate &&
+
+		mixed=$(git rev-parse origin/mixed-merge-state) &&
+		git --git-dir=../invalid-state.git update-ref refs/heads/meta \
+			"$mixed" "$duplicate" &&
+		fetch_all &&
+		snapshot_refs ../invalid-state.git >before-mixed &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result mixed-result \
+			--updates mixed-updates --inputs mixed-inputs \
+			--failure mixed-failure >mixed.out 2>mixed.err &&
+		test_grep "mixes master with topic prerequisites" mixed.err &&
+		snapshot_refs ../invalid-state.git >after-mixed &&
+		test_cmp before-mixed after-mixed
 	)
 '
 
@@ -6279,6 +6443,58 @@ test_expect_success 'unstable topics cannot hide workflow changes in a dependent
 	)
 '
 
+test_expect_success 'stable DAG topics cannot hide workflow changes behind a secondary parent' '
+	git init --bare stable-workflow-dag.git &&
+	test_create_repo stable-workflow-dag-source &&
+	(
+		cd stable-workflow-dag-source &&
+		git remote add origin ../stable-workflow-dag.git &&
+		write base shared &&
+		mkdir -p .github/workflows &&
+		write_automation_workflow .github/workflows/codex.yml &&
+		git add shared .github/workflows/codex.yml &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git switch -c aa/codex/automation codex &&
+		write_stable_reviewed_automation_workflow \
+			.github/workflows/codex.yml &&
+		git add .github/workflows/codex.yml &&
+		git commit -m "stable automation prerequisite" &&
+		git switch -c bb/codex/clean codex &&
+		write clean clean-file &&
+		git add clean-file &&
+		git commit -m "stable clean first parent" &&
+		git switch -c cc/codex/fan bb/codex/clean &&
+		git merge --no-ff aa/codex/automation \
+			-m "Merge stable automation prerequisite" &&
+		write_automation_workflow .github/workflows/codex.yml &&
+		git add .github/workflows/codex.yml &&
+		git commit -m "stable fan-in hides automation change" &&
+		git diff --quiet codex HEAD -- .github/workflows/codex.yml &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git push origin master meta codex \
+			aa/codex/automation bb/codex/clean cc/codex/fan
+	) &&
+
+	git clone stable-workflow-dag.git stable-workflow-dag-runner &&
+	(
+		cd stable-workflow-dag-runner &&
+		fetch_all &&
+		snapshot_refs ../stable-workflow-dag.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			--require-automation \
+			>out 2>err &&
+		test_grep "workflow\|controller\|protected" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../stable-workflow-dag.git >after &&
+		test_cmp before after
+	)
+'
+
 test_expect_success 'unstable topics cannot redirect or delete the production release workflow' '
 	git init --bare unstable-release.git &&
 	test_create_repo unstable-release-source &&
@@ -6530,6 +6746,798 @@ test_expect_success 'published stable topics cannot all disappear behind unstabl
 		test_path_is_missing result &&
 		snapshot_refs ../unstable-stable-retired.git >after &&
 		test_cmp before after
+	)
+'
+
+test_expect_success 'stable fan-in preserves internal merges and records its DAG' '
+	git init --bare stable-fan-in.git &&
+	test_create_repo stable-fan-in-source &&
+	(
+		cd stable-fan-in-source &&
+		git remote add origin ../stable-fan-in.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+
+		git switch -c shared-helper codex &&
+		write helper helper-file &&
+		git add helper-file &&
+		git commit -m "shared stable helper" &&
+		git switch -c aa/codex/a codex &&
+		write a a-file &&
+		git add a-file &&
+		git commit -m "stable fan-in prerequisite A" &&
+		git merge --no-ff shared-helper \
+			-m "Merge shared helper into stable A" &&
+		git switch -c bb/codex/b codex &&
+		write b b-file &&
+		git add b-file &&
+		git commit -m "stable fan-in prerequisite B" &&
+		git merge --no-ff shared-helper \
+			-m "Merge shared helper into stable B" &&
+		git switch -c cc/codex/c codex &&
+		write c c-file &&
+		git add c-file &&
+		git commit -m "stable fan-in prerequisite C" &&
+		git switch -c dd/codex/fan aa/codex/a &&
+		git merge --no-ff bb/codex/b cc/codex/c \
+			-m "Merge the stable fan-in prerequisites" &&
+		write fan fan-file &&
+		git add fan-file &&
+		git commit -m "stable fan-in payload" &&
+
+		git switch master &&
+		write advance advanced-base &&
+		git add advanced-base &&
+		git commit -m "advance production underneath stable DAG" &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git push origin master meta codex \
+			aa/codex/a bb/codex/b cc/codex/c dd/codex/fan
+	) &&
+
+	git clone stable-fan-in.git stable-fan-in-runner &&
+	(
+		cd stable-fan-in-runner &&
+		fetch_all &&
+		old_helper=$(git rev-parse "origin/aa/codex/a^2") &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		master=$(git rev-parse origin/master) &&
+		a=$(updated_tip aa/codex/a updates) &&
+		b=$(updated_tip bb/codex/b updates) &&
+		c=$(updated_tip cc/codex/c updates) &&
+		fan=$(updated_tip dd/codex/fan updates) &&
+		fan_merge=$(git rev-list \
+			--grep="^Merge the stable fan-in prerequisites$" \
+			"$master..$fan" | sed -n 1p) &&
+		test "$a" = "$(git rev-parse "$fan_merge^1")" &&
+		test "$b" = "$(git rev-parse "$fan_merge^2")" &&
+		test "$c" = "$(git rev-parse "$fan_merge^3")" &&
+		a_helper=$(git rev-list \
+			--grep="^Merge shared helper into stable A$" \
+			"$master..$a" | sed -n 1p) &&
+		b_helper=$(git rev-list \
+			--grep="^Merge shared helper into stable B$" \
+			"$master..$b" | sed -n 1p) &&
+		rewritten_helper=$(git rev-parse "$a_helper^2") &&
+		test "$rewritten_helper" = \
+			"$(git rev-parse "$b_helper^2")" &&
+		test "$rewritten_helper" != "$old_helper" &&
+		test "$master" = "$(git rev-parse "$rewritten_helper^")" &&
+		git merge-base --is-ancestor "$fan" "$candidate" &&
+		meta=$(updated_tip meta updates) &&
+		git show "$meta:codex.config" >next.config &&
+		git config --no-includes -f next.config --get-all \
+			branch.dd/codex/fan.merge >fan-prerequisites &&
+		printf "%s\n" refs/heads/aa/codex/a \
+			refs/heads/bb/codex/b \
+			refs/heads/cc/codex/c >expected-fan-prerequisites &&
+		test_cmp expected-fan-prerequisites fan-prerequisites &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates updates --result result &&
+		fan_parent=$(git rev-parse "$fan^") &&
+		ab_tree=$(git merge-tree --write-tree "$a" "$b") &&
+		ab=$(printf "%s\n" "tampered stable A+B fan-in" |
+			git commit-tree "$ab_tree" -p "$a" -p "$b") &&
+		abc=$(printf "%s\n" "tampered stable binary +C fan-in" |
+			git commit-tree "$fan_parent^{tree}" -p "$ab" -p "$c") &&
+		flattened=$(printf "%s\n" "tampered flattened stable fan-in payload" |
+			git commit-tree "$fan^{tree}" -p "$abc") &&
+		test "$(git rev-parse "$fan^{tree}")" = \
+			"$(git rev-parse "$flattened^{tree}")" &&
+		fake_candidate=$master &&
+		for entry in aa:a bb:b cc:c dd:fan
+		do
+			prefix=$(printf "%s\n" "$entry" | cut -d: -f1) &&
+			name=$(printf "%s\n" "$entry" | cut -d: -f2) &&
+			case "$name" in
+			a) tip=$a ;;
+			b) tip=$b ;;
+			c) tip=$c ;;
+			fan) tip=$flattened ;;
+			esac &&
+			tree=$(git merge-tree --write-tree "$fake_candidate" \
+				"$tip") &&
+			fake_candidate=$(make_test_integration \
+				"$prefix/codex/$name" "$tip" \
+				"$fake_candidate" "$tree") || return 1
+		done &&
+		old_meta=$(git rev-parse origin/meta) &&
+		git show "$meta:codex.config" |
+			sed -e "s/$fan/$flattened/g" \
+				-e "s/$candidate/$fake_candidate/g" \
+				>flattened.config &&
+		blob=$(git hash-object -w flattened.config) &&
+		index=$PWD/flattened.index &&
+		rm -f "$index" &&
+		GIT_INDEX_FILE=$index git read-tree "$old_meta^{tree}" &&
+		GIT_INDEX_FILE=$index git update-index --add --cacheinfo \
+			100644,"$blob",codex.config &&
+		tree=$(GIT_INDEX_FILE=$index git write-tree) &&
+		fake_meta=$(printf "%s\n" "meta: forged flattened stable fan-in" |
+			GIT_AUTHOR_NAME=$codex_bot_name \
+			GIT_AUTHOR_EMAIL=$codex_bot_email \
+			GIT_COMMITTER_NAME=$codex_bot_name \
+			GIT_COMMITTER_EMAIL=$codex_bot_email \
+			git -c commit.gpgSign=false commit-tree \
+				"$tree" -p "$old_meta") &&
+		awk -F "$(printf '\''\t'\'')" \
+			-v OFS="$(printf '\''\t'\'')" \
+			-v meta="$fake_meta" -v candidate="$fake_candidate" \
+			-v fan="$flattened" '\''
+			$1 == "refs/heads/meta" { $3=meta }
+			$1 == "refs/heads/codex" { $3=candidate }
+			$1 == "refs/heads/dd/codex/fan" { $3=fan }
+			{ print }
+		'\'' updates >flattened.updates &&
+		printf "%s\n" "$fake_candidate" >flattened.result &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates flattened.updates \
+			--result flattened.result \
+			>flattened.out 2>flattened.err &&
+		test_grep "merge rewrite.*topology" flattened.err &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result repeated-result \
+			--updates repeated-updates --inputs repeated-inputs \
+			--failure repeated-failure &&
+		test "$candidate" = "$(cat repeated-result)" &&
+		test "$fan" = "$(updated_tip dd/codex/fan repeated-updates)"
+	)
+'
+
+test_expect_success 'reviewed internal stable merges can share a helper without admitting descendants' '
+	for shape in explicit linear unstable-descendant
+	do
+		case "$shape" in
+		unstable-descendant)
+			hidden_ref=cc/codex/unadmitted-unstable
+			;;
+		*)
+			hidden_ref=cc/codex/unadmitted
+			;;
+		esac &&
+		fixture=stable-shared-$shape &&
+		git init --bare "$fixture.git" &&
+		test_create_repo "$fixture-source" &&
+		(
+			cd "$fixture-source" &&
+			git remote add origin "../$fixture.git" &&
+			write base shared &&
+			git add shared &&
+			install_rerere_train &&
+			git commit -m base &&
+			git switch -c aa/codex/enrolled master &&
+			write enrolled enrolled-file &&
+			git add enrolled-file &&
+			git commit -m "already enrolled stable topic" &&
+			git branch codex &&
+			git branch meta master &&
+			install_meta_state meta master codex &&
+			git switch -c shared-helper codex &&
+			write helper helper-file &&
+			git add helper-file &&
+			git commit -m "shared stable helper" &&
+			if test "$shape" != linear
+			then
+				git switch -c bb/codex/reviewed codex &&
+				write reviewed reviewed-file &&
+				git add reviewed-file &&
+				git commit -m "reviewed stable mainline" &&
+				git merge --no-ff shared-helper \
+					-m "Merge reviewed stable helper"
+			else
+				git switch -c bb/codex/reviewed \
+					shared-helper &&
+				write reviewed reviewed-file &&
+				git add reviewed-file &&
+				git commit -m "launder an unreviewed stable prerequisite"
+			fi &&
+			git switch -c "$hidden_ref" shared-helper &&
+			write hidden hidden-file &&
+			git add hidden-file &&
+			git commit -m "unadmitted stable helper descendant" &&
+			git switch codex &&
+			git merge --no-ff bb/codex/reviewed \
+				-m "Merge pull request #42 from openai/bb/codex/reviewed" &&
+			git push origin master meta codex \
+				aa/codex/enrolled bb/codex/reviewed \
+				"$hidden_ref"
+		) &&
+		git clone "$fixture.git" "$fixture-runner" &&
+		install_admission_gh "$TRASH_DIRECTORY/$fixture-bin" &&
+		(
+			cd "$fixture-runner" &&
+			fetch_all &&
+			if test "$shape" = explicit
+			then
+				admission_rewrite "$fixture" success &&
+				candidate=$(cat result) &&
+				test helper = "$(git show "$candidate:helper-file")" &&
+				test_must_fail git cat-file -e "$candidate:hidden-file" &&
+				test -z "$(updated_tip "$hidden_ref" updates)"
+			else
+				test_expect_code 1 admission_rewrite \
+					"$fixture" success >out 2>err &&
+				test_grep "unadmitted.*prerequisite" err &&
+				test_path_is_missing result
+			fi
+		) || return 1
+	done
+'
+
+test_expect_success 'unstable fan-in preserves internal merges and publishes its complete DAG atomically' '
+	git init --bare unstable-fan-in.git &&
+	test_create_repo unstable-fan-in-source &&
+	(
+		cd unstable-fan-in-source &&
+		git remote add origin ../unstable-fan-in.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+
+		git switch -c shared-helper codex &&
+		write helper helper-file &&
+		git add helper-file &&
+		git commit -m "shared namespace helper" &&
+		git switch -c bb/codex/a-unstable codex &&
+		write a a-file &&
+		git add a-file &&
+		git commit -m "fan-in prerequisite A" &&
+		git merge --no-ff shared-helper \
+			-m "Merge shared helper into A" &&
+		git switch -c cc/codex/b-unstable codex &&
+		write b b-file &&
+		git add b-file &&
+		git commit -m "fan-in prerequisite B" &&
+		git merge --no-ff shared-helper \
+			-m "Merge shared helper into B" &&
+		git switch -c dd/codex/c-unstable codex &&
+		write c c-file &&
+		git add c-file &&
+		git commit -m "fan-in prerequisite C" &&
+		git switch -c ee/codex/s05-unstable \
+			bb/codex/a-unstable &&
+		git merge --no-ff cc/codex/b-unstable \
+			dd/codex/c-unstable -m "Merge the S05 prerequisites" &&
+		write s05 s05-file &&
+		git add s05-file &&
+		git commit -m "S05 topic payload" &&
+		git switch -c ff/codex/d-unstable codex &&
+		write d d-file &&
+		git add d-file &&
+		git commit -m "nested fan-in prerequisite D" &&
+		git switch -c gg/codex/s13-unstable \
+			ee/codex/s05-unstable &&
+		git merge --no-ff ff/codex/d-unstable \
+			-m "Merge the S13 prerequisites" &&
+		write s13 s13-file &&
+		git add s13-file &&
+		git commit -m "S13 topic payload" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+
+		git switch master &&
+		write advance advanced-base &&
+		write c c-file &&
+		git add advanced-base c-file &&
+		git commit -m "advance production underneath unstable DAG" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/a-unstable \
+			cc/codex/b-unstable dd/codex/c-unstable \
+			ee/codex/s05-unstable ff/codex/d-unstable \
+			gg/codex/s13-unstable
+	) &&
+
+	git clone unstable-fan-in.git unstable-fan-in-runner &&
+	(
+		cd unstable-fan-in-runner &&
+		fetch_all &&
+		old_helper=$(git rev-parse \
+			"origin/bb/codex/a-unstable^2") &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --bundle candidate.bundle \
+			--failure failure &&
+		stable=$(cat result) &&
+		a=$(updated_tip bb/codex/a-unstable updates) &&
+		b=$(updated_tip cc/codex/b-unstable updates) &&
+		c=$(updated_tip dd/codex/c-unstable updates) &&
+		s05=$(updated_tip ee/codex/s05-unstable updates) &&
+		d=$(updated_tip ff/codex/d-unstable updates) &&
+		s13=$(updated_tip gg/codex/s13-unstable updates) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		meta=$(updated_tip meta updates) &&
+		test "$stable" = "$(git rev-parse "$c^")" &&
+		test "$(git rev-parse "$stable^{tree}")" = \
+			"$(git rev-parse "$c^{tree}")" &&
+		test "fan-in prerequisite C" = \
+			"$(git show -s --format=%s "$c")" &&
+		s05_merge=$(git rev-list --grep="^Merge the S05 prerequisites$" \
+			"$stable..$s05" | sed -n 1p) &&
+		test "$a" = "$(git rev-parse "$s05_merge^1")" &&
+		test "$b" = "$(git rev-parse "$s05_merge^2")" &&
+		test "$c" = "$(git rev-parse "$s05_merge^3")" &&
+		s13_merge=$(git rev-list --grep="^Merge the S13 prerequisites$" \
+			"$stable..$s13" | sed -n 1p) &&
+		test "$s05" = "$(git rev-parse "$s13_merge^1")" &&
+		test "$d" = "$(git rev-parse "$s13_merge^2")" &&
+		a_helper=$(git rev-list --grep="^Merge shared helper into A$" \
+			"$stable..$a" | sed -n 1p) &&
+		b_helper=$(git rev-list --grep="^Merge shared helper into B$" \
+			"$stable..$b" | sed -n 1p) &&
+		rewritten_helper=$(git rev-parse "$a_helper^2") &&
+		test "$rewritten_helper" = \
+			"$(git rev-parse "$b_helper^2")" &&
+		test "$rewritten_helper" != "$old_helper" &&
+		test "$stable" = "$(git rev-parse "$rewritten_helper^")" &&
+		git show "$meta:codex.config" >next.config &&
+		git config --no-includes -f next.config --get-all \
+			branch.ee/codex/s05-unstable.merge >s05-prerequisites &&
+		printf "%s\n" refs/heads/bb/codex/a-unstable \
+			refs/heads/cc/codex/b-unstable \
+			refs/heads/dd/codex/c-unstable >expected-s05-prerequisites &&
+		test_cmp expected-s05-prerequisites s05-prerequisites &&
+		git config --no-includes -f next.config --get-all \
+			branch.gg/codex/s13-unstable.merge >s13-prerequisites &&
+		printf "%s\n" refs/heads/ee/codex/s05-unstable \
+			refs/heads/ff/codex/d-unstable >expected-s13-prerequisites &&
+		test_cmp expected-s13-prerequisites s13-prerequisites &&
+		git bundle verify candidate.bundle &&
+		sh "$codex_branch" stage --remote origin \
+			--staging codex-staging --inputs inputs --updates updates &&
+		sh "$codex_branch" stage --remote origin \
+			--staging codex-unstable-staging \
+			--inputs inputs --updates updates &&
+		GIT_TRACE=1 sh "$codex_branch" promote --remote origin \
+			--staging codex-staging --inputs inputs --updates updates \
+			>promote.out 2>promote.trace &&
+		test_grep "push --atomic --porcelain" promote.trace &&
+		while IFS="$(printf "\t")" read -r ref old new
+		do
+			test_grep "force-with-lease=$ref:$old" promote.trace &&
+			test "$new" = "$(git --git-dir=../unstable-fan-in.git \
+				rev-parse "$ref")" || return 1
+		done <updates &&
+		git merge-base --is-ancestor "$stable" "$unstable" &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result repeated-result \
+			--updates repeated-updates --inputs repeated-inputs \
+			--failure repeated-failure &&
+		test "$stable" = "$(cat repeated-result)" &&
+		test "$unstable" = \
+			"$(updated_tip codex-unstable repeated-updates)" &&
+		test "$meta" = "$(updated_tip meta repeated-updates)" &&
+		test "$s05" = \
+			"$(updated_tip ee/codex/s05-unstable repeated-updates)" &&
+		test "$s13" = \
+			"$(updated_tip gg/codex/s13-unstable repeated-updates)" &&
+
+		git --git-dir=../unstable-fan-in.git update-ref \
+			refs/heads/dd/codex/c-unstable "$stable" "$c" &&
+		fetch_all &&
+		snapshot_refs ../unstable-fan-in.git >before-rewind &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result rewound-result --updates rewound-updates \
+			--inputs rewound-inputs --failure rewound-failure \
+			>rewound.out 2>rewound.err &&
+		test_grep "prerequisite.*changed; restack" rewound.err &&
+		test_path_is_missing rewound-result &&
+		snapshot_refs ../unstable-fan-in.git >after-rewind &&
+		test_cmp before-rewind after-rewind &&
+
+		git --git-dir=../unstable-fan-in.git update-ref \
+			refs/heads/dd/codex/c-unstable "$c" "$stable" &&
+		git --git-dir=../unstable-fan-in.git update-ref -d \
+			refs/heads/dd/codex/c-unstable "$c" &&
+		fetch_all &&
+		snapshot_refs ../unstable-fan-in.git >before-retirement &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result retired-result --updates retired-updates \
+			--inputs retired-inputs --failure retired-failure \
+			>retired.out 2>retired.err &&
+		test_grep "prerequisite.*retired" retired.err &&
+		test_path_is_missing retired-result &&
+		snapshot_refs ../unstable-fan-in.git >after-retirement &&
+		test_cmp before-retirement after-retirement
+	)
+'
+
+test_expect_success 'reviewed internal unstable merges can share a helper without admitting its descendants' '
+	for shape in explicit linear
+	do
+		fixture=unstable-shared-$shape &&
+		git init --bare "$fixture.git" &&
+		test_create_repo "$fixture-source" &&
+		(
+			cd "$fixture-source" &&
+			git remote add origin "../$fixture.git" &&
+			write base shared &&
+			git add shared &&
+			install_rerere_train &&
+			git commit -m base &&
+			git branch codex &&
+			git branch aa/codex/stable codex &&
+			create_unstable_sentinel codex &&
+			git branch meta master &&
+			install_unstable_meta_state meta master codex codex-unstable &&
+			git switch -c shared-helper codex &&
+			write helper helper-file &&
+			git add helper-file &&
+			git commit -m "shared unregistered helper" &&
+			if test "$shape" = explicit
+			then
+				git switch -c bb/codex/reviewed-unstable codex &&
+				write reviewed reviewed-file &&
+				git add reviewed-file &&
+				git commit -m "reviewed mainline" &&
+				git merge --no-ff shared-helper \
+					-m "Merge reviewed shared helper"
+			else
+				git switch -c bb/codex/reviewed-unstable \
+					shared-helper &&
+				write reviewed reviewed-file &&
+				git add reviewed-file &&
+				git commit -m "launder an unreviewed prerequisite"
+			fi &&
+			git switch -c cc/codex/unadmitted-unstable shared-helper &&
+			write hidden hidden-file &&
+			git add hidden-file &&
+			git commit -m "unadmitted helper descendant" &&
+			git switch codex-unstable &&
+			git merge --no-ff bb/codex/reviewed-unstable \
+				-m "Merge pull request #42 from openai/bb/codex/reviewed-unstable" &&
+			git push origin master meta codex codex-unstable \
+				aa/codex/stable bb/codex/reviewed-unstable \
+				cc/codex/unadmitted-unstable
+		) &&
+		git clone "$fixture.git" "$fixture-runner" &&
+		install_admission_gh "$TRASH_DIRECTORY/$fixture-bin" &&
+		(
+			cd "$fixture-runner" &&
+			fetch_all &&
+			if test "$shape" = explicit
+			then
+				unstable_admission_rewrite "$fixture" success &&
+				unstable=$(updated_tip codex-unstable updates) &&
+				test helper = "$(git show "$unstable:helper-file")" &&
+				test_must_fail git cat-file -e "$unstable:hidden-file" &&
+				test -z "$(updated_tip \
+					cc/codex/unadmitted-unstable updates)"
+			else
+				test_expect_code 1 unstable_admission_rewrite \
+					"$fixture" success >out 2>err &&
+				test_grep "unadmitted.*prerequisite" err &&
+				test_path_is_missing result
+			fi
+		) || return 1
+	done
+'
+
+test_expect_success 'the trusted admission gate permits only reviewed internal helper merges' '
+	install_admission_gate_gh "$TRASH_DIRECTORY/admission-gate-bin" &&
+	sed -n "/^        run: |\$/,/^        [^ ]/p" \
+		"$codex_admission_workflow" |
+	sed "1d; s/^          //" >"$TRASH_DIRECTORY/admission-gate.sh" &&
+	bash -n "$TRASH_DIRECTORY/admission-gate.sh" &&
+	for event in pull_request merge_group
+	do
+		run_admission_gate reviewed-shared-helper "$event" \
+			bb/codex/reviewed-unstable codex-unstable \
+			>"helper-$event.out" &&
+		test_grep "Approved pull request #42" \
+			"helper-$event.out" &&
+		run_admission_gate reviewed-shared-helper "$event" \
+			bb/codex/reviewed codex \
+			>"stable-helper-$event.out" &&
+		test_grep "Approved pull request #42" \
+			"stable-helper-$event.out" || return 1
+	done &&
+	for mode in linear-shared-helper ancestor-shared-helper \
+		helper-api-failure
+	do
+		test_expect_code 1 run_admission_gate "$mode" merge_group \
+			bb/codex/reviewed-unstable codex-unstable \
+			>"helper-$mode.out" 2>"helper-$mode.err" &&
+			test_expect_code 1 run_admission_gate "$mode" merge_group \
+			bb/codex/reviewed codex \
+			>"stable-helper-$mode.out" \
+			2>"stable-helper-$mode.err" || return 1
+	done &&
+	test_expect_code 1 run_admission_gate reviewed-unstable-helper \
+		merge_group bb/codex/reviewed codex \
+		>"stable-unstable-helper.out" \
+		2>"stable-unstable-helper.err" &&
+	test_grep "unenrolled history" stable-unstable-helper.err
+'
+
+test_expect_success 'an unstable merge graph cannot mix old and current production bases' '
+	git init --bare unstable-mixed-bases.git &&
+	test_create_repo unstable-mixed-bases-source &&
+	(
+		cd unstable-mixed-bases-source &&
+		git remote add origin ../unstable-mixed-bases.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/a-unstable codex &&
+		write A a-file &&
+		git add a-file &&
+		git commit -m "old-base prerequisite A" &&
+		git switch -c cc/codex/b-unstable codex &&
+		write B b-file &&
+		git add b-file &&
+		git commit -m "old-base prerequisite B" &&
+		git switch -c dd/codex/fan-unstable \
+			bb/codex/a-unstable &&
+		git merge --no-ff cc/codex/b-unstable \
+			-m "Merge mixed-base fan-in prerequisites" &&
+		write fan fan-file &&
+		git add fan-file &&
+		git commit -m "mixed-base fan-in payload" &&
+		git switch -c ee/codex/current-unstable codex &&
+		write current current-file &&
+		git add current-file &&
+		git commit -m "independent current-base topic" &&
+		git switch -c codex-unstable dd/codex/fan-unstable &&
+		git merge --no-ff ee/codex/current-unstable \
+			-m "Integrate the current-base topic" &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch master &&
+		write advance advanced-base &&
+		git add advanced-base &&
+		git commit -m "advance production before a partial restack" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/a-unstable \
+			cc/codex/b-unstable dd/codex/fan-unstable \
+			ee/codex/current-unstable
+	) &&
+
+	git clone unstable-mixed-bases.git unstable-mixed-bases-runner &&
+	(
+		cd unstable-mixed-bases-runner &&
+		fetch_all &&
+		fixed_date="2005-04-07T22:13:13+0000" &&
+		GIT_AUTHOR_DATE=$fixed_date GIT_COMMITTER_DATE=$fixed_date \
+			sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result valid-result \
+			--updates valid-updates --inputs valid-inputs \
+			--failure valid-failure &&
+		candidate=$(cat valid-result) &&
+		current_tree=$(git merge-tree --write-tree "$candidate" \
+			origin/ee/codex/current-unstable) &&
+		current=$(printf "%s\n" "partially restacked preview topic" |
+			git commit-tree "$current_tree" -p "$candidate") &&
+		git push --force origin \
+			"$current:refs/heads/ee/codex/current-unstable" &&
+		fetch_all &&
+		snapshot_refs ../unstable-mixed-bases.git >before &&
+		test_expect_code 1 env GIT_AUTHOR_DATE="$fixed_date" \
+			GIT_COMMITTER_DATE="$fixed_date" \
+			sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "mixes current and previous production bases" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../unstable-mixed-bases.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'upstream-absorbed fan-in prerequisites leave canonical unstable state' '
+	git init --bare unstable-absorbed-fan.git &&
+	test_create_repo unstable-absorbed-fan-source &&
+	(
+		cd unstable-absorbed-fan-source &&
+		git remote add origin ../unstable-absorbed-fan.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/a-unstable codex &&
+		write A a-file &&
+		git add a-file &&
+		git commit -m "upstream-absorbed prerequisite A" &&
+		git switch -c cc/codex/b-unstable codex &&
+		write B b-file &&
+		git add b-file &&
+		git commit -m "upstream-absorbed prerequisite B" &&
+		git switch -c dd/codex/fan-unstable \
+			bb/codex/a-unstable &&
+		git merge --no-ff cc/codex/b-unstable \
+			-m "Merge the upstream-absorbed prerequisites" &&
+		write fan fan-file &&
+		git add fan-file &&
+		git commit -m "retain the downstream fan-in payload" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch master &&
+		git merge --no-ff bb/codex/a-unstable \
+			cc/codex/b-unstable \
+			-m "Upstream accepts both fan-in prerequisites" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/a-unstable \
+			cc/codex/b-unstable dd/codex/fan-unstable
+	) &&
+
+	git clone unstable-absorbed-fan.git unstable-absorbed-fan-runner &&
+	(
+		cd unstable-absorbed-fan-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		meta=$(updated_tip meta updates) &&
+		git show "$meta:codex.config" >next.config &&
+		git config --no-includes --file next.config --get-all \
+			branch.dd/codex/fan-unstable.merge >fan-prerequisites &&
+		printf "%s\n" refs/heads/codex >expected-prerequisites &&
+		test_cmp expected-prerequisites fan-prerequisites &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result next-result \
+			--updates next-updates --inputs next-inputs \
+			--failure next-failure &&
+		test "$(cat result)" = "$(cat next-result)"
+	)
+'
+
+test_expect_success 'verify-output rejects a flattened unstable fan-in merge' '
+	git init --bare unstable-flattened-fan.git &&
+	test_create_repo unstable-flattened-fan-source &&
+	(
+		cd unstable-flattened-fan-source &&
+		git remote add origin ../unstable-flattened-fan.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		for entry in bb:a cc:b dd:c
+		do
+			prefix=${entry%:*} &&
+			name=${entry#*:} &&
+			git switch -c "$prefix/codex/$name-unstable" codex &&
+			write "$name" "$name-file" &&
+			git add "$name-file" &&
+			git commit -m "fan-in prerequisite $name" || return 1
+		done &&
+		git switch -c ee/codex/fan-unstable bb/codex/a-unstable &&
+		git merge --no-ff cc/codex/b-unstable \
+			dd/codex/c-unstable \
+			-m "Preserve the reviewed three-parent fan-in" &&
+		write fan fan-file &&
+		git add fan-file &&
+		git commit -m "reviewed fan-in payload" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch master &&
+		write advance advanced-base &&
+		git add advanced-base &&
+		git commit -m "advance before preserving fan-in topology" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/a-unstable \
+			cc/codex/b-unstable dd/codex/c-unstable \
+			ee/codex/fan-unstable
+	) &&
+
+	git clone unstable-flattened-fan.git unstable-flattened-fan-runner &&
+	(
+		cd unstable-flattened-fan-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		stable=$(cat result) &&
+		a=$(updated_tip bb/codex/a-unstable updates) &&
+		b=$(updated_tip cc/codex/b-unstable updates) &&
+		c=$(updated_tip dd/codex/c-unstable updates) &&
+		fan=$(updated_tip ee/codex/fan-unstable updates) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		meta=$(updated_tip meta updates) &&
+		old_meta=$(git rev-parse origin/meta) &&
+		fan_merge=$(git rev-parse "$fan^") &&
+		ab_tree=$(git merge-tree --write-tree "$a" "$b") &&
+		ab=$(printf "%s\n" "tampered binary A+B fan-in" |
+			git commit-tree "$ab_tree" -p "$a" -p "$b") &&
+		abc=$(printf "%s\n" "tampered binary +C fan-in" |
+			git commit-tree "$fan_merge^{tree}" -p "$ab" -p "$c") &&
+		flattened=$(printf "%s\n" "tampered flattened fan-in payload" |
+			git commit-tree "$fan^{tree}" -p "$abc") &&
+		test "$(git rev-parse "$fan^{tree}")" = \
+			"$(git rev-parse "$flattened^{tree}")" &&
+		fake_unstable=$stable &&
+		for entry in bb:a cc:b dd:c ee:fan
+		do
+			prefix=${entry%:*} &&
+			name=${entry#*:} &&
+			case "$name" in
+			a) tip=$a ;;
+			b) tip=$b ;;
+			c) tip=$c ;;
+			fan) tip=$flattened ;;
+			esac &&
+			tree=$(git merge-tree --write-tree "$fake_unstable" \
+				"$tip") &&
+			fake_unstable=$(make_test_unstable_integration \
+				"$prefix/codex/$name-unstable" "$tip" \
+				"$fake_unstable" "$tree") || return 1
+		done &&
+		git show "$meta:codex.config" |
+			sed -e "s/$fan/$flattened/g" \
+				-e "s/$unstable/$fake_unstable/g" \
+				>flattened.config &&
+		blob=$(git hash-object -w flattened.config) &&
+		index=$PWD/flattened.index &&
+		rm -f "$index" &&
+		GIT_INDEX_FILE=$index git read-tree "$old_meta^{tree}" &&
+		GIT_INDEX_FILE=$index git update-index --add --cacheinfo \
+			100644,"$blob",codex.config &&
+		tree=$(GIT_INDEX_FILE=$index git write-tree) &&
+		fake_meta=$(printf "%s\n" "meta: forged flattened fan-in" |
+			GIT_AUTHOR_NAME=$codex_bot_name \
+			GIT_AUTHOR_EMAIL=$codex_bot_email \
+			GIT_COMMITTER_NAME=$codex_bot_name \
+			GIT_COMMITTER_EMAIL=$codex_bot_email \
+			git -c commit.gpgSign=false commit-tree \
+				"$tree" -p "$old_meta") &&
+		awk -F "$(printf '\''\t'\'')" \
+			-v OFS="$(printf '\''\t'\'')" \
+			-v meta="$fake_meta" -v unstable="$fake_unstable" \
+			-v fan="$flattened" '\''
+			$1 == "refs/heads/meta" { $3=meta }
+			$1 == "refs/heads/codex-unstable" { $3=unstable }
+			$1 == "refs/heads/ee/codex/fan-unstable" { $3=fan }
+			{ print }
+		'\'' updates >flattened.updates &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs inputs --updates flattened.updates --result result \
+			>flattened.out 2>flattened.err &&
+		test_grep "merge rewrite.*topology" flattened.err
 	)
 '
 

@@ -42,6 +42,48 @@ jobs:
             gh api "$@"
           }
 
+          reviewed_internal_merge_contains () {
+            local reviewed_tip=$1
+            local shared=$2
+            local other_tip=$3
+            local published=$4
+            local merges merge first parents parent relationship
+
+            test "$shared" != "$other_tip" || return 1
+            merges=$(api --paginate \
+              "repos/$GITHUB_REPOSITORY/compare/$published...$reviewed_tip?per_page=100" \
+              --jq '.commits[] | select((.parents | length) > 1) |
+                     [.sha, .parents[0].sha,
+                      (.parents[1:] | map(.sha) | join(" "))] | @tsv') ||
+              die 'could not inspect reviewed internal merges'
+            while IFS=$'\t' read -r merge first parents
+            do
+              test -n "$merge" || continue
+              relationship=$(api \
+                "repos/$GITHUB_REPOSITORY/compare/$first...$shared" \
+                --jq '.status') ||
+                die 'could not inspect the reviewed first-parent history'
+              case "$relationship" in
+              behind|identical) continue ;;
+              ahead|diverged) ;;
+              *) die 'the reviewed first-parent relationship is invalid' ;;
+              esac
+              for parent in $parents
+              do
+                relationship=$(api \
+                  "repos/$GITHUB_REPOSITORY/compare/$parent...$shared" \
+                  --jq '.status') ||
+                  die 'could not inspect a reviewed internal merge parent'
+                case "$relationship" in
+                behind|identical) return 0 ;;
+                ahead|diverged) ;;
+                *) die 'the reviewed merge-parent relationship is invalid' ;;
+                esac
+              done
+            done <<<"$merges"
+            return 1
+          }
+
           test "$GITHUB_REPOSITORY" = openai/git ||
             die "unexpected repository '$GITHUB_REPOSITORY'"
           test "$WORKFLOW_REPOSITORY" = openai/git ||
@@ -311,6 +353,17 @@ jobs:
               case "$upstream_relationship" in
               behind|identical) ;;
               *)
+                case "$lane:$other_name" in
+                codex:*-unstable|codex:*-wip|codex:*-stale) ;;
+                *)
+                  if reviewed_internal_merge_contains \
+                       "$topic_oid" "$shared_base" "$other_oid" \
+                       "$published_oid"
+                  then
+                    continue
+                  fi
+                  ;;
+                esac
                 die "topic '$topic_name' shares unenrolled history with '$other_name'"
                 ;;
               esac

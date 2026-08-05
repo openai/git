@@ -15,8 +15,10 @@ merges into that lane and the controller enrolls its retained head. Merely
 pushing a matching branch, including an `-unstable` branch, never includes it
 in a build. The `-wip` and `-stale` suffixes are inactive.
 
-The generated `codex.config` records each enrolled topic's prerequisite and
-last published tip. When the preview lane is enabled, it also records the exact
+The generated `codex.config` records each enrolled topic's prerequisites and
+last published tip. A linear topic has one `branch.<name>.merge` value; a
+merge-shaped topic records every reviewed parent edge as a repeated `merge`
+value. When the preview lane is enabled, the file also records the exact
 production commit underlying `codex-unstable` and its published preview tip.
 Prerequisite edges form a partial order within each lane; there is no global
 topic order. Rows are sorted only to give the generated file a stable
@@ -132,16 +134,21 @@ Already enrolled topics remain active across rebuilds. You may push an update
 and run the controller directly, or use another reviewed topic pull request
 before rebuilding.
 
-Keep topic history linear. Rebase a dependent topic onto its prerequisite;
-never merge either generated branch into a topic or use GitHub's **Update
-branch** button on these pull requests.
+Keep topic history explicit. A topic may retain a reviewed merge-shaped DAG,
+including fan-in from other enrolled same-lane topics, but never merge either
+generated branch into a topic or use GitHub's **Update branch** button on
+these pull requests. The controller preserves the reviewed ordered merge
+parents and shared ancestry; it does not flatten them into a guessed linear
+stack.
 
-For a new topic, the controller infers one prerequisite: its nearest enrolled
-same-lane topic-tip ancestor, or that lane's root. The production root is
-`master`; the preview root is the exact generated `codex`. After publication
-it keeps that recorded edge across prerequisite rewrites. If sibling topics
-share private commits, create an enrolled topic at that shared prefix and base
-both siblings on it. Otherwise the controller rejects the ambiguous overlap.
+For a new topic, the controller infers its nearest enrolled same-lane
+topic-tip ancestors, or that lane's root when none exists. The production root
+is `master`; the preview root is the exact generated `codex`. After
+publication it keeps those recorded edges across prerequisite rewrites. If
+sibling topics share private commits, either represent that shared prefix as
+an enrolled topic or bring it in through an explicit reviewed non-first-parent
+merge. Linear hidden prerequisites and unapproved descendant tips remain
+rejected.
 
 You may append, amend, reorder, or drop commits on an existing topic. If it
 has dependents, you may leave them at the last published prerequisite tip; the
@@ -150,7 +157,9 @@ prerequisite, rebase it so the new topic's exact current tip is in its history.
 To make it a root topic, rebase it onto the current `master` or `codex`, as
 appropriate, and remove the old private prerequisite from its history. Those
 exact ancestry changes are the reordering signal; patch similarity and
-lexical branch order are never used.
+lexical branch order are never used. If a merge-shaped rewrite conflicts,
+the controller stops without moving refs; restack the reviewed graph and run
+`Meta/rebuild` again instead of using the linear `resolve`/`continue` path.
 
 Before making a prerequisite inactive, first restack every child onto a
 surviving topic in the same lane or that lane's root. The controller refuses
@@ -166,7 +175,8 @@ target the matching lane: ordinary topics go to `codex`; `-unstable` topics go
 to `codex-unstable`. The topic ruleset retains that head after the merge. Do
 not delete, force-rewrite, or otherwise change the reviewed head before the
 controller rebuilds it. Each lane rejects squash commits, unrelated direct
-commits, multiple pending merges, octopus merges, and merge-only edits.
+commits, multiple pending integration merges, octopus integration merges, and
+merge-only edits.
 
 ## Keep dispatch and admission on the generated branches
 
