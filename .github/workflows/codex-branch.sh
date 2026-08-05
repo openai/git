@@ -4199,6 +4199,41 @@ remote_head_oid () {
 		awk -v ref="$ref" '$2 == ref { print $1; exit }'
 }
 
+published_updates_match () (
+	remote=$1
+	updates=$2
+	staging=$3
+	unstable_staging=$(staging_ref codex-unstable-staging)
+	refs=$tmp_dir/published-update-refs
+
+	set -- git ls-remote --refs "$remote" "$staging" "$unstable_staging"
+	while IFS="$tab" read -r ref old new
+	do
+		set -- "$@" "$ref"
+	done <"$updates"
+	"$@" >"$refs" || return 1
+
+	for ref in "$staging" "$unstable_staging"
+	do
+		if awk -v ref="$ref" '$2 == ref { found=1 }
+			END { exit !found }' "$refs"
+		then
+			return 1
+		fi
+	done
+	while IFS="$tab" read -r ref old new
+	do
+		current=$(awk -v ref="$ref" '$2 == ref { print $1; exit }' \
+			"$refs")
+		if is_null_oid "$new"
+		then
+			test -z "$current" || return 1
+		else
+			test "$current" = "$new" || return 1
+		fi
+	done <"$updates"
+)
+
 stage_candidate () {
 	remote=origin
 	staging=codex-staging
@@ -4322,6 +4357,12 @@ promote () {
 	candidate=$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
 		"$updates")
 	test -n "$candidate" || die "update manifest has no codex candidate"
+	ref=$(staging_ref "$staging")
+	if published_updates_match "$remote" "$updates" "$ref"
+	then
+		say "Codex candidate $candidate was already published; all output refs match and staging is absent."
+		return 0
+	fi
 	printf '%s\n' "$candidate" >"$tmp_dir/promote-result" ||
 		die "could not prepare promotion verification"
 	set -- --inputs "$inputs" --updates "$updates" \
