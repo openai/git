@@ -523,10 +523,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_DESCRIPTION: ${{ needs.version.outputs.describe }}
+          SOURCE_REF: ${{ github.ref }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           assets=(artifacts/git-*)
+          release_notes=$(
+            printf '%s\n' \
+              "source_ref=$SOURCE_REF" \
+              "source_sha=$GITHUB_SHA" \
+              "" \
+              "OpenAI Git release artifacts for $SOURCE_DESCRIPTION, built from $GITHUB_SHA for Codex."
+          )
 
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
           then
@@ -538,6 +546,6 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$VERSION" \
-              --notes "OpenAI Git release artifacts for $SOURCE_DESCRIPTION, built from $GITHUB_SHA for Codex." \
+              --notes "$release_notes" \
               --prerelease
           fi
