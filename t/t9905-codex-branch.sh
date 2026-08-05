@@ -5301,7 +5301,48 @@ test_expect_success 'enabling unstable creates a strict empty sentinel' '
 			--inputs inputs --updates updates --result result &&
 		git bundle verify candidate.bundle &&
 		git bundle list-heads candidate.bundle >bundle-heads &&
-		test_grep "refs/codex-output/unstable" bundle-heads
+		test_grep "refs/codex-output/unstable" bundle-heads &&
+		sh "$codex_branch" stage --remote origin \
+			--staging codex-staging \
+			--inputs inputs --updates updates &&
+		sh "$codex_branch" stage --remote origin \
+			--staging codex-unstable-staging \
+			--inputs inputs --updates updates &&
+		GIT_TRACE=1 sh "$codex_branch" promote --remote origin \
+			--staging codex-staging \
+			--inputs inputs --updates updates \
+			>promote.out 2>promote.trace &&
+		test_grep "push --atomic --porcelain" promote.trace &&
+		test "$stable" = \
+			"$(git --git-dir=../enable-unstable.git \
+				rev-parse refs/heads/codex)" &&
+		test "$unstable" = \
+			"$(git --git-dir=../enable-unstable.git \
+				rev-parse refs/heads/codex-unstable)" &&
+		test "$meta" = \
+			"$(git --git-dir=../enable-unstable.git \
+				rev-parse refs/heads/meta)" &&
+		test_must_fail git --git-dir=../enable-unstable.git \
+			show-ref --verify refs/heads/codex-staging &&
+		test_must_fail git --git-dir=../enable-unstable.git \
+			show-ref --verify refs/heads/codex-unstable-staging &&
+		snapshot_refs ../enable-unstable.git >published &&
+		GIT_TRACE=1 sh "$codex_branch" promote --remote origin \
+			--staging codex-staging \
+			--inputs inputs --updates updates \
+			>retry.out 2>retry.trace &&
+		! grep -F "push --atomic" retry.trace &&
+		snapshot_refs ../enable-unstable.git >retried &&
+		test_cmp published retried &&
+		git --git-dir=../enable-unstable.git update-ref \
+			refs/heads/codex-unstable "$stable" "$unstable" &&
+		snapshot_refs ../enable-unstable.git >partial &&
+		test_expect_code 1 sh "$codex_branch" promote --remote origin \
+			--staging codex-staging \
+			--inputs inputs --updates updates \
+			>partial.out 2>partial.err &&
+		snapshot_refs ../enable-unstable.git >after-partial &&
+		test_cmp partial after-partial
 	)
 '
 
