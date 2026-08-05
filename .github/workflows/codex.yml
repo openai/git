@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   prepare:
-    name: Rebase topics and assemble codex
+    name: Rebase topics and assemble Codex branches
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the pinned controller
@@ -41,7 +41,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
           test "$(git rev-parse refs/remotes/origin/codex)" = "$GITHUB_SHA"
 
-      - name: Rebase every topic and assemble codex
+      - name: Rebase topics and assemble the enabled Codex branches
         id: rewrite
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,6 +61,18 @@ jobs:
             --failure "$RUNNER_TEMP/codex-conflict.md"
 
           candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          unstable_candidate=$(awk -F '\t' \
+            '$1 == "refs/heads/codex-unstable" { print $3 }' \
+            "$RUNNER_TEMP/codex-updates")
+          case "$unstable_candidate" in
+            '') ;;
+            *[!0]*)
+              test "$unstable_candidate" != "$candidate"
+              git merge-base --is-ancestor "$candidate" "$unstable_candidate"
+              echo "unstable-candidate=$unstable_candidate" >>"$GITHUB_OUTPUT"
+              ;;
+            *) ;;
+          esac
           artifact_name="codex-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           {
             printf 'repository\t%s\n' "$GITHUB_REPOSITORY"
@@ -85,11 +97,23 @@ jobs:
           old_codex=$(awk -F '\t' '$1 == "codex" { print $3 }' \
             "$RUNNER_TEMP/codex-inputs")
           candidate=$(cat "$RUNNER_TEMP/codex-candidate")
+          unstable_candidate=$(awk -F '\t' \
+            '$1 == "refs/heads/codex-unstable" { print $3 }' \
+            "$RUNNER_TEMP/codex-updates")
           {
             echo '## Codex candidate'
             echo
             echo "Old codex: \`$old_codex\`"
             echo "Candidate: \`$candidate\`"
+            case "$unstable_candidate" in
+              '') ;;
+              *[!0]*)
+                echo "Unstable candidate: \`$unstable_candidate\`"
+                ;;
+              *)
+                echo 'Unstable candidate: branch will be removed'
+                ;;
+            esac
             echo "Controller: \`$CONTROLLER_OID\`"
             echo
             echo 'Publish this exact prepared run from a clean local clone:'

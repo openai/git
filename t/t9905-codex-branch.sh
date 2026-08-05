@@ -54,7 +54,8 @@ manifest_has () {
 
 snapshot_without_staging () {
 	snapshot_refs "$1" |
-	sed '/^refs\/heads\/codex-staging[[:space:]]/d'
+	sed '/^refs\/heads\/codex-staging[[:space:]]/d
+		/^refs\/heads\/codex-unstable-staging[[:space:]]/d'
 }
 
 write_automation_workflow () {
@@ -74,6 +75,59 @@ write_automation_workflow () {
 }
 
 write_reviewed_automation_workflow () {
+	cat >"$1" <<-'EOF'
+	name: Refresh codex
+
+	on:
+	  workflow_dispatch:
+	  pull_request:
+	    branches:
+	      - codex
+	      - codex-unstable
+	    types:
+	      - opened
+	      - reopened
+	      - synchronize
+	      - ready_for_review
+	  merge_group:
+	    types:
+	      - checks_requested
+
+	permissions:
+	  actions: read
+	  contents: read
+	  pull-requests: read
+
+	jobs:
+	  refresh:
+	    if: github.event_name == 'workflow_dispatch'
+	    uses: openai/git/.github/workflows/codex.yml@meta
+	  admission:
+	    name: Codex admission
+	    if: >-
+	      (github.event_name == 'pull_request' &&
+	       github.event.pull_request.base.ref == 'codex') ||
+	      (github.event_name == 'merge_group' &&
+	       github.event.merge_group.base_ref == 'refs/heads/codex')
+	    permissions:
+	      contents: read
+	      pull-requests: read
+	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+	  unstable_admission:
+	    name: Codex unstable admission
+	    if: >-
+	      (github.event_name == 'pull_request' &&
+	       github.event.pull_request.base.ref == 'codex-unstable') ||
+	      (github.event_name == 'merge_group' &&
+	       github.event.merge_group.base_ref == 'refs/heads/codex-unstable')
+	    permissions:
+	      contents: read
+	      pull-requests: read
+	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+	EOF
+}
+
+write_stable_reviewed_automation_workflow () {
 	cat >"$1" <<-'EOF'
 	name: Refresh codex
 
@@ -179,7 +233,7 @@ install_admission_gh () {
 		merged_at=2026-08-04T00:00:00Z
 		merge=$FAKE_ADMISSION_MERGE
 		base_repository=openai/git
-		base=codex
+		base=${FAKE_ADMISSION_BASE:-codex}
 		head_repository=openai/git
 		head_ref=$FAKE_ADMISSION_BRANCH
 		head=$FAKE_ADMISSION_HEAD
@@ -280,6 +334,9 @@ install_admission_gate_gh () {
 	repos/openai/git/git/ref/heads/codex)
 		printf '%s\n' "$FAKE_GATE_CODEX"
 		;;
+	repos/openai/git/git/ref/heads/codex-unstable)
+		printf '%s\n' "$FAKE_GATE_UNSTABLE"
+		;;
 	repos/openai/git/git/ref/heads/??/codex/*)
 		if test "${FAKE_GATE_MODE:-}" = changed-topic
 		then
@@ -289,13 +346,31 @@ install_admission_gate_gh () {
 		fi
 		;;
 	repos/openai/git/contents/codex.config\?ref=*)
-		published=$FAKE_GATE_CODEX
-		test "${FAKE_GATE_MODE:-}" != pending ||
-			published=$FAKE_GATE_OTHER
-		printf '[codex]\n\toutput-tip = %s\n' "$published"
+		published_stable=$FAKE_GATE_CODEX
+		published_unstable=$FAKE_GATE_UNSTABLE
+		if test "${FAKE_GATE_MODE:-}" = pending
+		then
+			if test "${FAKE_GATE_LANE:-codex}" = codex-unstable
+			then
+				published_unstable=$FAKE_GATE_OTHER
+			else
+				published_stable=$FAKE_GATE_OTHER
+			fi
+		fi
+		printf '[codex]\n\toutput-tip = %s\n' \
+			"$published_stable"
+		printf '[codex-unstable]\n\tbase-tip = %s\n\toutput-tip = %s\n' \
+			"$published_stable" "$published_unstable"
+		if test "${FAKE_GATE_MODE:-}" = hidden-enrolled-unstable
+		then
+			printf '[branch "cc/codex/private-parent-unstable"]\n'
+			printf '\tcodex-tip = %s\n' "$FAKE_GATE_OTHER"
+		fi
 		;;
 	repos/openai/git/git/commits/*)
 		first=$FAKE_GATE_CODEX
+		test "${FAKE_GATE_LANE:-codex}" != codex-unstable ||
+			first=$FAKE_GATE_UNSTABLE
 		test "${FAKE_GATE_MODE:-}" != wrong-parent ||
 			first=$FAKE_GATE_OTHER
 		printf '%s\t%s\t%s\t%s\n' \
@@ -358,6 +433,14 @@ install_admission_gate_gh () {
 			printf '%s\t%s\n' "cc/codex/private-parent-$suffix" \
 				"$FAKE_GATE_OTHER"
 			;;
+		hidden-enrolled-unstable)
+			printf '%s\t%s\n' cc/codex/private-parent-unstable \
+				"$FAKE_GATE_OTHER"
+			;;
+		descendant-checkpoint)
+			printf '%s\t%s\n' cc/codex/checkpoint-unstable \
+				"$FAKE_GATE_OTHER"
+			;;
 		same-tip-alias)
 			printf '%s\t%s\n' cc/codex/same-tip \
 				"$FAKE_GATE_TOPIC"
@@ -367,7 +450,12 @@ install_admission_gate_gh () {
 	repos/openai/git/compare/*)
 		case "$endpoint" in
 		*"$FAKE_GATE_OTHER...$FAKE_GATE_TOPIC")
-			printf '%s\n' "$FAKE_GATE_SHARED"
+			if test "${FAKE_GATE_MODE:-}" = descendant-checkpoint
+			then
+				printf '%s\n' "$FAKE_GATE_TOPIC"
+			else
+				printf '%s\n' "$FAKE_GATE_SHARED"
+			fi
 			;;
 		*"master...$FAKE_GATE_SHARED")
 			if test "${FAKE_GATE_MODE:-}" = newer-master
@@ -396,25 +484,34 @@ run_admission_gate () {
 	mode=$1 &&
 	event=$2 &&
 	branch=${3:-bb/codex/reviewed} &&
+	lane=${4:-codex} &&
 	directory=$TRASH_DIRECTORY/admission-gate-bin &&
 	meta=1111111111111111111111111111111111111111 &&
 	codex=2222222222222222222222222222222222222222 &&
+	unstable=7777777777777777777777777777777777777777 &&
 	topic=3333333333333333333333333333333333333333 &&
 	candidate=4444444444444444444444444444444444444444 &&
 	other=5555555555555555555555555555555555555555 &&
 	shared=6666666666666666666666666666666666666666 &&
+	if test "$lane" = codex-unstable
+	then
+		base=$unstable
+	else
+		base=$codex
+	fi &&
 	env PATH="$directory:$PATH" GH_TOKEN=not-a-real-token \
 		GITHUB_REPOSITORY=openai/git GITHUB_EVENT_NAME="$event" \
 		GITHUB_SHA="$candidate" WORKFLOW_REPOSITORY=openai/git \
 		WORKFLOW_SHA="$meta" EVENT_ACTION=checks_requested \
-		GROUP_BASE_REF=refs/heads/codex GROUP_BASE_SHA="$codex" \
-		GROUP_HEAD_REF=refs/heads/gh-readonly-queue/codex/pr-42 \
+		GROUP_BASE_REF="refs/heads/$lane" GROUP_BASE_SHA="$base" \
+		GROUP_HEAD_REF="refs/heads/gh-readonly-queue/$lane/pr-42" \
 		GROUP_HEAD_SHA="$candidate" PULL_NUMBER=42 \
-		PULL_BASE_REF=codex PULL_BASE_SHA="$codex" \
+		PULL_BASE_REF="$lane" PULL_BASE_SHA="$base" \
 		PULL_HEAD_REF="$branch" PULL_HEAD_SHA="$topic" \
 		PULL_HEAD_REPOSITORY=openai/git PULL_DRAFT=false \
 		FAKE_GATE_MODE="$mode" FAKE_GATE_META="$meta" \
-		FAKE_GATE_CODEX="$codex" FAKE_GATE_TOPIC="$topic" \
+		FAKE_GATE_LANE="$lane" FAKE_GATE_CODEX="$codex" \
+		FAKE_GATE_UNSTABLE="$unstable" FAKE_GATE_TOPIC="$topic" \
 		FAKE_GATE_CANDIDATE="$candidate" FAKE_GATE_OTHER="$other" \
 		FAKE_GATE_SHARED="$shared" FAKE_GATE_BRANCH="$branch" \
 		bash "$TRASH_DIRECTORY/admission-gate.sh"
@@ -477,11 +574,13 @@ admission_command () {
 	fixture=$1 &&
 	mode=${2:-success} &&
 	shift 2 &&
+	base=${ADMISSION_BASE:-codex} &&
 	branch=${ADMISSION_TOPIC:-bb/codex/reviewed} &&
-	merge=$(git rev-parse refs/remotes/origin/codex) &&
+	merge=$(git rev-parse "refs/remotes/origin/$base") &&
 	head=$(git rev-parse "refs/remotes/origin/$branch") &&
 	other=$(git rev-parse refs/remotes/origin/master) &&
 	env PATH="$TRASH_DIRECTORY/$fixture-bin:$PATH" \
+		FAKE_ADMISSION_BASE="$base" \
 		FAKE_ADMISSION_MERGE="$merge" \
 		FAKE_ADMISSION_HEAD="$head" \
 		FAKE_ADMISSION_OTHER="$other" \
@@ -641,6 +740,181 @@ install_explicit_meta_state () (
 	rm -f "$state_bases" "$state_config" "$state_index"
 )
 
+install_unstable_meta_state () (
+	meta_branch=$1
+	base_branch=$2
+	stable_branch=$3
+	unstable_branch=$4
+	install_meta_state "$meta_branch" "$base_branch" "$stable_branch" &&
+	meta_parent=$(git rev-parse "$meta_branch") &&
+	stable_tip=$(git rev-parse "$stable_branch") &&
+	unstable_tip=$(git rev-parse "$unstable_branch") &&
+	state_topics=.codex-unstable-state-topics &&
+	state_config=.codex-unstable-state-config &&
+	state_index=.codex-unstable-state-index &&
+	git show "$meta_parent:codex.config" |
+	awk -v stable="$stable_tip" -v unstable="$unstable_tip" '
+		/^\tversion = 1$/ {
+			$0 = "\tversion = 2"
+		}
+		/^\toutput-tip = / && !added {
+			print
+			print ""
+			print "[codex-unstable]"
+			print "\tbase-ref = refs/heads/codex"
+			print "\tbase-tip = " stable
+			print "\toutput-ref = refs/heads/codex-unstable"
+			print "\toutput-tip = " unstable
+			added = 1
+			next
+		}
+		{ print }
+	' >"$state_config" &&
+	git for-each-ref --format="%(refname:short)%09%(objectname)" \
+		refs/heads |
+	while IFS="$(printf '\t')" read -r name oid
+	do
+		case "$name" in
+		??/codex/?*-unstable) ;;
+		*) continue ;;
+		esac
+		case "$name" in
+		??/codex/*/*) continue ;;
+		esac
+		if git merge-base --is-ancestor "$oid" "$unstable_tip"
+		then
+			printf "%s\t%s\n" "$name" "$oid"
+		fi
+	done | LC_ALL=C sort >"$state_topics" &&
+	while IFS="$(printf '\t')" read -r name oid
+	do
+		prerequisite=$stable_branch &&
+		prerequisite_tip=$stable_tip &&
+		while IFS="$(printf '\t')" read -r other_name other_oid
+		do
+			test "$name" = "$other_name" && continue
+			test "$oid" = "$other_oid" && continue
+			if git merge-base --is-ancestor "$other_oid" "$oid" &&
+				git merge-base --is-ancestor \
+					"$prerequisite_tip" "$other_oid"
+			then
+				prerequisite=$other_name &&
+				prerequisite_tip=$other_oid
+			fi
+		done <"$state_topics" &&
+		{
+			printf "\n[branch \"%s\"]\n" "$name" &&
+			printf "\tremote = .\n" &&
+			printf "\tmerge = refs/heads/%s\n" "$prerequisite" &&
+			printf "\tcodex-tip = %s\n" "$oid"
+		} >>"$state_config"
+	done <"$state_topics" &&
+	blob=$(git hash-object -w "$state_config") &&
+	helper_blob=$(git hash-object -w "$codex_branch") &&
+	rm -f "$state_index" &&
+	GIT_INDEX_FILE=$state_index git read-tree "$meta_parent^{tree}" &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100644,"$blob",codex.config &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100755,"$helper_blob",.github/workflows/codex-branch.sh &&
+	tree=$(GIT_INDEX_FILE=$state_index git write-tree) &&
+	meta_tip=$(printf "%s\n" "meta: initialize unstable Codex topic state" |
+		git commit-tree "$tree" -p "$meta_parent") &&
+	git update-ref "refs/heads/$meta_branch" "$meta_tip" "$meta_parent" &&
+	rm -f "$state_topics" "$state_config" "$state_index"
+)
+
+create_unstable_sentinel () (
+	base=$(git rev-parse "$1") &&
+	tree=$(git rev-parse "$base^{tree}") &&
+	sentinel=$(printf '%s\n' 'Initialize codex-unstable' |
+		GIT_AUTHOR_NAME=$codex_bot_name \
+		GIT_AUTHOR_EMAIL=$codex_bot_email \
+		GIT_COMMITTER_NAME=$codex_bot_name \
+		GIT_COMMITTER_EMAIL=$codex_bot_email \
+		git -c commit.gpgSign=false commit-tree "$tree" -p "$base") &&
+	git branch codex-unstable "$sentinel"
+)
+
+setup_pending_unstable () (
+	fixture=$1
+	topic=${2:-bb/codex/reviewed-unstable}
+	style=${3:-merge}
+
+	git init --bare "$fixture.git" &&
+	test_create_repo "$fixture-source" &&
+	(
+		cd "$fixture-source" &&
+		git remote add origin "../$fixture.git" &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "unstable admission base" &&
+		git switch -c aa/codex/enrolled master &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "already enrolled production topic" &&
+		git branch codex &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		if test "$style" = sentinel
+		then
+			git push origin master meta codex codex-unstable \
+				aa/codex/enrolled
+		else
+			git switch -c "$topic" codex &&
+			write reviewed reviewed-unstable-file &&
+			git add reviewed-unstable-file &&
+			git commit -m "reviewed unstable topic" &&
+			git switch codex-unstable &&
+			case "$style" in
+			merge)
+				git merge --no-ff "$topic" \
+					-m "Merge pull request #42 from openai/$topic"
+				;;
+			squash)
+				git merge --squash "$topic" &&
+				git commit -m "squash an unadmitted unstable topic"
+				;;
+			*) return 1 ;;
+			esac &&
+			git push origin master meta codex codex-unstable \
+				aa/codex/enrolled "$topic"
+		fi
+	) &&
+	git clone "$fixture.git" "$fixture-runner" &&
+	install_admission_gh "$TRASH_DIRECTORY/$fixture-bin"
+)
+
+unstable_admission_rewrite () {
+	fixture=$1 &&
+	mode=${2:-success} &&
+	shift 2 &&
+	ADMISSION_BASE=codex-unstable \
+	ADMISSION_TOPIC=${ADMISSION_TOPIC:-bb/codex/reviewed-unstable} \
+		admission_rewrite "$fixture" "$mode" "$@"
+}
+
+apply_test_updates () (
+	remote=$1
+	updates=$2
+	set -- git push --atomic --force "$remote"
+	while IFS="$(printf '\t')" read -r ref old new
+	do
+		case "$new" in
+		0000000000000000000000000000000000000000|\
+		0000000000000000000000000000000000000000000000000000000000000000)
+			set -- "$@" ":$ref"
+			;;
+		*)
+			set -- "$@" "$new:$ref"
+			;;
+		esac || return 1
+	done <"$updates"
+	"$@"
+)
+
 updated_tip () {
 	awk -F "$(printf '\t')" -v ref="refs/heads/$1" \
 		'$1 == ref { print $3 }' "$2"
@@ -798,7 +1072,7 @@ test_expect_success 'reviewed admission requires one app-authenticated queue ent
 	test_grep "pull_request)" "$codex_admission_workflow" &&
 	test_grep "merge_group)" "$codex_admission_workflow" &&
 	test_grep "codex.output-tip" "$codex_admission_workflow" &&
-	test_grep "refs/heads/gh-readonly-queue/codex/" \
+	test_grep "refs/heads/gh-readonly-queue/" \
 		"$codex_admission_workflow" &&
 	test_grep "pull-requests: read" "$codex_admission_workflow" &&
 	! grep -E "contents: write|pull-requests: write|statuses: write|id-token|actions/checkout|git push" \
@@ -855,7 +1129,7 @@ test_expect_success 'admission workflow executes both pull-request and queue che
 	test_grep "Approved pull request #42" newer-master.out &&
 	for mode in pending wrong-parent unapproved multiple-pulls \
 		changed-topic changed-workflow hidden-prerequisite \
-		hidden-wip hidden-stale hidden-unstable
+		hidden-wip hidden-stale hidden-unstable hidden-enrolled-unstable
 	do
 		test_expect_code 1 run_admission_gate "$mode" merge_group \
 			>"queue-$mode.out" 2>"queue-$mode.err" || return 1
@@ -1419,7 +1693,8 @@ test_expect_success 'topics cannot change the convenience wrappers' '
 '
 
 test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
-	for direction in upgrade downgrade
+	for direction in upgrade stable-upgrade downgrade \
+		stable-downgrade dual-downgrade
 	do
 		fixture="automation-$direction" &&
 		git init --bare "$fixture.git" &&
@@ -1433,27 +1708,39 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 			git commit -m "automation migration base" &&
 			git switch -c aa/codex/automation master &&
 			mkdir -p .github/workflows &&
-			if test "$direction" = upgrade
-			then
+			case "$direction" in
+			upgrade)
 				write_automation_workflow \
 					.github/workflows/codex.yml
-			else
+				;;
+			stable-upgrade|stable-downgrade)
+				write_stable_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+				;;
+			downgrade|dual-downgrade)
 				write_reviewed_automation_workflow \
 					.github/workflows/codex.yml
-			fi &&
+				;;
+			esac &&
 			git add .github/workflows/codex.yml &&
 			git commit -m "published automation" &&
 			git branch codex &&
 			git branch meta master &&
 			install_meta_state meta master codex &&
-			if test "$direction" = upgrade
-			then
+			case "$direction" in
+			upgrade|stable-upgrade)
 				write_reviewed_automation_workflow \
 					.github/workflows/codex.yml
-			else
+				;;
+			downgrade|stable-downgrade)
 				write_automation_workflow \
 					.github/workflows/codex.yml
-			fi &&
+				;;
+			dual-downgrade)
+				write_stable_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+				;;
+			esac &&
 			git add .github/workflows/codex.yml &&
 			git commit -m "change automation generation" &&
 			git push origin master meta codex aa/codex/automation
@@ -1462,7 +1749,8 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 		(
 			cd "$fixture-runner" &&
 			fetch_all &&
-			if test "$direction" = upgrade
+			if test "$direction" = upgrade ||
+				test "$direction" = stable-upgrade
 			then
 				sh "$codex_branch" rewrite --remote origin \
 					--base master --codex codex \
@@ -4870,6 +5158,1337 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		test_must_fail git show-ref --verify refs/codex-output/meta &&
 		test_must_fail git --git-dir=../publish-run.git show-ref --verify \
 			refs/heads/codex-staging
+	)
+'
+
+test_expect_success 'unstable rules require one app-authenticated queue entry' '
+	rules="$codex_root/.github/rulesets/codex-unstable-branch.json" &&
+	test_path_is_file "$rules" &&
+	jq -e "
+		(.conditions.ref_name.include == [\"refs/heads/codex-unstable\"]) and
+		(.rules[] | select(.type == \"merge_queue\") |
+		 .parameters.merge_method == \"MERGE\" and
+		 .parameters.grouping_strategy == \"ALLGREEN\" and
+		 .parameters.max_entries_to_build == 1 and
+		 .parameters.max_entries_to_merge == 1 and
+		 .parameters.min_entries_to_merge == 1) and
+		(.rules[] | select(.type == \"required_status_checks\") |
+		 .parameters.required_status_checks == [{
+		   \"context\": \"Codex unstable admission / Verify reviewed topic\",
+		   \"integration_id\": 15368
+		 }])
+	" "$rules" &&
+	test_grep "codex-unstable.output-tip" "$codex_admission_workflow" &&
+	test_grep "codex-unstable.base-tip" "$codex_admission_workflow"
+'
+
+test_expect_success 'unstable admission executes both lane-specific checks' '
+	install_admission_gate_gh "$TRASH_DIRECTORY/admission-gate-bin" &&
+	sed -n "/^        run: |\$/,/^        [^ ]/p" \
+		"$codex_admission_workflow" |
+	sed "1d; s/^          //" >"$TRASH_DIRECTORY/admission-gate.sh" &&
+	run_admission_gate success pull_request \
+		bb/codex/reviewed-unstable codex-unstable >unstable-pull.out &&
+	test_grep "Approved pull request #42" unstable-pull.out &&
+	run_admission_gate success merge_group \
+		bb/codex/reviewed-unstable codex-unstable >unstable-queue.out &&
+	test_grep "Approved pull request #42" unstable-queue.out &&
+	run_admission_gate descendant-checkpoint merge_group \
+		bb/codex/reviewed-unstable codex-unstable \
+		>unstable-descendant-queue.out &&
+	test_grep "Approved pull request #42" \
+		unstable-descendant-queue.out &&
+	for mode in pending wrong-parent unapproved multiple-pulls \
+		changed-topic changed-workflow hidden-prerequisite
+	do
+		test_expect_code 1 run_admission_gate "$mode" merge_group \
+			bb/codex/reviewed-unstable codex-unstable \
+			>"unstable-$mode.out" 2>"unstable-$mode.err" || return 1
+	done &&
+	test_expect_code 1 run_admission_gate success pull_request \
+		bb/codex/reviewed codex-unstable \
+		>stable-in-unstable.out 2>stable-in-unstable.err &&
+	test_grep "unstable" stable-in-unstable.err
+'
+
+test_expect_success 'unadmitted unstable checkpoints leave v1 output unchanged' '
+	setup_pending_admission inert-unstable-checkpoints &&
+	enrolled=$(git --git-dir=inert-unstable-checkpoints.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=inert-unstable-checkpoints.git update-ref \
+		refs/heads/codex "$enrolled" &&
+	(
+		cd inert-unstable-checkpoints-runner &&
+		fetch_all &&
+		admission_rewrite inert-unstable-checkpoints api-failure &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		stable=$(git rev-parse origin/codex) &&
+		meta=$(git rev-parse origin/meta) &&
+		(
+			cd ../inert-unstable-checkpoints-source &&
+			git switch -c tb/codex/status-part-01-unstable master &&
+			write one status-one &&
+			git add status-one &&
+			git commit -m "unreviewed status checkpoint one" &&
+			git switch -c tb/codex/status-part-02-unstable &&
+			write two status-two &&
+			git add status-two &&
+			git commit -m "unreviewed status checkpoint two" &&
+			git switch -c tb/codex/status-part-03-unstable master &&
+			write three status-three &&
+			git add status-three &&
+			git commit -m "unreviewed parallel status checkpoint" &&
+			git push origin tb/codex/status-part-01-unstable \
+				tb/codex/status-part-02-unstable \
+				tb/codex/status-part-03-unstable
+		) &&
+		fetch_all &&
+		: >"$TRASH_DIRECTORY/inert-unstable-checkpoints-gh.log" &&
+		snapshot_refs ../inert-unstable-checkpoints.git >before &&
+		CODEX_UNSTABLE_MODE=enable \
+			admission_rewrite inert-unstable-checkpoints api-failure &&
+		test "$stable" = "$(cat result)" &&
+		test "$meta" = "$(updated_tip meta updates)" &&
+		! grep -F -- "-unstable" inputs &&
+		! grep -F -- "-unstable" updates &&
+		test_must_be_empty \
+			"$TRASH_DIRECTORY/inert-unstable-checkpoints-gh.log" &&
+		snapshot_refs ../inert-unstable-checkpoints.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'enabling unstable creates a strict empty sentinel' '
+	setup_pending_admission enable-unstable &&
+	enrolled=$(git --git-dir=enable-unstable.git \
+		rev-parse refs/heads/aa/codex/enrolled) &&
+	git --git-dir=enable-unstable.git update-ref \
+		refs/heads/codex "$enrolled" &&
+	(
+		cd enable-unstable-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result stable.result --updates stable.updates \
+			--inputs stable.inputs --failure stable.failure &&
+		apply_test_updates origin stable.updates &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --enable-unstable \
+			--result result --updates updates --inputs inputs \
+			--bundle candidate.bundle --failure failure &&
+		stable=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		meta=$(updated_tip meta updates) &&
+		test -n "$unstable" &&
+		test "$stable" != "$unstable" &&
+		test "$stable" = "$(git rev-parse "$unstable^")" &&
+		test "$(git rev-parse "$stable^{tree}")" = \
+			"$(git rev-parse "$unstable^{tree}")" &&
+		test "Initialize codex-unstable" = \
+			"$(git show -s --format=%s "$unstable")" &&
+		has_codex_bot_author "$unstable" &&
+		has_codex_bot_committer "$unstable" &&
+		git show "$meta:codex.config" >enabled.config &&
+		test 2 = "$(git config -f enabled.config --get codex.version)" &&
+		test "$stable" = "$(git config -f enabled.config \
+			--get codex-unstable.base-tip)" &&
+		test "$unstable" = "$(git config -f enabled.config \
+			--get codex-unstable.output-tip)" &&
+		! grep -F -- "-unstable\"]" enabled.config &&
+		sh "$codex_branch" verify-output \
+			--inputs inputs --updates updates --result result &&
+		git bundle verify candidate.bundle &&
+		git bundle list-heads candidate.bundle >bundle-heads &&
+		test_grep "refs/codex-output/unstable" bundle-heads
+	)
+'
+
+test_expect_success 'an empty unstable sentinel stays strict across rebuilds' '
+	setup_pending_unstable empty-unstable \
+		bb/codex/reviewed-unstable sentinel &&
+	(
+		cd empty-unstable-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure &&
+		stable=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		test "$stable" != "$unstable" &&
+		test "$stable" = "$(git rev-parse "$unstable^")" &&
+		test "$(git rev-parse "$stable^{tree}")" = \
+			"$(git rev-parse "$unstable^{tree}")" &&
+		git show "$(updated_tip meta updates):codex.config" \
+			>next.config &&
+		! grep -F -- "-unstable\"]" next.config
+	)
+'
+
+test_expect_success 'a reviewed unstable merge enrolls only its retained head' '
+	setup_pending_unstable reviewed-unstable &&
+	(
+		cd reviewed-unstable-runner &&
+		fetch_all &&
+		unstable_admission_rewrite reviewed-unstable success &&
+		stable=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		topic=$(updated_tip bb/codex/reviewed-unstable updates) &&
+		meta=$(updated_tip meta updates) &&
+		test -n "$unstable" &&
+		git merge-base --is-ancestor "$stable" "$unstable" &&
+		test_must_fail git cat-file -e "$stable:reviewed-unstable-file" &&
+		test reviewed = "$(git show "$unstable:reviewed-unstable-file")" &&
+		git show "$meta:codex.config" >next.config &&
+		test "$topic" = "$(git config -f next.config \
+			--get branch.bb/codex/reviewed-unstable.codex-tip)" &&
+		test refs/heads/codex = "$(git config -f next.config \
+			--get branch.bb/codex/reviewed-unstable.merge)" &&
+		awk -F "$(printf "\t")" '\''
+			$1 == "unstable-admission" &&
+			$2 == "refs/heads/bb/codex/reviewed-unstable" &&
+			$4 == 42 { found=1 }
+			END { exit !found }
+		'\'' inputs &&
+		test_grep pulls "$TRASH_DIRECTORY/reviewed-unstable-gh.log" &&
+		test_grep reviews "$TRASH_DIRECTORY/reviewed-unstable-gh.log" &&
+		ADMISSION_BASE=codex-unstable \
+		ADMISSION_TOPIC=bb/codex/reviewed-unstable \
+			admission_command reviewed-unstable success \
+				verify-output --inputs inputs --updates updates \
+				--result result
+	)
+'
+
+test_expect_success 'an unstable admission rejects wrong lane or provenance' '
+	setup_pending_unstable unstable-provenance &&
+	(
+		cd unstable-provenance-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-provenance.git >before &&
+		for mode in no-pull-request wrong-merge wrong-base \
+			wrong-base-repository wrong-head-repository wrong-head-ref \
+			wrong-head draft-pull-request duplicate-pull-request \
+			open-pull-request unmerged-pull-request api-failure
+		do
+			test_expect_code 1 \
+				unstable_admission_rewrite unstable-provenance "$mode" \
+				>"$mode.out" 2>"$mode.err" || return 1
+		done &&
+		snapshot_refs ../unstable-provenance.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'an unstable admission requires a current trusted review' '
+	setup_pending_unstable unstable-review &&
+	(
+		cd unstable-review-runner &&
+		fetch_all &&
+		for mode in no-review outsider-review self-review stale-review \
+			rejected-review revoked-review dismissed-review \
+			review-api-failure
+		do
+			test_expect_code 1 \
+				unstable_admission_rewrite unstable-review "$mode" \
+				>"$mode.out" 2>"$mode.err" || return 1
+		done &&
+		unstable_admission_rewrite unstable-review commented-review
+	)
+'
+
+test_expect_success 'a squash cannot enroll an unstable preview' '
+	setup_pending_unstable unstable-squash \
+		bb/codex/reviewed-unstable squash &&
+	(
+		cd unstable-squash-runner &&
+		fetch_all &&
+		test_expect_code 1 \
+			unstable_admission_rewrite unstable-squash success \
+			>rewrite.out 2>rewrite.err &&
+		test_grep "normal two-parent merge" rewrite.err
+	)
+'
+
+test_expect_success 'an unadmitted unstable descendant remains inert' '
+	setup_pending_unstable unstable-descendant &&
+	(
+		cd unstable-descendant-source &&
+		git switch -c cc/codex/checkpoint-unstable \
+			bb/codex/reviewed-unstable &&
+		write unreviewed checkpoint-file &&
+		git add checkpoint-file &&
+		git commit -m "unreviewed descendant checkpoint" &&
+		git push origin cc/codex/checkpoint-unstable
+	) &&
+	(
+		cd unstable-descendant-runner &&
+		fetch_all &&
+		unstable_admission_rewrite unstable-descendant success &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		test reviewed = "$(git show "$unstable:reviewed-unstable-file")" &&
+		test_must_fail git cat-file -e "$unstable:checkpoint-file" &&
+		! grep -F "cc/codex/checkpoint-unstable" updates &&
+		! grep -F "cc/codex/checkpoint-unstable" inputs
+	)
+'
+
+test_expect_success 'disabling an empty unstable lane removes it atomically' '
+	setup_pending_unstable disable-empty-unstable \
+		bb/codex/reviewed-unstable sentinel &&
+	(
+		cd disable-empty-unstable-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result stable.result --updates stable.updates \
+			--inputs stable.inputs --failure stable.failure &&
+		apply_test_updates origin stable.updates &&
+		fetch_all &&
+		old=$(git rev-parse origin/codex-unstable) &&
+		git --git-dir=../disable-empty-unstable.git update-ref \
+			refs/heads/codex-unstable-staging "$old" &&
+		zero=$(printf "%s\n" "$old" | tr "0123456789abcdef" 0) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --disable-unstable \
+			--result result --updates updates --inputs inputs \
+			--failure failure &&
+		test "$zero" = "$(updated_tip codex-unstable updates)" &&
+		meta=$(updated_tip meta updates) &&
+		git show "$meta:codex.config" >disabled.config &&
+		test 1 = "$(git config -f disabled.config --get codex.version)" &&
+		test_must_fail git config -f disabled.config \
+			--get codex-unstable.output-tip &&
+		sh "$codex_branch" verify-output \
+			--inputs inputs --updates updates --result result &&
+		sh "$codex_branch" stage \
+			--remote origin --staging codex-staging \
+			--inputs inputs --updates updates &&
+		race_ref=refs/heads/codex-unstable-staging &&
+		race_new=$(git rev-parse origin/master) &&
+		test "$race_new" != "$old" &&
+		real_git=$(command -v git) &&
+		remote_git=$PWD/../disable-empty-unstable.git &&
+		mkdir stale-preview-race-bin &&
+		write "#!/bin/sh
+case \" \$* \" in
+*\" push \"*)
+	\"$real_git\" --git-dir=\"$remote_git\" update-ref \\
+		\"$race_ref\" \"$race_new\" \"$old\" || exit
+	;;
+esac
+exec \"$real_git\" \"\$@\"" stale-preview-race-bin/git &&
+		chmod +x stale-preview-race-bin/git &&
+		snapshot_without_staging ../disable-empty-unstable.git \
+			>before-stage-race &&
+		test_expect_code 1 env PATH="$PWD/stale-preview-race-bin:$PATH" \
+			sh "$codex_branch" promote \
+				--remote origin --staging codex-staging \
+				--inputs inputs --updates updates \
+				>race.out 2>race.err &&
+		test "$race_new" = \
+			"$(git --git-dir=../disable-empty-unstable.git \
+				rev-parse "$race_ref")" &&
+		snapshot_without_staging ../disable-empty-unstable.git \
+			>after-stage-race &&
+		test_cmp before-stage-race after-stage-race &&
+		git --git-dir=../disable-empty-unstable.git update-ref \
+			"$race_ref" "$old" "$race_new" &&
+		GIT_TRACE=1 sh "$codex_branch" promote \
+			--remote origin --staging codex-staging \
+			--inputs inputs --updates updates \
+			>promote.out 2>promote.trace &&
+		test_grep "push --atomic --porcelain" promote.trace &&
+		test_grep \
+			"force-with-lease=refs/heads/codex-unstable-staging:$old" \
+			promote.trace &&
+		test_grep ":refs/heads/codex-unstable-staging" promote.trace &&
+		test_must_fail git --git-dir=../disable-empty-unstable.git \
+			show-ref --verify refs/heads/codex-unstable &&
+		test_must_fail git --git-dir=../disable-empty-unstable.git \
+			show-ref --verify refs/heads/codex-unstable-staging &&
+		test_must_fail git --git-dir=../disable-empty-unstable.git \
+			show-ref --verify refs/heads/codex-staging
+	)
+'
+
+test_expect_success 'disabling an enrolled unstable lane fails closed' '
+	setup_pending_unstable disable-enrolled-unstable &&
+	(
+		cd disable-enrolled-unstable-runner &&
+		fetch_all &&
+		unstable_admission_rewrite disable-enrolled-unstable success &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		snapshot_refs ../disable-enrolled-unstable.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --disable-unstable \
+			--result disabled.result --updates disabled.updates \
+			--inputs disabled.inputs --failure disabled.failure \
+			>disabled.out 2>disabled.err &&
+		test_grep "unstable" disabled.err &&
+		snapshot_refs ../disable-enrolled-unstable.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'preview lane transitions require unchanged stable output' '
+	setup_pending_admission dirty-unstable-enable &&
+	(
+		cd dirty-unstable-enable-runner &&
+		fetch_all &&
+		snapshot_refs ../dirty-unstable-enable.git >before &&
+		test_expect_code 1 \
+			admission_command dirty-unstable-enable success \
+				rewrite --remote origin --base master --codex codex \
+				--enable-unstable --result result --updates updates \
+				--inputs inputs --failure failure \
+				>enable.out 2>enable.err &&
+		test_grep "stable\|codex" enable.err &&
+		snapshot_refs ../dirty-unstable-enable.git >after &&
+		test_cmp before after
+	) &&
+
+	setup_pending_unstable dirty-unstable-disable \
+		bb/codex/reviewed-unstable sentinel &&
+	(
+		cd dirty-unstable-disable-source &&
+		git switch aa/codex/enrolled &&
+		write changed changed-stable-file &&
+		git add changed-stable-file &&
+		git commit -m "advance enrolled stable topic" &&
+		git push origin aa/codex/enrolled
+	) &&
+	(
+		cd dirty-unstable-disable-runner &&
+		fetch_all &&
+		snapshot_refs ../dirty-unstable-disable.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --disable-unstable \
+			--result result --updates updates --inputs inputs \
+			--failure failure >disable.out 2>disable.err &&
+		test_grep "stable\|codex" disable.err &&
+		snapshot_refs ../dirty-unstable-disable.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'an empty unstable sentinel cannot impersonate its bot' '
+	setup_pending_unstable forged-unstable-sentinel \
+		bb/codex/reviewed-unstable sentinel &&
+	(
+		cd forged-unstable-sentinel-source &&
+		stable=$(git rev-parse codex) &&
+		forged=$(
+			GIT_AUTHOR_NAME="Untrusted Author" \
+			GIT_AUTHOR_EMAIL=author@example.com \
+			GIT_COMMITTER_NAME="Untrusted Committer" \
+			GIT_COMMITTER_EMAIL=committer@example.com \
+			git commit-tree "$stable^{tree}" -p "$stable" \
+				-m "Initialize codex-unstable"
+		) &&
+		git update-ref refs/heads/codex-unstable "$forged" &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git push --force origin meta codex-unstable
+	) &&
+	(
+		cd forged-unstable-sentinel-runner &&
+		fetch_all &&
+		snapshot_refs ../forged-unstable-sentinel.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure >rewrite.out 2>rewrite.err &&
+		test_grep "sentinel\|unstable" rewrite.err &&
+		test_path_is_missing result &&
+		snapshot_refs ../forged-unstable-sentinel.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'a v2 snapshot cannot silently erase its preview lane' '
+	setup_pending_unstable missing-unstable-snapshot \
+		bb/codex/reviewed-unstable sentinel &&
+	(
+		cd missing-unstable-snapshot-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure &&
+		awk -F "$(printf "\t")" '\''$1 != "unstable"'\'' \
+			inputs >missing.inputs &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs missing.inputs --updates updates --result result \
+			>verify.out 2>verify.err &&
+		test_grep "unstable\|snapshot" verify.err
+	)
+'
+
+test_expect_success 'stable conflict recovery preserves an enabled preview lane' '
+	git init --bare unstable-stable-recovery.git &&
+	test_create_repo unstable-stable-recovery-source &&
+	(
+		cd unstable-stable-recovery-source &&
+		git remote add origin ../unstable-stable-recovery.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/stable master &&
+		write topic shared &&
+		git add shared &&
+		git commit -m "conflicting enrolled stable topic" &&
+		git branch codex &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch master &&
+		write upstream shared &&
+		git add shared &&
+		git commit -m "conflicting upstream base" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable
+	) &&
+
+	git clone unstable-stable-recovery.git \
+		unstable-stable-recovery-runner &&
+	(
+		cd unstable-stable-recovery-runner &&
+		fetch_all &&
+		stable=$(git rev-parse origin/codex) &&
+		unstable=$(git rev-parse origin/codex-unstable) &&
+		meta=$(git rev-parse origin/meta) &&
+		old_topic=$(git rev-parse origin/aa/codex/stable) &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure >rewrite.out 2>rewrite.err &&
+		test_grep "aa/codex/stable" failure &&
+		digest=$(git hash-object inputs) &&
+		sh "$codex_branch" resolve --remote origin \
+			--base master --codex codex --inputs-oid "$digest" \
+			--worktree resolution >resolve.out &&
+		write resolved resolution/shared &&
+		git -C resolution add shared &&
+		sh "$codex_branch" continue --worktree resolution \
+			>continue.out &&
+		sh "$codex_branch" publish-topics --worktree resolution &&
+		new_topic=$(git --git-dir=../unstable-stable-recovery.git \
+			rev-parse refs/heads/aa/codex/stable) &&
+		test "$old_topic" != "$new_topic" &&
+		test resolved = "$(git show "$new_topic:shared")" &&
+		test "$stable" = \
+			"$(git --git-dir=../unstable-stable-recovery.git \
+				rev-parse refs/heads/codex)" &&
+		test "$unstable" = \
+			"$(git --git-dir=../unstable-stable-recovery.git \
+				rev-parse refs/heads/codex-unstable)" &&
+		test "$meta" = \
+			"$(git --git-dir=../unstable-stable-recovery.git \
+				rev-parse refs/heads/meta)" &&
+		git worktree remove --force resolution
+	)
+'
+
+test_expect_success 'unstable parent rewrites replace old history when codex advances' '
+	git init --bare unstable-parent.git &&
+	test_create_repo unstable-parent-source &&
+	(
+		cd unstable-parent-source &&
+		git remote add origin ../unstable-parent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/parent-unstable codex &&
+		write old unstable-old-parent-file &&
+		git add unstable-old-parent-file &&
+		git commit -m "old unstable parent" &&
+		git switch -c cc/codex/child-unstable &&
+		write child unstable-child-file &&
+		git add unstable-child-file &&
+		git commit -m "preserved unstable child" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+
+		git switch --detach codex &&
+		write replacement unstable-new-parent-file &&
+		git add unstable-new-parent-file &&
+		git commit -m "replacement unstable parent" &&
+		git branch -f bb/codex/parent-unstable HEAD &&
+		git switch master &&
+		write advanced unstable-advanced-base-file &&
+		git add unstable-advanced-base-file &&
+		git commit -m "advance codex underneath unstable topics" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/parent-unstable \
+			cc/codex/child-unstable
+	) &&
+
+	git clone unstable-parent.git unstable-parent-runner &&
+	(
+		cd unstable-parent-runner &&
+		fetch_all &&
+		old_stable=$(git rev-parse origin/codex) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --bundle candidate.bundle \
+			--failure failure &&
+		stable=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		parent=$(updated_tip bb/codex/parent-unstable updates) &&
+		child=$(updated_tip cc/codex/child-unstable updates) &&
+		test "$old_stable" != "$stable" &&
+		test "$stable" = "$(git rev-parse "$parent^")" &&
+		test "$parent" = "$(git rev-parse "$child^")" &&
+		test advanced = "$(git show "$unstable:unstable-advanced-base-file")" &&
+		test replacement = "$(git show "$unstable:unstable-new-parent-file")" &&
+		test child = "$(git show "$unstable:unstable-child-file")" &&
+		test_must_fail git cat-file -e \
+			"$unstable:unstable-old-parent-file" &&
+		git log --format=%s "$stable..$child" >subjects &&
+		test_grep "^replacement unstable parent$" subjects &&
+		! grep -q "^old unstable parent$" subjects &&
+		git merge-base --is-ancestor "$stable" "$unstable"
+	)
+'
+
+test_expect_success 'rewinding an unstable parent does not leak its removed commit' '
+	git init --bare unstable-rewind.git &&
+	test_create_repo unstable-rewind-source &&
+	(
+		cd unstable-rewind-source &&
+		git remote add origin ../unstable-rewind.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/parent-unstable codex &&
+		write kept unstable-kept-file &&
+		git add unstable-kept-file &&
+		git commit -m "kept unstable parent commit" &&
+		kept=$(git rev-parse HEAD) &&
+		write removed unstable-removed-file &&
+		git add unstable-removed-file &&
+		git commit -m "removed unstable parent commit" &&
+		git switch -c cc/codex/child-unstable &&
+		write child unstable-child-file &&
+		git add unstable-child-file &&
+		git commit -m "unstable child after rewind" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git branch -f bb/codex/parent-unstable "$kept" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/parent-unstable \
+			cc/codex/child-unstable
+	) &&
+
+	git clone unstable-rewind.git unstable-rewind-runner &&
+	(
+		cd unstable-rewind-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --bundle candidate.bundle \
+			--failure failure &&
+		stable=$(cat result) &&
+		parent=$(updated_tip bb/codex/parent-unstable updates) &&
+		child=$(updated_tip cc/codex/child-unstable updates) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		test "$stable" = "$(git rev-parse "$parent^")" &&
+		test "$parent" = "$(git rev-parse "$child^")" &&
+		test kept = "$(git show "$unstable:unstable-kept-file")" &&
+		test child = "$(git show "$unstable:unstable-child-file")" &&
+		test_must_fail git cat-file -e \
+			"$unstable:unstable-removed-file" &&
+		git log --format=%s "$stable..$child" >subjects &&
+		! grep -q "^removed unstable parent commit$" subjects &&
+		git bundle verify candidate.bundle &&
+		git bundle list-heads candidate.bundle >bundle-heads &&
+		test_grep "refs/codex-output/candidate" bundle-heads &&
+		test_grep "refs/codex-output/unstable" bundle-heads &&
+		git clone ../unstable-rewind.git ../unstable-rewind-import &&
+		git -C ../unstable-rewind-import bundle unbundle \
+			"$PWD/candidate.bundle" >imported-heads &&
+		test_grep "refs/codex-output/candidate" imported-heads &&
+		test_grep "refs/codex-output/unstable" imported-heads &&
+		git -C ../unstable-rewind-import cat-file -e \
+			"$unstable^{commit}"
+	)
+'
+
+test_expect_success 'a coherent unstable restack can reverse topic dependencies' '
+	git init --bare unstable-reorder.git &&
+	test_create_repo unstable-reorder-source &&
+	(
+		cd unstable-reorder-source &&
+		git remote add origin ../unstable-reorder.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/a-unstable codex &&
+		write A unstable-a-file &&
+		git add unstable-a-file &&
+		git commit -m "unstable dependency A" &&
+		old_a=$(git rev-parse HEAD) &&
+		git switch -c cc/codex/b-unstable &&
+		write B unstable-b-file &&
+		git add unstable-b-file &&
+		git commit -m "unstable dependency B" &&
+		old_b=$(git rev-parse HEAD) &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+
+		git switch --detach codex &&
+		git cherry-pick "$old_b" &&
+		new_b=$(git rev-parse HEAD) &&
+		git branch -f cc/codex/b-unstable "$new_b" &&
+		git cherry-pick "$old_a" &&
+		git branch -f bb/codex/a-unstable HEAD &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/a-unstable \
+			cc/codex/b-unstable
+	) &&
+
+	git clone unstable-reorder.git unstable-reorder-runner &&
+	(
+		cd unstable-reorder-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		stable=$(cat result) &&
+		a=$(updated_tip bb/codex/a-unstable updates) &&
+		b=$(updated_tip cc/codex/b-unstable updates) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		meta=$(updated_tip meta updates) &&
+		test "$stable" = "$(git rev-parse "$b^")" &&
+		test "$b" = "$(git rev-parse "$a^")" &&
+		git show "$meta:codex.config" >next.config &&
+		test refs/heads/codex = "$(git config -f next.config \
+			--get branch.cc/codex/b-unstable.merge)" &&
+		test refs/heads/cc/codex/b-unstable = \
+			"$(git config -f next.config \
+			--get branch.bb/codex/a-unstable.merge)" &&
+		git rev-list --first-parent --reverse "$stable..$unstable" \
+			>integrations &&
+		first=$(sed -n 1p integrations) &&
+		second=$(sed -n 2p integrations) &&
+		test "Merge cc/codex/b-unstable into codex-unstable" = \
+			"$(git show -s --format=%s "$first")" &&
+		test "Merge bb/codex/a-unstable into codex-unstable" = \
+			"$(git show -s --format=%s "$second")"
+	)
+'
+
+test_expect_success 'removing an unstable prerequisite with a stale child fails closed' '
+	git init --bare unstable-retired-parent.git &&
+	test_create_repo unstable-retired-parent-source &&
+	(
+		cd unstable-retired-parent-source &&
+		git remote add origin ../unstable-retired-parent.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/parent-unstable codex &&
+		write parent unstable-parent-file &&
+		git add unstable-parent-file &&
+		git commit -m "retired unstable prerequisite" &&
+		git switch -c cc/codex/child-unstable &&
+		write child unstable-child-file &&
+		git add unstable-child-file &&
+		git commit -m "stale unstable child" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable cc/codex/child-unstable
+	) &&
+
+	git clone unstable-retired-parent.git unstable-retired-parent-runner &&
+	(
+		cd unstable-retired-parent-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-retired-parent.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "prerequisite.*retired" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../unstable-retired-parent.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'unstable topics can be combined and split into a new prerequisite' '
+	git init --bare unstable-combine.git &&
+	test_create_repo unstable-combine-source &&
+	(
+		cd unstable-combine-source &&
+		git remote add origin ../unstable-combine.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/parent-unstable codex &&
+		write parent unstable-parent-file &&
+		git add unstable-parent-file &&
+		git commit -m "original unstable parent" &&
+		old_parent=$(git rev-parse HEAD) &&
+		git switch -c cc/codex/child-unstable &&
+		write child unstable-child-file &&
+		git add unstable-child-file &&
+		git commit -m "original unstable child" &&
+		old_child=$(git rev-parse HEAD) &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+
+		git switch --detach codex &&
+		git cherry-pick --no-commit "$old_parent" &&
+		git commit -m "combined unstable prefix" &&
+		git cherry-pick --no-commit "$old_child" &&
+		git commit -m "combined unstable suffix" &&
+		git branch -f cc/codex/child-unstable HEAD &&
+		git branch -D bb/codex/parent-unstable &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable cc/codex/child-unstable
+	) &&
+
+	git clone unstable-combine.git unstable-combine-runner &&
+	(
+		cd unstable-combine-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		combined=$(updated_tip cc/codex/child-unstable updates) &&
+		meta=$(updated_tip meta updates) &&
+		git show "$meta:codex.config" >combined.config &&
+		test refs/heads/codex = "$(git config -f combined.config \
+			--get branch.cc/codex/child-unstable.merge)" &&
+		test_must_fail git config -f combined.config \
+			--get branch.bb/codex/parent-unstable.codex-tip &&
+		test parent = "$(git show "$combined:unstable-parent-file")" &&
+		test child = "$(git show "$combined:unstable-child-file")" &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+
+		prefix=$(git rev-parse \
+			"origin/cc/codex/child-unstable^") &&
+		git branch bb/codex/prefix-unstable "$prefix" &&
+		git push origin bb/codex/prefix-unstable &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result ignored-result \
+			--updates ignored-updates --inputs ignored-inputs \
+			--failure ignored-failure &&
+		test -z "$(updated_tip bb/codex/prefix-unstable \
+			ignored-updates)" &&
+		ignored_meta=$(updated_tip meta ignored-updates) &&
+		git show "$ignored_meta:codex.config" >ignored.config &&
+		test_must_fail git config -f ignored.config \
+			--get branch.bb/codex/prefix-unstable.codex-tip &&
+
+		old_child=$(git rev-parse origin/cc/codex/child-unstable) &&
+		git switch bb/codex/prefix-unstable &&
+		write reviewed unstable-reviewed-prefix-file &&
+		git add unstable-reviewed-prefix-file &&
+		git commit -m "reviewed unstable prerequisite" &&
+		new_prefix=$(git rev-parse HEAD) &&
+		git switch --detach "$new_prefix" &&
+		git cherry-pick "$old_child" &&
+		git branch -f cc/codex/child-unstable HEAD &&
+		git switch --detach origin/codex-unstable &&
+		git merge --no-ff "$new_prefix" \
+			-m "Merge pull request #42 from openai/bb/codex/prefix-unstable" &&
+		git push --force origin \
+			HEAD:refs/heads/codex-unstable \
+			bb/codex/prefix-unstable \
+			cc/codex/child-unstable &&
+		fetch_all &&
+		install_admission_gh "$TRASH_DIRECTORY/unstable-combine-bin" &&
+		ADMISSION_BASE=codex-unstable \
+		ADMISSION_TOPIC=bb/codex/prefix-unstable \
+		admission_command unstable-combine success rewrite --remote origin \
+			--base master --codex codex --result split-result \
+			--updates split-updates --inputs split-inputs \
+			--failure split-failure &&
+		parent=$(updated_tip bb/codex/prefix-unstable split-updates) &&
+		child=$(updated_tip cc/codex/child-unstable split-updates) &&
+		meta=$(updated_tip meta split-updates) &&
+		test "$parent" = "$(git rev-parse "$child^")" &&
+		git show "$meta:codex.config" >split.config &&
+		test refs/heads/codex = "$(git config -f split.config \
+			--get branch.bb/codex/prefix-unstable.merge)" &&
+		test refs/heads/bb/codex/prefix-unstable = \
+			"$(git config -f split.config \
+			--get branch.cc/codex/child-unstable.merge)"
+	)
+'
+
+test_expect_success 'retiring the last unstable topic retains an empty preview lane' '
+	git init --bare unstable-delete.git &&
+	test_create_repo unstable-delete-source &&
+	(
+		cd unstable-delete-source &&
+		git remote add origin ../unstable-delete.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/last-unstable codex &&
+		write preview unstable-last-file &&
+		git add unstable-last-file &&
+		git commit -m "last unstable topic" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable
+	) &&
+
+	git clone unstable-delete.git unstable-delete-runner &&
+	(
+		cd unstable-delete-runner &&
+		fetch_all &&
+		old_unstable=$(git rev-parse origin/codex-unstable) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		stable=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		test "$stable" = "$(git rev-parse "$unstable^")" &&
+		test "$(git rev-parse "$stable^{tree}")" = \
+			"$(git rev-parse "$unstable^{tree}")" &&
+		test "Initialize codex-unstable" = \
+			"$(git show -s --format=%s "$unstable")" &&
+		manifest_has codex-unstable "$old_unstable" "$unstable" \
+			updates &&
+		meta=$(updated_tip meta updates) &&
+		git show "$meta:codex.config" >next.config &&
+		test 2 = "$(git config -f next.config --get codex.version)" &&
+		test "$unstable" = "$(git config -f next.config \
+			--get codex-unstable.output-tip)" &&
+		test_must_fail git config -f next.config \
+			--get branch.bb/codex/last-unstable.codex-tip &&
+		sh "$codex_branch" verify-output \
+			--inputs inputs --updates updates --result result &&
+		apply_test_updates origin updates &&
+		test "$unstable" = "$(git --git-dir=../unstable-delete.git \
+			rev-parse refs/heads/codex-unstable)"
+	)
+'
+
+test_expect_success 'an untracked unstable output cannot be silently retired' '
+	git init --bare unstable-untracked.git &&
+	test_create_repo unstable-untracked-source &&
+	(
+		cd unstable-untracked-source &&
+		git remote add origin ../unstable-untracked.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git switch -c codex-unstable codex &&
+		write manual untracked-unstable-file &&
+		git add untracked-unstable-file &&
+		git commit -m "untracked unstable integration" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable
+	) &&
+
+	git clone unstable-untracked.git unstable-untracked-runner &&
+	(
+		cd unstable-untracked-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-untracked.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "codex-unstable" err &&
+		test_path_is_missing result &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --enable-unstable \
+			--result enabled.result --updates enabled.updates \
+			--inputs enabled.inputs --failure enabled.failure \
+			>enabled.out 2>enabled.err &&
+		test_grep "codex-unstable" enabled.err &&
+		test_path_is_missing enabled.result &&
+		snapshot_refs ../unstable-untracked.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'retiring unstable output rejects unrecorded direct commits' '
+	git init --bare unstable-retire-race.git &&
+	test_create_repo unstable-retire-race-source &&
+	(
+		cd unstable-retire-race-source &&
+		git remote add origin ../unstable-retire-race.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/retired-unstable codex &&
+		write preview unstable-retired-file &&
+		git add unstable-retired-file &&
+		git commit -m "recorded unstable topic" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch codex-unstable &&
+		write direct unstable-direct-file &&
+		git add unstable-direct-file &&
+		git commit -m "direct commit after recorded unstable output" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable
+	) &&
+
+	git clone unstable-retire-race.git unstable-retire-race-runner &&
+	(
+		cd unstable-retire-race-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-retire-race.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep \
+			"codex-unstable\|unstable output\|normal two-parent merge" \
+			err &&
+		test_path_is_missing result &&
+		snapshot_refs ../unstable-retire-race.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'unstable topics cannot hide workflow changes in a dependent revert' '
+	git init --bare unstable-workflow.git &&
+	test_create_repo unstable-workflow-source &&
+	(
+		cd unstable-workflow-source &&
+		git remote add origin ../unstable-workflow.git &&
+		write base shared &&
+		mkdir -p .github/workflows &&
+		write trusted .github/workflows/main.yml &&
+		git add shared .github/workflows/main.yml &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/parent-unstable codex &&
+		write malicious .github/workflows/main.yml &&
+		git add .github/workflows/main.yml &&
+		git commit -m "unstable topic changes protected workflow" &&
+		git switch -c cc/codex/child-unstable &&
+		write trusted .github/workflows/main.yml &&
+		git add .github/workflows/main.yml &&
+		git commit -m "unstable child hides protected workflow change" &&
+		git diff --quiet codex HEAD -- .github/workflows/main.yml &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/parent-unstable \
+			cc/codex/child-unstable
+	) &&
+
+	git clone unstable-workflow.git unstable-workflow-runner &&
+	(
+		cd unstable-workflow-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-workflow.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "workflow\|controller\|protected" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../unstable-workflow.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'unstable topics cannot redirect or delete the production release workflow' '
+	git init --bare unstable-release.git &&
+	test_create_repo unstable-release-source &&
+	(
+		cd unstable-release-source &&
+		git remote add origin ../unstable-release.git &&
+		write base shared &&
+		mkdir -p .github/workflows &&
+		write_release_workflow codex .github/workflows/codex-release.yml &&
+		git add shared .github/workflows/codex-release.yml &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/release-unstable codex &&
+		write_release_workflow codex-unstable \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "release untrusted preview builds" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch -c release-deleted codex &&
+		git rm .github/workflows/codex-release.yml &&
+		git commit -m "delete production release workflow" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/release-unstable release-deleted
+	) &&
+
+	git clone unstable-release.git unstable-release-runner &&
+	(
+		cd unstable-release-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-release.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "release\|workflow\|protected" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../unstable-release.git >after &&
+		test_cmp before after &&
+		old=$(git rev-parse origin/bb/codex/release-unstable) &&
+		deleted=$(git rev-parse origin/release-deleted) &&
+		git --git-dir=../unstable-release.git update-ref \
+			refs/heads/bb/codex/release-unstable "$deleted" "$old" &&
+		fetch_all &&
+		snapshot_refs ../unstable-release.git >before-deletion &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result deleted-result \
+			--updates deleted-updates --inputs deleted-inputs \
+			--failure deleted-failure >deleted.out 2>deleted.err &&
+		test_grep "release\|workflow\|protected" deleted.err &&
+		test_path_is_missing deleted-result &&
+		snapshot_refs ../unstable-release.git >after-deletion &&
+		test_cmp before-deletion after-deletion
+	)
+'
+
+test_expect_success 'both candidates stage independently and publish under one atomic lease' '
+	git init --bare unstable-promotion.git &&
+	test_create_repo unstable-promotion-source &&
+	(
+		cd unstable-promotion-source &&
+		git remote add origin ../unstable-promotion.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/stable master &&
+		write stable stable-file &&
+		git add stable-file &&
+		git commit -m "atomic stable topic" &&
+		git branch codex &&
+		git switch -c bb/codex/preview-unstable codex &&
+		write preview preview-file &&
+		git add preview-file &&
+		git commit -m "atomic unstable topic" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/preview-unstable
+	) &&
+
+	git clone unstable-promotion.git unstable-promotion-runner &&
+	(
+		cd unstable-promotion-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		stable=$(cat result) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		snapshot_without_staging ../unstable-promotion.git >primary-before &&
+		GIT_TRACE=1 sh "$codex_branch" stage \
+			--remote origin --staging codex-staging \
+			--inputs inputs --updates updates \
+			>stable-stage.out 2>stable-stage.trace &&
+		test "$stable" = "$(git --git-dir=../unstable-promotion.git \
+			rev-parse refs/heads/codex-staging)" &&
+		test_expect_code 1 sh "$codex_branch" promote \
+			--remote origin --staging codex-staging \
+			--inputs inputs --updates updates \
+			>missing-stage.out 2>missing-stage.err &&
+		snapshot_without_staging ../unstable-promotion.git \
+			>after-missing-stage &&
+		test_cmp primary-before after-missing-stage &&
+
+		GIT_TRACE=1 sh "$codex_branch" stage \
+			--remote origin --staging codex-unstable-staging \
+			--inputs inputs --updates updates \
+			>unstable-stage.out 2>unstable-stage.trace &&
+		test "$unstable" = "$(git --git-dir=../unstable-promotion.git \
+			rev-parse refs/heads/codex-unstable-staging)" &&
+		snapshot_without_staging ../unstable-promotion.git \
+			>after-both-stages &&
+		test_cmp primary-before after-both-stages &&
+		git --git-dir=../unstable-promotion.git update-ref \
+			refs/heads/codex-unstable-staging "$stable" "$unstable" &&
+		test_expect_code 1 sh "$codex_branch" promote \
+			--remote origin --staging codex-staging \
+			--inputs inputs --updates updates \
+			>moved-stage.out 2>moved-stage.err &&
+		snapshot_without_staging ../unstable-promotion.git \
+			>after-stage-race &&
+		test_cmp primary-before after-stage-race &&
+		git --git-dir=../unstable-promotion.git update-ref \
+			refs/heads/codex-unstable-staging "$unstable" "$stable" &&
+
+		GIT_TRACE=1 sh "$codex_branch" promote \
+			--remote origin --staging codex-staging \
+			--inputs inputs --updates updates \
+			>promote.out 2>promote.trace &&
+		test_grep "push --atomic --porcelain" promote.trace &&
+		test_grep \
+			"force-with-lease=refs/heads/codex-staging:$stable" \
+			promote.trace &&
+		test_grep \
+			"force-with-lease=refs/heads/codex-unstable-staging:$unstable" \
+			promote.trace &&
+		test_grep ":refs/heads/codex-staging" promote.trace &&
+		test_grep ":refs/heads/codex-unstable-staging" promote.trace &&
+		while IFS="$(printf "\t")" read -r ref old new
+		do
+			lease_old=$old &&
+			case "$lease_old" in
+			0000000000000000000000000000000000000000|\
+			0000000000000000000000000000000000000000000000000000000000000000)
+				lease_old=
+				;;
+			esac &&
+			test_grep "force-with-lease=$ref:$lease_old" promote.trace &&
+			test "$new" = "$(git --git-dir=../unstable-promotion.git \
+				rev-parse "$ref")" || return 1
+		done <updates &&
+		test_must_fail git --git-dir=../unstable-promotion.git \
+			show-ref --verify refs/heads/codex-staging &&
+		test_must_fail git --git-dir=../unstable-promotion.git \
+			show-ref --verify refs/heads/codex-unstable-staging
+	)
+'
+
+test_expect_success 'unstable rebase conflicts preserve refs and give honest recovery guidance' '
+	git init --bare unstable-conflict.git &&
+	test_create_repo unstable-conflict-source &&
+	(
+		cd unstable-conflict-source &&
+		git remote add origin ../unstable-conflict.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git branch codex &&
+		git branch aa/codex/stable codex &&
+		git switch -c bb/codex/conflict-unstable codex &&
+		write preview shared &&
+		git add shared &&
+		git commit -m "conflicting unstable preview" &&
+		git branch codex-unstable &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch master &&
+		write stable shared &&
+		git add shared &&
+		git commit -m "conflicting stable base" &&
+		git push origin master meta codex codex-unstable \
+			aa/codex/stable bb/codex/conflict-unstable
+	) &&
+
+	git clone unstable-conflict.git unstable-conflict-runner &&
+	(
+		cd unstable-conflict-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-conflict.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "bb/codex/conflict-unstable" err &&
+		test_path_is_missing result &&
+		if test -f failure
+		then
+			test_grep "bb/codex/conflict-unstable" failure &&
+			! grep -E "resolve .*--base(=| )codex .*--codex(=| )codex-unstable" \
+				failure
+		else
+			test_grep "restack\|rebase\|resolve" err
+		fi &&
+		snapshot_refs ../unstable-conflict.git >after &&
+		test_cmp before after
+	)
+'
+
+test_expect_success 'published stable topics cannot all disappear behind unstable previews' '
+	git init --bare unstable-stable-retired.git &&
+	test_create_repo unstable-stable-retired-source &&
+	(
+		cd unstable-stable-retired-source &&
+		git remote add origin ../unstable-stable-retired.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m base &&
+		git switch -c aa/codex/stable master &&
+		write stable stable-file &&
+		git add stable-file &&
+		git commit -m "last published stable topic" &&
+		git branch codex &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git switch -c bb/codex/preview-unstable codex &&
+		write preview preview-file &&
+		git add preview-file &&
+		git commit -m "unstable preview cannot replace stable" &&
+		git push origin master meta codex bb/codex/preview-unstable
+	) &&
+
+	git clone unstable-stable-retired.git unstable-stable-retired-runner &&
+	(
+		cd unstable-stable-retired-runner &&
+		fetch_all &&
+		snapshot_refs ../unstable-stable-retired.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure \
+			>out 2>err &&
+		test_grep "all enrolled Codex topics were removed" err &&
+		test_path_is_missing result &&
+		snapshot_refs ../unstable-stable-retired.git >after &&
+		test_cmp before after
 	)
 '
 

@@ -26,21 +26,25 @@ usage () {
 	cat <<-\EOF
 	usage: codex-branch check-topic <branch>
 	   or: codex-branch rebuild [--local]
+		[--enable-unstable | --disable-unstable]
 	   or: codex-branch publish <run-id>
 	   or: codex-branch initialize [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--output <path>] [--require-automation]
 	   or: codex-branch refresh [--session <directory>]
 		[--remote <remote>] [--base <branch>] [--codex <branch>]
 		[--rerere-from <branch>] [--require-automation]
+		[--enable-unstable | --disable-unstable]
 	   or: codex-branch rewrite [--remote <remote>] [--base <branch>]
 		[--codex <branch>] [--rerere-from <branch>]
 		[--result <path>] [--updates <path>] [--inputs <path>]
 		[--bundle <path>] [--failure <path>]
 		[--worktree <path>] [--require-automation]
+		[--enable-unstable | --disable-unstable]
 	   or: codex-branch verify-inputs [--remote <remote>]
 		[--base <branch>] [--codex <branch>] <snapshot>
 	   or: codex-branch verify-output --inputs <path>
 		--updates <path> --result <path> [--require-automation]
+		[--stable-recovery]
 	   or: codex-branch stage [--remote <remote>] [--staging <branch>]
 		--inputs <path> --updates <path> [--require-automation]
 	   or: codex-branch promote [--remote <remote>] [--staging <branch>]
@@ -177,6 +181,40 @@ is_stable_topic_name () (
 	esac
 )
 
+is_unstable_topic_name () (
+	is_active_topic_name "$1" || return 1
+	case "$1" in
+	*-unstable) ;;
+	*) return 1 ;;
+	esac
+)
+
+null_oid () {
+	git hash-object --stdin </dev/null |
+		sed 's/./0/g'
+}
+
+is_null_oid () (
+	case "$1" in
+	''|*[!0]*) return 1 ;;
+	esac
+	test "${#1}" = "$(git hash-object --stdin </dev/null | tr -d '\n' | wc -c | tr -d ' ')"
+)
+
+unstable_sentinel_is_canonical () (
+	base=$1
+	head=$2
+	test "$(git show -s --format=%P "$head")" = "$base" &&
+		test "$(git rev-parse "$head^{tree}")" = \
+		"$(git rev-parse "$base^{tree}")" &&
+		test "$(git show -s --format=%s "$head")" = \
+		'Initialize codex-unstable' &&
+		test "$(git show -s --format=%an "$head")" = "$bot_name" &&
+		test "$(git show -s --format=%ae "$head")" = "$bot_email" &&
+		test "$(git show -s --format=%cn "$head")" = "$bot_name" &&
+		test "$(git show -s --format=%ce "$head")" = "$bot_email"
+)
+
 check_topic () {
 	test $# = 1 || {
 		usage >&2
@@ -208,6 +246,7 @@ legacy_control_paths_unchanged () (
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
+		.github/rulesets/codex-unstable-branch.json \
 		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
@@ -227,6 +266,7 @@ meta_control_paths_unchanged () (
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
+		.github/rulesets/codex-unstable-branch.json \
 		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex-branch.sh \
@@ -244,6 +284,59 @@ meta_control_paths_unchanged () (
 )
 
 write_automation_workflow () {
+	cat <<-'EOF'
+	name: Refresh codex
+
+	on:
+	  workflow_dispatch:
+	  pull_request:
+	    branches:
+	      - codex
+	      - codex-unstable
+	    types:
+	      - opened
+	      - reopened
+	      - synchronize
+	      - ready_for_review
+	  merge_group:
+	    types:
+	      - checks_requested
+
+	permissions:
+	  actions: read
+	  contents: read
+	  pull-requests: read
+
+	jobs:
+	  refresh:
+	    if: github.event_name == 'workflow_dispatch'
+	    uses: openai/git/.github/workflows/codex.yml@meta
+	  admission:
+	    name: Codex admission
+	    if: >-
+	      (github.event_name == 'pull_request' &&
+	       github.event.pull_request.base.ref == 'codex') ||
+	      (github.event_name == 'merge_group' &&
+	       github.event.merge_group.base_ref == 'refs/heads/codex')
+	    permissions:
+	      contents: read
+	      pull-requests: read
+	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+	  unstable_admission:
+	    name: Codex unstable admission
+	    if: >-
+	      (github.event_name == 'pull_request' &&
+	       github.event.pull_request.base.ref == 'codex-unstable') ||
+	      (github.event_name == 'merge_group' &&
+	       github.event.merge_group.base_ref == 'refs/heads/codex-unstable')
+	    permissions:
+	      contents: read
+	      pull-requests: read
+	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+	EOF
+}
+
+write_stable_automation_workflow () {
 	cat <<-'EOF'
 	name: Refresh codex
 
@@ -306,9 +399,20 @@ automation_workflow_is_current () {
 		"$tmp_dir/actual-automation.yml"
 }
 
-automation_workflow_matches () {
+automation_workflow_is_reviewed () {
 	head_oid=$1
 	if automation_workflow_is_current "$head_oid"
+	then
+		return 0
+	fi
+	write_stable_automation_workflow >"$tmp_dir/expected-automation.yml"
+	cmp -s "$tmp_dir/expected-automation.yml" \
+		"$tmp_dir/actual-automation.yml"
+}
+
+automation_workflow_matches () {
+	head_oid=$1
+	if automation_workflow_is_reviewed "$head_oid"
 	then
 		return 0
 	fi
@@ -417,6 +521,7 @@ authenticate_pending_codex_merge () (
 	current=$3
 	output=$4
 	snapshot_head=${5:-}
+	lane=${6:-codex}
 	state=$output.state
 	mkdir -p "$state" || die "could not prepare Codex admission verification"
 
@@ -458,10 +563,10 @@ authenticate_pending_codex_merge () (
 	then
 		die "could not authenticate the merged Codex pull request"
 	fi
-	awk -F '\t' -v merge="$merge" -v head="$head" '
+	awk -F '\t' -v merge="$merge" -v head="$head" -v base="$lane" '
 		NF == 11 && $1 ~ /^[0-9]+$/ && $2 == "closed" &&
 		$3 != "-" && $4 == merge && $5 == "openai/git" &&
-		$6 == "codex" && $7 == "openai/git" && $9 == head &&
+		$6 == base && $7 == "openai/git" && $9 == head &&
 		$10 == "false" && $11 != "-" { print }
 	' "$state/pull-requests" >"$state/matching-pull-requests" ||
 		die "could not authenticate the merged Codex pull request"
@@ -471,8 +576,17 @@ authenticate_pending_codex_merge () (
 		base_repository base_name head_repository name head_oid draft author \
 		<"$state/matching-pull-requests" ||
 		die "could not authenticate the merged Codex pull request"
-	is_stable_topic_name "$name" ||
-		die "could not authenticate the merged Codex pull request"
+	case "$lane" in
+	codex)
+		is_stable_topic_name "$name" ||
+			die "could not authenticate the merged Codex pull request"
+		;;
+	codex-unstable)
+		is_unstable_topic_name "$name" ||
+			die "could not authenticate the merged unstable Codex pull request"
+		;;
+	*) die "cannot authenticate unknown Codex output '$lane'" ;;
+	esac
 	if test "$remote" = -
 	then
 		current_head=$snapshot_head
@@ -518,6 +632,7 @@ collect_topics () (
 	published_state=$3
 	codex_oid=$4
 	base_oid=$5
+	lane=${6:-codex}
 	root=refs/remotes/$remote/
 	admission=$output.admission
 	: >"$admission"
@@ -538,12 +653,26 @@ collect_topics () (
 		exit 0
 	fi
 
-	published=$published_state/published-topics
-	published_codex=$(state_value "$published_state" published-codex-oid)
+	if test "$lane" = codex-unstable
+	then
+		published=$published_state/published-unstable-topics
+		if test "$(state_value "$published_state" config-version)" = 2
+		then
+			published_codex=$(state_value "$published_state" \
+				published-unstable-oid)
+		else
+			published_codex=$(null_oid)
+		fi
+	else
+		published=$published_state/published-topics
+		published_codex=$(state_value "$published_state" published-codex-oid)
+	fi
 	if test "$published_codex" != "$codex_oid"
 	then
+		! is_null_oid "$published_codex" && ! is_null_oid "$codex_oid" ||
+			die "the '$lane' output does not match its published state"
 		authenticate_pending_codex_merge "$remote" "$published_codex" \
-			"$codex_oid" "$admission"
+			"$codex_oid" "$admission" '' "$lane"
 	fi
 
 	: >"$output.unsorted"
@@ -569,11 +698,14 @@ collect_topics () (
 	fi
 	LC_ALL=C sort "$output.unsorted" >"$output" ||
 		die "could not sort enrolled Codex topics"
-	test -s "$output" ||
+	test "$lane" = codex-unstable || test -s "$output" ||
 		die "all enrolled Codex topics were removed"
 
-	reject_unadmitted_topic_history "$remote" "$output" \
-		"$published_codex" "$base_oid"
+	if test -s "$output"
+	then
+		reject_unadmitted_topic_history "$remote" "$output" \
+			"$published_codex" "$base_oid" "$lane"
+	fi
 )
 
 reject_unadmitted_topic_history () (
@@ -581,6 +713,7 @@ reject_unadmitted_topic_history () (
 	topics=$2
 	published_codex=$3
 	base_oid=$4
+	lane=${5:-codex}
 	root=refs/remotes/$remote/
 	state=$topics.unadmitted-history
 	mkdir -p "$state" ||
@@ -603,6 +736,10 @@ reject_unadmitted_topic_history () (
 		while IFS="$tab" read -r selected selected_oid
 		do
 			test "$oid" = "$selected_oid" && continue
+			if git merge-base --is-ancestor "$selected_oid" "$oid"
+			then
+				continue
+			fi
 			git merge-base --all "$oid" "$selected_oid" \
 				>"$state/merge-bases" ||
 				die "could not compare unadmitted Codex topic '$name' with '$selected'"
@@ -633,11 +770,26 @@ write_input_snapshot () (
 	topics=$6
 	output=$7
 	admission=$8
+	unstable_topics=${9:-}
+	shift 9 || :
+	unstable_oid=${1:-}
+	unstable_admission=${2:-}
+	lane_mode=${3:-}
 
 	{
 		printf 'controller\trefs/heads/meta\t%s\n' "$controller_oid"
 		printf 'base\trefs/heads/%s\t%s\n' "$base_name" "$base_oid"
 		printf 'codex\trefs/heads/%s\t%s\n' "$codex_name" "$codex_oid"
+		if test -n "$lane_mode"
+		then
+			printf 'lane-mode\trefs/heads/codex-unstable\t%s\n' \
+				"$lane_mode"
+		fi
+		if test -n "$unstable_oid"
+		then
+			printf 'unstable\trefs/heads/codex-unstable\t%s\n' \
+				"$unstable_oid"
+		fi
 		if test -s "$admission"
 		then
 			IFS="$tab" read -r name oid number merge <"$admission" ||
@@ -645,10 +797,25 @@ write_input_snapshot () (
 			printf 'admission\trefs/heads/%s\t%s\t%s\t%s\n' \
 				"$name" "$oid" "$number" "$merge"
 		fi
+		if test -n "$unstable_admission" && test -s "$unstable_admission"
+		then
+			IFS="$tab" read -r name oid number merge <"$unstable_admission" ||
+				die "could not inspect the reviewed unstable Codex admission"
+			printf 'unstable-admission\trefs/heads/%s\t%s\t%s\t%s\n' \
+				"$name" "$oid" "$number" "$merge"
+		fi
 		while IFS="$tab" read -r name oid
 		do
 			printf 'topic\trefs/heads/%s\t%s\n' "$name" "$oid"
 		done <"$topics"
+		if test -n "$unstable_topics"
+		then
+			while IFS="$tab" read -r name oid
+			do
+				printf 'unstable-topic\trefs/heads/%s\t%s\n' \
+					"$name" "$oid"
+			done <"$unstable_topics"
+		fi
 	} >"$output"
 )
 
@@ -659,6 +826,7 @@ snapshot_inputs () {
 	output=$4
 	topics_output=$5
 	controller_oid=${6:-${CODEX_CONTROLLER_OID:-}}
+	lane_mode=${7:-}
 	remote_controller_oid=$(resolve_commit "$(remote_ref "$remote" meta)")
 
 	if test -n "$controller_oid"
@@ -682,9 +850,59 @@ snapshot_inputs () {
 	fi
 	collect_topics "$remote" "$topics_output" "$published_state" \
 		"$codex_oid" "$base_oid"
+	unstable_topics=
+	unstable_oid=
+	unstable_admission=
+	if test -n "$published_state"
+	then
+		version=$(state_value "$published_state" config-version)
+		case "$lane_mode:$version" in
+		enable:1|disable:2|:1|:2) ;;
+		enable:2) die "codex-unstable is already enabled" ;;
+		disable:1) die "codex-unstable is not enabled" ;;
+		*) die "invalid unstable-lane mode '$lane_mode'" ;;
+		esac
+		if test "$version" = 1 && test "$lane_mode" != enable &&
+			git rev-parse --verify \
+				"$(remote_ref "$remote" codex-unstable)^{commit}" \
+				>/dev/null 2>&1
+		then
+			die "$meta_config_path does not describe the existing codex-unstable output"
+		fi
+		if test "$version" = 2 || test "$lane_mode" = enable
+		then
+			unstable_topics=$topics_output.unstable
+			unstable_oid=$(git rev-parse --verify \
+				"$(remote_ref "$remote" codex-unstable)^{commit}" \
+				2>/dev/null || :)
+			if test "$version" = 1
+			then
+				test -z "$unstable_oid" ||
+					die "codex-unstable already exists outside its published state"
+				unstable_oid=$(null_oid)
+				: >"$unstable_topics"
+				: >"$unstable_topics.admission"
+			else
+				test -n "$unstable_oid" ||
+					die "$meta_config_path records codex-unstable, but its output disappeared"
+				collect_topics "$remote" "$unstable_topics" \
+					"$published_state" "$unstable_oid" "$codex_oid" \
+					codex-unstable
+			fi
+			unstable_admission=$unstable_topics.admission
+			if test "$lane_mode" = disable
+			then
+				! test -s "$unstable_topics" ||
+					die "cannot disable codex-unstable while enrolled topics remain"
+				! test -s "$unstable_admission" ||
+					die "cannot disable codex-unstable with a pending pull-request merge"
+			fi
+		fi
+	fi
 	write_input_snapshot "$controller_oid" "$base_name" "$base_oid" \
 		"$codex_name" "$codex_oid" "$topics_output" "$output" \
-		"$topics_output.admission"
+		"$topics_output.admission" "$unstable_topics" "$unstable_oid" \
+		"$unstable_admission" "$lane_mode"
 }
 
 input_oid () {
@@ -795,14 +1013,34 @@ write_meta_config () (
 	codex_oid=$4
 	rows=$5
 	output=$6
+	unstable_rows=${7:-}
+	unstable_base=${8:-}
+	unstable_output=${9:-}
 
 	{
 		printf '[codex]\n'
-		printf '\tversion = 1\n'
+		if test -n "$unstable_rows"
+		then
+			printf '\tversion = 2\n'
+		else
+			printf '\tversion = 1\n'
+		fi
 		printf '\tbase-ref = refs/heads/%s\n' "$base_name"
 		printf '\tbase-tip = %s\n' "$base_oid"
 		printf '\toutput-ref = refs/heads/%s\n' "$codex_name"
 		printf '\toutput-tip = %s\n' "$codex_oid"
+		if test -n "$unstable_rows"
+		then
+			printf '\n[codex-unstable]\n'
+			printf '\tbase-ref = refs/heads/%s\n' "$codex_name"
+			printf '\tbase-tip = %s\n' "$unstable_base"
+			printf '\toutput-ref = refs/heads/codex-unstable\n'
+			printf '\toutput-tip = %s\n' "$unstable_output"
+			cat "$rows" "$unstable_rows" | LC_ALL=C sort \
+				>"$output.rows" ||
+				die "could not sort stable and unstable topic state"
+			rows=$output.rows
+		fi
 		while IFS="$tab" read -r name tip prerequisite
 		do
 			quoted=$(config_subsection_quote "$name")
@@ -812,6 +1050,7 @@ write_meta_config () (
 			printf '\tcodex-tip = %s\n' "$tip"
 		done <"$rows"
 	} >"$output" || die "could not write $meta_config_path"
+	test -z "$unstable_rows" || rm -f "$output.rows"
 )
 
 config_get_one () (
@@ -845,11 +1084,12 @@ read_meta_config () (
 	state=$4
 	config=$state/published-config
 	rows=$state/published-topics
+	unstable_rows=$state/published-unstable-topics
 
 	git show "$controller_oid:$meta_config_path" >"$config" 2>/dev/null ||
 		die "meta has no $meta_config_path; run Meta/codex initialize before refreshing"
 	version=$(config_get_one "$config" codex.version)
-	test "$version" = 1 ||
+	test "$version" = 1 || test "$version" = 2 ||
 		die "$meta_config_path has unsupported version '$version'"
 	base_ref=$(config_get_one "$config" codex.base-ref)
 	base_tip=$(config_get_one "$config" codex.base-tip)
@@ -861,37 +1101,84 @@ read_meta_config () (
 		die "$meta_config_path records output '$output_ref', not refs/heads/$codex_name"
 	require_full_commit_oid "$base_tip"
 	require_full_commit_oid "$output_tip"
+	if test "$version" = 2
+	then
+		unstable_base_ref=$(config_get_one "$config" \
+			codex-unstable.base-ref)
+		unstable_base_tip=$(config_get_one "$config" \
+			codex-unstable.base-tip)
+		unstable_output_ref=$(config_get_one "$config" \
+			codex-unstable.output-ref)
+		unstable_output_tip=$(config_get_one "$config" \
+			codex-unstable.output-tip)
+		test "$unstable_base_ref" = "refs/heads/$codex_name" ||
+			die "$meta_config_path records unstable base '$unstable_base_ref', not refs/heads/$codex_name"
+		test "$unstable_output_ref" = refs/heads/codex-unstable ||
+			die "$meta_config_path records invalid unstable output '$unstable_output_ref'"
+		require_full_commit_oid "$unstable_base_tip"
+		require_full_commit_oid "$unstable_output_tip"
+		test "$unstable_base_tip" = "$output_tip" ||
+			die "$meta_config_path unstable base does not match its published codex output"
+		git merge-base --is-ancestor "$unstable_base_tip" \
+			"$unstable_output_tip" ||
+			die "$meta_config_path unstable output is not based on codex"
+		test "$unstable_base_tip" != "$unstable_output_tip" ||
+			die "$meta_config_path unstable output is not strictly ahead of codex"
+	fi
 
 	: >"$rows"
+	: >"$unstable_rows"
 	git config --no-includes --file "$config" --get-regexp \
 		'^branch\..*\.codex-tip$' >"$state/published-tip-keys" || :
 	while IFS=' ' read -r key tip
 	do
 		name=${key#branch.}
 		name=${name%.codex-tip}
-		is_stable_topic_name "$name" ||
+		is_active_topic_name "$name" ||
 			die "$meta_config_path records invalid topic '$name'"
 		remote=$(config_get_one "$config" "branch.$name.remote")
 		merge=$(config_get_one "$config" "branch.$name.merge")
 		test "$remote" = . ||
 			die "$meta_config_path gives '$name' non-local remote '$remote'"
-		case "$merge" in
-		"refs/heads/$base_name") prerequisite=$base_name ;;
-		refs/heads/*)
-			prerequisite=${merge#refs/heads/}
-			is_stable_topic_name "$prerequisite" ||
-				die "$meta_config_path gives '$name' invalid prerequisite '$merge'"
-			;;
-		*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
-		esac
+		if is_unstable_topic_name "$name"
+		then
+			test "$version" = 2 ||
+				die "$meta_config_path version 1 records unstable topic '$name'"
+			case "$merge" in
+			"refs/heads/$codex_name") prerequisite=$codex_name ;;
+			refs/heads/*)
+				prerequisite=${merge#refs/heads/}
+				is_unstable_topic_name "$prerequisite" ||
+					die "$meta_config_path gives unstable topic '$name' invalid prerequisite '$merge'"
+				;;
+			*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
+			esac
+			target_rows=$unstable_rows
+		else
+			case "$merge" in
+			"refs/heads/$base_name") prerequisite=$base_name ;;
+			refs/heads/*)
+				prerequisite=${merge#refs/heads/}
+				is_stable_topic_name "$prerequisite" ||
+					die "$meta_config_path gives '$name' invalid prerequisite '$merge'"
+				;;
+			*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
+			esac
+			target_rows=$rows
+		fi
 		require_full_commit_oid "$tip"
-		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisite" >>"$rows" ||
+		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisite" \
+			>>"$target_rows" ||
 			die "could not read '$name' from $meta_config_path"
 	done <"$state/published-tip-keys"
 	LC_ALL=C sort -o "$rows" "$rows"
+	LC_ALL=C sort -o "$unstable_rows" "$unstable_rows"
 	test "$(cut -f1 "$rows" | sort -u | wc -l | tr -d ' ')" = \
 		"$(wc -l <"$rows" | tr -d ' ')" ||
 		die "$meta_config_path records a topic more than once"
+	test "$(cut -f1 "$unstable_rows" | sort -u | wc -l | tr -d ' ')" = \
+		"$(wc -l <"$unstable_rows" | tr -d ' ')" ||
+		die "$meta_config_path records an unstable topic more than once"
 
 	while IFS="$tab" read -r name tip prerequisite
 	do
@@ -914,15 +1201,62 @@ read_meta_config () (
 		git merge-base --is-ancestor "$tip" "$output_tip" ||
 			die "$meta_config_path output does not contain published topic '$name'"
 	done <"$rows"
+	if test "$version" = 2
+	then
+		if ! test -s "$unstable_rows"
+		then
+			unstable_sentinel_is_canonical "$unstable_base_tip" \
+				"$unstable_output_tip" ||
+				die "$meta_config_path empty unstable output is not its canonical sentinel"
+		fi
+		while IFS="$tab" read -r name tip prerequisite
+		do
+			test "$name" != "$prerequisite" ||
+				die "$meta_config_path makes '$name' its own prerequisite"
+			if published_depends_on "$unstable_rows" "$prerequisite" \
+				"$name"
+			then
+				die "$meta_config_path contains an unstable dependency cycle through '$name'"
+			fi
+			if test "$prerequisite" = "$codex_name"
+			then
+				prerequisite_tip=$unstable_base_tip
+			else
+				prerequisite_tip=$(published_tip "$unstable_rows" \
+					"$prerequisite")
+				test -n "$prerequisite_tip" ||
+					die "$meta_config_path records missing prerequisite '$prerequisite' for '$name'"
+			fi
+			git merge-base --is-ancestor "$prerequisite_tip" "$tip" ||
+				die "$meta_config_path boundary for unstable topic '$name' is not in its published history"
+			git merge-base --is-ancestor "$tip" "$unstable_output_tip" ||
+				die "$meta_config_path output does not contain published unstable topic '$name'"
+		done <"$unstable_rows"
+	fi
 	git merge-base --is-ancestor "$base_tip" "$output_tip" ||
 		die "$meta_config_path output is not based on its recorded base"
 
-	write_meta_config "$base_name" "$base_tip" "$codex_name" "$output_tip" \
-		"$rows" "$state/canonical-published-config"
+	if test "$version" = 2
+	then
+		write_meta_config "$base_name" "$base_tip" "$codex_name" \
+			"$output_tip" "$rows" "$state/canonical-published-config" \
+			"$unstable_rows" "$unstable_base_tip" "$unstable_output_tip"
+	else
+		write_meta_config "$base_name" "$base_tip" "$codex_name" \
+			"$output_tip" "$rows" "$state/canonical-published-config"
+	fi
 	cmp -s "$config" "$state/canonical-published-config" ||
 		die "$meta_config_path is not in canonical form"
+	printf '%s\n' "$version" >"$state/config-version"
 	printf '%s\n' "$base_tip" >"$state/published-base-oid"
 	printf '%s\n' "$output_tip" >"$state/published-codex-oid"
+	if test "$version" = 2
+	then
+		printf '%s\n' "$unstable_base_tip" \
+			>"$state/published-unstable-base-oid"
+		printf '%s\n' "$unstable_output_tip" \
+			>"$state/published-unstable-oid"
+	fi
 )
 
 topic_contains_commit () (
@@ -1453,13 +1787,16 @@ prepare_stateful_plan () (
 				{ test -n "$published_parent_is_upstream" ||
 					! git merge-base --is-ancestor \
 						"$published_prerequisite_tip" "$current_tip"; } &&
-				git merge-base --is-ancestor "$base_oid" "$current_tip"
+				{ git merge-base --is-ancestor "$base_oid" "$current_tip" ||
+					git merge-base --is-ancestor "$published_base" \
+						"$current_tip"; }
 			then
 				# With the published prerequisite absent, a root history is
-				# an explicit restack onto master.
+				# an explicit restack onto the current or published base.
 				prerequisite=$base_name
 				prerequisite_tip=$base_oid
-				old_base=$base_oid
+				old_base=$(root_replay_boundary "$name" \
+					"$published_base" "$base_oid" "$current_tip" "$state")
 				reparented=t
 			elif test "$old_prerequisite" = "$base_name" ||
 				test -n "$old_prerequisite_tip"
@@ -1473,9 +1810,17 @@ prepare_stateful_plan () (
 
 			if test "$reparented" = t
 			then
-				git merge-base --is-ancestor "$prerequisite_tip" \
-					"$current_tip" ||
-					die "new prerequisite '$prerequisite' is not in '$name'"
+				if ! git merge-base --is-ancestor "$prerequisite_tip" \
+					"$current_tip"
+				then
+					test "$prerequisite" = "$base_name" &&
+						test -n "$old_base" &&
+						git merge-base --is-ancestor "$old_base" \
+							"$current_tip" &&
+						git merge-base --is-ancestor "$old_base" \
+							"$prerequisite_tip" ||
+						die "new prerequisite '$prerequisite' is not in '$name'"
+				fi
 				test -n "${old_base:-}" || old_base=$prerequisite_tip
 			else
 				old_base=$(choose_replay_boundary "$name" \
@@ -1787,6 +2132,19 @@ write_complete_updates () {
 	printf 'refs/heads/%s\t%s\t%s\n' \
 		"$codex_name" "$codex_oid" "$candidate" >>"$output.unsorted" ||
 		die "could not record the codex update"
+	if test -f "$state/unstable-output-oid"
+	then
+		unstable_old=$(state_value "$state" unstable-oid)
+		unstable_new=$(state_value "$state" unstable-output-oid)
+		printf 'refs/heads/codex-unstable\t%s\t%s\n' \
+			"$unstable_old" "$unstable_new" >>"$output.unsorted" ||
+			die "could not record the codex-unstable update"
+		if test -f "$state/unstable/topic-updates"
+		then
+			cat "$state/unstable/topic-updates" >>"$output.unsorted" ||
+				die "could not record unstable topic updates"
+		fi
+	fi
 	LC_ALL=C sort "$output.unsorted" >"$output" ||
 		die "could not sort the complete update manifest"
 	rm -f "$output.unsorted"
@@ -1810,10 +2168,38 @@ write_next_meta_config () (
 			die "could not record next state for '$name'"
 	done <"$state/topics"
 	LC_ALL=C sort -o "$rows" "$rows"
-	write_meta_config "$(state_value "$state" base-name)" \
-		"$(state_value "$state" base-oid)" \
-		"$(state_value "$state" codex-name)" "$candidate" \
-		"$rows" "$state/next-meta-config"
+	if test -f "$state/unstable-output-oid" &&
+		! is_null_oid "$(state_value "$state" unstable-output-oid)"
+	then
+		unstable_state=$state/unstable
+		unstable_rows=$state/next-published-unstable-topics
+		: >"$unstable_rows"
+		while IFS="$tab" read -r name old
+		do
+			new=$(result_lookup "$unstable_state/results" "$name")
+			test -n "$new" ||
+				die "unstable topic '$name' has no rewritten tip"
+			prerequisite=$(awk -F '\t' -v name="$name" \
+				'$1 == name { value=$3 } END { if (value != "") print value }' \
+				"$unstable_state/plan")
+			test -n "$prerequisite" ||
+				die "unstable topic '$name' has no recorded prerequisite"
+			printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" \
+				>>"$unstable_rows" ||
+				die "could not record next state for unstable topic '$name'"
+		done <"$unstable_state/topics"
+		LC_ALL=C sort -o "$unstable_rows" "$unstable_rows"
+		write_meta_config "$(state_value "$state" base-name)" \
+			"$(state_value "$state" base-oid)" \
+			"$(state_value "$state" codex-name)" "$candidate" \
+			"$rows" "$state/next-meta-config" "$unstable_rows" \
+			"$candidate" "$(state_value "$state" unstable-output-oid)"
+	else
+		write_meta_config "$(state_value "$state" base-name)" \
+			"$(state_value "$state" base-oid)" \
+			"$(state_value "$state" codex-name)" "$candidate" \
+			"$rows" "$state/next-meta-config"
+	fi
 )
 
 create_meta_commit () (
@@ -1981,6 +2367,38 @@ write_failure () {
 	} >"$path"
 }
 
+write_unstable_failure () {
+	path=$1
+	state=$2
+	worktree=$3
+	test -n "$path" || return 0
+
+	failed_owner=$(state_value "$state" failed-owner)
+	failed_commit=$(state_value "$state" failed-commit)
+	{
+		say "## No refs were updated"
+		say
+		say "Rebasing unstable topic \`$failed_owner\` stopped while applying \`$failed_commit\`."
+		say "Neither \`codex\`, \`codex-unstable\`, \`meta\`, nor a topic branch was updated."
+		say
+		say "Resolve this experimental conflict manually: restack the affected"
+		say "unstable topic and its descendants onto their current prerequisite,"
+		say "publish the coherent topic graph in one exact-lease atomic push,"
+		say "and run \`Meta/rebuild\` again."
+		say "The production-only \`resolve\`/\`continue\` recovery commands do not"
+		say "reconstruct this nested unstable integration lane."
+		if test -n "$(git -C "$worktree" -c core.fsmonitor=false \
+			diff --name-only --diff-filter=U)"
+		then
+			say
+			say "Conflicted paths:"
+			git -C "$worktree" -c core.fsmonitor=false \
+				diff --name-only --diff-filter=U |
+				sed 's/^/- `/' | sed 's/$/`/'
+		fi
+	} >"$path"
+}
+
 write_integration_failure () {
 	path=$1
 	state=$2
@@ -2024,10 +2442,11 @@ merge_topic () {
 	worktree=$1
 	name=$2
 	oid=$3
+	output_name=${4:-codex}
 	before=$(git -C "$worktree" rev-parse HEAD) ||
 		die "could not resolve the candidate before integrating '$name'"
-	message=$(printf 'Merge %s into codex\n\nIntegrate the current %s topic into the internally distributed codex branch.\n\nCodex-Integration: %s@%s' \
-		"$name" "$name" "$name" "$oid")
+	message=$(printf 'Merge %s into %s\n\nIntegrate the current %s topic into the internally distributed %s branch.\n\nCodex-Integration: %s@%s' \
+		"$name" "$output_name" "$name" "$output_name" "$name" "$oid")
 
 	if git -C "$worktree" merge-base --is-ancestor "$oid" "$before"
 	then
@@ -2035,7 +2454,8 @@ merge_topic () {
 		then
 			tree=$(git -C "$worktree" rev-parse "$before^{tree}") ||
 				die "could not resolve the integration base tree"
-			anchor_message=$(printf 'Begin codex integration\n\nCreate a distinct first parent for explicit topic integration commits.\n')
+			anchor_message=$(printf 'Begin %s integration\n\nCreate a distinct first parent for explicit topic integration commits.\n' \
+				"$output_name")
 			anchor=$(printf '%s' "$anchor_message" | \
 				GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
 				GIT_COMMITTER_NAME=$bot_name \
@@ -2142,13 +2562,14 @@ codex_has_expected_integrations () (
 	state=$1
 	head_oid=$2
 	base_oid=$(state_value "$state" base-oid)
+	output_name=$(state_value "$state" codex-name)
 	expected=$state/expected-integrations
 	actual=$state/actual-integrations
 	: >"$expected"
 	while IFS="$tab" read -r name oid
 	do
-		printf '%s@%s\t%s\tMerge %s into codex\t%s\t%s\t%s\t%s\n' \
-			"$name" "$oid" "$oid" "$name" \
+		printf '%s@%s\t%s\tMerge %s into %s\t%s\t%s\t%s\t%s\n' \
+			"$name" "$oid" "$oid" "$name" "$output_name" \
 			"$bot_name" "$bot_email" "$bot_name" "$bot_email" \
 			>>"$expected" || return 1
 	done <"$state/integration-topics"
@@ -2177,6 +2598,7 @@ assemble_candidate () {
 	worktree=$1
 	state=$2
 	base_oid=$(state_value "$state" base-oid)
+	output_name=$(state_value "$state" codex-name)
 	rm -f "$state/integration-failed-name" \
 		"$state/integration-failed-oid" ||
 		die "could not clear old integration state"
@@ -2187,10 +2609,10 @@ assemble_candidate () {
 
 	git -C "$worktree" -c core.fsmonitor=false \
 		-c advice.detachedHead=false switch --detach "$base_oid" >/dev/null ||
-		die "could not check out master while assembling codex"
+		die "could not check out the base while assembling $output_name"
 	while IFS="$tab" read -r name oid
 	do
-		if ! merge_topic "$worktree" "$name" "$oid"
+		if ! merge_topic "$worktree" "$name" "$oid" "$output_name"
 		then
 			printf '%s\n' "$name" >"$state/integration-failed-name" ||
 				die "could not record the conflicting integration topic"
@@ -2212,7 +2634,8 @@ assemble_candidate () {
 	codex_has_expected_integrations "$state" "$candidate" ||
 		die "candidate does not contain one canonical integration merge per topic"
 	require_automation=$(state_value "$state" require-automation)
-	if ! test -f "$state/initializing"
+	if ! test -f "$state/initializing" &&
+		test "$output_name" != codex-unstable
 	then
 		verify_control_paths "$state/inputs" "$state/topic-updates" \
 			"$candidate" "$state" "$require_automation"
@@ -2233,6 +2656,14 @@ create_bundle () {
 	git update-ref refs/codex-output/candidate "$candidate" ||
 		die "could not retain the bundle candidate"
 	set -- git bundle create "$bundle" refs/codex-output/candidate
+	if test -f "$state/unstable-output-oid" &&
+		! is_null_oid "$(state_value "$state" unstable-output-oid)"
+	then
+		git update-ref refs/codex-output/unstable \
+			"$(state_value "$state" unstable-output-oid)" ||
+			die "could not retain the unstable bundle candidate"
+		set -- "$@" refs/codex-output/unstable
+	fi
 	if test "$meta_oid" != "$controller_oid"
 	then
 		git update-ref refs/codex-output/meta "$meta_oid" ||
@@ -2264,13 +2695,43 @@ create_bundle () {
 	if ! "$@"
 	then
 		git update-ref -d refs/codex-output/candidate || :
+		git update-ref -d refs/codex-output/unstable || :
 		git update-ref -d refs/codex-output/meta || :
 		die "could not create candidate bundle"
 	fi
 	git update-ref -d refs/codex-output/candidate ||
 		die "could not remove the temporary bundle ref"
+	git update-ref -d refs/codex-output/unstable || :
 	git update-ref -d refs/codex-output/meta || :
 }
+
+validate_lane_isolation () (
+	state=$1
+	stable_topics=$2
+	unstable_topics=$3
+	codex_oid=$4
+
+	cp "$unstable_topics" "$state/cross-lane-unstable-tips" ||
+		die "could not prepare current unstable ownership checks"
+	awk -F '\t' '{ printf "%s\t%s\n", $1, $2 }' \
+		"$state/published-unstable-topics" \
+		>>"$state/cross-lane-unstable-tips" ||
+		die "could not prepare published unstable ownership checks"
+	while IFS="$tab" read -r unstable_name unstable_tip
+	do
+		while IFS="$tab" read -r stable_name stable_tip
+		do
+			git merge-base --all "$unstable_tip" "$stable_tip" \
+				>"$state/cross-lane-bases" ||
+				die "could not compare stable topic '$stable_name' with unstable topic '$unstable_name'"
+			while read -r shared
+			do
+				git merge-base --is-ancestor "$shared" "$codex_oid" ||
+					die "stable topic '$stable_name' contains private commits from unstable topic '$unstable_name'"
+			done <"$state/cross-lane-bases"
+		done <"$stable_topics"
+	done <"$state/cross-lane-unstable-tips"
+)
 
 initialize_rewrite () {
 	remote=$1
@@ -2286,22 +2747,40 @@ initialize_rewrite () {
 	mkdir -p "$state"
 	cp "$inputs" "$state/inputs"
 	cp "$topics" "$state/topics"
+	if test -f "$topics.unstable"
+	then
+		cp "$topics.unstable" "$state/unstable-topics" ||
+			die "could not retain unstable topic inputs"
+	else
+		: >"$state/unstable-topics"
+	fi
 	controller_oid=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
 	base_name=${base_ref#refs/heads/}
 	codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
+	unstable_oid=$(awk -F '\t' '$1 == "unstable" { print $3 }' "$inputs")
+	lane_mode=$(awk -F '\t' '$1 == "lane-mode" { print $3 }' "$inputs")
 	printf '%s\n' "$controller_oid" >"$state/controller-oid"
 	printf '%s\n' "$remote" >"$state/remote"
 	printf '%s\n' "$base_name" >"$state/base-name"
 	printf '%s\n' "$base_oid" >"$state/base-oid"
 	printf '%s\n' "$codex_name" >"$state/codex-name"
 	printf '%s\n' "$codex_oid" >"$state/codex-oid"
+	test -z "$unstable_oid" ||
+		printf '%s\n' "$unstable_oid" >"$state/unstable-oid"
+	printf '%s\n' "$lane_mode" >"$state/unstable-mode"
 	printf '%s\n' "$rerere_name" >"$state/rerere-name"
 	printf '%s\n' "$require_automation" >"$state/require-automation"
 	printf '%s\n' "$script_path" >"$state/helper"
 
 	read_meta_config "$controller_oid" "$base_name" "$codex_name" "$state"
+	if test -s "$state/published-topics" && ! test -s "$state/topics"
+	then
+		die "all previously published production topics disappeared"
+	fi
+	validate_lane_isolation "$state" "$state/topics" \
+		"$state/unstable-topics" "$codex_oid"
 	published_codex_oid=$(state_value "$state" published-codex-oid)
 	validate_live_codex_delta "$published_codex_oid" "$codex_oid" \
 		"$state/topics" "$state"
@@ -2311,6 +2790,155 @@ initialize_rewrite () {
 		train_rerere "$worktree" "$base_oid" "$codex_oid"
 	fi
 }
+
+create_unstable_sentinel () (
+	base=$1
+	tree=$(git rev-parse "$base^{tree}") ||
+		die "could not resolve the codex-unstable sentinel tree"
+	printf 'Initialize codex-unstable\n' |
+		GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+		git -c commit.gpgSign=false commit-tree "$tree" -p "$base" ||
+		die "could not create the empty codex-unstable sentinel"
+)
+
+prepare_unstable_candidate () (
+	worktree=$1
+	state=$2
+	root_state=$state
+	stable_candidate=$3
+	failure_file=$4
+	topics=$state/unstable-topics
+	unstable_old=$(awk -F '\t' '$1 == "unstable" { print $3 }' \
+		"$state/inputs")
+	mode=$(state_value "$state" unstable-mode)
+	version=$(state_value "$state" config-version)
+
+	if ! test -s "$topics"
+	then
+		if test "$mode" = disable
+		then
+			test "$version" = 2 ||
+				die "codex-unstable is not enabled"
+			test "$unstable_old" = \
+				"$(state_value "$state" published-unstable-oid)" ||
+				die "cannot disable codex-unstable after its published output changed"
+			printf '%s\n' "$(null_oid)" >"$state/unstable-output-oid" ||
+				die "could not disable the empty codex-unstable output"
+			return 0
+		fi
+		if test "$version" = 1 && test "$mode" != enable
+		then
+			return 0
+		fi
+		test -n "$unstable_old" ||
+			die "the enabled codex-unstable output was not snapshotted"
+		mkdir -p "$state/unstable" ||
+			die "could not prepare empty codex-unstable state"
+		: >"$state/unstable/topics"
+		: >"$state/unstable/topic-updates"
+		if ! is_null_oid "$unstable_old" &&
+			test "$(git show -s --format=%P "$unstable_old")" = \
+			"$stable_candidate" &&
+			test "$(git rev-parse "$unstable_old^{tree}")" = \
+			"$(git rev-parse "$stable_candidate^{tree}")"
+		then
+			unstable_candidate=$unstable_old
+		else
+			unstable_candidate=$(create_unstable_sentinel \
+				"$stable_candidate")
+		fi
+		printf '%s\n' "$unstable_candidate" \
+			>"$state/unstable-output-oid" ||
+			die "could not retain the empty codex-unstable sentinel"
+		return 0
+	fi
+	test "$mode" != disable ||
+		die "cannot disable codex-unstable while enrolled topics remain"
+
+	test -n "$unstable_old" ||
+		die "active unstable topics were not included in the input snapshot"
+	if test "$version" = 1 && ! is_null_oid "$unstable_old"
+	then
+		die "$meta_config_path does not describe the existing codex-unstable output"
+	fi
+	if test "$version" = 2 && is_null_oid "$unstable_old"
+	then
+		die "$meta_config_path records codex-unstable, but its output disappeared"
+	fi
+
+	unstable_state=$state/unstable
+	mkdir -p "$unstable_state" ||
+		die "could not prepare unstable reconstruction state"
+	cp "$state/inputs" "$unstable_state/inputs" ||
+		die "could not pin unstable inputs"
+	cp "$topics" "$unstable_state/topics" ||
+		die "could not pin unstable topics"
+	cp "$state/published-unstable-topics" \
+		"$unstable_state/published-topics" ||
+		die "could not retain published unstable topology"
+	printf '%s\n' "$(state_value "$state" controller-oid)" \
+		>"$unstable_state/controller-oid"
+	printf '%s\n' "$(state_value "$state" remote)" \
+		>"$unstable_state/remote"
+	printf '%s\n' codex >"$unstable_state/base-name"
+	printf '%s\n' "$stable_candidate" >"$unstable_state/base-oid"
+	printf '%s\n' codex-unstable >"$unstable_state/codex-name"
+	printf '%s\n' "$unstable_old" >"$unstable_state/codex-oid"
+	printf '%s\n' "$(state_value "$state" require-automation)" \
+		>"$unstable_state/require-automation"
+	printf '%s\n' "$script_path" >"$unstable_state/helper"
+	if test "$version" = 2
+	then
+		published_base=$(state_value "$state" published-unstable-base-oid)
+		published_output=$(state_value "$state" published-unstable-oid)
+		validate_live_codex_delta "$published_output" "$unstable_old" \
+			"$unstable_state/topics" "$unstable_state"
+	else
+		published_base=$(state_value "$state" codex-oid)
+		published_output=$(null_oid)
+	fi
+	printf '%s\n' "$published_base" \
+		>"$unstable_state/published-base-oid"
+	printf '%s\n' "$published_output" \
+		>"$unstable_state/published-codex-oid"
+	prepare_stateful_plan codex "$stable_candidate" \
+		"$unstable_state/topics" "$unstable_state"
+	if ! process_plan "$worktree" "$unstable_state"
+	then
+		write_unstable_failure "$failure_file" "$unstable_state" "$worktree"
+		die "conflict while rebasing unstable topic '$(state_value "$unstable_state" failed-owner)'; no refs were updated"
+	fi
+	if ! unstable_candidate=$(assemble_candidate "$worktree" \
+		"$unstable_state")
+	then
+		if test -f "$unstable_state/integration-failed-name"
+		then
+			write_integration_failure "$failure_file" \
+				"$unstable_state" "$worktree"
+			die "codex-unstable integration conflicts while merging '$(state_value "$unstable_state" integration-failed-name)'; no refs were updated"
+		fi
+		die "codex-unstable candidate validation failed; no refs were updated"
+	fi
+	git merge-base --is-ancestor "$stable_candidate" \
+		"$unstable_candidate" ||
+		die "codex-unstable candidate does not contain its exact codex base"
+	test "$stable_candidate" != "$unstable_candidate" ||
+		die "codex-unstable candidate is not strictly ahead of codex"
+	verify_unstable_control_paths "$stable_candidate" \
+		"$unstable_candidate" "$unstable_state"
+	if ! is_null_oid "$unstable_old" &&
+		git merge-base --is-ancestor "$stable_candidate" "$unstable_old" &&
+		test "$(git rev-parse "$unstable_candidate^{tree}")" = \
+			"$(git rev-parse "$unstable_old^{tree}")" &&
+		codex_has_expected_integrations "$unstable_state" "$unstable_old"
+	then
+		unstable_candidate=$unstable_old
+	fi
+	printf '%s\n' "$unstable_candidate" \
+		>"$root_state/unstable-output-oid" ||
+		die "could not retain the unstable output candidate"
+)
 
 initialize_config () {
 	remote=origin
@@ -2493,6 +3121,7 @@ local_refresh () {
 	rerere_name=codex
 	session=
 	require_automation=
+	unstable_mode=
 	while test $# -gt 0
 	do
 		case "$1" in
@@ -2502,6 +3131,18 @@ local_refresh () {
 		--codex) require_arg "$@"; codex_name=$2; shift 2 ;;
 		--rerere-from) require_arg "$@"; rerere_name=$2; shift 2 ;;
 		--require-automation) require_automation=t; shift ;;
+		--enable-unstable)
+			test -z "$unstable_mode" ||
+				die "unstable lane mode was specified more than once"
+			unstable_mode=enable
+			shift
+			;;
+		--disable-unstable)
+			test -z "$unstable_mode" ||
+				die "unstable lane mode was specified more than once"
+			unstable_mode=disable
+			shift
+			;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown refresh option '$1'" ;;
 		esac
@@ -2531,6 +3172,7 @@ local_refresh () {
 		--bundle "$session/codex.bundle" \
 		--failure "$session/codex-conflict.md"
 	test -z "$require_automation" || set -- "$@" --require-automation
+	test -z "$unstable_mode" || set -- "$@" "--${unstable_mode}-unstable"
 	fetch_heads "$remote"
 	rewrite "$@"
 	say "local refresh session: $session"
@@ -2549,6 +3191,7 @@ rewrite () {
 	failure_file=
 	worktree=
 	require_automation=
+	unstable_mode=
 
 	while test $# -gt 0
 	do
@@ -2564,6 +3207,18 @@ rewrite () {
 		--failure) require_arg "$@"; failure_file=$2; shift 2 ;;
 		--worktree) require_arg "$@"; worktree=$2; shift 2 ;;
 		--require-automation) require_automation=t; shift ;;
+		--enable-unstable)
+			test -z "$unstable_mode" ||
+				die "unstable lane mode was specified more than once"
+			unstable_mode=enable
+			shift
+			;;
+		--disable-unstable)
+			test -z "$unstable_mode" ||
+				die "unstable lane mode was specified more than once"
+			unstable_mode=disable
+			shift
+			;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown rewrite option '$1'" ;;
 		esac
@@ -2573,7 +3228,8 @@ rewrite () {
 	require_full_repository
 	inputs=$tmp_dir/inputs
 	topics=$tmp_dir/topics
-	snapshot_inputs "$remote" "$base_name" "$codex_name" "$inputs" "$topics"
+	snapshot_inputs "$remote" "$base_name" "$codex_name" "$inputs" \
+		"$topics" '' "$unstable_mode"
 	test -z "$inputs_file" || cp "$inputs" "$inputs_file"
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 
@@ -2623,6 +3279,15 @@ rewrite () {
 	then
 		candidate=$codex_oid
 	fi
+	if test -n "$(state_value "$state" unstable-mode)"
+	then
+		published_codex=$(state_value "$state" published-codex-oid)
+		test "$candidate" = "$codex_oid" &&
+			test "$codex_oid" = "$published_codex" ||
+			die "changing the codex-unstable lane requires a clean, unchanged production codex output"
+	fi
+	prepare_unstable_candidate "$worktree" "$state" "$candidate" \
+		"$failure_file"
 	create_meta_commit "$state" "$candidate"
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
 
@@ -2630,6 +3295,11 @@ rewrite () {
 	test -z "$updates_file" || cp "$tmp_dir/updates" "$updates_file"
 	test -z "$bundle_file" || create_bundle "$bundle_file" "$state" "$candidate"
 	say "rewrote all active topics and assembled codex candidate $candidate"
+	if test -f "$state/unstable-output-oid" &&
+		! is_null_oid "$(state_value "$state" unstable-output-oid)"
+	then
+		say "assembled codex-unstable candidate $(state_value "$state" unstable-output-oid)"
+	fi
 }
 
 verify_inputs () {
@@ -2657,10 +3327,12 @@ verify_inputs () {
 		"$expected")
 	test -n "$expected_controller" ||
 		die "input snapshot has no controller commit"
+	expected_mode=$(awk -F '\t' '$1 == "lane-mode" { print $3 }' \
+		"$expected")
 	actual=$tmp_dir/actual-inputs
 	topics=$tmp_dir/actual-topics
 	snapshot_inputs "$remote" "$base_name" "$codex_name" "$actual" "$topics" \
-		"$expected_controller"
+		"$expected_controller" "$expected_mode"
 	if ! cmp -s "$expected" "$actual"
 	then
 		diff -u "$expected" "$actual" >&2 || :
@@ -2674,8 +3346,15 @@ prepare_input_graph () {
 	mkdir -p "$graph" || die "could not prepare input graph verification"
 	awk -F '\t' '
 		$1 == "controller" || $1 == "base" || $1 == "codex" ||
-		$1 == "topic" { if (NF != 3) exit 1; next }
-		$1 == "admission" { if (NF != 5) exit 1; next }
+		$1 == "topic" || $1 == "unstable" ||
+		$1 == "unstable-topic" || $1 == "lane-mode" {
+			if (NF != 3) exit 1
+			next
+		}
+		$1 == "admission" || $1 == "unstable-admission" {
+			if (NF != 5) exit 1
+			next
+		}
 		{ exit 1 }
 	' "$inputs" || die "input snapshot contains an invalid record"
 	for kind in controller base codex
@@ -2684,6 +3363,23 @@ prepare_input_graph () {
 			END { print count + 0 }' "$inputs")" = 1 ||
 			die "input snapshot must contain exactly one '$kind' record"
 	done
+	for kind in unstable lane-mode admission unstable-admission
+	do
+		test "$(awk -F '\t' -v kind="$kind" '$1 == kind { count++ }
+			END { print count + 0 }' "$inputs")" -le 1 ||
+			die "input snapshot contains more than one '$kind' record"
+	done
+	lane_mode=$(awk -F '\t' '$1 == "lane-mode" { print $3 }' "$inputs")
+	case "$lane_mode" in
+	''|enable|disable) ;;
+	*) die "input snapshot contains an invalid unstable lane mode" ;;
+	esac
+	if test -n "$lane_mode"
+	then
+		test "$(awk -F '\t' '$1 == "lane-mode" { print $2 }' \
+			"$inputs")" = refs/heads/codex-unstable ||
+			die "input snapshot contains an invalid unstable lane ref"
+	fi
 	awk -F '\t' '$1 == "topic" {
 		name=$2
 		sub("^refs/heads/", "", name)
@@ -2710,7 +3406,32 @@ prepare_input_graph () {
 	base_name=${base_ref#refs/heads/}
 	codex_name=${codex_ref#refs/heads/}
 	read_meta_config "$controller_oid" "$base_name" "$codex_name" "$graph"
+	config_version=$(state_value "$graph" config-version)
+	unstable_count=$(awk -F '\t' '$1 == "unstable" { count++ }
+		END { print count + 0 }' "$inputs")
+	case "$config_version:$lane_mode" in
+	1:)
+		test "$unstable_count" = 0 ||
+			die "version 1 input snapshot invents an unstable output"
+		;;
+	1:enable|2:|2:disable)
+		test "$unstable_count" = 1 ||
+			die "enabled unstable lane is missing its snapshotted output"
+		test "$(awk -F '\t' '$1 == "unstable" { print $2 }' \
+			"$inputs")" = refs/heads/codex-unstable ||
+			die "input snapshot records an invalid unstable output ref"
+		;;
+	*) die "input snapshot changes the unstable lane without authorization" ;;
+	esac
 	codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
+	awk -F '\t' '$1 == "unstable-topic" {
+		name=$2
+		sub("^refs/heads/", "", name)
+		printf "%s\t%s\n", name, $3
+	}' "$inputs" | LC_ALL=C sort >"$graph/unstable-current-topics" ||
+		die "could not prepare unstable ownership verification"
+	validate_lane_isolation "$graph" "$graph/topics" \
+		"$graph/unstable-current-topics" "$codex_oid"
 	published_codex=$(state_value "$graph" published-codex-oid)
 	awk -F '\t' '$1 == "admission" { print }' "$inputs" \
 		>"$graph/snapshot-admissions" ||
@@ -2776,12 +3497,140 @@ prepare_input_graph () {
 	done <"$graph/remotes"
 	test -n "$graph_remote" ||
 		die "could not locate the snapshotted Codex remote"
+	if test "$config_version" = 1 &&
+		git rev-parse --verify \
+			"$(remote_ref "$graph_remote" codex-unstable)^{commit}" \
+			>/dev/null 2>&1
+	then
+		die "$meta_config_path does not describe the existing codex-unstable output"
+	fi
+	printf '%s\n' "$graph_remote" >"$graph/remote"
 	reject_unadmitted_topic_history "$graph_remote" "$graph/topics" \
 		"$published_codex" "$base_oid"
 	validate_live_codex_delta "$published_codex" \
 		"$codex_oid" "$graph/topics" "$graph"
 	prepare_stateful_plan "$base_name" "$base_oid" "$graph/topics" "$graph"
 }
+
+prepare_unstable_input_graph () (
+	inputs=$1
+	stable_candidate=$2
+	stable_graph=$3
+	graph=$4
+	mkdir -p "$graph" ||
+		die "could not prepare unstable input graph verification"
+	awk -F '\t' '$1 == "unstable-topic" {
+		name=$2
+		sub("^refs/heads/", "", name)
+		printf "%s\t%s\n", name, $3
+	}' "$inputs" | LC_ALL=C sort >"$graph/topics" ||
+		die "could not read unstable topics from the input snapshot"
+	test "$(cut -f1 "$graph/topics" | sort -u | wc -l | tr -d ' ')" = \
+		"$(wc -l <"$graph/topics" | tr -d ' ')" ||
+		die "input snapshot contains duplicate unstable Codex topics"
+	while IFS="$tab" read -r name oid
+	do
+		is_unstable_topic_name "$name" ||
+			die "input snapshot contains invalid unstable topic '$name'"
+		require_full_commit_oid "$oid"
+	done <"$graph/topics"
+	cp "$stable_graph/published-unstable-topics" \
+		"$graph/published-topics" ||
+		die "could not retain published unstable topology for verification"
+	version=$(state_value "$stable_graph" config-version)
+	mode=$(awk -F '\t' '$1 == "lane-mode" { print $3 }' "$inputs")
+	unstable_oid=$(awk -F '\t' '$1 == "unstable" { print $3 }' "$inputs")
+	test -n "$unstable_oid" ||
+		die "unstable topics have no snapshotted output ref"
+	awk -F '\t' '$1 == "unstable-admission" { print }' "$inputs" \
+		>"$graph/snapshot-admissions" ||
+		die "could not inspect reviewed unstable Codex admissions"
+	if test "$version" = 2
+	then
+		! is_null_oid "$unstable_oid" ||
+			die "published codex-unstable output is missing"
+		published_base=$(state_value "$stable_graph" \
+			published-unstable-base-oid)
+		published_output=$(state_value "$stable_graph" \
+			published-unstable-oid)
+		if test "$published_output" = "$unstable_oid"
+		then
+			test ! -s "$graph/snapshot-admissions" ||
+				die "input snapshot records an unstable admission without a pending merge"
+			admitted_name=
+		else
+			test "$(wc -l <"$graph/snapshot-admissions" | tr -d ' ')" = 1 ||
+				die "input snapshot does not contain exactly one reviewed unstable admission"
+			IFS="$tab" read -r kind admitted_ref admitted_oid \
+				admitted_number admitted_merge <"$graph/snapshot-admissions" ||
+				die "could not inspect the reviewed unstable Codex admission"
+			admitted_name=${admitted_ref#refs/heads/}
+			test "$admitted_ref" = "refs/heads/$admitted_name" &&
+				is_unstable_topic_name "$admitted_name" &&
+				test "$admitted_merge" = "$unstable_oid" ||
+				die "input snapshot contains an invalid reviewed unstable admission"
+			snapshot_head=$(awk -F '\t' -v name="$admitted_name" \
+				'$1 == name { print $2 }' "$graph/topics")
+			test "$snapshot_head" = "$admitted_oid" ||
+				die "input snapshot contains an invalid reviewed unstable admission"
+			authenticate_pending_codex_merge - "$published_output" \
+				"$unstable_oid" "$graph/verified-admission" \
+				"$snapshot_head" codex-unstable
+			printf '%s\t%s\t%s\t%s\n' "$admitted_name" \
+				"$admitted_oid" "$admitted_number" "$admitted_merge" \
+				>"$graph/expected-admission"
+			cmp -s "$graph/expected-admission" \
+				"$graph/verified-admission" ||
+				die "input snapshot does not match the reviewed unstable admission"
+		fi
+	else
+		test "$mode" = enable && is_null_oid "$unstable_oid" ||
+			die "$meta_config_path does not describe the existing codex-unstable output"
+		test ! -s "$graph/topics" &&
+			test ! -s "$graph/snapshot-admissions" ||
+			die "a newly enabled unstable lane cannot enroll unreviewed topics"
+		published_base=$(awk -F '\t' '$1 == "codex" { print $3 }' \
+			"$inputs")
+		published_output=$(null_oid)
+		admitted_name=
+	fi
+	while IFS="$tab" read -r name oid
+	do
+		if ! awk -F '\t' -v name="$name" '$1 == name { found=1 }
+			END { exit !found }' "$graph/published-topics" &&
+			test "$name" != "$admitted_name"
+		then
+			die "input snapshot contains unadmitted unstable topic '$name'"
+		fi
+	done <"$graph/topics"
+	if test "$mode" = disable
+	then
+		test "$version" = 2 && ! test -s "$graph/topics" &&
+			test ! -s "$graph/snapshot-admissions" ||
+			die "cannot disable codex-unstable while reviewed topics remain"
+	fi
+	if test -s "$graph/topics"
+	then
+		graph_remote=$(state_value "$stable_graph" remote)
+		codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
+		reject_unadmitted_topic_history "$graph_remote" "$graph/topics" \
+			"$published_output" "$codex_oid" codex-unstable
+		validate_live_codex_delta "$published_output" "$unstable_oid" \
+			"$graph/topics" "$graph"
+	fi
+	printf '%s\n' codex >"$graph/base-name"
+	printf '%s\n' "$stable_candidate" >"$graph/base-oid"
+	printf '%s\n' codex-unstable >"$graph/codex-name"
+	printf '%s\n' "$published_base" >"$graph/published-base-oid"
+	printf '%s\n' "$published_output" >"$graph/published-codex-oid"
+	if test -s "$graph/topics"
+	then
+		prepare_stateful_plan codex "$stable_candidate" \
+			"$graph/topics" "$graph"
+	else
+		: >"$graph/plan"
+	fi
+)
 
 topic_control_paths_unchanged () (
 	base_oid=$1
@@ -2791,6 +3640,7 @@ topic_control_paths_unchanged () (
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
 		.github/rulesets/codex-topics.json \
+		.github/rulesets/codex-unstable-branch.json \
 		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
@@ -2805,6 +3655,44 @@ topic_control_paths_unchanged () (
 		':(glob).github/workflows/*.yml' \
 		':(glob).github/workflows/*.yaml' \
 		':(exclude).github/workflows/codex-release.yml'
+)
+
+verify_unstable_control_paths () (
+	base_oid=$1
+	unstable_candidate=$2
+	state=$3
+
+	topic_control_paths_unchanged "$base_oid" "$unstable_candidate" ||
+		die "codex-unstable changes a protected controller or CI file"
+	git diff --quiet "$base_oid" "$unstable_candidate" -- \
+		':(glob).github/workflows/*.yml' \
+		':(glob).github/workflows/*.yaml' ||
+		die "codex-unstable changes a GitHub Actions workflow"
+	release_workflow_is_codex_only "$unstable_candidate" ||
+		die "codex-unstable changes the production-only release trigger"
+	while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
+	do
+		is_unstable_topic_name "$name" ||
+			die "unstable integration contains stable topic '$name'"
+		if test "$prerequisite" != codex
+		then
+			is_unstable_topic_name "$prerequisite" ||
+				die "unstable topic '$name' has non-unstable prerequisite '$prerequisite'"
+			dependency=$(result_lookup "$state/results" "$prerequisite")
+			test -n "$dependency" ||
+				die "unstable topic '$name' has no rewritten prerequisite"
+		else
+			dependency=$base_oid
+		fi
+		tip=$(result_lookup "$state/results" "$name")
+		test -n "$tip" || die "unstable topic '$name' has no rewritten tip"
+		topic_control_paths_unchanged "$dependency" "$tip" ||
+			die "unstable topic '$name' changes a protected controller or CI file"
+		git diff --quiet "$dependency" "$tip" -- \
+			':(glob).github/workflows/*.yml' \
+			':(glob).github/workflows/*.yaml' ||
+			die "unstable topic '$name' changes a GitHub Actions workflow"
+	done <"$state/plan"
 )
 
 verify_control_paths () {
@@ -2822,6 +3710,11 @@ verify_control_paths () {
 			die "candidate changes the controller-only release publication guard"
 		if automation_workflow_is_current "$published_codex" &&
 			! automation_workflow_is_current "$candidate"
+		then
+			die "candidate downgrades the canonical Codex admission workflow"
+		fi
+		if automation_workflow_is_reviewed "$published_codex" &&
+			! automation_workflow_is_reviewed "$candidate"
 		then
 			die "candidate downgrades the canonical Codex admission workflow"
 		fi
@@ -2845,7 +3738,8 @@ verify_control_paths () {
 	while IFS="$tab" read -r ref old new
 	do
 		case "$ref" in
-		refs/heads/meta|refs/heads/codex) continue ;;
+		refs/heads/meta|refs/heads/codex|refs/heads/codex-unstable) continue ;;
+		refs/heads/??/codex/*-unstable) continue ;;
 		esac
 		name=${ref#refs/heads/}
 		plan_row=$(awk -F '\t' -v name="$name" '$1 == name { print; exit }' \
@@ -2898,6 +3792,8 @@ verify_meta_update () (
 	updates=$2
 	candidate=$3
 	graph=$4
+	unstable_graph=${5:-}
+	unstable_candidate=${6:-}
 	old_meta=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
 	new_meta=$(awk -F '\t' '$1 == "refs/heads/meta" { print $3 }' "$updates")
 	test -n "$new_meta" || die "updates contain no meta state commit"
@@ -2951,8 +3847,39 @@ verify_meta_update () (
 	codex_ref=$(awk -F '\t' '$1 == "codex" { print $2 }' "$inputs")
 	base_name=${base_ref#refs/heads/}
 	codex_name=${codex_ref#refs/heads/}
-	write_meta_config "$base_name" "$base_oid" "$codex_name" "$candidate" \
-		"$graph/expected-meta-topics" "$graph/expected-meta-config"
+	if test -n "$unstable_candidate" &&
+		! is_null_oid "$unstable_candidate"
+	then
+		test -n "$unstable_graph" ||
+			die "unstable output has no verified topic graph"
+		: >"$graph/expected-meta-unstable-topics"
+		while IFS="$tab" read -r name old
+		do
+			ref=refs/heads/$name
+			new=$(awk -F '\t' -v ref="$ref" \
+				'$1 == ref { print $3 }' "$updates")
+			test -n "$new" ||
+				die "updates contain no rewritten unstable tip for '$name'"
+			prerequisite=$(awk -F '\t' -v name="$name" \
+				'$1 == name { value=$3 } END { if (value != "") print value }' \
+				"$unstable_graph/plan")
+			test -n "$prerequisite" ||
+				die "verified unstable graph contains no prerequisite for '$name'"
+			printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" \
+				>>"$graph/expected-meta-unstable-topics"
+		done <"$unstable_graph/topics"
+		LC_ALL=C sort -o "$graph/expected-meta-unstable-topics" \
+			"$graph/expected-meta-unstable-topics"
+		write_meta_config "$base_name" "$base_oid" "$codex_name" \
+			"$candidate" "$graph/expected-meta-topics" \
+			"$graph/expected-meta-config" \
+			"$graph/expected-meta-unstable-topics" \
+			"$candidate" "$unstable_candidate"
+	else
+		write_meta_config "$base_name" "$base_oid" "$codex_name" \
+			"$candidate" "$graph/expected-meta-topics" \
+			"$graph/expected-meta-config"
+	fi
 	git show "$new_meta:$meta_config_path" >"$graph/actual-meta-config" \
 		2>/dev/null || die "next meta state has no $meta_config_path"
 	cmp -s "$graph/expected-meta-config" "$graph/actual-meta-config" ||
@@ -2964,6 +3891,7 @@ verify_output () {
 	updates=
 	result=
 	require_automation=
+	stable_recovery=
 	while test $# -gt 0
 	do
 		case "$1" in
@@ -2971,6 +3899,7 @@ verify_output () {
 		--updates) require_arg "$@"; updates=$2; shift 2 ;;
 		--result) require_arg "$@"; result=$2; shift 2 ;;
 		--require-automation) require_automation=t; shift ;;
+		--stable-recovery) stable_recovery=t; shift ;;
 		*) die "unknown verify-output option '$1'" ;;
 		esac
 	done
@@ -2983,37 +3912,142 @@ verify_output () {
 	candidate=$(resolve_commit "$(sed -n '1p' "$result")")
 	test "$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' "$updates")" = "$candidate" ||
 		die "candidate does not match the codex update"
+	unstable_candidate=$(awk -F '\t' \
+		'$1 == "refs/heads/codex-unstable" { print $3 }' "$updates")
+	unstable_input=$(awk -F '\t' '$1 == "unstable" { print $3 }' \
+		"$inputs")
+	lane_mode=$(awk -F '\t' '$1 == "lane-mode" { print $3 }' "$inputs")
+	unstable_topic_count=$(awk -F '\t' \
+		'$1 == "unstable-topic" { count++ } END { print count + 0 }' \
+		"$inputs")
+	if test -n "$stable_recovery"
+	then
+		test -n "$unstable_input" &&
+			! is_null_oid "$unstable_input" &&
+			test -z "$unstable_candidate" &&
+			test -z "$lane_mode" ||
+			die "production recovery cannot change its enabled unstable lane"
+		test "$(awk -F '\t' '$1 == "unstable-admission" { count++ }
+			END { print count + 0 }' "$inputs")" = 0 ||
+			die "production recovery cannot bypass a pending unstable admission"
+	elif test -z "$unstable_input"
+	then
+		test -z "$unstable_candidate" && test "$unstable_topic_count" = 0 &&
+			test -z "$lane_mode" ||
+			die "disabled unstable lane has unsnapshotted output or topics"
+	elif test "$lane_mode" = enable
+	then
+		is_null_oid "$unstable_input" &&
+			test -n "$unstable_candidate" &&
+			! is_null_oid "$unstable_candidate" &&
+			test "$unstable_topic_count" = 0 ||
+			die "enabling codex-unstable requires an empty reviewed sentinel"
+	elif test "$lane_mode" = disable
+	then
+		! is_null_oid "$unstable_input" &&
+			is_null_oid "$unstable_candidate" &&
+			test "$unstable_topic_count" = 0 ||
+			die "disabling codex-unstable requires an empty published lane"
+	else
+		! is_null_oid "$unstable_input" &&
+			test -n "$unstable_candidate" &&
+			! is_null_oid "$unstable_candidate" ||
+			die "enabled unstable lane must retain its generated output"
+	fi
 	LC_ALL=C sort -c "$updates" || die "updates are not canonically sorted"
 	test "$(cut -f1 "$updates" | sort -u | wc -l | tr -d ' ')" = \
 		"$(wc -l <"$updates" | tr -d ' ')" || die "updates contain duplicate refs"
-	awk -F '\t' '$1 == "controller" || $1 == "codex" || $1 == "topic" { print $2 }' "$inputs" \
+	awk -F '\t' -v recovery="$stable_recovery" '
+		$1 == "controller" || $1 == "codex" || $1 == "topic" ||
+		(recovery == "" && ($1 == "unstable" || $1 == "unstable-topic")) {
+			print $2
+		}
+	' "$inputs" \
 		| LC_ALL=C sort >"$tmp_dir/expected-update-refs"
 	cut -f1 "$updates" | LC_ALL=C sort >"$tmp_dir/actual-update-refs"
 	cmp -s "$tmp_dir/expected-update-refs" "$tmp_dir/actual-update-refs" ||
-		die "updates do not cover exactly codex and every snapshotted topic"
+		die "updates do not cover exactly every snapshotted output and topic"
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 	test -n "$base_oid" || die "input snapshot has no base commit"
 	prepare_input_graph "$inputs" "$tmp_dir/topic-graph"
+	if test -n "$lane_mode"
+	then
+		input_codex=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
+		published_codex=$(state_value "$tmp_dir/topic-graph" \
+			published-codex-oid)
+		test "$candidate" = "$input_codex" &&
+			test "$input_codex" = "$published_codex" ||
+			die "changing the codex-unstable lane cannot publish a production update"
+	fi
+	unstable_graph=
+	if test -n "$unstable_input" && test -z "$stable_recovery"
+	then
+		unstable_graph=$tmp_dir/unstable-topic-graph
+		prepare_unstable_input_graph "$inputs" "$candidate" \
+			"$tmp_dir/topic-graph" "$unstable_graph"
+	fi
 	git merge-base --is-ancestor "$base_oid" "$candidate" ||
 		die "candidate is not based on the snapshotted master"
-	verify_meta_update "$inputs" "$updates" "$candidate" \
-		"$tmp_dir/topic-graph"
+	if test -n "$stable_recovery"
+	then
+		test "$(state_value "$tmp_dir/topic-graph" config-version)" = 2 &&
+			test "$unstable_input" = "$(state_value \
+			"$tmp_dir/topic-graph" published-unstable-oid)" ||
+			die "production recovery cannot change the published unstable output"
+		old_meta=$(awk -F '\t' '$1 == "controller" { print $3 }' \
+			"$inputs")
+		new_meta=$(awk -F '\t' '$1 == "refs/heads/meta" { print $3 }' \
+			"$updates")
+		test "$old_meta" = "$new_meta" ||
+			die "production recovery cannot change published meta state"
+	else
+		verify_meta_update "$inputs" "$updates" "$candidate" \
+			"$tmp_dir/topic-graph" "$unstable_graph" "$unstable_candidate"
+	fi
 	verify_control_paths "$inputs" "$updates" "$candidate" \
 		"$tmp_dir/topic-graph" "$require_automation"
 	while IFS="$tab" read -r ref old new
 	do
 		git check-ref-format "$ref" >/dev/null || die "invalid update ref '$ref'"
 		expected_old=$(awk -F '\t' -v ref="$ref" \
-			'$1 != "admission" && $2 == ref { print $3 }' \
+			'($1 == "controller" || $1 == "codex" ||
+			  $1 == "topic" || $1 == "unstable" ||
+			  $1 == "unstable-topic") && $2 == ref { print $3 }' \
 			"$inputs")
 		test "$old" = "$expected_old" ||
 			die "old value for '$ref' does not match the input snapshot"
-		resolve_commit "$old" >/dev/null
-		require_full_commit_oid "$new"
+		if ! is_null_oid "$old"
+		then
+			resolve_commit "$old" >/dev/null
+		fi
+		if ! is_null_oid "$new"
+		then
+			require_full_commit_oid "$new"
+		fi
 		case "$ref" in
 		refs/heads/meta) ;;
 		refs/heads/codex) ;;
+		refs/heads/codex-unstable)
+			if ! is_null_oid "$new"
+			then
+				git merge-base --is-ancestor "$candidate" "$new" ||
+					die "codex-unstable does not contain its exact codex candidate"
+				test "$new" != "$candidate" ||
+					die "codex-unstable is not strictly ahead of codex"
+			fi
+			;;
+		refs/heads/??/codex/*-unstable)
+			test -n "$unstable_candidate" &&
+				! is_null_oid "$unstable_candidate" ||
+				die "unstable topic update has no unstable output"
+			git merge-base --is-ancestor "$candidate" "$new" ||
+				die "rewritten '$ref' is not based on codex"
+			git merge-base --is-ancestor "$new" "$unstable_candidate" ||
+				die "codex-unstable does not contain '$ref'"
+			;;
 		refs/heads/??/codex/?*)
+			is_stable_topic_name "${ref#refs/heads/}" ||
+				die "unstable topic '$ref' entered the stable update set"
 			git merge-base --is-ancestor "$base_oid" "$new" ||
 				die "rewritten '$ref' is not based on master"
 			git merge-base --is-ancestor "$new" "$candidate" ||
@@ -3049,6 +4083,8 @@ verify_output () {
 		die "could not prepare integration verification"
 	printf '%s\n' "$base_oid" >"$tmp_dir/topic-graph/base-oid" ||
 		die "could not prepare integration base verification"
+	printf '%s\n' codex >"$tmp_dir/topic-graph/codex-name" ||
+		die "could not prepare integration output verification"
 	: >"$tmp_dir/topic-graph/results" ||
 		die "could not prepare rewritten topic verification"
 	while IFS="$tab" read -r name old
@@ -3062,6 +4098,52 @@ verify_output () {
 	write_integration_topics "$tmp_dir/topic-graph"
 	codex_has_expected_integrations "$tmp_dir/topic-graph" "$candidate" ||
 		die "candidate does not contain one canonical integration merge per topic"
+	if test -n "$unstable_graph"
+	then
+		if is_null_oid "$unstable_candidate"
+		then
+			return 0
+		fi
+		: >"$unstable_graph/results" ||
+			die "could not prepare rewritten unstable topic verification"
+		while IFS="$tab" read -r name old
+		do
+			ref=refs/heads/$name
+			new=$(awk -F '\t' -v ref="$ref" \
+				'$1 == ref { print $3 }' "$updates")
+			test -n "$new" ||
+				die "updates contain no rewritten unstable tip for '$name'"
+			result_record "$unstable_graph/results" "$name" "$new"
+		done <"$unstable_graph/topics"
+		while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
+		do
+			new=$(result_lookup "$unstable_graph/results" "$name")
+			if test "$prerequisite" = codex
+			then
+				new_prerequisite=$candidate
+			else
+				new_prerequisite=$(result_lookup \
+					"$unstable_graph/results" "$prerequisite")
+				test -n "$new_prerequisite" ||
+					die "unstable topic '$name' has no rewritten prerequisite '$prerequisite'"
+			fi
+			git merge-base --is-ancestor "$new_prerequisite" "$new" ||
+				die "unstable rewrite lost dependency '$prerequisite' -> '$name'"
+		done <"$unstable_graph/plan"
+		if test -s "$unstable_graph/topics"
+		then
+			write_integration_topics "$unstable_graph"
+			codex_has_expected_integrations "$unstable_graph" \
+				"$unstable_candidate" ||
+				die "codex-unstable does not contain one canonical integration merge per topic"
+		else
+			unstable_sentinel_is_canonical "$candidate" \
+				"$unstable_candidate" ||
+				die "empty codex-unstable output is not its canonical sentinel"
+		fi
+		verify_unstable_control_paths "$candidate" \
+			"$unstable_candidate" "$unstable_graph"
+	fi
 }
 
 push_updates () {
@@ -3073,17 +4155,27 @@ push_updates () {
 	while IFS="$tab" read -r ref old new
 	do
 		case "$filter:$ref" in
-		topics:refs/heads/meta|topics:refs/heads/codex) continue ;;
+		topics:refs/heads/meta|topics:refs/heads/codex|topics:refs/heads/codex-unstable) continue ;;
 		esac
-		set -- "$@" "--force-with-lease=$ref:$old"
+		if is_null_oid "$old"
+		then
+			set -- "$@" "--force-with-lease=$ref:"
+		else
+			set -- "$@" "--force-with-lease=$ref:$old"
+		fi
 	done <"$updates"
 	set -- "$@" "$remote"
 	while IFS="$tab" read -r ref old new
 	do
 		case "$filter:$ref" in
-		topics:refs/heads/meta|topics:refs/heads/codex) continue ;;
+		topics:refs/heads/meta|topics:refs/heads/codex|topics:refs/heads/codex-unstable) continue ;;
 		esac
-		set -- "$@" "$new:$ref"
+		if is_null_oid "$new"
+		then
+			set -- "$@" ":$ref"
+		else
+			set -- "$@" "$new:$ref"
+		fi
 	done <"$updates"
 	"$@"
 }
@@ -3093,7 +4185,7 @@ staging_ref () {
 	git check-ref-format "refs/heads/$name" >/dev/null 2>&1 ||
 		die "invalid staging branch '$name'"
 	case "$name" in
-	??/codex/*|codex|master|meta)
+	??/codex/*|codex|codex-unstable|master|meta)
 		die "staging branch '$name' overlaps a protected input or output"
 		;;
 	esac
@@ -3129,10 +4221,22 @@ stage_candidate () {
 	test -f "$inputs" || die "input snapshot '$inputs' does not exist"
 	test -f "$updates" || die "update manifest '$updates' does not exist"
 	make_tmp_dir
-	candidate=$(awk -F '\t' '$1 == "refs/heads/codex" { print $3 }' \
-		"$updates")
-	test -n "$candidate" || die "update manifest has no codex candidate"
-	printf '%s\n' "$candidate" >"$tmp_dir/stage-result" ||
+	stable_candidate=$(awk -F '\t' \
+		'$1 == "refs/heads/codex" { print $3 }' "$updates")
+	test -n "$stable_candidate" ||
+		die "update manifest has no codex candidate"
+	if test "$staging" = codex-unstable-staging
+	then
+		candidate=$(awk -F '\t' \
+			'$1 == "refs/heads/codex-unstable" { print $3 }' \
+			"$updates")
+		test -n "$candidate" && ! is_null_oid "$candidate" ||
+			die "update manifest has no codex-unstable candidate"
+	else
+		candidate=$stable_candidate
+	fi
+	stage_target=$candidate
+	printf '%s\n' "$stable_candidate" >"$tmp_dir/stage-result" ||
 		die "could not prepare staging verification"
 	set -- --inputs "$inputs" --updates "$updates" \
 		--result "$tmp_dir/stage-result"
@@ -3144,14 +4248,14 @@ stage_candidate () {
 
 	# A failed CI run intentionally leaves staging behind. Recreate an
 	# identical ref so a new user-authenticated push starts fresh push CI.
-	if test -n "$old" && test "$old" = "$candidate"
+	if test -n "$old" && test "$old" = "$stage_target"
 	then
 		git -c core.hooksPath=/dev/null push --atomic --porcelain \
 			"--force-with-lease=$ref:$old" "$remote" ":$ref"
 		old=
 	fi
 	git -c core.hooksPath=/dev/null push --atomic --porcelain \
-		"--force-with-lease=$ref:$old" "$remote" "$candidate:$ref"
+		"--force-with-lease=$ref:$old" "$remote" "$stage_target:$ref"
 }
 
 promote_updates () {
@@ -3159,18 +4263,37 @@ promote_updates () {
 	updates=$2
 	ref=$3
 	candidate=$4
+	unstable_ref=${5:-}
+	unstable_candidate=${6:-}
 
 	set -- git -c core.hooksPath=/dev/null push --atomic --porcelain
 	while IFS="$tab" read -r update_ref old new
 	do
-		set -- "$@" "--force-with-lease=$update_ref:$old"
+		if is_null_oid "$old"
+		then
+			set -- "$@" "--force-with-lease=$update_ref:"
+		else
+			set -- "$@" "--force-with-lease=$update_ref:$old"
+		fi
 	done <"$updates"
-	set -- "$@" "--force-with-lease=$ref:$candidate" "$remote"
+	set -- "$@" "--force-with-lease=$ref:$candidate"
+	if test -n "$unstable_ref"
+	then
+		set -- "$@" \
+			"--force-with-lease=$unstable_ref:$unstable_candidate"
+	fi
+	set -- "$@" "$remote"
 	while IFS="$tab" read -r update_ref old new
 	do
-		set -- "$@" "$new:$update_ref"
+		if is_null_oid "$new"
+		then
+			set -- "$@" ":$update_ref"
+		else
+			set -- "$@" "$new:$update_ref"
+		fi
 	done <"$updates"
 	set -- "$@" ":$ref"
+	test -z "$unstable_ref" || set -- "$@" ":$unstable_ref"
 	"$@"
 }
 
@@ -3211,7 +4334,33 @@ promote () {
 	staged=$(remote_head_oid "$remote" "$ref")
 	test "$staged" = "$candidate" ||
 		die "staging ref '$ref' moved or disappeared before promotion"
-	promote_updates "$remote" "$updates" "$ref" "$candidate"
+	unstable_candidate=$(awk -F '\t' \
+		'$1 == "refs/heads/codex-unstable" { print $3 }' "$updates")
+	unstable_ref=
+	unstable_staged=
+	if test -n "$unstable_candidate" &&
+		! is_null_oid "$unstable_candidate"
+	then
+		unstable_ref=$(staging_ref codex-unstable-staging)
+		test "$ref" != "$unstable_ref" ||
+			die "stable and unstable staging refs must be distinct"
+		unstable_staged=$(remote_head_oid "$remote" "$unstable_ref")
+		test "$unstable_staged" = "$unstable_candidate" ||
+			die "unstable staging ref '$unstable_ref' moved or disappeared before promotion"
+	elif test -n "$unstable_candidate" &&
+		test "$(awk -F '\t' '$1 == "lane-mode" { print $3 }' \
+			"$inputs")" = disable
+	then
+		candidate_unstable_ref=$(staging_ref codex-unstable-staging)
+		unstable_staged=$(remote_head_oid "$remote" \
+			"$candidate_unstable_ref")
+		if test -n "$unstable_staged"
+		then
+			unstable_ref=$candidate_unstable_ref
+		fi
+	fi
+	promote_updates "$remote" "$updates" "$ref" "$candidate" \
+		"$unstable_ref" "$unstable_staged"
 	base_ref=$(awk -F '\t' '$1 == "base" { print $2 }' "$inputs")
 	base_oid=$(awk -F '\t' '$1 == "base" { print $3 }' "$inputs")
 	current_base=$(remote_head_oid "$remote" "$base_ref")
@@ -3331,14 +4480,27 @@ wait_for_refresh_run () (
 
 rebuild_codex () {
 	local_preparation=
-	case $# in
-	0) ;;
-	1)
-		test "$1" = --local || { usage >&2; exit 129; }
-		local_preparation=t
-		;;
-	*) usage >&2; exit 129 ;;
-	esac
+	rebuild_unstable_mode=
+	for option in "$@"
+	do
+		case "$option" in
+		--local)
+			test -z "$local_preparation" || { usage >&2; exit 129; }
+			local_preparation=t
+			;;
+		--enable-unstable)
+			test -z "$rebuild_unstable_mode" || { usage >&2; exit 129; }
+			rebuild_unstable_mode=enable
+			;;
+		--disable-unstable)
+			test -z "$rebuild_unstable_mode" || { usage >&2; exit 129; }
+			rebuild_unstable_mode=disable
+			;;
+		*) usage >&2; exit 129 ;;
+		esac
+	done
+	test -z "$rebuild_unstable_mode" || test -n "$local_preparation" ||
+		die "changing the codex-unstable lane requires Meta/rebuild --local"
 	require_operator_context
 	if test -z "$local_preparation"
 	then
@@ -3434,22 +4596,28 @@ wait_for_staging_ci () (
 	repository=$2
 	candidate=$3
 	baseline=$4
-	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100"
+	staging=${5:-codex-staging}
+	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=$staging&event=push&head_sha=$candidate&per_page=100"
 
-	say "Waiting for staging CI for $candidate..."
+	if test "$staging" = codex-staging
+	then
+		say "Waiting for staging CI for $candidate..."
+	else
+		say "Waiting for $staging CI for $candidate..."
+	fi
 	run_id=
 	attempt=0
 	while test "$attempt" -lt 60
 	do
 		attempt=$((attempt + 1))
 		run_id=$("$gh_command" api --hostname github.com "$workflow_runs" --jq \
-			".workflow_runs | map(select(.id > ($baseline | tonumber) and .head_branch == \"codex-staging\" and .head_sha == \"$candidate\" and .event == \"push\" and .path == \".github/workflows/main.yml\")) | sort_by(.id) | .[0].id // empty") ||
+			".workflow_runs | map(select(.id > ($baseline | tonumber) and .head_branch == \"$staging\" and .head_sha == \"$candidate\" and .event == \"push\" and .path == \".github/workflows/main.yml\")) | sort_by(.id) | .[0].id // empty") ||
 			die "could not query staging CI"
 		test -z "$run_id" || break
 		sleep 5
 	done
 	test -n "$run_id" ||
-		die "no new CI run appeared for codex-staging at $candidate"
+		die "no new CI run appeared for $staging at $candidate"
 	case "$run_id" in
 	''|*[!0-9]*) die "staging CI returned an invalid run ID" ;;
 	esac
@@ -3471,7 +4639,7 @@ wait_for_staging_ci () (
 		IFS="$tab" read -r actual_id event branch sha path status \
 			conclusion url <"$tmp_dir/ci-run"
 		test "$actual_id" = "$run_id" && test "$event" = push &&
-			test "$branch" = codex-staging && test "$sha" = "$candidate" &&
+			test "$branch" = "$staging" && test "$sha" = "$candidate" &&
 			test "$path" = .github/workflows/main.yml ||
 			die "staging CI run $run_id no longer identifies the exact candidate"
 		"$gh_command" api --hostname github.com --paginate \
@@ -3534,8 +4702,13 @@ wait_for_staging_ci () (
 		die "could not inspect jobs for staging CI run $run_id"
 	test "$(printf '%s\n' "$config_conclusion" | sed '/^$/d' | wc -l | tr -d ' ')" = 1 &&
 		test "$config_conclusion" = success ||
-		die "CI config did not run successfully on codex-staging"
-	say "Full staging CI passed."
+		die "CI config did not run successfully on $staging"
+	if test "$staging" = codex-staging
+	then
+		say "Full staging CI passed."
+	else
+		say "Full $staging CI passed."
+	fi
 )
 
 freeze_local_candidate () {
@@ -3574,6 +4747,14 @@ verify_candidate_bundle () {
 	if test "$new_meta" != "$controller"
 	then
 		printf '%s refs/codex-output/meta\n' "$new_meta" \
+			>>"$tmp_dir/expected-bundle-heads"
+	fi
+	unstable_candidate=$(awk -F '\t' \
+		'$1 == "refs/heads/codex-unstable" { print $3 }' "$updates")
+	if test -n "$unstable_candidate" &&
+		! is_null_oid "$unstable_candidate"
+	then
+		printf '%s refs/codex-output/unstable\n' "$unstable_candidate" \
 			>>"$tmp_dir/expected-bundle-heads"
 	fi
 	LC_ALL=C sort -o "$tmp_dir/bundle-heads" "$tmp_dir/bundle-heads"
@@ -3660,10 +4841,12 @@ prepare_local_candidate () {
 	say "Local preparation session: $session"
 	(
 		cd "$prepare_repository" || exit 1
-		with_isolated_git_environment \
-			"$frozen_helper" refresh \
+		set -- "$frozen_helper" refresh \
 			--session "$session" --remote origin --base master \
 			--codex codex --rerere-from codex --require-automation
+		test -z "${rebuild_unstable_mode:-}" ||
+			set -- "$@" "--${rebuild_unstable_mode}-unstable"
+		with_isolated_git_environment "$@"
 	) || die "local Codex preparation failed; inspect '$session'"
 	local_candidate_dir=$tmp_dir/local-candidate
 	freeze_local_candidate "$session" "$local_candidate_dir"
@@ -3674,7 +4857,8 @@ stage_and_wait_for_ci () {
 	candidate=$2
 	inputs=$3
 	updates=$4
-	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=codex-staging&event=push&head_sha=$candidate&per_page=100"
+	staging=codex-staging
+	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=$staging&event=push&head_sha=$candidate&per_page=100"
 	baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
 		'[.workflow_runs[].id] | max // 0') ||
 		die "could not record the staging CI baseline"
@@ -3686,9 +4870,28 @@ stage_and_wait_for_ci () {
 	test -n "$publisher" || die "GitHub CLI returned no authenticated user"
 	say "Publishing the prepared candidate with the credentials for origin."
 	say "GitHub API user: $publisher"
-	stage_candidate --remote origin --staging codex-staging \
+	stage_candidate --remote origin --staging "$staging" \
 		--inputs "$inputs" --updates "$updates" --require-automation
-	wait_for_staging_ci gh "$repository" "$candidate" "$baseline"
+	wait_for_staging_ci gh "$repository" "$candidate" "$baseline" \
+		"$staging"
+	unstable_candidate=$(awk -F '\t' \
+		'$1 == "refs/heads/codex-unstable" { print $3 }' "$updates")
+	if test -n "$unstable_candidate" &&
+		! is_null_oid "$unstable_candidate"
+	then
+		staging=codex-unstable-staging
+		workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=$staging&event=push&head_sha=$unstable_candidate&per_page=100"
+		baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
+			'[.workflow_runs[].id] | max // 0') ||
+			die "could not record the unstable staging CI baseline"
+		case "$baseline" in
+		''|*[!0-9]*) die "unstable staging CI baseline is not a numeric run ID" ;;
+		esac
+		stage_candidate --remote origin --staging "$staging" \
+			--inputs "$inputs" --updates "$updates" --require-automation
+		wait_for_staging_ci gh "$repository" "$unstable_candidate" \
+			"$baseline" "$staging"
+	fi
 }
 
 rebuild_codex_locally () {
@@ -4012,7 +5215,16 @@ publish_topics () {
 		fi
 		die "rewritten topic graph failed candidate validation; no refs were updated"
 	fi
-	create_meta_commit "$state" "$candidate"
+	stable_recovery=
+	if test "$(state_value "$state" config-version)" = 2
+	then
+		stable_recovery=t
+		printf '%s\n' "$(state_value "$state" controller-oid)" \
+			>"$state/meta-oid" ||
+			die "could not preserve published meta state during recovery"
+	else
+		create_meta_commit "$state" "$candidate"
+	fi
 	write_complete_updates "$state" "$candidate" "$tmp_dir/updates"
 	printf '%s\n' "$candidate" >"$tmp_dir/result" ||
 		die "could not prepare topic verification"
@@ -4022,6 +5234,7 @@ publish_topics () {
 		set -- --inputs "$state/inputs" --updates "$tmp_dir/updates" \
 			--result "$tmp_dir/result"
 		test -z "$require_automation" || set -- "$@" --require-automation
+		test -z "$stable_recovery" || set -- "$@" --stable-recovery
 		verify_output "$@"
 	) || die "rewritten topic graph failed output verification"
 	git -C "$worktree" -c core.fsmonitor=false worktree remove --force \

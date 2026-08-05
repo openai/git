@@ -58,17 +58,60 @@ jobs:
             "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta_oid" \
             -H 'Accept: application/vnd.github.raw+json') ||
             die 'could not read published codex.config'
-          published_oid=$(printf '%s\n' "$config" |
+          published_codex_oid=$(printf '%s\n' "$config" |
             git config --no-includes --file /dev/stdin \
               --get codex.output-tip) ||
             die 'published codex.config has no codex.output-tip'
 
           case "$GITHUB_EVENT_NAME" in
           pull_request)
-            test "$PULL_BASE_REF" = codex ||
-              die "pull request targets '$PULL_BASE_REF', not codex"
-            test "$PULL_BASE_SHA" = "$codex_oid" ||
-              die 'the pull request base no longer matches published codex'
+            lane=$PULL_BASE_REF
+            ;;
+          merge_group)
+            test "$EVENT_ACTION" = checks_requested ||
+              die "unexpected merge-group action '$EVENT_ACTION'"
+            case "$GROUP_BASE_REF" in
+            refs/heads/codex|refs/heads/codex-unstable)
+              lane=${GROUP_BASE_REF#refs/heads/}
+              ;;
+            *) die "unexpected merge-group target '$GROUP_BASE_REF'" ;;
+            esac
+            ;;
+          *)
+            die "unexpected event '$GITHUB_EVENT_NAME'"
+            ;;
+          esac
+
+          case "$lane" in
+          codex)
+            lane_oid=$codex_oid
+            published_oid=$published_codex_oid
+            ;;
+          codex-unstable)
+            lane_oid=$(api \
+              "repos/$GITHUB_REPOSITORY/git/ref/heads/codex-unstable" \
+              --jq '.object.sha') ||
+              die 'could not resolve the codex-unstable branch'
+            published_oid=$(printf '%s\n' "$config" |
+              git config --no-includes --file /dev/stdin \
+                --get codex-unstable.output-tip) ||
+              die 'published codex.config has no codex-unstable.output-tip'
+            unstable_base=$(printf '%s\n' "$config" |
+              git config --no-includes --file /dev/stdin \
+                --get codex-unstable.base-tip) ||
+              die 'published codex.config has no codex-unstable.base-tip'
+            test "$unstable_base" = "$published_codex_oid" ||
+              die 'codex-unstable is not based on the published codex output'
+            test "$published_oid" != "$published_codex_oid" ||
+              die 'codex-unstable is not strictly ahead of codex'
+            ;;
+          *) die "unexpected pull-request target '$lane'" ;;
+          esac
+
+          case "$GITHUB_EVENT_NAME" in
+          pull_request)
+            test "$PULL_BASE_SHA" = "$lane_oid" ||
+              die "the pull request base no longer matches published $lane"
             test "$PULL_HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ||
               die 'the pull request topic must belong to openai/git'
             test "$PULL_DRAFT" = false ||
@@ -81,23 +124,16 @@ jobs:
             pull_number=$PULL_NUMBER
             ;;
           merge_group)
-            test "$EVENT_ACTION" = checks_requested ||
-              die "unexpected merge-group action '$EVENT_ACTION'"
-            test "$GROUP_BASE_REF" = refs/heads/codex ||
-              die "merge group targets '$GROUP_BASE_REF', not codex"
-            test "$codex_oid" = "$published_oid" ||
-              die 'codex already contains a pending topic; run Meta/rebuild first'
-            test "$GROUP_BASE_SHA" = "$codex_oid" ||
-              die 'merge group does not start at the published codex tip'
+            test "$lane_oid" = "$published_oid" ||
+              die "$lane already contains a pending topic; run Meta/rebuild first"
+            test "$GROUP_BASE_SHA" = "$lane_oid" ||
+              die "merge group does not start at the published $lane tip"
             test "$GROUP_HEAD_SHA" = "$GITHUB_SHA" ||
               die 'merge-group event does not describe its checked commit'
             case "$GROUP_HEAD_REF" in
-            refs/heads/gh-readonly-queue/codex/*) ;;
+            "refs/heads/gh-readonly-queue/$lane/"*) ;;
             *) die "unexpected merge-group ref '$GROUP_HEAD_REF'" ;;
             esac
-            ;;
-          *)
-            die "unexpected event '$GITHUB_EVENT_NAME'"
             ;;
           esac
 
@@ -111,15 +147,15 @@ jobs:
             die 'the inspected candidate does not match the workflow commit'
           test "$parent_count" = 2 ||
             die 'Codex admission requires exactly one explicit topic merge'
-          test "$first_parent" = "$codex_oid" ||
-            die 'the integration does not start at the published codex tip'
+          test "$first_parent" = "$lane_oid" ||
+            die "the integration does not start at the published $lane tip"
 
           if test "$GITHUB_EVENT_NAME" = merge_group
           then
             associated=$(api --paginate \
               "repos/$GITHUB_REPOSITORY/commits/$second_parent/pulls?per_page=100" \
               --jq '.[] | select(.state == "open" and
-                                 .base.ref == "codex" and
+                                 .base.ref == "'"$lane"'" and
                                  .head.sha == "'"$second_parent"'" and
                                  .head.repo.full_name == "'"$GITHUB_REPOSITORY"'" and
                                  .draft == false) |
@@ -154,9 +190,14 @@ jobs:
           case "${topic_name#??/codex/}" in
           */*) die "topic '$topic_name' contains another namespace component" ;;
           esac
-          case "$topic_name" in
-          *-unstable|*-wip|*-stale)
+          case "$lane:$topic_name" in
+          codex:*-unstable|codex:*-wip|codex:*-stale)
             die "topic '$topic_name' is not eligible for production codex"
+            ;;
+          codex:*) ;;
+          codex-unstable:*-unstable) ;;
+          codex-unstable:*)
+            die "topic '$topic_name' is not eligible for codex-unstable"
             ;;
           esac
 
@@ -172,9 +213,9 @@ jobs:
             .github/workflows/codex-release.yml
           do
             published_blob=$(api \
-              "repos/$GITHUB_REPOSITORY/contents/$protected_path?ref=$codex_oid" \
+              "repos/$GITHUB_REPOSITORY/contents/$protected_path?ref=$lane_oid" \
               --jq '.sha') ||
-              die "published codex is missing '$protected_path'"
+              die "published $lane is missing '$protected_path'"
             candidate_blob=$(api \
               "repos/$GITHUB_REPOSITORY/contents/$protected_path?ref=$GITHUB_SHA" \
               --jq '.sha') ||
@@ -184,7 +225,7 @@ jobs:
           done
 
           published_workflows=$(api \
-            "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$codex_oid" \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows?ref=$lane_oid" \
             --jq '[.[] | select(.type == "file" and
                                  (.name | test("\\.ya?ml$"))) |
                    [.name, .sha]] | sort | @json') ||
@@ -199,7 +240,7 @@ jobs:
             die 'the candidate adds, removes, or modifies a GitHub Actions workflow'
 
           automation=$(api \
-            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/codex.yml?ref=$codex_oid" \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/codex.yml?ref=$lane_oid" \
             -H 'Accept: application/vnd.github.raw+json') ||
             die 'could not read the published automation trampoline'
           grep -Fxq '  pull_request:' <<<"$automation" &&
@@ -213,7 +254,7 @@ jobs:
             die 'published codex does not contain the canonical admission trampoline'
 
           release=$(api \
-            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/codex-release.yml?ref=$codex_oid" \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/codex-release.yml?ref=$lane_oid" \
             -H 'Accept: application/vnd.github.raw+json') ||
             die 'could not read the published release workflow'
           grep -Fxq '  publication:' <<<"$release" &&
@@ -242,7 +283,10 @@ jobs:
                git config --no-includes --file /dev/stdin \
                  --get "branch.$other_name.codex-tip" >/dev/null
             then
-              continue
+              case "$lane:$other_name" in
+              codex:*-unstable) ;;
+              *) continue ;;
+              esac
             fi
 
             shared_base=$(api \
@@ -251,6 +295,7 @@ jobs:
               die "could not inspect prerequisite '$other_name'"
             test -n "$shared_base" ||
               die "prerequisite '$other_name' has no common base"
+            test "$shared_base" != "$topic_oid" || continue
 
             published_relationship=$(api \
               "repos/$GITHUB_REPOSITORY/compare/$published_oid...$shared_base" \
@@ -273,12 +318,12 @@ jobs:
             esac
           done <<<"$topics"
 
-          current_codex_oid=$(api \
-            "repos/$GITHUB_REPOSITORY/git/ref/heads/codex" \
+          current_lane_oid=$(api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/$lane" \
             --jq '.object.sha') ||
-            die 'could not recheck the codex branch'
-          test "$current_codex_oid" = "$codex_oid" ||
-            die 'codex changed while its topic admission was being verified'
+            die "could not recheck the $lane branch"
+          test "$current_lane_oid" = "$lane_oid" ||
+            die "$lane changed while its topic admission was being verified"
 
           printf 'Approved pull request #%s: %s at %s\n' \
             "$pull_number" "$topic_name" "$topic_oid"
