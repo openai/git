@@ -1,0 +1,74 @@
+# OpenAI release build settings.
+#
+# The Codex release workflow copies this file to config.mak before
+# building. Keep release-only optimizations here instead of in the
+# upstream Makefile.
+
+OPENAI_PROFILE_DIR := $(CURDIR)
+OPENAI_PROFILE_RAW := $(OPENAI_PROFILE_DIR)/default_%m_%p.profraw
+OPENAI_PROFILE_DATA := $(OPENAI_PROFILE_DIR)/default.profdata
+OPENAI_PROFILE_TRAINING ?= .github/workflows/codex-pgo-training.sh
+OPENAI_LLVM_PROFDATA ?= llvm-profdata
+
+ifdef OPENAI_LTO
+CFLAGS_APPEND += -flto=$(OPENAI_LTO)
+LDFLAGS_APPEND += -flto=$(OPENAI_LTO)
+endif
+
+ifeq ("$(OPENAI_PROFILE_FORMAT)","LLVM")
+ifeq ("$(OPENAI_PROFILE)","GEN")
+	BASIC_CFLAGS += -fprofile-instr-generate=$(OPENAI_PROFILE_RAW)
+	BASIC_CFLAGS += -DNO_NORETURN=1
+	export CCACHE_DISABLE = t
+	V = 1
+else
+ifneq ("$(OPENAI_PROFILE)","")
+	BASIC_CFLAGS += -fprofile-instr-use=$(OPENAI_PROFILE_DATA)
+	BASIC_CFLAGS += -Wno-profile-instr-unprofiled -DNO_NORETURN=1
+	export CCACHE_DISABLE = t
+	V = 1
+endif
+endif
+else
+ifeq ("$(OPENAI_PROFILE)","GEN")
+	BASIC_CFLAGS += -fprofile-generate=$(OPENAI_PROFILE_DIR)
+	BASIC_CFLAGS += -DNO_NORETURN=1
+	EXTLIBS += -lgcov
+	export CCACHE_DISABLE = t
+	V = 1
+else
+ifneq ("$(OPENAI_PROFILE)","")
+	BASIC_CFLAGS += -fprofile-use=$(OPENAI_PROFILE_DIR)
+	BASIC_CFLAGS += -fprofile-correction -DNO_NORETURN=1
+	export CCACHE_DISABLE = t
+	V = 1
+endif
+endif
+endif
+
+# Every C object already waits for Git's forced GIT-CFLAGS target. Gate that
+# target so "make strip install" finishes PGO before its normal prerequisites
+# can start compiling with profile-use flags.
+ifeq "$(OPENAI_PROFILE)" "BUILD"
+GIT-CFLAGS: openai-profile
+endif
+
+openai-profile: profile-clean openai-profile-clean
+	$(MAKE) OPENAI_PROFILE=GEN all
+	$(SHELL_PATH) $(OPENAI_PROFILE_TRAINING)
+	$(MAKE) OPENAI_PROFILE= openai-profile-merge
+	$(MAKE) OPENAI_PROFILE=USE all
+
+openai-profile-merge:
+ifeq ("$(OPENAI_PROFILE_FORMAT)","LLVM")
+	$(OPENAI_LLVM_PROFDATA) merge \
+		-output=$(OPENAI_PROFILE_DATA) \
+		$(OPENAI_PROFILE_DIR)/*.profraw
+endif
+
+clean: openai-profile-clean
+
+openai-profile-clean:
+	$(RM) $(OPENAI_PROFILE_DIR)/*.profraw $(OPENAI_PROFILE_DATA)
+
+.PHONY: openai-profile openai-profile-merge openai-profile-clean
