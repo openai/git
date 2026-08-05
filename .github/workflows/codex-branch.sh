@@ -704,8 +704,46 @@ collect_topics () (
 	if test -s "$output"
 	then
 		reject_unadmitted_topic_history "$remote" "$output" \
-			"$published_codex" "$base_oid" "$lane"
+			"$published_codex" "$base_oid" "$lane" "$admission"
 	fi
+)
+
+reviewed_internal_merge_contains () (
+	selected=$1
+	selected_oid=$2
+	shared=$3
+	unadmitted_oid=$4
+	published_codex=$5
+	base_oid=$6
+	admission=$7
+	state=$8
+
+	test -n "$admission" && test -s "$admission" || return 1
+	IFS="$tab" read -r admitted_name admitted_oid admitted_number \
+		admitted_merge <"$admission" || return 1
+	test "$admitted_name" = "$selected" &&
+		test "$admitted_oid" = "$selected_oid" || return 1
+	git merge-base --is-ancestor "$unadmitted_oid" "$selected_oid" &&
+		return 1
+	git rev-list --min-parents=2 "$selected_oid" \
+		"^$published_codex" "^$base_oid" >"$state/reviewed-merges" ||
+		return 1
+	while read -r merge
+	do
+		parents=$(git show -s --format=%P "$merge") || return 1
+		set -- $parents
+		first=$1
+		shift
+		git merge-base --is-ancestor "$shared" "$first" && continue
+		for secondary
+		do
+			if git merge-base --is-ancestor "$shared" "$secondary"
+			then
+				return 0
+			fi
+		done
+	done <"$state/reviewed-merges"
+	return 1
 )
 
 reject_unadmitted_topic_history () (
@@ -714,6 +752,7 @@ reject_unadmitted_topic_history () (
 	published_codex=$3
 	base_oid=$4
 	lane=${5:-codex}
+	admission=${6:-}
 	root=refs/remotes/$remote/
 	state=$topics.unadmitted-history
 	mkdir -p "$state" ||
@@ -748,6 +787,15 @@ reject_unadmitted_topic_history () (
 				if ! git merge-base --is-ancestor "$shared" "$published_codex" &&
 					! git merge-base --is-ancestor "$shared" "$base_oid"
 				then
+					if { test "$lane" = codex-unstable ||
+						is_stable_topic_name "$name"; } &&
+						reviewed_internal_merge_contains "$selected" \
+							"$selected_oid" "$shared" "$oid" \
+							"$published_codex" "$base_oid" \
+							"$admission" "$state"
+					then
+						continue
+					fi
 					die "unadmitted Codex topic '$name' is an unmerged prerequisite of '$selected'"
 				fi
 			done <"$state/merge-bases"
@@ -1041,12 +1089,15 @@ write_meta_config () (
 				die "could not sort stable and unstable topic state"
 			rows=$output.rows
 		fi
-		while IFS="$tab" read -r name tip prerequisite
+		while IFS="$tab" read -r name tip prerequisites
 		do
 			quoted=$(config_subsection_quote "$name")
 			printf '\n[branch "%s"]\n' "$quoted"
 			printf '\tremote = .\n'
-			printf '\tmerge = refs/heads/%s\n' "$prerequisite"
+			for prerequisite in $prerequisites
+			do
+				printf '\tmerge = refs/heads/%s\n' "$prerequisite"
+			done
 			printf '\tcodex-tip = %s\n' "$tip"
 		done <"$rows"
 	} >"$output" || die "could not write $meta_config_path"
@@ -1073,8 +1124,29 @@ published_tip () (
 published_prerequisite () (
 	rows=$1
 	name=$2
+	awk -F '\t' -v name="$name" '$1 == name {
+		split($3, prerequisites, " ")
+		value=prerequisites[1]
+	}
+		END { if (value != "") print value }' "$rows"
+)
+
+published_prerequisites () (
+	rows=$1
+	name=$2
 	awk -F '\t' -v name="$name" '$1 == name { value=$3 }
 		END { if (value != "") print value }' "$rows"
+)
+
+planned_prerequisites () (
+	state=$1
+	name=$2
+	if test -f "$state/prerequisites"
+	then
+		published_prerequisites "$state/prerequisites" "$name"
+	else
+		published_prerequisite "$state/plan" "$name"
+	fi
 )
 
 read_meta_config () (
@@ -1137,37 +1209,76 @@ read_meta_config () (
 		is_active_topic_name "$name" ||
 			die "$meta_config_path records invalid topic '$name'"
 		remote=$(config_get_one "$config" "branch.$name.remote")
-		merge=$(config_get_one "$config" "branch.$name.merge")
 		test "$remote" = . ||
 			die "$meta_config_path gives '$name' non-local remote '$remote'"
 		if is_unstable_topic_name "$name"
 		then
 			test "$version" = 2 ||
 				die "$meta_config_path version 1 records unstable topic '$name'"
-			case "$merge" in
-			"refs/heads/$codex_name") prerequisite=$codex_name ;;
-			refs/heads/*)
-				prerequisite=${merge#refs/heads/}
-				is_unstable_topic_name "$prerequisite" ||
-					die "$meta_config_path gives unstable topic '$name' invalid prerequisite '$merge'"
+			merges=$(git config --no-includes --file "$config" \
+				--get-all "branch.$name.merge" || :)
+			test -n "$merges" ||
+				die "$meta_config_path is missing 'branch.$name.merge'"
+			prerequisites=
+			for merge in $merges
+			do
+				case "$merge" in
+				"refs/heads/$codex_name") prerequisite=$codex_name ;;
+				refs/heads/*)
+					prerequisite=${merge#refs/heads/}
+					is_unstable_topic_name "$prerequisite" ||
+						die "$meta_config_path gives unstable topic '$name' invalid prerequisite '$merge'"
+					;;
+				*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
+				esac
+				case " $prerequisites " in
+				*" $prerequisite "*)
+					die "$meta_config_path repeats prerequisite '$prerequisite' for '$name'"
+					;;
+				esac
+				prerequisites=${prerequisites:+$prerequisites }$prerequisite
+			done
+			case " $prerequisites " in
+			*" $codex_name "*)
+				test "$prerequisites" = "$codex_name" ||
+					die "$meta_config_path mixes codex with topic prerequisites for '$name'"
 				;;
-			*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
 			esac
 			target_rows=$unstable_rows
 		else
-			case "$merge" in
-			"refs/heads/$base_name") prerequisite=$base_name ;;
-			refs/heads/*)
-				prerequisite=${merge#refs/heads/}
-				is_stable_topic_name "$prerequisite" ||
-					die "$meta_config_path gives '$name' invalid prerequisite '$merge'"
+			merges=$(git config --no-includes --file "$config" \
+				--get-all "branch.$name.merge" || :)
+			test -n "$merges" ||
+				die "$meta_config_path is missing 'branch.$name.merge'"
+			prerequisites=
+			for merge in $merges
+			do
+				case "$merge" in
+				"refs/heads/$base_name") prerequisite=$base_name ;;
+				refs/heads/*)
+					prerequisite=${merge#refs/heads/}
+					is_stable_topic_name "$prerequisite" ||
+						die "$meta_config_path gives '$name' invalid prerequisite '$merge'"
+					;;
+				*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
+				esac
+				case " $prerequisites " in
+				*" $prerequisite "*)
+					die "$meta_config_path repeats prerequisite '$prerequisite' for '$name'"
+					;;
+				esac
+				prerequisites=${prerequisites:+$prerequisites }$prerequisite
+			done
+			case " $prerequisites " in
+			*" $base_name "*)
+				test "$prerequisites" = "$base_name" ||
+					die "$meta_config_path mixes master with topic prerequisites for '$name'"
 				;;
-			*) die "$meta_config_path gives '$name' invalid prerequisite '$merge'" ;;
 			esac
 			target_rows=$rows
 		fi
 		require_full_commit_oid "$tip"
-		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisite" \
+		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisites" \
 			>>"$target_rows" ||
 			die "could not read '$name' from $meta_config_path"
 	done <"$state/published-tip-keys"
@@ -1180,24 +1291,27 @@ read_meta_config () (
 		"$(wc -l <"$unstable_rows" | tr -d ' ')" ||
 		die "$meta_config_path records an unstable topic more than once"
 
-	while IFS="$tab" read -r name tip prerequisite
+	while IFS="$tab" read -r name tip prerequisites
 	do
-		test "$name" != "$prerequisite" ||
-			die "$meta_config_path makes '$name' its own prerequisite"
-		if published_depends_on "$rows" "$prerequisite" "$name"
-		then
-			die "$meta_config_path contains a dependency cycle through '$name'"
-		fi
-		if test "$prerequisite" = "$base_name"
-		then
-			prerequisite_tip=$base_tip
-		else
-			prerequisite_tip=$(published_tip "$rows" "$prerequisite")
-			test -n "$prerequisite_tip" ||
-				die "$meta_config_path records missing prerequisite '$prerequisite' for '$name'"
-		fi
-		git merge-base --is-ancestor "$prerequisite_tip" "$tip" ||
-			die "$meta_config_path boundary for '$name' is not in its published history"
+		for prerequisite in $prerequisites
+		do
+			test "$name" != "$prerequisite" ||
+				die "$meta_config_path makes '$name' its own prerequisite"
+			if published_depends_on "$rows" "$prerequisite" "$name"
+			then
+				die "$meta_config_path contains a dependency cycle through '$name'"
+			fi
+			if test "$prerequisite" = "$base_name"
+			then
+				prerequisite_tip=$base_tip
+			else
+				prerequisite_tip=$(published_tip "$rows" "$prerequisite")
+				test -n "$prerequisite_tip" ||
+					die "$meta_config_path records missing prerequisite '$prerequisite' for '$name'"
+			fi
+			git merge-base --is-ancestor "$prerequisite_tip" "$tip" ||
+				die "$meta_config_path boundary for '$name' is not in its published history"
+		done
 		git merge-base --is-ancestor "$tip" "$output_tip" ||
 			die "$meta_config_path output does not contain published topic '$name'"
 	done <"$rows"
@@ -1209,26 +1323,29 @@ read_meta_config () (
 				"$unstable_output_tip" ||
 				die "$meta_config_path empty unstable output is not its canonical sentinel"
 		fi
-		while IFS="$tab" read -r name tip prerequisite
+		while IFS="$tab" read -r name tip prerequisites
 		do
-			test "$name" != "$prerequisite" ||
-				die "$meta_config_path makes '$name' its own prerequisite"
-			if published_depends_on "$unstable_rows" "$prerequisite" \
-				"$name"
-			then
-				die "$meta_config_path contains an unstable dependency cycle through '$name'"
-			fi
-			if test "$prerequisite" = "$codex_name"
-			then
-				prerequisite_tip=$unstable_base_tip
-			else
-				prerequisite_tip=$(published_tip "$unstable_rows" \
-					"$prerequisite")
-				test -n "$prerequisite_tip" ||
-					die "$meta_config_path records missing prerequisite '$prerequisite' for '$name'"
-			fi
-			git merge-base --is-ancestor "$prerequisite_tip" "$tip" ||
-				die "$meta_config_path boundary for unstable topic '$name' is not in its published history"
+			for prerequisite in $prerequisites
+			do
+				test "$name" != "$prerequisite" ||
+					die "$meta_config_path makes '$name' its own prerequisite"
+				if published_depends_on "$unstable_rows" "$prerequisite" \
+					"$name"
+				then
+					die "$meta_config_path contains an unstable dependency cycle through '$name'"
+				fi
+				if test "$prerequisite" = "$codex_name"
+				then
+					prerequisite_tip=$unstable_base_tip
+				else
+					prerequisite_tip=$(published_tip "$unstable_rows" \
+						"$prerequisite")
+					test -n "$prerequisite_tip" ||
+						die "$meta_config_path records missing prerequisite '$prerequisite' for '$name'"
+				fi
+				git merge-base --is-ancestor "$prerequisite_tip" "$tip" ||
+					die "$meta_config_path boundary for unstable topic '$name' is not in its published history"
+			done
 			git merge-base --is-ancestor "$tip" "$unstable_output_tip" ||
 				die "$meta_config_path output does not contain published unstable topic '$name'"
 		done <"$unstable_rows"
@@ -1314,9 +1431,14 @@ prepare_plan () {
 	base_oid=$2
 	topics=$3
 	state=$4
+	allow_merge_graph=${5:-}
 	unique=$state/unique-topic-inputs
 	pairs=$state/topic-pairs
 	plan=$state/plan
+	if test -n "$allow_merge_graph"
+	then
+		: >"$state/prerequisites"
+	fi
 
 	# Multiple refs may intentionally name the same topic tip.  Rewrite that
 	# tip once and let finish_updates() apply the result to every alias.
@@ -1353,6 +1475,15 @@ prepare_plan () {
 			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
 				END { exit !found }' "$unique"
 		then
+			continue
+		fi
+		if test -n "$allow_merge_graph" &&
+			topic_integrates_shared_helper "$left_oid" "$shared" \
+				"$base_oid" "$state" &&
+			topic_integrates_shared_helper "$right_oid" "$shared" \
+				"$base_oid" "$state"
+		then
+			: >"$state/merge-graph"
 			continue
 		fi
 		die "topics '$left_name' and '$right_name' share private commits through $shared; create an active ??/codex/* prerequisite topic at that shared prefix or restack the branches"
@@ -1407,15 +1538,24 @@ prepare_plan () {
 		0)
 			prerequisite=$base_name
 			old_base=$root_base
+			prerequisites=$base_name
 			;;
 		1)
 			IFS="$tab" read -r prerequisite old_base \
 				<"$state/nearest-ancestors"
+			prerequisites=$prerequisite
 			;;
 		*)
-			prerequisites=$(cut -f1 "$state/nearest-ancestors" |
-				LC_ALL=C sort | tr '\n' ' ')
-			die "topic '$name' has more than one nearest prerequisite ($prerequisites); restack it onto one prerequisite topic"
+			test -n "$allow_merge_graph" ||
+				die "topic '$name' has more than one nearest prerequisite; restack it onto one prerequisite topic"
+			LC_ALL=C sort -t "$tab" -k1,1 \
+				"$state/nearest-ancestors" >"$state/sorted-nearest-ancestors" ||
+				die "could not sort prerequisites for '$name'"
+			IFS="$tab" read -r prerequisite old_base \
+				<"$state/sorted-nearest-ancestors"
+			prerequisites=$(cut -f1 "$state/sorted-nearest-ancestors" |
+				tr '\n' ' ' | sed 's/ $//')
+			: >"$state/merge-graph"
 			;;
 		esac
 
@@ -1423,8 +1563,18 @@ prepare_plan () {
 			die "prerequisite '$prerequisite' is not an ancestor of '$name'"
 		merge_commit=$(git rev-list --min-parents=2 \
 			"$old_base..$old" | sed -n '1p')
-		test -z "$merge_commit" ||
-			die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
+		if test -n "$merge_commit"
+		then
+			test -n "$allow_merge_graph" ||
+				die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
+			: >"$state/merge-graph"
+		fi
+		if test -n "$allow_merge_graph"
+		then
+			printf '%s\t%s\t%s\n' "$name" "$old" "$prerequisites" \
+				>>"$state/prerequisites" ||
+				die "could not record merge-graph prerequisites for '$name'"
+		fi
 		printf '%s\t%s\t%s\t%s\t%s\n' \
 			"$name" "$old" "$prerequisite" "$old_base" "$old_base" \
 			>>"$plan" ||
@@ -1441,16 +1591,29 @@ published_depends_on () (
 	ancestor=$3
 	limit=$(wc -l <"$rows" | tr -d ' ')
 	steps=0
-	while test "$steps" -le "$limit"
+	queue=$child
+	visited=
+	while test -n "$queue"
 	do
-		parent=$(published_prerequisite "$rows" "$child")
-		test -n "$parent" || return 1
-		test "$parent" = "$ancestor" && return 0
-		published_tip "$rows" "$parent" >/dev/null || return 1
-		child=$parent
+		set -- $queue
+		child=$1
+		shift
+		queue=$*
+		case " $visited " in
+		*" $child "*) continue ;;
+		esac
+		visited=${visited:+$visited }$child
 		steps=$((steps + 1))
+		test "$steps" -le "$limit" ||
+			die "$meta_config_path contains a dependency cycle"
+		for parent in $(published_prerequisites "$rows" "$child")
+		do
+			test "$parent" = "$ancestor" && return 0
+			test -n "$(published_tip "$rows" "$parent")" || continue
+			queue=${queue:+$queue }$parent
+		done
 	done
-	die "$meta_config_path contains a dependency cycle"
+	return 1
 )
 
 published_shared_prerequisite () (
@@ -1601,15 +1764,44 @@ choose_replay_boundary () (
 	die "topic '$name' contains neither its last published nor current prerequisite; restack it explicitly before refreshing codex"
 )
 
+topic_integrates_shared_helper () (
+	tip=$1
+	shared=$2
+	base=$3
+	state=$4
+	git rev-list --min-parents=2 "$tip" "^$base" \
+		>"$state/internal-helper-merges" || return 1
+	while read -r merge
+	do
+		parents=$(git show -s --format=%P "$merge") || return 1
+		set -- $parents
+		first=$1
+		shift
+		git merge-base --is-ancestor "$shared" "$first" && continue
+		for parent
+		do
+			git merge-base --is-ancestor "$shared" "$parent" &&
+				return 0
+		done
+	done <"$state/internal-helper-merges"
+	return 1
+)
+
 prepare_stateful_plan () (
 	base_name=$1
 	base_oid=$2
 	topics=$3
 	state=$4
+	allow_merge_graph=${5:-}
 	published=$state/published-topics
 	published_base=$(state_value "$state" published-base-oid)
+	output_name=$(state_value "$state" codex-name)
 	pairs=$state/topic-pairs
 	plan=$state/plan
+	if test -n "$allow_merge_graph"
+	then
+		: >"$state/prerequisites"
+	fi
 
 	# If two current tips are no longer comparable, their old recorded edge
 	# still proves ownership across a prerequisite rewrite.  New incomparable
@@ -1649,6 +1841,15 @@ prepare_stateful_plan () (
 			published_shared_prerequisite "$published" "$published" \
 				"$topics" "$left_name" "$right_name" "$shared"
 		then
+			continue
+		fi
+		if test -n "$allow_merge_graph" &&
+			topic_integrates_shared_helper "$left_oid" "$shared" \
+				"$published_base" "$state" &&
+			topic_integrates_shared_helper "$right_oid" "$shared" \
+				"$published_base" "$state"
+		then
+			: >"$state/merge-graph"
 			continue
 		fi
 		die "topics '$left_name' and '$right_name' share private commits through $shared; create an active ??/codex/* prerequisite topic at that shared prefix or restack the branches"
@@ -1698,7 +1899,28 @@ prepare_stateful_plan () (
 			<"$state/nearest-ancestors" ;;
 		*)
 			current_nearest=
-			if test -n "$published_tip_oid"
+			if test -n "$allow_merge_graph"
+			then
+				git rev-list --first-parent "$current_tip" \
+					>"$state/first-parent-ancestry" ||
+					die "could not inspect the first-parent prerequisite of '$name'"
+				while read -r first_parent
+				do
+					first_parent_row=$(awk -F '\t' \
+						-v oid="$first_parent" \
+						'$2 == oid { print; exit }' \
+						"$state/nearest-ancestors")
+					test -n "$first_parent_row" || continue
+					IFS="$tab" read -r current_nearest \
+						current_nearest_tip <<-EOF
+					$first_parent_row
+					EOF
+					break
+				done <"$state/first-parent-ancestry"
+				: >"$state/merge-graph"
+			fi
+			if test -z "$current_nearest" &&
+				test -n "$published_tip_oid"
 			then
 				old_prerequisite=$(published_prerequisite "$published" "$name")
 				current_nearest_tip=$(awk -F '\t' \
@@ -1850,11 +2072,61 @@ prepare_stateful_plan () (
 
 		merge_commit=$(git rev-list --min-parents=2 \
 			"$old_base..$current_tip" | sed -n '1p')
-		test -z "$merge_commit" ||
-			die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
+		if test -n "$merge_commit"
+		then
+			test -n "$allow_merge_graph" ||
+				die "topic history for '$name' contains merge commit $merge_commit; linearize it before refreshing codex"
+			: >"$state/merge-graph"
+		fi
 		printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$current_tip" \
 			"$prerequisite" "$old_base" "$prerequisite_tip" >>"$plan" ||
 			die "could not record the stateful rewrite plan for '$name'"
+		if test -n "$allow_merge_graph"
+		then
+			prerequisites=$prerequisite
+			if test "$prerequisite" != "$base_name"
+			then
+				while IFS="$tab" read -r ancestor_name ancestor_tip
+				do
+					test "$ancestor_name" = "$prerequisite" && continue
+					case " $prerequisites " in
+					*" $ancestor_name "*) continue ;;
+					esac
+					prerequisites="$prerequisites $ancestor_name"
+				done <"$state/nearest-ancestors"
+			fi
+			for previous in $(published_prerequisites "$published" "$name")
+			do
+				test "$previous" = "$base_name" && continue
+				previous_tip=$(published_tip "$published" "$previous")
+				test -n "$previous_tip" || continue
+				if git merge-base --is-ancestor "$previous_tip" "$base_oid"
+				then
+					continue
+				fi
+				git merge-base --is-ancestor "$previous_tip" \
+					"$current_tip" || continue
+				previous_current=$(current_topic_tip "$topics" "$previous")
+				test -n "$previous_current" ||
+					die "published prerequisite '$previous' of '$name' was retired while its merge remains in the topic"
+				if test -n "$merge_commit" &&
+					test "$previous_current" != "$previous_tip" &&
+					{ ! git merge-base --is-ancestor "$previous_tip" \
+							"$previous_current" ||
+						! git merge-base --is-ancestor "$previous_current" \
+							"$current_tip"; }
+				then
+					die "published prerequisite '$previous' of merge topic '$name' changed; restack '$name' explicitly before refreshing $output_name"
+				fi
+				case " $prerequisites " in
+				*" $previous "*) continue ;;
+				esac
+				prerequisites="$prerequisites $previous"
+			done
+			printf '%s\t%s\t%s\n' "$name" "$current_tip" \
+				"$prerequisites" >>"$state/prerequisites" ||
+				die "could not record merge-graph prerequisites for '$name'"
+		fi
 	done <"$topics"
 	while IFS="$tab" read -r name current_tip prerequisite old_base prerequisite_tip
 	do
@@ -1862,21 +2134,41 @@ prepare_stateful_plan () (
 			die "topic '$name' cannot be its own prerequisite"
 		if test "$prerequisite" != "$base_name"
 		then
-			current_topic_tip "$topics" "$prerequisite" >/dev/null ||
-				die "topic '$name' has missing prerequisite '$prerequisite'"
-			if published_depends_on "$plan" "$prerequisite" "$name"
+			if test -n "$allow_merge_graph"
 			then
-				die "current topic prerequisites contain a cycle through '$name'"
+				prerequisites=$(planned_prerequisites "$state" "$name")
+				dependency_rows=$state/prerequisites
+			else
+				prerequisites=$prerequisite
+				dependency_rows=$plan
 			fi
+			for dependency in $prerequisites
+			do
+				test -n "$(current_topic_tip "$topics" "$dependency")" ||
+					die "topic '$name' has missing prerequisite '$dependency'"
+				if published_depends_on "$dependency_rows" \
+					"$dependency" "$name"
+				then
+					die "current topic prerequisites contain a cycle through '$name'"
+				fi
+			done
 		fi
 	done <"$plan"
+	if test -n "$allow_merge_graph"
+	then
+		dependency_rows=$state/prerequisites
+	else
+		dependency_rows=$plan
+	fi
 	while IFS="$tab" read -r left_name left_oid right_name right_oid
 	do
 		test "$left_oid" = "$right_oid" && continue
 		if git merge-base --is-ancestor "$left_oid" "$right_oid" ||
 			git merge-base --is-ancestor "$right_oid" "$left_oid" ||
-			published_depends_on "$plan" "$left_name" "$right_name" ||
-			published_depends_on "$plan" "$right_name" "$left_name"
+			published_depends_on "$dependency_rows" \
+				"$left_name" "$right_name" ||
+			published_depends_on "$dependency_rows" \
+				"$right_name" "$left_name"
 		then
 			continue
 		fi
@@ -1889,8 +2181,16 @@ prepare_stateful_plan () (
 		if git merge-base --is-ancestor "$shared" "$base_oid" ||
 			awk -F '\t' -v oid="$shared" '$2 == oid { found=1 }
 				END { exit !found }' "$topics" ||
-			published_shared_prerequisite "$published" "$plan" \
+			published_shared_prerequisite "$published" "$dependency_rows" \
 				"$topics" "$left_name" "$right_name" "$shared"
+		then
+			continue
+		fi
+		if test -n "$allow_merge_graph" &&
+			topic_integrates_shared_helper "$left_oid" "$shared" \
+				"$published_base" "$state" &&
+			topic_integrates_shared_helper "$right_oid" "$shared" \
+				"$published_base" "$state"
 		then
 			continue
 		fi
@@ -1902,12 +2202,40 @@ prepare_stateful_plan () (
 	while IFS="$tab" read -r old_name old_tip old_prerequisite
 	do
 		current_topic_tip "$topics" "$old_name" >/dev/null && continue
-		if awk -F '\t' -v prerequisite="$old_name" \
-			'$3 == prerequisite { found=1 } END { exit !found }' "$plan"
+		if test -n "$allow_merge_graph"
+		then
+			dependency_rows=$state/prerequisites
+		else
+			dependency_rows=$plan
+		fi
+		if awk -F '\t' -v prerequisite="$old_name" '
+			{
+				count=split($3, dependencies, " ")
+				for (i=1; i<=count; i++)
+					if (dependencies[i] == prerequisite) found=1
+			}
+			END { exit !found }
+		' "$dependency_rows"
 		then
 			die "published topic '$old_name' was removed while an active topic still depends on it"
 		fi
 	done <"$published"
+	if test -n "$allow_merge_graph" && test -f "$state/merge-graph"
+	then
+		current_base_topics=
+		old_base_topics=
+		while IFS="$tab" read -r name oid
+		do
+			if git merge-base --is-ancestor "$base_oid" "$oid"
+			then
+				current_base_topics=t
+			else
+				old_base_topics=t
+			fi
+		done <"$topics"
+		test -z "$current_base_topics" || test -z "$old_base_topics" ||
+			die "merge graph mixes current and previous production bases; restack every topic onto the same production base"
+	fi
 	: >"$state/map"
 	: >"$state/results"
 )
@@ -2159,12 +2487,10 @@ write_next_meta_config () (
 	do
 		new=$(result_lookup "$state/results" "$name")
 		test -n "$new" || die "topic '$name' has no rewritten tip"
-		prerequisite=$(awk -F '\t' -v name="$name" \
-			'$1 == name { value=$3 } END { if (value != "") print value }' \
-			"$state/plan")
-		test -n "$prerequisite" ||
+		prerequisites=$(planned_prerequisites "$state" "$name")
+		test -n "$prerequisites" ||
 			die "topic '$name' has no recorded prerequisite"
-		printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" >>"$rows" ||
+		printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisites" >>"$rows" ||
 			die "could not record next state for '$name'"
 	done <"$state/topics"
 	LC_ALL=C sort -o "$rows" "$rows"
@@ -2179,12 +2505,10 @@ write_next_meta_config () (
 			new=$(result_lookup "$unstable_state/results" "$name")
 			test -n "$new" ||
 				die "unstable topic '$name' has no rewritten tip"
-			prerequisite=$(awk -F '\t' -v name="$name" \
-				'$1 == name { value=$3 } END { if (value != "") print value }' \
-				"$unstable_state/plan")
-			test -n "$prerequisite" ||
+			prerequisites=$(planned_prerequisites "$unstable_state" "$name")
+			test -n "$prerequisites" ||
 				die "unstable topic '$name' has no recorded prerequisite"
-			printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" \
+			printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisites" \
 				>>"$unstable_rows" ||
 				die "could not record next state for unstable topic '$name'"
 		done <"$unstable_state/topics"
@@ -2296,6 +2620,284 @@ process_plan () {
 	finish_updates "$state" || die "could not finish topic updates"
 }
 
+process_planned_graph () {
+	worktree=$1
+	state=$2
+	if test -f "$state/merge-graph"
+	then
+		process_merge_graph "$worktree" "$state"
+	else
+		process_plan "$worktree" "$state"
+	fi
+}
+
+process_merge_graph () (
+	worktree=$1
+	state=$2
+	base_oid=$(state_value "$state" base-oid)
+	output_name=$(state_value "$state" codex-name)
+	topics=$state/topics
+	private=$state/private-merge-replay
+	tracking=$state/private-topic-refs
+	maximal=$state/maximal-topic-heads
+	common=$state/merge-graph-root
+	object_directory=$(git -C "$worktree" rev-parse \
+		--path-format=absolute --git-path objects) ||
+		die "could not locate the merge-replay object database"
+	source=$(git -C "$worktree" rev-parse \
+		--path-format=absolute --git-common-dir) ||
+		die "could not locate the merge-replay source repository"
+
+	set -- git merge-base --all --octopus "$base_oid"
+	while IFS="$tab" read -r name oid
+	do
+		set -- "$@" "$oid"
+	done <"$topics"
+	"$@" >"$common" ||
+		die "$output_name merge graph has no common production ancestor"
+	test "$(wc -l <"$common" | tr -d ' ')" = 1 ||
+		die "$output_name merge graph has more than one production boundary"
+	root=$(sed -n '1p' "$common")
+	git merge-base --is-ancestor "$root" "$base_oid" ||
+		die "$output_name merge graph is not rooted in the production candidate"
+
+	if test "$root" = "$base_oid"
+	then
+		while IFS="$tab" read -r name oid
+		do
+			result_record "$state/results" "$name" "$oid"
+		done <"$topics"
+		finish_updates "$state"
+		return 0
+	fi
+
+	: >"$maximal"
+	while IFS="$tab" read -r name oid
+	do
+		if awk -F '\t' -v oid="$oid" '$2 == oid { found=1 }
+			END { exit !found }' "$maximal"
+		then
+			continue
+		fi
+		dominated=
+		while IFS="$tab" read -r other_name other_oid
+		do
+			test "$oid" = "$other_oid" && continue
+			if git merge-base --is-ancestor "$oid" "$other_oid"
+			then
+				dominated=t
+				break
+			fi
+		done <"$topics"
+		test -n "$dominated" ||
+			printf '%s\t%s\n' "$name" "$oid" >>"$maximal"
+	done <"$topics"
+	test -s "$maximal" ||
+		die "$output_name merge graph has no maximal topic"
+	first=$(awk -F '\t' 'NR == 1 { print $2 }' "$maximal")
+	tree=$(git rev-parse "$first^{tree}") ||
+		die "could not resolve the synthetic merge-replay tree"
+	set -- git -c commit.gpgSign=false commit-tree "$tree"
+	while IFS="$tab" read -r name oid
+	do
+		set -- "$@" -p "$oid"
+	done <"$maximal"
+	aggregate=$(printf 'Codex merge replay sentinel\n' |
+		GIT_AUTHOR_NAME=$bot_name GIT_AUTHOR_EMAIL=$bot_email \
+		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+		"$@") ||
+		die "could not create the synthetic merge-replay sentinel"
+
+	git -c core.fsmonitor=false clone --shared --no-checkout --no-tags \
+		"$source" "$private" >/dev/null 2>&1 ||
+		die "could not isolate the merge replay"
+	: >"$tracking"
+	index=0
+	while IFS="$tab" read -r name oid
+	do
+		index=$((index + 1))
+		ref=$(printf 'refs/heads/codex-private-rewrite/%06d' "$index")
+		git -C "$private" update-ref "$ref" "$oid" ||
+			die "could not track topic '$name' privately"
+		printf '%s\t%s\t%s\n' "$name" "$oid" "$ref" \
+			>>"$tracking" ||
+			die "could not record the private merge-replay ref"
+	done <"$topics"
+	git -C "$private" -c core.fsmonitor=false \
+		-c advice.detachedHead=false switch --detach "$aggregate" \
+		>/dev/null 2>&1 ||
+		die "could not check out the synthetic merge graph"
+	if ! GIT_OBJECT_DIRECTORY=$object_directory \
+		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
+		GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git -C "$private" \
+		-c core.hooksPath=/dev/null \
+		-c core.fsmonitor=false \
+		-c commit.gpgSign=false \
+		-c rerere.enabled=true \
+		-c rerere.autoupdate=true \
+		rebase --rebase-merges=rebase-cousins --update-refs \
+		--empty=keep \
+		--keep-empty --reapply-cherry-picks --no-autostash \
+		--onto "$base_oid" "$root"
+	then
+		owner=$(awk -F '\t' 'NR == 1 { print $1 }' "$state/plan")
+		old=$(awk -F '\t' -v name="$owner" \
+			'$1 == name { print $2; exit }' "$topics")
+		record_rebase_failure "$private" "$state" "$owner" \
+			"$old" "$root" "$base_oid" || return 1
+		return 1
+	fi
+	while IFS="$tab" read -r name old ref
+	do
+		if test "$old" = "$root"
+		then
+			new=$base_oid
+		else
+			new=$(git -C "$private" rev-parse "$ref") ||
+				die "could not read rewritten topic '$name'"
+		fi
+		git cat-file -e "$new^{commit}" ||
+			die "topic '$name' was not imported into the main object database"
+		git merge-base --is-ancestor "$base_oid" "$new" ||
+			die "rewritten topic '$name' lost its production base"
+		result_record "$state/results" "$name" "$new"
+	done <"$tracking"
+	finish_updates "$state"
+)
+
+verify_merge_topology () (
+	base=$1
+	state=$2
+	topics=$state/topics
+	root_file=$state/verified-merge-root
+	source=$state/verified-source-commits
+	rewritten=$state/verified-rewritten-commits
+	map=$state/verified-commit-map
+	pending=$state/verified-pending-commits
+	round=$state/verified-current-commits
+
+	set -- git merge-base --all --octopus "$base"
+	while IFS="$tab" read -r name oid
+	do
+		set -- "$@" "$oid"
+	done <"$topics"
+	"$@" >"$root_file" ||
+		die "could not reconstruct the original merge-graph root"
+	test "$(wc -l <"$root_file" | tr -d ' ')" = 1 ||
+		die "merge graph has no unique verified production root"
+	root=$(sed -n '1p' "$root_file")
+
+	set -- git rev-list
+	while IFS="$tab" read -r name oid
+	do
+		set -- "$@" "$oid"
+	done <"$topics"
+	set -- "$@" "^$root"
+	"$@" >"$source" ||
+		die "could not enumerate the original merge graph"
+
+	set -- git rev-list
+	while IFS="$tab" read -r name oid
+	do
+		new=$(result_lookup "$state/results" "$name")
+		test -n "$new" ||
+			die "merge graph has no rewritten tip for '$name'"
+		set -- "$@" "$new"
+	done <"$topics"
+	set -- "$@" "^$base"
+	"$@" >"$rewritten" ||
+		die "could not enumerate the rewritten merge graph"
+
+	: >"$map"
+	printf '%s\t%s\n' "$root" "$base" >"$pending" ||
+		die "could not map the merge-graph production root"
+	while IFS="$tab" read -r name oid
+	do
+		new=$(result_lookup "$state/results" "$name")
+		printf '%s\t%s\n' "$oid" "$new" >>"$pending" ||
+			die "could not map merge topic '$name'"
+	done <"$topics"
+
+	while test -s "$pending"
+	do
+		mv "$pending" "$round" ||
+			die "could not advance merge topology verification"
+		: >"$pending"
+		while IFS="$tab" read -r old new
+		do
+			mapped_new=$(awk -F '\t' -v oid="$old" \
+				'$1 == oid { print $2; exit }' "$map")
+			if test -n "$mapped_new"
+			then
+				test "$mapped_new" = "$new" ||
+					die "merge rewrite duplicates a shared original commit"
+				continue
+			fi
+			mapped_old=$(awk -F '\t' -v oid="$new" \
+				'$2 == oid { print $1; exit }' "$map")
+			test -z "$mapped_old" ||
+				die "merge rewrite collapses distinct original commits"
+			printf '%s\t%s\n' "$old" "$new" >>"$map" ||
+				die "could not retain the verified commit mapping"
+
+			if test "$old" = "$root"
+			then
+				test "$new" = "$base" ||
+					die "merge rewrite changes its production root"
+				continue
+			fi
+			if git merge-base --is-ancestor "$old" "$root"
+			then
+				git merge-base --is-ancestor "$new" "$base" ||
+					die "merge rewrite introduces extra production ancestry"
+				continue
+			fi
+			! git merge-base --is-ancestor "$new" "$base" ||
+				die "merge rewrite drops an original topic commit"
+
+			old_parents=$(git show -s --format=%P "$old") ||
+				die "could not inspect an original merge-graph commit"
+			new_parents=$(git show -s --format=%P "$new") ||
+				die "could not inspect a rewritten merge-graph commit"
+			set -- $old_parents
+			old_count=$#
+			set -- $new_parents
+			test "$old_count" = "$#" ||
+				die "merge rewrite changes commit parent topology"
+			while test -n "$old_parents"
+			do
+				set -- $old_parents
+				old_parent=$1
+				shift
+				old_parents=$*
+				set -- $new_parents
+				new_parent=$1
+				shift
+				new_parents=$*
+				printf '%s\t%s\n' "$old_parent" "$new_parent" \
+					>>"$pending" ||
+					die "could not map a merge parent"
+			done
+		done <"$round"
+	done
+
+	LC_ALL=C sort "$source" >"$source.sorted" ||
+		die "could not sort the original merge graph"
+	LC_ALL=C sort "$rewritten" >"$rewritten.sorted" ||
+		die "could not sort the rewritten merge graph"
+	awk -F '\t' 'NR == FNR { expected[$1]=1; next }
+		$1 in expected { print $1 }' "$source" "$map" |
+		LC_ALL=C sort >"$source.mapped" ||
+		die "could not enumerate mapped original commits"
+	awk -F '\t' 'NR == FNR { expected[$1]=1; next }
+		$2 in expected { print $2 }' "$rewritten" "$map" |
+		LC_ALL=C sort >"$rewritten.mapped" ||
+		die "could not enumerate mapped rewritten commits"
+	cmp -s "$source.sorted" "$source.mapped" &&
+		cmp -s "$rewritten.sorted" "$rewritten.mapped" ||
+		die "merge rewrite adds or removes topic commits"
+)
+
 write_failure () {
 	path=$1
 	state=$2
@@ -2387,6 +2989,39 @@ write_unstable_failure () {
 		say "and run \`Meta/rebuild\` again."
 		say "The production-only \`resolve\`/\`continue\` recovery commands do not"
 		say "reconstruct this nested unstable integration lane."
+		if test -n "$(git -C "$worktree" -c core.fsmonitor=false \
+			diff --name-only --diff-filter=U)"
+		then
+			say
+			say "Conflicted paths:"
+			git -C "$worktree" -c core.fsmonitor=false \
+				diff --name-only --diff-filter=U |
+				sed 's/^/- `/' | sed 's/$/`/'
+		fi
+	} >"$path"
+}
+
+write_merge_graph_failure () {
+	path=$1
+	state=$2
+	worktree=$3
+	test -n "$path" || return 0
+
+	failed_owner=$(state_value "$state" failed-owner)
+	failed_commit=$(state_value "$state" failed-commit)
+	output_name=$(state_value "$state" codex-name)
+	{
+		say "## No refs were updated"
+		say
+		say "Rebasing merge-shaped topic \`$failed_owner\` stopped while applying \`$failed_commit\`."
+		say "Neither \`$output_name\`, \`meta\`, nor a topic branch was updated."
+		say
+		say "Resolve this merge-graph conflict manually: restack the affected"
+		say "topic and its descendants onto their current prerequisites,"
+		say "publish the coherent topic graph in one exact-lease atomic push,"
+		say "and run \`Meta/rebuild\` again."
+		say "The linear \`resolve\`/\`continue\` recovery commands do not"
+		say "reconstruct a merge-shaped topic graph."
 		if test -n "$(git -C "$worktree" -c core.fsmonitor=false \
 			diff --name-only --diff-filter=U)"
 		then
@@ -2540,11 +3175,23 @@ write_integration_topics () {
 		while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
 		do
 			integration_name_recorded "$merged" "$name" && continue
-			if test "$prerequisite" != "$base_name" &&
-				! integration_name_recorded "$merged" "$prerequisite"
+			if test -f "$state/prerequisites"
 			then
-				continue
+				prerequisites=$(planned_prerequisites "$state" "$name")
+			else
+				prerequisites=$prerequisite
 			fi
+			waiting=
+			for dependency in $prerequisites
+			do
+				if test "$dependency" != "$base_name" &&
+					! integration_name_recorded "$merged" "$dependency"
+				then
+					waiting=t
+					break
+				fi
+			done
+			test -z "$waiting" || continue
 			oid=$(result_lookup "$state/results" "$name")
 			test -n "$oid" || die "topic '$name' has no rewritten tip"
 			printf '%s\t%s\n' "$name" "$oid" >>"$ready" ||
@@ -2784,7 +3431,8 @@ initialize_rewrite () {
 	published_codex_oid=$(state_value "$state" published-codex-oid)
 	validate_live_codex_delta "$published_codex_oid" "$codex_oid" \
 		"$state/topics" "$state"
-	prepare_stateful_plan "$base_name" "$base_oid" "$state/topics" "$state"
+	prepare_stateful_plan "$base_name" "$base_oid" "$state/topics" \
+		"$state" stable
 	if test -n "$rerere_name" && test "$codex_oid" != "$base_oid"
 	then
 		train_rerere "$worktree" "$base_oid" "$codex_oid"
@@ -2903,10 +3551,17 @@ prepare_unstable_candidate () (
 	printf '%s\n' "$published_output" \
 		>"$unstable_state/published-codex-oid"
 	prepare_stateful_plan codex "$stable_candidate" \
-		"$unstable_state/topics" "$unstable_state"
-	if ! process_plan "$worktree" "$unstable_state"
+		"$unstable_state/topics" "$unstable_state" unstable
+	if ! process_planned_graph "$worktree" "$unstable_state"
 	then
-		write_unstable_failure "$failure_file" "$unstable_state" "$worktree"
+		if test -f "$unstable_state/merge-graph"
+		then
+			write_merge_graph_failure "$failure_file" \
+				"$unstable_state" "$worktree"
+		else
+			write_unstable_failure "$failure_file" \
+				"$unstable_state" "$worktree"
+		fi
 		die "conflict while rebasing unstable topic '$(state_value "$unstable_state" failed-owner)'; no refs were updated"
 	fi
 	if ! unstable_candidate=$(assemble_candidate "$worktree" \
@@ -3012,9 +3667,16 @@ initialize_config () {
 	printf '%s\n' "$require_automation" >"$state/require-automation"
 	printf '%s\n' "$script_path" >"$state/helper"
 	: >"$state/initializing"
-	prepare_plan "$base_name" "$published_base" "$state/topics" "$state"
+	prepare_plan "$base_name" "$published_base" "$state/topics" \
+		"$state" stable
 	mv "$state/plan" "$state/unique-plan" ||
 		die "could not retain the inferred initialization plan"
+	if test -f "$state/prerequisites"
+	then
+		mv "$state/prerequisites" "$state/unique-prerequisites" ||
+			die "could not retain inferred merge-graph prerequisites"
+		: >"$state/prerequisites"
+	fi
 	: >"$state/plan"
 	while IFS="$tab" read -r name tip
 	do
@@ -3027,23 +3689,42 @@ initialize_config () {
 		printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$tip" \
 			"$prerequisite" "$old_base" "$prerequisite_tip" \
 			>>"$state/plan"
+		if test -f "$state/unique-prerequisites"
+		then
+			prerequisites=$(published_prerequisites \
+				"$state/unique-prerequisites" "$representative")
+			test -n "$prerequisites" ||
+				die "could not infer merge-graph prerequisites for '$name'"
+			printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisites" \
+				>>"$state/prerequisites" ||
+				die "could not retain merge-graph prerequisites for '$name'"
+		fi
 	done <"$state/topics"
 	: >"$state/results"
 	: >"$state/map"
 	while IFS="$tab" read -r name tip prerequisite old_base prerequisite_tip
 	do
-		if test "$prerequisite" = "$base_name"
-		then
-			test "$old_base" = "$published_base" ||
-				die "root topic '$name' is not based on the inferred published base"
-		else
-			parent_tip=$(current_topic_tip "$state/topics" "$prerequisite")
-			test -n "$parent_tip" && test "$old_base" = "$parent_tip" ||
-				die "topic '$name' is not based on the exact tip of '$prerequisite'"
-		fi
+		prerequisites=$(planned_prerequisites "$state" "$name")
+		for prerequisite in $prerequisites
+		do
+			if test "$prerequisite" = "$base_name"
+			then
+				parent_tip=$published_base
+			else
+				parent_tip=$(current_topic_tip "$state/topics" "$prerequisite")
+				test -n "$parent_tip" ||
+					die "topic '$name' has no active prerequisite '$prerequisite'"
+			fi
+			git merge-base --is-ancestor "$parent_tip" "$tip" ||
+				die "topic '$name' is not based on '$prerequisite'"
+		done
 		result_record "$state/results" "$name" "$tip"
 	done <"$state/plan"
 	finish_updates "$state"
+	if test -f "$state/merge-graph"
+	then
+		verify_merge_topology "$published_base" "$state"
+	fi
 	if test "$codex_oid" != "$published_base"
 	then
 		train_rerere "$worktree" "$published_base" "$codex_oid"
@@ -3064,7 +3745,8 @@ initialize_config () {
 	: >"$state/initial-topics"
 	while IFS="$tab" read -r name tip prerequisite old_base prerequisite_tip
 	do
-		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisite" \
+		prerequisites=$(planned_prerequisites "$state" "$name")
+		printf '%s\t%s\t%s\n' "$name" "$tip" "$prerequisites" \
 			>>"$state/initial-topics"
 	done <"$state/plan"
 	LC_ALL=C sort -o "$state/initial-topics" "$state/initial-topics"
@@ -3250,9 +3932,14 @@ rewrite () {
 	initialize_rewrite "$remote" "$base_name" "$codex_name" "$rerere_name" \
 		"$worktree" "$state" "$inputs" "$topics" "$require_automation"
 
-	if ! process_plan "$worktree" "$state"
+	if ! process_planned_graph "$worktree" "$state"
 	then
-		write_failure "$failure_file" "$state" "$worktree"
+		if test -f "$state/merge-graph"
+		then
+			write_merge_graph_failure "$failure_file" "$state" "$worktree"
+		else
+			write_failure "$failure_file" "$state" "$worktree"
+		fi
 		die "conflict while rebasing '$(state_value "$state" failed-owner)'; no refs were updated"
 	fi
 
@@ -3405,6 +4092,8 @@ prepare_input_graph () {
 	controller_oid=$(awk -F '\t' '$1 == "controller" { print $3 }' "$inputs")
 	base_name=${base_ref#refs/heads/}
 	codex_name=${codex_ref#refs/heads/}
+	printf '%s\n' "$codex_name" >"$graph/codex-name" ||
+		die "could not retain the snapshotted Codex output name"
 	read_meta_config "$controller_oid" "$base_name" "$codex_name" "$graph"
 	config_version=$(state_value "$graph" config-version)
 	unstable_count=$(awk -F '\t' '$1 == "unstable" { count++ }
@@ -3506,10 +4195,11 @@ prepare_input_graph () {
 	fi
 	printf '%s\n' "$graph_remote" >"$graph/remote"
 	reject_unadmitted_topic_history "$graph_remote" "$graph/topics" \
-		"$published_codex" "$base_oid"
+		"$published_codex" "$base_oid" codex "$graph/verified-admission"
 	validate_live_codex_delta "$published_codex" \
 		"$codex_oid" "$graph/topics" "$graph"
-	prepare_stateful_plan "$base_name" "$base_oid" "$graph/topics" "$graph"
+	prepare_stateful_plan "$base_name" "$base_oid" "$graph/topics" \
+		"$graph" stable
 }
 
 prepare_unstable_input_graph () (
@@ -3614,7 +4304,8 @@ prepare_unstable_input_graph () (
 		graph_remote=$(state_value "$stable_graph" remote)
 		codex_oid=$(awk -F '\t' '$1 == "codex" { print $3 }' "$inputs")
 		reject_unadmitted_topic_history "$graph_remote" "$graph/topics" \
-			"$published_output" "$codex_oid" codex-unstable
+			"$published_output" "$codex_oid" codex-unstable \
+			"$graph/verified-admission"
 		validate_live_codex_delta "$published_output" "$unstable_oid" \
 			"$graph/topics" "$graph"
 	fi
@@ -3626,7 +4317,7 @@ prepare_unstable_input_graph () (
 	if test -s "$graph/topics"
 	then
 		prepare_stateful_plan codex "$stable_candidate" \
-			"$graph/topics" "$graph"
+			"$graph/topics" "$graph" unstable
 	else
 		: >"$graph/plan"
 	fi
@@ -3674,24 +4365,28 @@ verify_unstable_control_paths () (
 	do
 		is_unstable_topic_name "$name" ||
 			die "unstable integration contains stable topic '$name'"
-		if test "$prerequisite" != codex
-		then
-			is_unstable_topic_name "$prerequisite" ||
-				die "unstable topic '$name' has non-unstable prerequisite '$prerequisite'"
-			dependency=$(result_lookup "$state/results" "$prerequisite")
-			test -n "$dependency" ||
-				die "unstable topic '$name' has no rewritten prerequisite"
-		else
-			dependency=$base_oid
-		fi
 		tip=$(result_lookup "$state/results" "$name")
 		test -n "$tip" || die "unstable topic '$name' has no rewritten tip"
-		topic_control_paths_unchanged "$dependency" "$tip" ||
-			die "unstable topic '$name' changes a protected controller or CI file"
-		git diff --quiet "$dependency" "$tip" -- \
-			':(glob).github/workflows/*.yml' \
-			':(glob).github/workflows/*.yaml' ||
-			die "unstable topic '$name' changes a GitHub Actions workflow"
+		prerequisites=$(planned_prerequisites "$state" "$name")
+		for prerequisite in $prerequisites
+		do
+			if test "$prerequisite" != codex
+			then
+				is_unstable_topic_name "$prerequisite" ||
+					die "unstable topic '$name' has non-unstable prerequisite '$prerequisite'"
+				dependency=$(result_lookup "$state/results" "$prerequisite")
+				test -n "$dependency" ||
+					die "unstable topic '$name' has no rewritten prerequisite"
+			else
+				dependency=$base_oid
+			fi
+			topic_control_paths_unchanged "$dependency" "$tip" ||
+				die "unstable topic '$name' changes a protected controller or CI file"
+			git diff --quiet "$dependency" "$tip" -- \
+				':(glob).github/workflows/*.yml' \
+				':(glob).github/workflows/*.yaml' ||
+				die "unstable topic '$name' changes a GitHub Actions workflow"
+		done
 	done <"$state/plan"
 )
 
@@ -3749,22 +4444,14 @@ verify_control_paths () {
 		IFS="$tab" read -r canonical_name plan_old prerequisite old_base prerequisite_tip <<-EOF
 		$plan_row
 		EOF
-		if test "$prerequisite" = "$base_name"
-		then
-			dependency_new=$base_oid
-		else
-			dependency_ref=refs/heads/$prerequisite
-			dependency_new=$(awk -F '\t' -v ref="$dependency_ref" \
-				'$1 == ref { print $3 }' "$updates")
-			test -n "$dependency_new" ||
-				die "updates do not contain prerequisite '$dependency_ref'"
-		fi
+		prerequisites=$(planned_prerequisites "$graph" "$name")
 
 		case "$name" in
 		??/codex/automation)
 			automation_count=$((automation_count + 1))
-			test "$prerequisite" = master ||
+			test "$prerequisites" = master ||
 				die "automation topic '$name' must be based directly on master"
+			dependency_new=$base_oid
 			make_tmp_dir
 			git diff --name-only "$dependency_new" "$new" \
 				>"$tmp_dir/automation-paths" ||
@@ -3778,8 +4465,21 @@ verify_control_paths () {
 				die "automation topic '$name' does not contain the canonical Refresh codex workflow"
 			;;
 		*)
-			topic_control_paths_unchanged "$dependency_new" "$new" ||
-				die "topic '$name' changes a protected controller or CI file"
+			for prerequisite in $prerequisites
+			do
+				if test "$prerequisite" = "$base_name"
+				then
+					dependency_new=$base_oid
+				else
+					dependency_ref=refs/heads/$prerequisite
+					dependency_new=$(awk -F '\t' -v ref="$dependency_ref" \
+						'$1 == ref { print $3 }' "$updates")
+					test -n "$dependency_new" ||
+						die "updates do not contain prerequisite '$dependency_ref'"
+				fi
+				topic_control_paths_unchanged "$dependency_new" "$new" ||
+					die "topic '$name' changes a protected controller or CI file"
+			done
 			;;
 		esac
 	done <"$updates"
@@ -3832,12 +4532,10 @@ verify_meta_update () (
 		ref=refs/heads/$name
 		new=$(awk -F '\t' -v ref="$ref" '$1 == ref { print $3 }' "$updates")
 		test -n "$new" || die "updates contain no rewritten tip for '$name'"
-		prerequisite=$(awk -F '\t' -v name="$name" \
-			'$1 == name { value=$3 } END { if (value != "") print value }' \
-			"$graph/plan")
-		test -n "$prerequisite" ||
+		prerequisites=$(planned_prerequisites "$graph" "$name")
+		test -n "$prerequisites" ||
 			die "verified graph contains no prerequisite for '$name'"
-		printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" \
+		printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisites" \
 			>>"$graph/expected-meta-topics"
 	done <"$graph/topics"
 	LC_ALL=C sort -o "$graph/expected-meta-topics" \
@@ -3860,12 +4558,10 @@ verify_meta_update () (
 				'$1 == ref { print $3 }' "$updates")
 			test -n "$new" ||
 				die "updates contain no rewritten unstable tip for '$name'"
-			prerequisite=$(awk -F '\t' -v name="$name" \
-				'$1 == name { value=$3 } END { if (value != "") print value }' \
-				"$unstable_graph/plan")
-			test -n "$prerequisite" ||
+			prerequisites=$(planned_prerequisites "$unstable_graph" "$name")
+			test -n "$prerequisites" ||
 				die "verified unstable graph contains no prerequisite for '$name'"
-			printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisite" \
+			printf '%s\t%s\t%s\n' "$name" "$new" "$prerequisites" \
 				>>"$graph/expected-meta-unstable-topics"
 		done <"$unstable_graph/topics"
 		LC_ALL=C sort -o "$graph/expected-meta-unstable-topics" \
@@ -4061,18 +4757,22 @@ verify_output () {
 		ref=refs/heads/$name
 		new=$(awk -F '\t' -v ref="$ref" '$1 == ref { print $3 }' \
 			"$updates")
-		if test "$prerequisite" = "$base_name"
-		then
-			new_prerequisite=$base_oid
-		else
-			prerequisite_ref=refs/heads/$prerequisite
-			new_prerequisite=$(awk -F '\t' -v ref="$prerequisite_ref" \
-				'$1 == ref { print $3 }' "$updates")
-			test -n "$new_prerequisite" ||
-				die "updates contain no configured prerequisite '$prerequisite_ref'"
-		fi
-		git merge-base --is-ancestor "$new_prerequisite" "$new" ||
-			die "rewrite lost configured dependency '$prerequisite' -> '$name'"
+		prerequisites=$(planned_prerequisites "$tmp_dir/topic-graph" "$name")
+		for prerequisite in $prerequisites
+		do
+			if test "$prerequisite" = "$base_name"
+			then
+				new_prerequisite=$base_oid
+			else
+				prerequisite_ref=refs/heads/$prerequisite
+				new_prerequisite=$(awk -F '\t' -v ref="$prerequisite_ref" \
+					'$1 == ref { print $3 }' "$updates")
+				test -n "$new_prerequisite" ||
+					die "updates contain no configured prerequisite '$prerequisite_ref'"
+			fi
+			git merge-base --is-ancestor "$new_prerequisite" "$new" ||
+				die "rewrite lost configured dependency '$prerequisite' -> '$name'"
+		done
 	done <"$tmp_dir/topic-graph/plan"
 
 	# Reconstruct the canonical integration order independently from the
@@ -4095,6 +4795,10 @@ verify_output () {
 		test -n "$new" || die "updates contain no rewritten tip for '$name'"
 		result_record "$tmp_dir/topic-graph/results" "$name" "$new"
 	done <"$tmp_dir/topic-graph/topics"
+	if test -f "$tmp_dir/topic-graph/merge-graph"
+	then
+		verify_merge_topology "$base_oid" "$tmp_dir/topic-graph"
+	fi
 	write_integration_topics "$tmp_dir/topic-graph"
 	codex_has_expected_integrations "$tmp_dir/topic-graph" "$candidate" ||
 		die "candidate does not contain one canonical integration merge per topic"
@@ -4115,20 +4819,28 @@ verify_output () {
 				die "updates contain no rewritten unstable tip for '$name'"
 			result_record "$unstable_graph/results" "$name" "$new"
 		done <"$unstable_graph/topics"
+		if test -f "$unstable_graph/merge-graph"
+		then
+			verify_merge_topology "$candidate" "$unstable_graph"
+		fi
 		while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
 		do
 			new=$(result_lookup "$unstable_graph/results" "$name")
-			if test "$prerequisite" = codex
-			then
-				new_prerequisite=$candidate
-			else
-				new_prerequisite=$(result_lookup \
-					"$unstable_graph/results" "$prerequisite")
-				test -n "$new_prerequisite" ||
-					die "unstable topic '$name' has no rewritten prerequisite '$prerequisite'"
-			fi
-			git merge-base --is-ancestor "$new_prerequisite" "$new" ||
-				die "unstable rewrite lost dependency '$prerequisite' -> '$name'"
+			prerequisites=$(planned_prerequisites "$unstable_graph" "$name")
+			for prerequisite in $prerequisites
+			do
+				if test "$prerequisite" = codex
+				then
+					new_prerequisite=$candidate
+				else
+					new_prerequisite=$(result_lookup \
+						"$unstable_graph/results" "$prerequisite")
+					test -n "$new_prerequisite" ||
+						die "unstable topic '$name' has no rewritten prerequisite '$prerequisite'"
+				fi
+				git merge-base --is-ancestor "$new_prerequisite" "$new" ||
+					die "unstable rewrite lost dependency '$prerequisite' -> '$name'"
+			done
 		done <"$unstable_graph/plan"
 		if test -s "$unstable_graph/topics"
 		then
@@ -5122,6 +5834,8 @@ resolve_rebase () {
 	state=$(state_path "$worktree")
 	initialize_rewrite "$remote" "$base_name" "$codex_name" "$codex_name" \
 		"$worktree" "$state" "$inputs" "$topics" "$require_automation"
+	test ! -f "$state/merge-graph" ||
+		die "resolve does not reconstruct merge-shaped topic graphs; restack the reviewed graph and rerun Meta/rebuild"
 
 	if process_plan "$worktree" "$state"
 	then
@@ -5169,6 +5883,8 @@ continue_rewrite () {
 	state=$(state_path "$worktree")
 	test -d "$state" || die "'$worktree' has no Codex rewrite state"
 	require_state_controller "$state"
+	test ! -f "$state/merge-graph" ||
+		die "continue does not reconstruct merge-shaped topic graphs; restack the reviewed graph and rerun Meta/rebuild"
 	if rebase_in_progress "$worktree"
 	then
 		if test -n "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
