@@ -421,14 +421,10 @@ automation_workflow_matches () {
 		"$tmp_dir/actual-automation.yml"
 }
 
-release_workflow_is_codex_only () {
+extract_release_trigger () {
 	head_oid=$1
+	output=$2
 	make_tmp_dir
-	if ! git cat-file -e \
-		"$head_oid:.github/workflows/codex-release.yml" 2>/dev/null
-	then
-		return 0
-	fi
 	git show "$head_oid:.github/workflows/codex-release.yml" \
 		>"$tmp_dir/codex-release.yml" 2>/dev/null || return 1
 	test "$(grep -c '^on:$' "$tmp_dir/codex-release.yml")" = 1 || return 1
@@ -437,13 +433,20 @@ release_workflow_is_codex_only () {
 			found = 1
 			in_trigger = 1
 		}
-		in_trigger && $0 != "" {
+		in_trigger && $0 == "" { exit }
+		in_trigger {
 			if (seen && $0 !~ /^[[:space:]]/) exit
 			print
 			seen = 1
 		}
 		END { if (!found) exit 1 }
-	' "$tmp_dir/codex-release.yml" >"$tmp_dir/release-trigger" || return 1
+	' "$tmp_dir/codex-release.yml" >"$output"
+}
+
+release_workflow_has_codex_trigger () {
+	head_oid=$1
+	make_tmp_dir
+	extract_release_trigger "$head_oid" "$tmp_dir/release-trigger" || return 1
 	cat >"$tmp_dir/expected-release-trigger" <<-'EOF'
 	on:
 	  push:
@@ -451,7 +454,39 @@ release_workflow_is_codex_only () {
 	      - codex
 	EOF
 	cmp -s "$tmp_dir/expected-release-trigger" \
-		"$tmp_dir/release-trigger" || return 1
+		"$tmp_dir/release-trigger"
+}
+
+release_workflow_has_dual_trigger () {
+	head_oid=$1
+	make_tmp_dir
+	extract_release_trigger "$head_oid" "$tmp_dir/release-trigger" || return 1
+	cat >"$tmp_dir/expected-release-trigger" <<-'EOF'
+	on:
+	  push:
+	    branches:
+	      - codex
+	      - codex-unstable
+	EOF
+	cmp -s "$tmp_dir/expected-release-trigger" \
+		"$tmp_dir/release-trigger"
+}
+
+release_workflow_is_reviewed () {
+	head_oid=$1
+	make_tmp_dir
+	if ! git cat-file -e \
+		"$head_oid:.github/workflows/codex-release.yml" 2>/dev/null
+	then
+		return 0
+	fi
+	if ! release_workflow_has_codex_trigger "$head_oid" &&
+		! release_workflow_has_dual_trigger "$head_oid"
+	then
+		return 1
+	fi
+	git show "$head_oid:.github/workflows/codex-release.yml" \
+		>"$tmp_dir/codex-release.yml" 2>/dev/null || return 1
 	! grep -E \
 		'CODEX_BRANCH_TOKEN|CODEX_BRANCH_MANAGER_TOKEN|CODEX_DEPLOY_KEY|codex-publish|ci-token-gh-installation-token-codex-branch-manager|secret-broker-github-action' \
 		"$tmp_dir/codex-release.yml" >/dev/null &&
@@ -475,6 +510,64 @@ extract_release_job () (
 	' "$workflow" >"$output"
 )
 
+upgrade_release_publication_job () {
+	old_job=$1
+	output=$2
+	test "$(grep -F -x -c '    runs-on: ubuntu-24.04' "$old_job")" = 1 ||
+		return 1
+	test "$(grep -F -x -c '          set -euo pipefail' "$old_job")" = 1 ||
+		return 1
+	test "$(grep -F -x -c \
+		'              --get codex.output-tip)' "$old_job")" = 1 ||
+		return 1
+	awk '
+		$0 == "    runs-on: ubuntu-24.04" {
+			print
+			print "    if: github.event.deleted == false"
+			next
+		}
+		$0 == "          set -euo pipefail" {
+			print
+			print "          case \"$GITHUB_REF\" in"
+			print "          refs/heads/codex)"
+			print "            output_key=codex.output-tip"
+			print "            ;;"
+			print "          refs/heads/codex-unstable)"
+			print "            output_key=codex-unstable.output-tip"
+			print "            ;;"
+			print "          *)"
+			print "            printf \047unexpected release ref: %s\\n\047 \"$GITHUB_REF\" >&2"
+			print "            exit 1"
+			print "            ;;"
+			print "          esac"
+			next
+		}
+		$0 == "              --get codex.output-tip)" {
+			print "              --get \"$output_key\")"
+			next
+		}
+		{ print }
+	' "$old_job" >"$output"
+}
+
+release_publication_job_is_dual () {
+	job=$1
+	test "$(grep -F -x -c \
+		'    if: github.event.deleted == false' "$job")" = 1 &&
+	test "$(grep -F -x -c \
+		'          case "$GITHUB_REF" in' "$job")" = 1 &&
+	test "$(grep -F -x -c \
+		'          refs/heads/codex)' "$job")" = 1 &&
+	test "$(grep -F -x -c \
+		'            output_key=codex.output-tip' "$job")" = 1 &&
+	test "$(grep -F -x -c \
+		'          refs/heads/codex-unstable)' "$job")" = 1 &&
+	test "$(grep -F -x -c \
+		'            output_key=codex-unstable.output-tip' "$job")" = 1 &&
+	test "$(grep -F -x -c \
+		'              --get "$output_key")' "$job")" = 1
+}
+
 release_publication_controls_preserved () (
 	published=$1
 	candidate=$2
@@ -496,8 +589,28 @@ release_publication_controls_preserved () (
 		"$tmp_dir/published-publication" || return 1
 	extract_release_job "$new_workflow" publication \
 		"$tmp_dir/candidate-publication" || return 1
-	cmp -s "$tmp_dir/published-publication" \
-		"$tmp_dir/candidate-publication" || return 1
+	if release_workflow_has_dual_trigger "$published"
+	then
+		release_workflow_has_dual_trigger "$candidate" || return 1
+	fi
+	if release_workflow_has_dual_trigger "$candidate"
+	then
+		if ! cmp -s "$tmp_dir/published-publication" \
+			"$tmp_dir/candidate-publication"
+		then
+			release_workflow_has_codex_trigger "$published" || return 1
+			upgrade_release_publication_job \
+				"$tmp_dir/published-publication" \
+				"$tmp_dir/expected-publication" || return 1
+			cmp -s "$tmp_dir/expected-publication" \
+				"$tmp_dir/candidate-publication" || return 1
+		fi
+		release_publication_job_is_dual \
+			"$tmp_dir/candidate-publication" || return 1
+	else
+		cmp -s "$tmp_dir/published-publication" \
+			"$tmp_dir/candidate-publication" || return 1
+	fi
 	extract_release_job "$old_workflow" version \
 		"$tmp_dir/published-version" || return 1
 	extract_release_job "$new_workflow" version \
@@ -4359,8 +4472,8 @@ verify_unstable_control_paths () (
 		':(glob).github/workflows/*.yml' \
 		':(glob).github/workflows/*.yaml' ||
 		die "codex-unstable changes a GitHub Actions workflow"
-	release_workflow_is_codex_only "$unstable_candidate" ||
-		die "codex-unstable changes the production-only release trigger"
+	release_workflow_is_reviewed "$unstable_candidate" ||
+		die "codex-unstable changes the reviewed release trigger"
 	while IFS="$tab" read -r name old prerequisite old_base prerequisite_tip
 	do
 		is_unstable_topic_name "$name" ||
@@ -4426,8 +4539,8 @@ verify_control_paths () {
 		die "candidate changes a protected controller or CI file"
 	automation_workflow_matches "$candidate" ||
 		die "candidate does not contain the canonical Refresh codex workflow"
-	release_workflow_is_codex_only "$candidate" ||
-		die "candidate release workflow must run only for pushes to codex and must not obtain promotion credentials"
+	release_workflow_is_reviewed "$candidate" ||
+		die "candidate release workflow must use the reviewed Codex branch triggers and must not obtain promotion credentials"
 
 	automation_count=0
 	while IFS="$tab" read -r ref old new
