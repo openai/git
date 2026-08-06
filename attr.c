@@ -14,6 +14,7 @@
 #include "environment.h"
 #include "exec-cmd.h"
 #include "attr.h"
+#include "attr-fingerprint.h"
 #include "dir.h"
 #include "gettext.h"
 #include "path.h"
@@ -477,6 +478,8 @@ static struct check_vector {
 	pthread_mutex_t mutex;
 } check_vector;
 
+static const struct attr_source_snapshot *source_snapshot;
+
 static inline void vector_lock(void)
 {
 	pthread_mutex_lock(&check_vector.mutex);
@@ -534,6 +537,31 @@ static void drop_all_attr_stacks(void)
 	}
 
 	vector_unlock();
+}
+
+void git_attr_invalidate_all(void)
+{
+	drop_all_attr_stacks();
+}
+
+void git_attr_source_snapshot_begin(
+	const struct attr_source_snapshot *snapshot)
+{
+	if (!snapshot)
+		BUG("cannot begin a NULL attribute source snapshot");
+	if (source_snapshot)
+		BUG("attribute source snapshots cannot be nested");
+	drop_all_attr_stacks();
+	source_snapshot = snapshot;
+}
+
+void git_attr_source_snapshot_end(
+	const struct attr_source_snapshot *snapshot)
+{
+	if (!snapshot || source_snapshot != snapshot)
+		BUG("ending an inactive attribute source snapshot");
+	drop_all_attr_stacks();
+	source_snapshot = NULL;
 }
 
 struct attr_check *attr_check_alloc(void)
@@ -668,6 +696,15 @@ static struct attr_stack *read_attr_from_array(const char **list)
 	return res;
 }
 
+static void handle_attr_line_buf(struct attr_stack *res,
+				 struct strbuf *line, const char *path,
+				 int *lineno, unsigned flags)
+{
+	if (!*lineno && starts_with(line->buf, utf8_bom))
+		strbuf_remove(line, 0, strlen(utf8_bom));
+	handle_attr_line(res, line->buf, path, ++*lineno, flags);
+}
+
 /*
  * Callers into the attribute system assume there is a single, system-wide
  * global state where attributes are read from and when the state is flipped by
@@ -721,14 +758,45 @@ static struct attr_stack *read_attr_from_file(const char *path, unsigned flags)
 	}
 
 	CALLOC_ARRAY(res, 1);
-	while (strbuf_getline(&buf, fp) != EOF) {
-		if (!lineno && starts_with(buf.buf, utf8_bom))
-			strbuf_remove(&buf, 0, strlen(utf8_bom));
-		handle_attr_line(res, buf.buf, path, ++lineno, flags);
-	}
+	while (strbuf_getline(&buf, fp) != EOF)
+		handle_attr_line_buf(res, &buf, path, &lineno, flags);
 
 	fclose(fp);
 	strbuf_release(&buf);
+	return res;
+}
+
+static struct attr_stack *read_attr_from_snapshot(
+	enum attr_source_snapshot_kind kind, unsigned flags)
+{
+	struct attr_stack *res;
+	struct strbuf line = STRBUF_INIT;
+	const char *path, *buf;
+	size_t length;
+	size_t offset = 0;
+	int lineno = 0;
+
+	if (!source_snapshot)
+		BUG("attribute source snapshot is not set");
+	if (!attr_source_snapshot_read(source_snapshot, kind,
+				       &path, &buf, &length))
+		return NULL;
+
+	CALLOC_ARRAY(res, 1);
+	while (offset < length) {
+		const char *start = buf + offset;
+		const char *newline = memchr(start, '\n', length - offset);
+		size_t len = newline ? (size_t)(newline - start) :
+			length - offset;
+
+		if (newline && len && start[len - 1] == '\r')
+			len--;
+		strbuf_reset(&line);
+		strbuf_add(&line, start, len);
+		handle_attr_line_buf(res, &line, path, &lineno, flags);
+		offset = newline ? (size_t)(newline - buf) + 1 : length;
+	}
+	strbuf_release(&line);
 	return res;
 }
 
@@ -922,13 +990,21 @@ static void bootstrap_attr_stack(struct index_state *istate,
 	push_stack(stack, e, NULL, 0);
 
 	/* system-wide frame */
-	if (git_attr_system_is_enabled()) {
+	if (source_snapshot) {
+		e = read_attr_from_snapshot(
+			ATTR_SOURCE_SNAPSHOT_SYSTEM, flags);
+		push_stack(stack, e, NULL, 0);
+	} else if (git_attr_system_is_enabled()) {
 		e = read_attr_from_file(git_attr_system_file(), flags);
 		push_stack(stack, e, NULL, 0);
 	}
 
 	/* home directory */
-	if (git_attr_global_file()) {
+	if (source_snapshot) {
+		e = read_attr_from_snapshot(
+			ATTR_SOURCE_SNAPSHOT_GLOBAL, flags);
+		push_stack(stack, e, NULL, 0);
+	} else if (git_attr_global_file()) {
 		e = read_attr_from_file(git_attr_global_file(), flags);
 		push_stack(stack, e, NULL, 0);
 	}
@@ -938,7 +1014,9 @@ static void bootstrap_attr_stack(struct index_state *istate,
 	push_stack(stack, e, xstrdup(""), 0);
 
 	/* info frame */
-	if (startup_info->have_repository)
+	if (source_snapshot)
+		e = read_attr_from_snapshot(ATTR_SOURCE_SNAPSHOT_INFO, flags);
+	else if (startup_info->have_repository)
 		e = read_attr_from_file(git_path_info_attributes(), flags);
 	else
 		e = NULL;

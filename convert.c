@@ -1318,11 +1318,8 @@ static int git_path_check_ident(struct attr_check_item *check)
 
 static struct attr_check *check;
 
-void convert_attrs(struct index_state *istate,
-		   struct conv_attrs *ca, const char *path)
+static void convert_attrs_init(void)
 {
-	struct attr_check_item *ccheck = NULL;
-
 	if (!check) {
 		check = attr_check_initl("crlf", "ident", "filter",
 					 "eol", "text", "working-tree-encoding",
@@ -1330,9 +1327,33 @@ void convert_attrs(struct index_state *istate,
 		user_convert_tail = &user_convert;
 		repo_config(the_repository, read_convert_config, NULL);
 	}
+}
 
-	git_check_attr(istate, path, check);
-	ccheck = check->items;
+struct attr_check *convert_attrs_check_alloc(void)
+{
+	return attr_check_initl("crlf", "ident", "filter",
+				"eol", "text", "working-tree-encoding",
+				NULL);
+}
+
+void convert_attrs_prepare(struct index_state *istate)
+{
+	convert_attrs_init();
+	/* Prime default_attr_source() and the root attribute stack on main. */
+	git_check_attr(istate, "", check);
+}
+
+void convert_attrs_with_check(struct index_state *istate,
+			      struct conv_attrs *ca, const char *path,
+			      struct attr_check *attr_check)
+{
+	struct attr_check_item *ccheck;
+
+	if (!attr_check || attr_check->nr != 6)
+		BUG("invalid per-thread conversion attribute check");
+
+	git_check_attr(istate, path, attr_check);
+	ccheck = attr_check->items;
 	ca->crlf_action = git_path_check_crlf(ccheck + 4);
 	if (ca->crlf_action == CRLF_UNDEFINED)
 		ca->crlf_action = git_path_check_crlf(ccheck + 0);
@@ -1361,6 +1382,23 @@ void convert_attrs(struct index_state *istate,
 		ca->crlf_action = CRLF_AUTO_CRLF;
 	if (ca->crlf_action == CRLF_UNDEFINED && auto_crlf == AUTO_CRLF_INPUT)
 		ca->crlf_action = CRLF_AUTO_INPUT;
+}
+
+void convert_attrs(struct index_state *istate,
+		   struct conv_attrs *ca, const char *path)
+{
+	convert_attrs_init();
+	convert_attrs_with_check(istate, ca, path, check);
+}
+
+int convert_attrs_is_raw_safe(struct index_state *istate, const char *path,
+			      struct attr_check *attr_check)
+{
+	struct conv_attrs ca;
+
+	convert_attrs_with_check(istate, &ca, path, attr_check);
+	return !ca.drv && !ca.working_tree_encoding && !ca.ident &&
+		ca.crlf_action == CRLF_BINARY;
 }
 
 void reset_parsed_attributes(void)

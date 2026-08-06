@@ -3,6 +3,7 @@
 test_description='git status with file system watcher'
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-semantic-verify.sh
 
 # Note, after "git reset --hard HEAD" no extensions exist other than 'TREE'
 # "git update-index --fsmonitor" can be used to get the extension written
@@ -53,6 +54,809 @@ write_integration_script () {
 test_lazy_prereq UNTRACKED_CACHE '
 	{ git update-index --test-untracked-cache; ret=$?; } &&
 	test $ret -ne 1
+'
+
+test_lazy_prereq HARDLINKS '
+	: >hardlink-a &&
+	ln hardlink-a hardlink-b
+'
+
+test_expect_success 'FSMN parser fails closed' '
+	test-tool read-cache --test-fsmn-parser
+'
+
+test_expect_success 'FSUC parser fails closed' '
+	test-tool read-cache --test-fsuc-parser
+'
+
+test_expect_success !SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'unsupported identity preserves an ordinary provider token' '
+	test_when_finished "rm -rf unsupported-provider-token" &&
+	test_create_repo unsupported-provider-token &&
+	(
+		cd unsupported-provider-token &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep "^fsmonitor last update builtin:test:" \
+			.git/fsmonitor &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'FSCF survives index I/O and generic rewrites' '
+	test_when_finished "rm -rf fscf-round-trip" &&
+	test_create_repo fscf-round-trip &&
+	(
+		cd fscf-round-trip &&
+		test_commit base tracked &&
+		test-tool read-cache --test-fscf-round-trip &&
+		test_grep FSCF .git/index
+	)
+'
+
+test_expect_success 'hook parser ignores empty path records' '
+	test_when_finished "rm -rf empty-hook-record" &&
+	test_create_repo empty-hook-record &&
+	(
+		cd empty-hook-record &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+			printf "\0"
+			printf "tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		echo changed >tracked &&
+		git status --porcelain --untracked-files=no >actual &&
+		echo " M tracked" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success UNTRACKED_CACHE 'trivial hook clears a paired UNTR token' '
+	test_when_finished "rm -rf hook-token-pair" &&
+	test_create_repo hook-token-pair &&
+	(
+		cd hook-token-pair &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token1\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		test_grep ! FSUC .git/index &&
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep FSUC .git/index &&
+		test_hook --clobber fsmonitor-test <<-\EOF &&
+			printf "token2\0/\0"
+		EOF
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep ! FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE 'failed hook clears a paired UNTR token' '
+	test_when_finished "rm -rf hook-token-error" &&
+	test_create_repo hook-token-error &&
+	(
+		cd hook-token-error &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 >/dev/null &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token1\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep FSUC .git/index &&
+		test_hook --clobber fsmonitor-test <<-\EOF &&
+			exit 1
+		EOF
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep ! FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE \
+	'paired fsmonitor cache prunes recursively valid empty subtrees' '
+	test_when_finished "rm -rf fsmonitor-untracked-prune" &&
+	test_create_repo fsmonitor-untracked-prune &&
+	(
+		cd fsmonitor-untracked-prune &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/empty/deep &&
+		test_write_lines tracked >cached/empty/deep/tracked &&
+		git add cached/empty/deep/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/prime &&
+		test_must_be_empty .git/prime &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime-fsmonitor &&
+		test_must_be_empty .git/prime-fsmonitor &&
+		test_grep FSUC .git/index &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status --porcelain=v2 >.git/clean &&
+		test_must_be_empty .git/clean &&
+		test_trace2_data read_directory directories-visited 0 \
+			<.git/clean.trace &&
+
+		test_write_lines untracked >cached/empty/deep/new &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/empty/deep/new \
+			git status --porcelain=v2 >.git/changed &&
+		test_grep "^? cached/empty/deep/new$" .git/changed
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,HARDLINKS \
+	'fsmonitor pruning rechecks cached per-directory excludes' '
+	test_when_finished "rm -rf fsmonitor-untracked-exclude" &&
+	test_when_finished "rm -f fsmonitor-untracked-exclude-alias" &&
+	test_create_repo fsmonitor-untracked-exclude &&
+	(
+		cd fsmonitor-untracked-exclude &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached cached2 cached3 &&
+		test_write_lines ignored >cached/.gitignore &&
+		test_write_lines hidden >cached/ignored &&
+		test_write_lines ignored >cached2/.gitignore &&
+		test_write_lines hidden >cached2/ignored &&
+		test_write_lines ignored >cached3/.gitignore &&
+		test_write_lines hidden >cached3/ignored &&
+		git add cached/.gitignore cached2/.gitignore \
+			cached3/.gitignore &&
+		git commit -m base &&
+		test-tool chmtime +60 cached2/.gitignore &&
+		test-tool chmtime =-60 cached3/.gitignore &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/prime &&
+		test_must_be_empty .git/prime &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime-fsmonitor &&
+		test_must_be_empty .git/prime-fsmonitor &&
+		test_grep FSUC .git/index &&
+		ln cached/.gitignore ../fsmonitor-untracked-exclude-alias &&
+
+		if test_have_prereq PTHREADS
+		then
+			threads=2
+		else
+			threads=1
+		fi &&
+		if test_have_prereq MINGW || test_have_prereq CYGWIN
+		then
+			index_excludes=0
+		else
+			index_excludes=1
+		fi &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT_NESTING=10 \
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status --porcelain >.git/clean &&
+		test_must_be_empty .git/clean &&
+		test_trace2_data dir \
+			preload_untracked_cache/fsmonitor-excludes-only 1 \
+			<.git/clean.trace &&
+		test_trace2_data dir preload_untracked_cache/threads \
+			$threads \
+			<.git/clean.trace &&
+		test_trace2_data dir preload_untracked_cache/dirs 3 \
+			<.git/clean.trace &&
+		test_trace2_data dir \
+			preload_untracked_cache/index-excludes "$index_excludes" \
+			<.git/clean.trace &&
+		test_trace2_data read_directory directories-visited 0 \
+			<.git/clean.trace &&
+
+		if test_have_prereq FILEMODE
+		then
+			chmod +x ../fsmonitor-untracked-exclude-alias &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/mode.trace" \
+				git status --porcelain >.git/mode &&
+			test_trace2_data dir \
+				preload_untracked_cache/index-uptodate 2 \
+				<.git/mode.trace &&
+			chmod -x ../fsmonitor-untracked-exclude-alias
+		else
+			:
+		fi &&
+
+		mtime=$(test-tool chmtime --get cached/.gitignore) &&
+		test_write_lines visible \
+			>../fsmonitor-untracked-exclude-alias &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/changed.trace" \
+			git status >.git/changed &&
+		test_grep "modified:.*cached/.gitignore" .git/changed &&
+		test_grep "cached/ignored" .git/changed &&
+		test_trace2_data status \
+			fsmonitor/exclude-index-invalidated 1 \
+			<.git/changed.trace &&
+
+		test_write_lines ignored \
+			>../fsmonitor-untracked-exclude-alias &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/restored.trace" \
+			git status >.git/restored &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/restored &&
+
+		test_write_lines "?? cached/ignored" >.git/flagged.expect &&
+
+		git update-index --assume-unchanged cached/.gitignore &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/assume-prime &&
+		test_must_be_empty .git/assume-prime &&
+		mtime=$(test-tool chmtime --get cached/.gitignore) &&
+		test_write_lines visible \
+			>../fsmonitor-untracked-exclude-alias &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/assume-changed.trace" \
+			git status --porcelain >.git/assume-changed &&
+		test_cmp .git/flagged.expect .git/assume-changed &&
+		test_write_lines ignored \
+			>../fsmonitor-untracked-exclude-alias &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/assume-restored.trace" \
+			git status --porcelain >.git/assume-restored &&
+		test_must_be_empty .git/assume-restored &&
+		git update-index --no-assume-unchanged cached/.gitignore &&
+
+		git update-index --skip-worktree cached/.gitignore &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/skip-prime &&
+		test_must_be_empty .git/skip-prime &&
+		mtime=$(test-tool chmtime --get cached/.gitignore) &&
+		test_write_lines visible \
+			>../fsmonitor-untracked-exclude-alias &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/skip-changed.trace" \
+			git status --porcelain >.git/skip-changed &&
+		test_cmp .git/flagged.expect .git/skip-changed &&
+		test_write_lines ignored \
+			>../fsmonitor-untracked-exclude-alias &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=2 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/skip-restored.trace" \
+			git status --porcelain >.git/skip-restored &&
+		test_must_be_empty .git/skip-restored &&
+		git update-index --no-skip-worktree cached/.gitignore
+	)
+'
+
+test_expect_success UNTRACKED_CACHE \
+	'converted cached excludes retain a stable index proof' '
+	test_when_finished "rm -rf fsmonitor-converted-exclude" &&
+	test_create_repo fsmonitor-converted-exclude &&
+	(
+		cd fsmonitor-converted-exclude &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		printf "ignored\r\n" >cached/.gitignore &&
+		test_write_lines hidden >cached/ignored &&
+		test_write_lines "cached/.gitignore text eol=lf" \
+			>.gitattributes &&
+		git add .gitattributes cached/.gitignore &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain >.git/prime &&
+		test_must_be_empty .git/prime &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/prime-fsmonitor &&
+		test_must_be_empty .git/prime-fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status >.git/settle &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/settle &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status >.git/clean &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/clean &&
+		test_trace2_data dir \
+			preload_untracked_cache/index-uptodate 1 \
+			<.git/clean.trace &&
+		test_trace2_data dir \
+			preload_untracked_cache/index-invalidated 0 \
+			<.git/clean.trace &&
+		test_trace2_data dir \
+			preload_untracked_cache/normalized-excludes 0 \
+			<.git/clean.trace &&
+		test_trace2_data read_directory directories-visited 0 \
+			<.git/clean.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,HARDLINKS,POSIXPERM,SANITY \
+	'fsmonitor rechecks cached unreadable per-directory excludes' '
+	test_when_finished "rm -rf fsmonitor-unreadable-exclude" &&
+	test_when_finished "rm -f fsmonitor-unreadable-exclude-alias" &&
+	test_create_repo fsmonitor-unreadable-exclude &&
+	(
+		cd fsmonitor-unreadable-exclude &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines hidden >cached/.gitignore &&
+		test_write_lines untracked >cached/hidden &&
+		test_write_lines tracked >cached/tracked &&
+		git add cached/tracked &&
+		git commit -m base &&
+		chmod 000 cached/.gitignore &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain \
+			>.git/prime 2>.git/prime.err &&
+		test_grep "^?? cached/hidden$" .git/prime &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/prime-fsmonitor \
+				2>.git/prime-fsmonitor.err &&
+		test_grep "^?? cached/hidden$" .git/prime-fsmonitor &&
+		empty_tree=$(git mktree </dev/null) &&
+		test-tool dump-untracked-cache >.git/untracked-cache &&
+		test_grep "cached/ $empty_tree" .git/untracked-cache &&
+		ln cached/.gitignore \
+			../fsmonitor-unreadable-exclude-alias &&
+
+		chmod 644 ../fsmonitor-unreadable-exclude-alias &&
+		test_write_lines "?? cached/.gitignore" \
+			>.git/readable.expect &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/readable.trace" \
+			git status --porcelain >.git/readable &&
+		test_cmp .git/readable.expect .git/readable &&
+		test_trace2_data dir \
+			preload_untracked_cache/dirs "[1-9]" \
+			<.git/readable.trace
+	)
+'
+
+check_weak_exclude_stat () {
+	repo=$1 &&
+	key=$2 &&
+	value=$3 &&
+	test_create_repo "$repo" &&
+	(
+		cd "$repo" &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines ignored >cached/.gitignore &&
+		test_write_lines hidden >cached/ignored &&
+		git add cached/.gitignore &&
+		git commit -m base &&
+		git config "$key" "$value" &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/prime &&
+		test_must_be_empty .git/prime &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime-fsmonitor &&
+		test_must_be_empty .git/prime-fsmonitor &&
+
+		mtime=$(test-tool chmtime --get cached/.gitignore) &&
+		test_write_lines visible >cached/.gitignore &&
+		test-tool chmtime =$mtime cached/.gitignore &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/changed.trace" \
+			git status --porcelain >.git/changed &&
+		test_grep "^?? cached/ignored$" .git/changed &&
+		test_trace2_data dir \
+			preload_untracked_cache/index-excludes 0 \
+			<.git/changed.trace
+	)
+}
+
+test_expect_success UNTRACKED_CACHE \
+	'weak stat settings retain exclude content checks' '
+	test_when_finished "rm -rf weak-exclude-ctime weak-exclude-stat" &&
+	check_weak_exclude_stat weak-exclude-ctime \
+		core.trustctime false &&
+	check_weak_exclude_stat weak-exclude-stat \
+		core.checkStat minimal
+'
+
+test_expect_success UNTRACKED_CACHE \
+	'root untracked events preserve cached descendant excludes' '
+	test_when_finished "rm -rf root-untracked-event" &&
+	test_create_repo root-untracked-event &&
+	(
+		cd root-untracked-event &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep &&
+		test_write_lines "*.ignored" >.gitignore &&
+		test_write_lines "*.ignored" >cached/.gitignore &&
+		test_write_lines tracked >cached/deep/tracked &&
+		test_write_lines ignored >cached/deep/junk.ignored &&
+		git add .gitignore cached/.gitignore cached/deep/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/prime &&
+		test_must_be_empty .git/prime &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime-fsmonitor &&
+		test_must_be_empty .git/prime-fsmonitor &&
+
+		test_write_lines visible >root-probe &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=root-probe \
+		GIT_TRACE2_EVENT="$PWD/.git/created.trace" \
+			git status >.git/created &&
+		test_grep "root-probe" .git/created &&
+		test_trace2_data read_directory directories-visited 1 \
+			<.git/created.trace &&
+		test_trace2_data read_directory gitignore-invalidation 0 \
+			<.git/created.trace &&
+
+		rm root-probe &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=root-probe \
+		GIT_TRACE2_EVENT="$PWD/.git/removed.trace" \
+			git status >.git/removed &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/removed &&
+		test_trace2_data read_directory directories-visited 1 \
+			<.git/removed.trace &&
+		test_trace2_data read_directory gitignore-invalidation 0 \
+			<.git/removed.trace
+	)
+'
+
+prepare_builtin_closure_repo () {
+	test_create_repo "$1" &&
+	(
+		cd "$1" &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		if test "${2-}" = untracked
+		then
+			git config core.untrackedCache true &&
+			git -c core.fsmonitor=false status --porcelain=v2 \
+				>.git/actual &&
+			test_must_be_empty .git/actual &&
+			test_grep UNTR .git/index &&
+			test_grep ! FSUC .git/index
+		else
+			:
+		fi &&
+		git config core.fsmonitor true &&
+		test_grep ! FSMN .git/index
+	)
+}
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'bare status reuses a current tracked fsmonitor proof' '
+	test_when_finished "rm -rf builtin-tracked-clean" &&
+	prepare_builtin_closure_repo builtin-tracked-clean &&
+	(
+		cd builtin-tracked-clean &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status >.git/clean &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/clean &&
+		test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/clean.trace &&
+		test_trace2_data status index/cache-tree-match 1 \
+			<.git/clean.trace &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/exact.trace" \
+			git status --porcelain=v2 >.git/exact &&
+		test_must_be_empty .git/exact &&
+		! test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/exact.trace &&
+		test_grep \
+			"\"category\":\"index\",\"label\":\"refresh\"" \
+			.git/exact.trace &&
+
+		test_write_lines changed >tracked &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/dirty.trace" \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		! test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/dirty.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git checkout -- tracked &&
+		test_write_lines staged >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git write-tree >.git/staged-tree &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain >.git/staged-prime &&
+		test_grep "^M  tracked$" .git/staged-prime &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/staged.trace" \
+			git status >.git/staged &&
+		test_grep "Changes to be committed:" .git/staged &&
+		test_grep "modified:.*tracked" .git/staged &&
+		test_trace2_data status fsmonitor/tracked-clean 1 \
+			<.git/staged.trace &&
+		! test_trace2_data status index/cache-tree-match 1 \
+			<.git/staged.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin closure initializes a new untracked cache' '
+	test_when_finished "rm -rf builtin-closure-new-uc" &&
+	test_create_repo builtin-closure-new-uc &&
+	(
+		cd builtin-closure-new-uc &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSUC .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep \
+			"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+			.git/status.trace >.git/read-directory &&
+		test_line_count = 1 .git/read-directory &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin clean closure publishes its proof' '
+	test_when_finished "rm -rf builtin-closure-clean" &&
+	prepare_builtin_closure_repo builtin-closure-clean untracked &&
+	(
+		cd builtin-closure-clean &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines visible >visible &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^? visible$" .git/actual &&
+		test_grep \
+			"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+			.git/status.trace >.git/read-directory &&
+		test_line_count = 1 .git/read-directory &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin changed closure rescans before acceptance' '
+	test_when_finished "rm -rf builtin-closure-changed" &&
+	prepare_builtin_closure_repo builtin-closure-changed &&
+	(
+		cd builtin-closure-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CDC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+		GIT_TRACE_FSMONITOR="$PWD/.git/fsmonitor.trace" \
+			git status --porcelain=v2 \
+				--untracked-files=no >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep "fsmonitor_refresh_callback.*tracked" \
+			.git/fsmonitor.trace &&
+		test_trace2_data fsmonitor token_closure/apply_count 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin initial trivial response anchors a closure' '
+	test_when_finished "rm -rf builtin-initial-trivial" &&
+	prepare_builtin_closure_repo builtin-initial-trivial &&
+	(
+		cd builtin-initial-trivial &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 \
+				--untracked-files=no >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep "^fsmonitor last update builtin:test:2" \
+			.git/fsmonitor
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin trivial closure can rescan and accept' '
+	test_when_finished "rm -rf builtin-closure-trivial" &&
+	prepare_builtin_closure_repo builtin-closure-trivial &&
+	(
+		cd builtin-closure-trivial &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CTC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 \
+				--untracked-files=no >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data fsmonitor token_closure/trivial 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin closure rejects three intervening changes' '
+	test_when_finished "rm -rf builtin-closure-exhausted" &&
+	prepare_builtin_closure_repo builtin-closure-exhausted &&
+	(
+		cd builtin-closure-exhausted &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CDDD \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 \
+				--untracked-files=no >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data fsmonitor token_closure/apply_count 1 \
+			<.git/status.trace >.git/applied &&
+		test_line_count = 3 .git/applied &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep ! FSUC .git/index
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'builtin closure query errors fall back completely' '
+	test_when_finished "rm -rf builtin-closure-error" &&
+	prepare_builtin_closure_repo builtin-closure-error untracked &&
+	(
+		cd builtin-closure-error &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines visible >visible &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCE \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^? visible$" .git/actual &&
+		test_grep \
+			"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+			.git/status.trace >.git/read-directory &&
+		test_line_count = 2 .git/read-directory &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep ! FSUC .git/index
+	)
+'
+
+test_expect_success PERL_TEST_HELPERS \
+	'index reader rejects an out-of-bounds extension size' '
+	test_when_finished "rm -rf oversized-index-extension" &&
+	test_create_repo oversized-index-extension &&
+	(
+		cd oversized-index-extension &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		test_grep FSMN .git/index >/dev/null &&
+		perl -0777 -pe "
+			\$pos = index(\$_, q(FSMN));
+			die q(FSMN-not-found) if \$pos < 0;
+			substr(\$_, \$pos + 4, 4) = pack(q(N), 0xffffffff);
+		" .git/index >.git/index.bad &&
+		mv .git/index.bad .git/index &&
+		test_must_fail git status --porcelain=v2 2>err &&
+		test_grep "index file corrupt" err
+	)
 '
 
 # Test that we detect and disallow repos that are incompatible with FSMonitor.
@@ -474,6 +1278,370 @@ test_expect_success 'status succeeds with sparse index' '
 			printf "dir1a/modified\0"
 		EOF
 		check_sparse_index_behavior
+	)
+'
+
+test_expect_success 'reported events poison weak stat-cache matches' '
+	test_create_repo reported-event &&
+	(
+		cd reported-event &&
+		printf "aaaa\n" >tracked &&
+		printf "clean\n" >clean &&
+		git add tracked clean &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked clean &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0clean\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+
+		GIT_OPTIONAL_LOCKS=0 git diff-index --name-status HEAD \
+			>.git/diff-index &&
+		test_grep "^M.*tracked$" .git/diff-index &&
+		test_grep ! "clean$" .git/diff-index &&
+		git status --porcelain=v2 >.git/status &&
+		test_grep "^1 \.M .* tracked$" .git/status &&
+		test_grep ! " clean$" .git/status
+	)
+'
+
+test_expect_success 'reported path permits apply --index content match' '
+	test_create_repo apply-marker &&
+	(
+		cd apply-marker &&
+		test_commit base tracked &&
+		test_write_lines next >tracked &&
+		git diff >../apply-marker.patch &&
+		git checkout -- tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git apply --index ../apply-marker.patch
+	)
+'
+
+test_expect_success 'reported path permits checkout-index content match' '
+	test_create_repo checkout-marker &&
+	(
+		cd checkout-marker &&
+		test_commit base tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git checkout-index tracked
+	)
+'
+
+test_expect_success CASE_INSENSITIVE_FS \
+	'reported path permits case-folded unpack match' '
+	test_create_repo icase-marker &&
+	(
+		cd icase-marker &&
+		test_write_lines same >foo &&
+		git add foo &&
+		git commit -m base &&
+		base=$(git rev-parse HEAD) &&
+		git mv foo intermediate &&
+		git mv intermediate FOO &&
+		git commit -m target &&
+		target=$(git rev-parse HEAD) &&
+		git checkout "$base" &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0foo\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git read-tree -m -u "$target" &&
+		echo FOO >expect &&
+		git ls-files >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'reported unchanged path avoids reset checkout' '
+	test_create_repo reset-marker &&
+	(
+		cd reset-marker &&
+		test_commit base tracked &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked &&
+		git update-index --refresh &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0tracked\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		before=$(test-tool chmtime --get tracked) &&
+		git reset --hard HEAD &&
+		after=$(test-tool chmtime --get tracked) &&
+		test "$before" = "$after"
+	)
+'
+
+test_expect_success 'ordinary zero-stat entries retain diff-index behavior' '
+	test_create_repo ordinary-zero-stat &&
+	(
+		cd ordinary-zero-stat &&
+		echo content >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		oid=$(git rev-parse :tracked) &&
+		git update-index --cacheinfo 100644,$oid,tracked &&
+		git -c core.fsmonitor=false diff-index --name-status HEAD >actual &&
+		test_grep "^M.*tracked$" actual
+	)
+'
+
+test_expect_success 'verified reported paths restore poisoned stat data' '
+	test_create_repo fsmonitor-stat-recovery &&
+	(
+		cd fsmonitor-stat-recovery &&
+		echo content >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		test-tool read-cache \
+			--test-fsmonitor-content-recovery tracked
+	)
+'
+
+test_expect_success 'provider global marker invalidates every tracked entry' '
+	test_create_repo global-invalidate &&
+	(
+		cd global-invalidate &&
+		printf "aaaa\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			if test -f .git/global
+			then
+				printf "token1\0//\0"
+			else
+				printf "token0\0"
+			fi
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+		> .git/global &&
+		git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual
+	)
+'
+
+test_expect_success \
+	'directory attribute invalidation requires an indexed cone' '
+	test_create_repo directory-attributes &&
+	(
+		cd directory-attributes &&
+		mkdir tracked-dir &&
+		test_commit base tracked-dir/tracked &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			if test -f .git/report-cone
+			then
+				printf "cone-token\0tracked-dir/\0"
+			elif test -f .git/report-unmatched
+			then
+				printf "unmatched-token\0untracked/\0"
+			else
+				printf "base-token\0"
+			fi
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+
+		> .git/report-cone &&
+		GIT_TRACE2_EVENT="$PWD/.git/cone.trace" \
+		GIT_TRACE_FSMONITOR="$PWD/.git/cone.fsm" \
+			git status --porcelain=v2 >.git/cone.actual &&
+		test_must_be_empty .git/cone.actual &&
+		test_grep "fsmonitor_refresh_callback.*tracked-dir/" \
+			.git/cone.fsm &&
+		test_trace2_data fsmonitor semantic/attributes-cone 1 \
+			<.git/cone.trace &&
+
+		rm .git/report-cone &&
+		> .git/report-unmatched &&
+		GIT_TRACE2_EVENT="$PWD/.git/unmatched.trace" \
+		GIT_TRACE_FSMONITOR="$PWD/.git/unmatched.fsm" \
+			git status --porcelain=v2 >.git/unmatched.actual &&
+		test_must_be_empty .git/unmatched.actual &&
+		test_grep "fsmonitor_refresh_callback.*untracked/" \
+			.git/unmatched.fsm &&
+		test_grep ! \
+			"\"category\":\"fsmonitor\",\"key\":\"semantic/attributes-cone\"" \
+			.git/unmatched.trace
+	)
+'
+
+test_expect_success 'directory events invalidate cached attributes' '
+	test_create_repo directory-attribute-cache &&
+	(
+		cd directory-attribute-cache &&
+		mkdir tracked-dir &&
+		test_write_lines "tracked marker=old" \
+			>tracked-dir/.gitattributes &&
+		test_write_lines tracked >tracked-dir/tracked &&
+		git add tracked-dir &&
+		git commit -m base &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "new-token\0tracked-dir/\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		test-tool read-cache \
+			--test-fsmonitor-directory-attributes
+	)
+'
+
+test_expect_success HARDLINKS,!MINGW,!CYGWIN \
+	'multiply-linked files stay fsmonitor-invalid' '
+	test_when_finished "rm -f hardlink-alias" &&
+	test_create_repo hardlink-validity &&
+	(
+		cd hardlink-validity &&
+		echo content >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		ln tracked ../hardlink-alias &&
+		test_hook --setup fsmonitor-test <<-\EOF &&
+			printf "token\0"
+		EOF
+		git config core.fsmonitor .git/hooks/fsmonitor-test &&
+		git config core.fsmonitorHookVersion 2 &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		git ls-files -f >.git/flags &&
+		test_grep "^H tracked$" .git/flags &&
+		echo changed >>../hardlink-alias &&
+		git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'second closing-query change reprimes untracked cache' '
+	test_when_finished "rm -rf second-query-changed" &&
+	test_create_repo second-query-changed &&
+	(
+		cd second-query-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines "*.ignored" >.gitignore &&
+		test_write_lines "*.ignored" >cached/.gitignore &&
+		printf "aaaa\n" >cached/tracked &&
+		test_write_lines ignored >cached/junk.ignored &&
+		git add .gitignore cached/.gitignore cached/tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/prime &&
+		test_must_be_empty .git/prime &&
+		test-tool chmtime =-60 cached/tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get cached/tracked) &&
+		printf "bbbb\n" >cached/tracked &&
+		test-tool chmtime =$mtime cached/tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid cached/tracked &&
+		test_grep ! FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_line_count = 1 .git/actual &&
+		test_grep "^1 \.M .* cached/tracked$" .git/actual &&
+		test_trace2_data status fsmonitor_token/semantic-closed 1 \
+			<.git/status.trace &&
+		test_trace2_data status \
+			fsmonitor_token/untracked-after-semantic 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/apply_count 1 \
+			<.git/status.trace &&
+		test_trace2_data status \
+			fsmonitor_token/untracked-after-retry 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success PTHREADS,UNTRACKED_CACHE,SHA1 'load cache-tree and untracked-cache extensions in parallel' '
+	test_create_repo parallel-extensions &&
+	(
+		cd parallel-extensions &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir dir &&
+		echo tracked >dir/tracked &&
+		git config index.threads 4 &&
+		git add dir/tracked &&
+		git commit -m initial &&
+		git config core.untrackedCache true &&
+		git status --porcelain >/dev/null &&
+		echo modified >>dir/tracked &&
+		echo untracked >dir/untracked &&
+		GIT_TEST_INDEX_THREADS=1 \
+		git --no-optional-locks status --porcelain >"$TRASH_DIRECTORY/parallel-serial.status" &&
+		GIT_TEST_INDEX_THREADS=1 \
+		test-tool dump-cache-tree >"$TRASH_DIRECTORY/parallel-serial.tree" &&
+		GIT_TEST_INDEX_THREADS=1 \
+		test-tool dump-untracked-cache >"$TRASH_DIRECTORY/parallel-serial.untracked" &&
+		GIT_TEST_INDEX_THREADS=4 \
+		GIT_TEST_PARALLEL_INDEX_EXTENSIONS=1 \
+		GIT_TRACE2_EVENT="$TRASH_DIRECTORY/parallel-extensions.trace" \
+		git --no-optional-locks status --porcelain >"$TRASH_DIRECTORY/parallel-parallel.status" &&
+		GIT_TEST_INDEX_THREADS=4 GIT_TEST_PARALLEL_INDEX_EXTENSIONS=1 \
+		test-tool dump-cache-tree >"$TRASH_DIRECTORY/parallel-parallel.tree" &&
+		GIT_TEST_INDEX_THREADS=4 GIT_TEST_PARALLEL_INDEX_EXTENSIONS=1 \
+		test-tool dump-untracked-cache >"$TRASH_DIRECTORY/parallel-parallel.untracked" &&
+		test_grep "extension/parallel/tree-untracked" \
+			"$TRASH_DIRECTORY/parallel-extensions.trace" &&
+		test_cmp "$TRASH_DIRECTORY/parallel-serial.status" \
+			 "$TRASH_DIRECTORY/parallel-parallel.status" &&
+		test_cmp "$TRASH_DIRECTORY/parallel-serial.tree" \
+			 "$TRASH_DIRECTORY/parallel-parallel.tree" &&
+		test_cmp "$TRASH_DIRECTORY/parallel-serial.untracked" \
+			 "$TRASH_DIRECTORY/parallel-parallel.untracked"
 	)
 '
 

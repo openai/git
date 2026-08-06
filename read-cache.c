@@ -16,6 +16,7 @@
 #include "tempfile.h"
 #include "lockfile.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "refs.h"
 #include "dir.h"
 #include "object-file.h"
@@ -71,6 +72,8 @@
 #define CACHE_EXT_LINK 0x6c696e6b	  /* "link" */
 #define CACHE_EXT_UNTRACKED 0x554E5452	  /* "UNTR" */
 #define CACHE_EXT_FSMONITOR 0x46534D4E	  /* "FSMN" */
+#define CACHE_EXT_FSMONITOR_CONFIG 0x46534346 /* "FSCF" */
+#define CACHE_EXT_FSMONITOR_UNTRACKED 0x46535543 /* "FSUC" */
 #define CACHE_EXT_ENDOFINDEXENTRIES 0x454F4945	/* "EOIE" */
 #define CACHE_EXT_INDEXENTRYOFFSETTABLE 0x49454F54 /* "IEOT" */
 #define CACHE_EXT_SPARSE_DIRECTORIES 0x73646972 /* "sdir" */
@@ -199,8 +202,33 @@ void fill_stat_cache_info(struct index_state *istate, struct cache_entry *ce, st
 
 	if (S_ISREG(st->st_mode)) {
 		ce_mark_uptodate(ce);
-		mark_fsmonitor_valid(istate, ce);
+		if (fsmonitor_stat_can_be_valid(st))
+			mark_fsmonitor_valid(istate, ce);
 	}
+}
+
+static struct cache_entry *make_refreshed_cache_entry(
+	struct index_state *istate, const struct cache_entry *ce,
+	struct stat *st, int preserve_valid)
+{
+	struct cache_entry *updated =
+		make_empty_cache_entry(istate, ce_namelen(ce));
+
+	copy_cache_entry(updated, ce);
+	memcpy(updated->name, ce->name, ce->ce_namelen + 1);
+	fill_stat_cache_info(istate, updated, st);
+	/* Do not let assume-unchanged reacquire a caller-cleared CE_VALID. */
+	if (preserve_valid && assume_unchanged &&
+	    !(ce->ce_flags & CE_VALID))
+		updated->ce_flags &= ~CE_VALID;
+	return updated;
+}
+
+void refresh_index_entry_stat(struct index_state *istate, int nr,
+			      struct stat *st)
+{
+	replace_index_entry(istate, nr, make_refreshed_cache_entry(
+		istate, istate->cache[nr], st, 1));
 }
 
 static unsigned int st_mode_from_ce(const struct cache_entry *ce)
@@ -489,6 +517,32 @@ int ie_modified(struct index_state *istate,
 	changed_fs = ce_modified_check_fs(istate, ce, st);
 	if (changed_fs)
 		return changed | changed_fs;
+	return 0;
+}
+
+int ie_match_stat_with_content_check(struct index_state *istate,
+				     const struct cache_entry *ce,
+				     struct stat *st, unsigned int options)
+{
+	struct cache_entry *current;
+	int changed, pos;
+
+	if (S_ISGITLINK(ce->ce_mode) ||
+	    !(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED))
+		return ie_match_stat(istate, ce, st, options);
+
+	changed = ie_modified(istate, ce, st, options);
+	if (changed)
+		return changed;
+
+	pos = index_name_pos(istate, ce->name, ce_namelen(ce));
+	if (pos < 0 || istate->cache[pos] != ce)
+		return 0;
+
+	current = istate->cache[pos];
+	fill_stat_data(&current->ce_stat_data, st);
+	current->ce_flags |= CE_UPDATE_IN_BASE;
+	istate->cache_changed |= CE_ENTRY_CHANGED;
 	return 0;
 }
 
@@ -1415,7 +1469,8 @@ static struct cache_entry *refresh_cache_ent(struct index_state *istate,
 			 */
 			if (!S_ISGITLINK(ce->ce_mode)) {
 				ce_mark_uptodate(ce);
-				mark_fsmonitor_valid(istate, ce);
+				if (fsmonitor_stat_can_be_valid(&st))
+					mark_fsmonitor_valid(istate, ce);
 			}
 			return ce;
 		}
@@ -1429,19 +1484,7 @@ static struct cache_entry *refresh_cache_ent(struct index_state *istate,
 		return NULL;
 	}
 
-	updated = make_empty_cache_entry(istate, ce_namelen(ce));
-	copy_cache_entry(updated, ce);
-	memcpy(updated->name, ce->name, ce->ce_namelen + 1);
-	fill_stat_cache_info(istate, updated, &st);
-	/*
-	 * If ignore_valid is not set, we should leave CE_VALID bit
-	 * alone.  Otherwise, paths marked with --no-assume-unchanged
-	 * (i.e. things to be edited) will reacquire CE_VALID bit
-	 * automatically, which is not really what we want.
-	 */
-	if (!ignore_valid && assume_unchanged &&
-	    !(ce->ce_flags & CE_VALID))
-		updated->ce_flags &= ~CE_VALID;
+	updated = make_refreshed_cache_entry(istate, ce, &st, !ignore_valid);
 
 	/* istate->cache_changed is updated in the caller */
 	return updated;
@@ -1521,7 +1564,7 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 	 * cache entries quickly then in the single threaded loop below,
 	 * we only have to do the special cases that are left.
 	 */
-	preload_index(istate, pathspec, 0);
+	preload_index(istate, pathspec, flags & REFRESH_DEFER_BULK_DIRTY);
 	trace2_region_enter("index", "refresh", NULL);
 
 	for (i = 0; i < istate->cache_nr; i++) {
@@ -1565,6 +1608,23 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 		if (filtered)
 			continue;
 
+		if ((flags & REFRESH_DEFER_BULK_DIRTY) &&
+		    istate->preload_bulk_tracked_nr == istate->cache_nr) {
+			unsigned char state =
+				istate->preload_bulk_tracked_state[i];
+
+			if (istate->preload_bulk_provider_pending &&
+			    state == PRELOAD_BULK_TRACKED_CLEAN)
+				continue;
+			if (state == PRELOAD_BULK_TRACKED_CONTENT_CHECK) {
+				ce->ce_flags |= CE_CONTENT_CHECK_REQUIRED;
+				continue;
+			}
+			if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED ||
+			    state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED)
+				continue;
+		}
+
 		new_entry = refresh_cache_ent(istate, ce, options,
 					      &cache_errno, &changed,
 					      &t2_did_lstat, &t2_did_scan);
@@ -1602,7 +1662,17 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 			continue;
 		}
 
-		replace_index_entry(istate, i, new_entry);
+		{
+			int baseline_valid =
+				clean_status_fsmonitor_semantic_baseline_pending(
+					istate) &&
+				(new_entry->ce_flags & CE_FSMONITOR_VALID);
+
+			replace_index_entry(istate, i, new_entry);
+			if (baseline_valid)
+				mark_fsmonitor_valid(istate,
+						     istate->cache[i]);
+		}
 	}
 	trace2_data_intmax("index", NULL, "refresh/sum_lstat", t2_sum_lstat);
 	trace2_data_intmax("index", NULL, "refresh/sum_scan", t2_sum_scan);
@@ -1748,6 +1818,12 @@ static int read_index_extension(struct index_state *istate,
 		break;
 	case CACHE_EXT_FSMONITOR:
 		read_fsmonitor_extension(istate, data, sz);
+		break;
+	case CACHE_EXT_FSMONITOR_CONFIG:
+		clean_status_read_fsmonitor_config(istate, data, sz);
+		break;
+	case CACHE_EXT_FSMONITOR_UNTRACKED:
+		read_fsmonitor_untracked_extension(istate, data, sz);
 		break;
 	case CACHE_EXT_ENDOFINDEXENTRIES:
 	case CACHE_EXT_INDEXENTRYOFFSETTABLE:
@@ -1950,6 +2026,8 @@ static void post_read_index_from(struct index_state *istate)
 	check_ce_order(istate);
 	tweak_untracked_cache(istate);
 	tweak_split_index(istate);
+	prepare_fsmonitor_untracked(istate);
+	clean_status_prepare_fsmonitor_config(istate);
 	tweak_fsmonitor(istate);
 }
 
@@ -1994,30 +2072,149 @@ struct load_index_extensions
 	const char *mmap;
 	size_t mmap_size;
 	unsigned long src_offset;
+	int allow_parallel;
+	int force_parallel;
 };
+
+struct load_index_extension {
+	pthread_t pthread;
+	struct index_state *istate;
+	const char *ext;
+	const char *data;
+	unsigned long size;
+	int result;
+};
+
+#define PARALLEL_INDEX_EXTENSION_THRESHOLD (1024 * 1024)
+
+static void *load_one_index_extension(void *_data)
+{
+	struct load_index_extension *p = _data;
+
+	trace2_thread_start("index-extension");
+	trace2_data_intmax("index", p->istate->repo,
+			   "extension/parallel/tree-untracked", 1);
+	p->result = read_index_extension(p->istate, p->ext, p->data, p->size);
+	trace2_thread_exit();
+	return NULL;
+}
+
+/*
+ * TREE and UNTR are usually the two largest index extensions.  They read the
+ * same immutable mmap but publish to separate index_state fields, so they can
+ * be decoded concurrently.  Keep split indexes on the established serial
+ * path because LINK changes how the completed index is assembled.
+ */
+static int find_parallel_index_extensions(struct load_index_extensions *p,
+					  struct load_index_extension *tree)
+{
+	size_t offset = p->src_offset;
+	size_t end = p->mmap_size - the_hash_algo->rawsz;
+	int tree_nr = 0, untracked_nr = 0, link_nr = 0;
+	uint32_t untracked_size = 0;
+
+	if (!p->allow_parallel)
+		return 0;
+
+	while (offset <= end - 8) {
+		const char *ext = p->mmap + offset;
+		uint32_t size = get_be32(ext + 4);
+
+		if (size > end - offset - 8)
+			return 0;
+
+		switch (CACHE_EXT(ext)) {
+		case CACHE_EXT_TREE:
+			tree_nr++;
+			tree->istate = p->istate;
+			tree->ext = ext;
+			tree->data = ext + 8;
+			tree->size = size;
+			break;
+		case CACHE_EXT_UNTRACKED:
+			untracked_nr++;
+			untracked_size = size;
+			break;
+		case CACHE_EXT_LINK:
+			link_nr++;
+			break;
+		}
+
+		offset += 8 + size;
+	}
+
+	return offset == end && tree_nr == 1 && untracked_nr == 1 && !link_nr &&
+		(p->force_parallel ||
+		 (tree->size >= PARALLEL_INDEX_EXTENSION_THRESHOLD &&
+		  untracked_size >= PARALLEL_INDEX_EXTENSION_THRESHOLD));
+}
 
 static void *load_index_extensions(void *_data)
 {
 	struct load_index_extensions *p = _data;
-	unsigned long src_offset = p->src_offset;
+	size_t src_offset = p->src_offset;
+	size_t end;
+	struct load_index_extension tree = { 0 };
+	int tree_thread = 0;
+	int extension_error = 0;
 
-	while (src_offset <= p->mmap_size - the_hash_algo->rawsz - 8) {
+	if (p->mmap_size < the_hash_algo->rawsz) {
+		extension_error = 1;
+		goto join_tree;
+	}
+	end = p->mmap_size - the_hash_algo->rawsz;
+	if (src_offset > end) {
+		extension_error = 1;
+		goto join_tree;
+	}
+	if (find_parallel_index_extensions(p, &tree) &&
+	    !pthread_create(&tree.pthread, NULL, load_one_index_extension, &tree)) {
+		tree_thread = 1;
+	}
+
+	while (src_offset < end) {
 		/* After an array of active_nr index entries,
 		 * there can be arbitrary number of extended
 		 * sections, each of which is prefixed with
 		 * extension name (4-byte) and section length
 		 * in 4-byte network byte order.
 		 */
-		uint32_t extsize = get_be32(p->mmap + src_offset + 4);
-		if (read_index_extension(p->istate,
-					 p->mmap + src_offset,
-					 p->mmap + src_offset + 8,
-					 extsize) < 0) {
-			munmap((void *)p->mmap, p->mmap_size);
-			die(_("index file corrupt"));
+		uint32_t extsize;
+		const char *ext = p->mmap + src_offset;
+
+		if (end - src_offset < 8) {
+			extension_error = 1;
+			break;
 		}
-		src_offset += 8;
-		src_offset += extsize;
+		extsize = get_be32(ext + 4);
+		if (extsize > end - src_offset - 8) {
+			extension_error = 1;
+			break;
+		}
+		if ((!tree_thread || CACHE_EXT(ext) != CACHE_EXT_TREE) &&
+		    read_index_extension(p->istate, ext, ext + 8, extsize) < 0) {
+			extension_error = 1;
+			break;
+		}
+		src_offset += 8 + extsize;
+	}
+	if (src_offset != end)
+		extension_error = 1;
+
+join_tree:
+	if (tree_thread) {
+		int err = pthread_join(tree.pthread, NULL);
+
+		if (err)
+			die(_("unable to join load_index_extension thread: %s"),
+			    strerror(err));
+		if (tree.result < 0)
+			extension_error = 1;
+	}
+
+	if (extension_error) {
+		munmap((void *)p->mmap, p->mmap_size);
+		die(_("index file corrupt"));
 	}
 
 	return NULL;
@@ -2208,6 +2405,7 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	int nr_threads, cpus;
 	struct index_entry_offset_table *ieot = NULL;
 
+	clean_status_attach_config(istate);
 	if (istate->initialized)
 		return istate->cache_nr;
 
@@ -2225,6 +2423,7 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 
 	if (fstat(fd, &st))
 		die_errno(_("%s: cannot stat the open index"), path);
+	clean_status_record_source_identity(istate, &st);
 
 	mmap_size = xsize_t(st.st_size);
 	if (mmap_size < sizeof(struct cache_header) + the_hash_algo->rawsz)
@@ -2251,6 +2450,8 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	p.istate = istate;
 	p.mmap = mmap;
 	p.mmap_size = mmap_size;
+	p.allow_parallel = 0;
+	p.force_parallel = git_env_bool("GIT_TEST_PARALLEL_INDEX_EXTENSIONS", 0);
 
 	src_offset = sizeof(*hdr);
 
@@ -2272,13 +2473,21 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 		extension_offset = read_eoie_extension(mmap, mmap_size);
 		if (extension_offset) {
 			int err;
+			struct load_index_extension tree = { 0 };
 
 			p.src_offset = extension_offset;
+			/* Keep at least two workers available for cache entries. */
+			p.allow_parallel = nr_threads > 3;
+			if (p.allow_parallel)
+				p.allow_parallel =
+					find_parallel_index_extensions(&p, &tree);
 			err = pthread_create(&p.pthread, NULL, load_index_extensions, &p);
 			if (err)
 				die(_("unable to create load_index_extensions thread: %s"), strerror(err));
 
 			nr_threads--;
+			if (p.allow_parallel)
+				nr_threads--;
 		}
 	}
 
@@ -2438,6 +2647,11 @@ void release_index(struct index_state *istate)
 	free_name_hash(istate);
 	cache_tree_free(&(istate->cache_tree));
 	free(istate->fsmonitor_last_update);
+	free(istate->fsmonitor_last_update_pending);
+	free(istate->fsmonitor_untracked_token);
+	clean_status_release(istate);
+	free(istate->preload_bulk_tracked_state);
+	free(istate->preload_bulk_stat_updates);
 	free(istate->cache);
 	discard_split_index(istate);
 	free_untracked_cache(istate->untracked);
@@ -2711,6 +2925,9 @@ static int verify_index_from(const struct index_state *istate, const char *path)
 
 	if (st.st_size < sizeof(struct cache_header) + the_hash_algo->rawsz)
 		goto out;
+	if (is_null_oid(&istate->oid) &&
+	    !clean_status_verify_null_index(istate, &st))
+		goto out;
 
 	n = pread_in_full(fd, hash, the_hash_algo->rawsz, st.st_size - the_hash_algo->rawsz);
 	if (n != the_hash_algo->rawsz)
@@ -2793,6 +3010,7 @@ enum write_extensions {
 	WRITE_RESOLVE_UNDO_EXTENSION =    1<<2,
 	WRITE_UNTRACKED_CACHE_EXTENSION = 1<<3,
 	WRITE_FSMONITOR_EXTENSION =       1<<4,
+	WRITE_FSCF_EXTENSION =            1<<5,
 };
 #define WRITE_ALL_EXTENSIONS ((enum write_extensions)-1)
 
@@ -3038,6 +3256,35 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 
 		write_fsmonitor_extension(&sb, istate);
 		err = write_index_ext_header(f, eoie_c, CACHE_EXT_FSMONITOR, sb.len) < 0;
+		hashwrite(f, sb.buf, sb.len);
+		if (err) {
+			ret = -1;
+			goto out;
+		}
+	}
+	if (write_extensions & WRITE_FSMONITOR_EXTENSION &&
+	    istate->untracked &&
+	    istate->fsmonitor_last_update &&
+	    istate->fsmonitor_untracked_valid) {
+		strbuf_reset(&sb);
+
+		write_fsmonitor_untracked_extension(&sb, istate);
+		err = write_index_ext_header(f, eoie_c,
+					     CACHE_EXT_FSMONITOR_UNTRACKED,
+					     sb.len) < 0;
+		hashwrite(f, sb.buf, sb.len);
+		if (err) {
+			ret = -1;
+			goto out;
+		}
+	}
+	if (write_extensions & WRITE_FSCF_EXTENSION &&
+	    clean_status_should_write_fsmonitor_config(istate)) {
+		strbuf_reset(&sb);
+		clean_status_write_fsmonitor_config(&sb, istate);
+		err = write_index_ext_header(f, eoie_c,
+					     CACHE_EXT_FSMONITOR_CONFIG,
+					     sb.len) < 0;
 		hashwrite(f, sb.buf, sb.len);
 		if (err) {
 			ret = -1;
@@ -3498,6 +3745,7 @@ void *read_blob_data_from_index(struct index_state *istate,
 
 void move_index_extensions(struct index_state *dst, struct index_state *src)
 {
+	clean_status_copy_fsmonitor_history(dst, src);
 	dst->untracked = src->untracked;
 	src->untracked = NULL;
 	dst->cache_tree = src->cache_tree;
