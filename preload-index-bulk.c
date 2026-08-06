@@ -45,6 +45,7 @@ int preload_bulk_test_barrier(struct preload_bulk_scan *scan,
 			      const char *path)
 {
 	struct strbuf buf = STRBUF_INIT;
+	int fd;
 	int result;
 
 	if (!scan->test_barrier_path ||
@@ -53,9 +54,12 @@ int preload_bulk_test_barrier(struct preload_bulk_scan *scan,
 	if (!scan->test_barrier_ready || !scan->test_barrier_resume)
 		return -1;
 
+	fd = open(scan->test_barrier_resume, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
 	write_file(scan->test_barrier_ready, "ready");
-	result = strbuf_read_file(&buf, scan->test_barrier_resume, 1) > 0 ?
-		0 : -1;
+	result = strbuf_read(&buf, fd, 1) > 0 ? 0 : -1;
+	close(fd);
 	strbuf_release(&buf);
 	return result;
 }
