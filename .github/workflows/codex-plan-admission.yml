@@ -1,0 +1,156 @@
+name: Codex plan admission
+
+on:
+  # The protected default-branch trampoline calls this only from a
+  # pull_request_target event.  Never call it from pull_request or
+  # pull_request_review, whose workflow file can come from the proposal.
+  workflow_call:
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: codex-plan-admission-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify pinned manifest
+    if: github.event.pull_request.base.ref == 'meta'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out only the trusted meta base
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify reviewed pinned plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PULL_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PULL_DRAFT: ${{ github.event.pull_request.draft }}
+          PULL_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          die () {
+            printf '%s\n' "$*" >&2
+            exit 1
+          }
+
+
+          test "$GITHUB_REPOSITORY" = openai/git ||
+            die "unexpected repository '$GITHUB_REPOSITORY'"
+          test "$BASE_REF" = meta ||
+            die "Codex plan admission only runs against meta"
+          case "$PULL_NUMBER" in
+          ''|*[!0-9]*) die "invalid pull request number '$PULL_NUMBER'" ;;
+          esac
+
+          basic=$(printf 'x-access-token:%s' "$GH_TOKEN" |
+            base64 | tr -d '\n')
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --force --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*' \
+            "$HEAD_SHA"
+          test "$(git rev-parse HEAD)" = "$BASE_SHA" ||
+            die "trusted checkout does not match the pull request base"
+          test "$(git rev-parse refs/remotes/origin/meta)" = "$BASE_SHA" ||
+            die "meta changed while Codex plan admission was starting"
+          git cat-file -e "$HEAD_SHA^{commit}" ||
+            die "could not fetch the pinned plan head"
+
+          changed=$(git diff-tree --no-commit-id --name-only -r \
+            "$BASE_SHA" "$HEAD_SHA")
+          if ! printf '%s\n' "$changed" |
+            grep -Eq '^(codex\.plan|codex-unstable\.plan)$'
+          then
+            printf '%s\n' \
+              "No Codex plan changed; ordinary meta review applies."
+            exit 0
+          fi
+
+          test "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ||
+            die "Codex plan branches must belong to openai/git"
+          case "$HEAD_REF" in
+          codex-plan/*/*)
+            die "Codex plan branch '$HEAD_REF' has a nested suffix"
+            ;;
+          codex-plan/*) ;;
+          *) die "Codex plan branch '$HEAD_REF' is not bot-owned" ;;
+          esac
+          test "$PULL_DRAFT" = false ||
+            die "draft Codex plan pull requests cannot be admitted"
+
+          sh .github/workflows/codex-branch.sh validate-plan-transition \
+            --remote origin --base-commit "$BASE_SHA" \
+            --head-commit "$HEAD_SHA"
+
+          bootstrap=$(git show -s \
+            --format='%(trailers:key=Codex-Plan-Bootstrap,valueonly)' \
+            "$HEAD_SHA" | sed -n '1p')
+          test -z "$bootstrap" ||
+            die "pre-v3 bootstrap is a deployment-only direct transition"
+
+          action=$(git show -s \
+            --format='%(trailers:key=Codex-Plan-Action,valueonly)' \
+            "$HEAD_SHA" | sed -n '1p')
+          case "$action" in
+          add|alter)
+            lane=$(git show -s \
+              --format='%(trailers:key=Codex-Plan-Lane,valueonly)' \
+              "$HEAD_SHA" | sed -n '1p')
+            topic=$(git show -s \
+              --format='%(trailers:key=Codex-Plan-Topic,valueonly)' \
+              "$HEAD_SHA" | sed -n '1p')
+            source_tip=$(git show -s \
+              --format='%(trailers:key=Codex-Plan-Source-Tip,valueonly)' \
+              "$HEAD_SHA" | sed -n '1p')
+            review_pr=$(git show -s \
+              --format='%(trailers:key=Codex-Plan-Review,valueonly)' \
+              "$HEAD_SHA" | sed -n '1p')
+            sh .github/workflows/codex-branch.sh validate-topic-review \
+              --pull-request "$review_pr" --lane "$lane" \
+              --topic "$topic" --source-tip "$source_tip"
+            ;;
+          remove|reorder)
+            printf '%s\n' \
+              "Explicit plan policy change; ordinary meta review applies."
+            ;;
+          *) die "Codex plan transition has unknown action '$action'" ;;
+          esac
+
+          # Re-fetch before the mechanical approval.  Strict required
+          # checks make GitHub rerun this trusted-base gate if meta moves.
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --force --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*'
+          test "$(git rev-parse refs/remotes/origin/meta)" = "$BASE_SHA" ||
+            die "meta changed while Codex plan admission was running"
+          test "$(git rev-parse "refs/remotes/origin/$HEAD_REF")" = \
+            "$HEAD_SHA" ||
+            die "Codex plan branch moved while admission was running"
+          sh .github/workflows/codex-branch.sh validate-plan-transition \
+            --remote origin --base-commit "$BASE_SHA" \
+            --head-commit "$HEAD_SHA"
+          case "$action" in
+          add|alter)
+            sh .github/workflows/codex-branch.sh validate-topic-review \
+              --pull-request "$review_pr" --lane "$lane" \
+              --topic "$topic" --source-tip "$source_tip"
+            gh pr review "$PULL_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --approve \
+              --body "Mechanical projection of reviewed topic PR #$review_pr at $source_tip."
+            ;;
+          remove|reorder)
+            :
+            ;;
+          esac
