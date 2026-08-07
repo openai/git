@@ -1,0 +1,44 @@
+[plan]
+	version = 1
+	lane = codex
+	base-ref = refs/heads/master
+	topic = refs/heads/tb/codex/automation
+	topic = refs/heads/tb/codex/geometric-maintenance-promisor
+	topic = refs/heads/tb/codex/release
+	topic = refs/heads/dr/codex/dugite
+	topic = refs/heads/tb/codex/lto-pgo
+
+[branch "tb/codex/automation"]
+	remote = .
+	source-ref = refs/heads/tb/codex/automation
+	source-tip = 5cd3b3771c0aac541add6fc3a7a97bcfe1749cbb
+	source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7
+	merge = refs/heads/master
+
+[branch "tb/codex/geometric-maintenance-promisor"]
+	remote = .
+	source-ref = refs/heads/tb/codex/geometric-maintenance-promisor
+	source-tip = dc2fffc37cead551f8036c9ecab5e52a4cbee37b
+	source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7
+	merge = refs/heads/master
+
+[branch "tb/codex/release"]
+	remote = .
+	source-ref = refs/heads/tb/codex/release
+	source-tip = ba107e0ae8c7142238bb612e530d51d42f0280d3
+	source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7
+	merge = refs/heads/master
+
+[branch "dr/codex/dugite"]
+	remote = .
+	source-ref = refs/heads/dr/codex/dugite
+	source-tip = 988cecced01f69765d599a2d6c023406af98fa1b
+	source-base = ba107e0ae8c7142238bb612e530d51d42f0280d3
+	merge = refs/heads/tb/codex/release
+
+[branch "tb/codex/lto-pgo"]
+	remote = .
+	source-ref = refs/heads/tb/codex/lto-pgo
+	source-tip = 88fcb4ac12c583bedf010e97ebf83cec240e3120
+	source-base = ba107e0ae8c7142238bb612e530d51d42f0280d3
+	merge = refs/heads/tb/codex/release
