@@ -38,8 +38,10 @@ active topics belong in `codex`.
 
 An add or alter has one human decision: the topic PR. The pull request is
 review-only because the output-lane rulesets reject ordinary updates. When an
-approval is submitted, GitHub loads the review-event workflow from the
-trusted default branch rather than from the topic head. That trusted run:
+approval is submitted, a scheduled scanner on the trusted default branch
+notices the exact approved head and runs the plan producer. Operators can
+dispatch the same scan immediately when waiting five minutes is undesirable.
+That trusted run:
 
 1. rechecks that the PR is open, same-repository, non-draft, aimed at the
    matching lane, and overall `APPROVED`;
@@ -89,8 +91,8 @@ git push -u origin HEAD
 ```
 
 Open the topic PR against `codex` or `codex-unstable` and obtain approval.
-Do not click merge; the output branch cannot accept it. The approval event
-creates the pinned plan PR automatically.
+Do not click merge; the output branch cannot accept it. The next trusted
+scan creates the pinned plan PR automatically.
 
 For a local diagnostic of the same projection:
 
@@ -139,11 +141,11 @@ closed instead of flattening the reviewed DAG.
 
 Exactly one stable topic named `??/codex/automation` must be based directly
 on `master` and change only `.github/workflows/codex.yml`. Its canonical
-workflow is the default-branch trampoline that:
+default-branch trampoline:
 
 - dispatches ordinary refresh;
-- turns an approved topic PR into a trusted default-branch dispatch, which
-  then creates the automatic add/alter proposal;
+- scans exact approved topic PRs from the trusted default branch and creates
+  one automatic add/alter proposal at a time;
 - offers explicit remove/reorder dispatch inputs; and
 - runs plan admission through `pull_request_target` while loading the
   reusable implementation from `meta`.
@@ -153,11 +155,11 @@ that trampoline. During migration, the controller accepts the previous
 trampoline as published history, but it refuses the first v3 refresh until the
 plan pins the current trampoline.
 
-The topic head never supplies executable workflow code. The trusted
-`pull_request_review` run only queues `codex.yml` at `refs/heads/codex`; the
-resulting default-branch dispatch calls the reusable producer from `meta`.
-That producer revalidates the PR before the `codex-plan` environment is
-opened.
+No topic merge ref runs the pinning path. The default-branch scanner checks
+each open approved PR with the trusted `meta` controller, skips tips already
+present in the active plans or represented by an open plan PR, and only then
+calls the reusable producer from `meta`. The producer revalidates the exact
+approval again before it writes a pin or plan branch.
 
 ## One-time v2 to v3 rollout
 
