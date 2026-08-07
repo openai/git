@@ -376,16 +376,18 @@ write_automation_workflow () {
 name: Refresh codex
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       operation:
-        description: Refresh, remove, reorder, or internal topic review
+        description: Refresh, scan, remove, or reorder a pinned topic
         type: choice
         options:
           - refresh
+          - scan
           - remove
           - reorder
-          - topic-review
         default: refresh
       lane:
         description: codex or codex-unstable for a plan operation
@@ -393,14 +395,6 @@ on:
         type: string
       topic:
         description: Exact topic branch for a plan operation
-        required: false
-        type: string
-      source_tip:
-        description: Exact reviewed source SHA for internal topic review
-        required: false
-        type: string
-      review_pr:
-        description: Topic PR number for internal topic review
         required: false
         type: string
       after:
@@ -411,9 +405,6 @@ on:
         description: Optional codex-plan/* branch name
         required: false
         type: string
-  pull_request_review:
-    types:
-      - submitted
   pull_request_target:
     branches:
       - meta
@@ -432,56 +423,174 @@ jobs:
   refresh:
     if: >-
       github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/codex' &&
       inputs.operation == 'refresh'
     uses: openai/git/.github/workflows/codex.yml@meta
-  topic_plan_dispatch:
-    name: Queue reviewed topic plan
+  topic_plan_scan:
+    name: Find one approved topic plan
     if: >-
-      github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      (github.event.pull_request.base.ref == 'codex' ||
-       github.event.pull_request.base.ref == 'codex-unstable')
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/codex' &&
+       inputs.operation == 'scan')
     runs-on: ubuntu-24.04
     permissions:
-      actions: write
       contents: read
+      pull-requests: read
+    concurrency:
+      group: codex-topic-plan-scan
+      cancel-in-progress: false
+    outputs:
+      lane: ${{ steps.reviewed.outputs.lane }}
+      topic: ${{ steps.reviewed.outputs.topic }}
+      source_tip: ${{ steps.reviewed.outputs.source_tip }}
+      review_pr: ${{ steps.reviewed.outputs.review_pr }}
     env:
       GH_TOKEN: ${{ github.token }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      LANE: ${{ github.event.pull_request.base.ref }}
-      TOPIC: ${{ github.event.pull_request.head.ref }}
-      SOURCE_TIP: ${{ github.event.pull_request.head.sha }}
-      REVIEW_PR: ${{ github.event.pull_request.number }}
     steps:
-      - name: Queue trusted plan proposal
+      - name: Pin trusted meta
+        id: meta
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = openai/git
-          test "$DEFAULT_BRANCH" = codex
-          gh workflow run codex.yml --repo "$GITHUB_REPOSITORY" \
-            --ref "$DEFAULT_BRANCH" \
-            -f operation=topic-review \
-            -f lane="$LANE" \
-            -f topic="$TOPIC" \
-            -f source_tip="$SOURCE_TIP" \
-            -f review_pr="$REVIEW_PR"
+          test "$GITHUB_REF" = refs/heads/codex
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+            --jq .object.sha)
+          case "$sha" in
+          ''|*[!0-9a-f]*) exit 1 ;;
+          esac
+          test "${#sha}" = 40
+          printf 'sha=%s\n' "$sha" >>"$GITHUB_OUTPUT"
+
+      - name: Check out trusted meta
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.meta.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find one exact approved topic PR
+        id: reviewed
+        env:
+          META_SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          die () {
+            printf '%s\n' "$*" >&2
+            exit 1
+          }
+
+          test "$GITHUB_REPOSITORY" = openai/git
+          test "$GITHUB_REF" = refs/heads/codex ||
+            die "topic scan must run from the trusted default branch"
+          test "$(git rev-parse HEAD)" = "$META_SHA" ||
+            die "trusted checkout does not match pinned meta"
+          gh auth setup-git
+          mkdir -p "$RUNNER_TEMP/codex-plan-scan"
+          for lane in codex codex-unstable
+          do
+            case "$lane" in
+            codex) plan=codex.plan ;;
+            codex-unstable) plan=codex-unstable.plan ;;
+            esac
+            test -f "$plan" ||
+              die "trusted meta has no $plan"
+            gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --base "$lane" --limit 1000 \
+              --json number,isDraft,headRefName,headRefOid,headRepository,reviewDecision |
+              jq -r --arg lane "$lane" '
+                .[] |
+                select(.isDraft | not) |
+                select(.reviewDecision == "APPROVED") |
+                select(.headRepository.nameWithOwner == "openai/git") |
+                [$lane, .headRefName, .headRefOid,
+                 (.number | tostring)] | @tsv
+              '
+          done | sort -k4,4n >"$RUNNER_TEMP/codex-plan-scan/candidates"
+
+          while IFS=$'\t' read -r lane topic source_tip review_pr
+          do
+            test -n "$review_pr" || continue
+            case "$review_pr" in
+            *[!0-9]*) die "approved topic PR has invalid number '$review_pr'" ;;
+            esac
+            case "$source_tip" in
+            *[!0-9a-f]*|'') die "approved topic PR has invalid source SHA" ;;
+            esac
+            test "${#source_tip}" = 40 ||
+              die "approved topic PR has invalid source SHA"
+            git check-ref-format "refs/heads/$topic" >/dev/null 2>&1 ||
+              die "approved topic PR has invalid branch '$topic'"
+            case "$topic" in
+            ??/codex/*) ;;
+            *) continue ;;
+            esac
+            suffix=${topic#??/codex/}
+            case "$suffix" in
+            ''|*/*|*-wip|*-stale) continue ;;
+            esac
+            case "$lane" in
+            codex)
+              case "$topic" in
+              *-unstable) continue ;;
+              esac
+              plan=codex.plan
+              ;;
+            codex-unstable)
+              case "$topic" in
+              *-unstable) ;;
+              *) continue ;;
+              esac
+              plan=codex-unstable.plan
+              ;;
+            *) die "approved topic PR has invalid lane '$lane'" ;;
+            esac
+            pinned=$(git config --no-includes \
+              --file "$plan" \
+              --get "branch.$topic.source-tip" || :)
+            test "$pinned" = "$source_tip" && continue
+            short=$(printf '%.12s' "$source_tip")
+            slug=${topic##*/}
+            plan_branch=codex-plan/$lane-$slug-$short
+            pending=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+              --state open --base meta --head "$plan_branch" \
+              --json number --jq '.[0].number // empty') ||
+              die "could not inspect pending Codex plan PR"
+            test -n "$pending" && continue
+            if ! sh .github/workflows/codex-branch.sh propose-plan \
+              --remote origin --lane "$lane" --topic "$topic" \
+              --action auto --source-tip "$source_tip" \
+              --review-pr "$review_pr" --expected-meta "$META_SHA" \
+              --no-push >/dev/null
+            then
+              printf 'skipping approved topic PR #%s: preflight failed\n' \
+                "$review_pr" >&2
+              continue
+            fi
+            {
+              printf 'lane=%s\n' "$lane"
+              printf 'topic=%s\n' "$topic"
+              printf 'source_tip=%s\n' "$source_tip"
+              printf 'review_pr=%s\n' "$review_pr"
+            } >>"$GITHUB_OUTPUT"
+            exit 0
+          done <"$RUNNER_TEMP/codex-plan-scan/candidates"
   topic_plan_propose:
     name: Propose reviewed topic plan
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/codex' &&
-      inputs.operation == 'topic-review'
+    needs: topic_plan_scan
+    if: needs.topic_plan_scan.outputs.review_pr != ''
     permissions:
       contents: read
       pull-requests: read
     uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
     with:
-      lane: ${{ inputs.lane }}
-      topic: ${{ inputs.topic }}
+      lane: ${{ needs.topic_plan_scan.outputs.lane }}
+      topic: ${{ needs.topic_plan_scan.outputs.topic }}
       action: auto
-      source_tip: ${{ inputs.source_tip }}
-      review_pr: ${{ inputs.review_pr }}
+      source_tip: ${{ needs.topic_plan_scan.outputs.source_tip }}
+      review_pr: ${{ needs.topic_plan_scan.outputs.review_pr }}
   policy_plan_propose:
     name: Propose explicit plan policy
     if: >-

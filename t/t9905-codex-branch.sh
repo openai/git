@@ -77,142 +77,10 @@ write_automation_workflow () {
 }
 
 write_reviewed_automation_workflow () {
-	cat >"$1" <<-'EOF'
-name: Refresh codex
-
-on:
-  workflow_dispatch:
-    inputs:
-      operation:
-        description: Refresh, remove, reorder, or internal topic review
-        type: choice
-        options:
-          - refresh
-          - remove
-          - reorder
-          - topic-review
-        default: refresh
-      lane:
-        description: codex or codex-unstable for a plan operation
-        required: false
-        type: string
-      topic:
-        description: Exact topic branch for a plan operation
-        required: false
-        type: string
-      source_tip:
-        description: Exact reviewed source SHA for internal topic review
-        required: false
-        type: string
-      review_pr:
-        description: Topic PR number for internal topic review
-        required: false
-        type: string
-      after:
-        description: Existing topic or root for reorder
-        required: false
-        type: string
-      plan_branch:
-        description: Optional codex-plan/* branch name
-        required: false
-        type: string
-  pull_request_review:
-    types:
-      - submitted
-  pull_request_target:
-    branches:
-      - meta
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
-
-permissions:
-  actions: read
-  contents: read
-  pull-requests: read
-
-jobs:
-  refresh:
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      inputs.operation == 'refresh'
-    uses: openai/git/.github/workflows/codex.yml@meta
-  topic_plan_dispatch:
-    name: Queue reviewed topic plan
-    if: >-
-      github.event_name == 'pull_request_review' &&
-      github.event.review.state == 'approved' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      (github.event.pull_request.base.ref == 'codex' ||
-       github.event.pull_request.base.ref == 'codex-unstable')
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      LANE: ${{ github.event.pull_request.base.ref }}
-      TOPIC: ${{ github.event.pull_request.head.ref }}
-      SOURCE_TIP: ${{ github.event.pull_request.head.sha }}
-      REVIEW_PR: ${{ github.event.pull_request.number }}
-    steps:
-      - name: Queue trusted plan proposal
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REPOSITORY" = openai/git
-          test "$DEFAULT_BRANCH" = codex
-          gh workflow run codex.yml --repo "$GITHUB_REPOSITORY" \
-            --ref "$DEFAULT_BRANCH" \
-            -f operation=topic-review \
-            -f lane="$LANE" \
-            -f topic="$TOPIC" \
-            -f source_tip="$SOURCE_TIP" \
-            -f review_pr="$REVIEW_PR"
-  topic_plan_propose:
-    name: Propose reviewed topic plan
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/codex' &&
-      inputs.operation == 'topic-review'
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
-    with:
-      lane: ${{ inputs.lane }}
-      topic: ${{ inputs.topic }}
-      action: auto
-      source_tip: ${{ inputs.source_tip }}
-      review_pr: ${{ inputs.review_pr }}
-  policy_plan_propose:
-    name: Propose explicit plan policy
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/codex' &&
-      (inputs.operation == 'remove' || inputs.operation == 'reorder')
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
-    with:
-      lane: ${{ inputs.lane }}
-      topic: ${{ inputs.topic }}
-      action: ${{ inputs.operation }}
-      after: ${{ inputs.after }}
-      plan_branch: ${{ inputs.plan_branch }}
-  plan_admission:
-    name: Codex plan admission
-    if: >-
-      github.event_name == 'pull_request_target' &&
-      github.event.pull_request.base.ref == 'meta'
-    permissions:
-      contents: read
-      pull-requests: write
-    uses: openai/git/.github/workflows/codex-plan-admission.yml@meta
-	EOF
+	output=$1 &&
+	sed -n '/^write_automation_workflow () {$/,/^}$/p' \
+		"$codex_branch" |
+	sed '1,2d;$d' | sed '$d;s/^\t//' >"$output"
 }
 
 install_reviewed_automation_topic () {
@@ -1652,21 +1520,34 @@ test_expect_success 'generated lanes are output-only and meta gates review in th
 	" "$codex_root/.github/rulesets/codex-meta.json"
 '
 
-test_expect_success 'plan admission checks the exact reviewed head from trusted meta' '
+test_expect_success 'plan admission checks exact reviewed heads from trusted meta' '
 	test_path_is_file "$codex_plan_admission_workflow" &&
 	test_grep "name: Codex plan admission" \
 		"$codex_plan_admission_workflow" &&
 	test_grep "  workflow_call:" "$codex_plan_admission_workflow" &&
 	! grep -F "  pull_request_review:" \
 		"$codex_plan_admission_workflow" &&
-	test_grep "pull_request_review:" "$codex_branch" &&
+	test_grep "schedule:" "$codex_branch" &&
+	test_grep "cron: .*/5" "$codex_branch" &&
+	! grep -F "pull_request_review:" "$codex_branch" &&
+	! grep -F "workflow_run:" "$codex_branch" &&
 	test_grep "pull_request_target:" "$codex_branch" &&
-	test_grep "topic_plan_dispatch:" "$codex_branch" &&
-	test_grep "actions: write" "$codex_branch" &&
-	test_grep "gh workflow run codex.yml" "$codex_branch" &&
-	test_grep "inputs.operation == .*topic-review" "$codex_branch" &&
-	sed -n "/^  topic_plan_dispatch:/,/^  topic_plan_propose:/p" "$codex_branch" >review-dispatch &&
-	! grep -E "codex-plan-propose|environment:|CODEX_PLAN_APP_PRIVATE_KEY|contents: write|pull-requests: write" review-dispatch &&
+	test_grep "topic_plan_scan:" "$codex_branch" &&
+	test_grep "github.event_name == .schedule." "$codex_branch" &&
+	test_grep "topic scan must run from the trusted default branch" \
+		"$codex_branch" &&
+	test_grep "git/ref/heads/meta" "$codex_branch" &&
+	test_grep "Check out trusted meta" "$codex_branch" &&
+	test_grep "steps.meta.outputs.sha" "$codex_branch" &&
+	test_grep "base .*lane.* --limit 1000" "$codex_branch" &&
+	test_grep "propose-plan" "$codex_branch" &&
+	test_grep "expected-meta" "$codex_branch" &&
+	test_grep "no-push" "$codex_branch" &&
+	! grep -F "actions: write" "$codex_branch" &&
+	! grep -F "gh workflow run codex.yml" "$codex_branch" &&
+	sed -n "/^  topic_plan_scan:/,/^  topic_plan_propose:/p" "$codex_branch" >review-scan &&
+	! grep -E "codex-plan-propose|environment:|CODEX_PLAN_APP_PRIVATE_KEY|contents: write|pull-requests: write" review-scan &&
+	test_grep "needs: topic_plan_scan" "$codex_branch" &&
 	test_grep "action: auto" "$codex_branch" &&
 	test_grep "policy_plan_propose:" "$codex_branch" &&
 	test_grep "inputs.operation" "$codex_branch" &&
