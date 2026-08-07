@@ -313,6 +313,35 @@ install_bootstrap_pin_guard_gh () {
 	chmod +x "$directory/gh"
 }
 
+install_release_recovery_gh () {
+	directory=$1 &&
+	mkdir -p "$directory" &&
+	cat >"$directory/gh" <<-'EOF' &&
+	#!/bin/sh
+
+	set -eu
+
+	test "${1:-}" = api || exit 90
+	case " $* " in
+	*" repos/openai/git/rulesets?"*)
+		printf '%s\n' 123
+		;;
+	*" repos/openai/git/rulesets/123 "*)
+		printf '%s\n' true
+		;;
+	*" repos/openai/git/pulls/22 "*)
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			closed true "$FAKE_RECOVERY_TOPIC" openai/git \
+			"$FAKE_RECOVERY_HEAD_REF" \
+			"$FAKE_RECOVERY_HEAD_TIP" \
+			"$FAKE_RECOVERY_NEW_TIP"
+		;;
+	*) exit 91 ;;
+	esac
+	EOF
+	chmod +x "$directory/gh"
+}
+
 install_admission_gh () {
 	directory=$1 &&
 	mkdir -p "$directory" &&
@@ -8958,6 +8987,242 @@ test_expect_success 'topic review requires the exact approved head' '
 			--topic aa/codex/reviewed --source-tip "$source" \
 		>stale.out 2>stale.err &&
 	test_grep "has no current approval for $source" stale.err
+'
+
+test_expect_success 'checked-in release recovery manifest is the bound incident' '
+	test "$(git hash-object "$codex_root/codex.release-recovery")" = \
+		8ef04578ac791a3499b1406a1d0ae9884bacd559 &&
+	git init --bare release-recovery-binding.git &&
+	test_create_repo release-recovery-binding-source &&
+	(
+		cd release-recovery-binding-source &&
+		git remote add origin ../release-recovery-binding.git &&
+		write base shared &&
+		git add shared &&
+		git commit -m "release recovery binding base" &&
+		git branch codex &&
+		git switch -c meta &&
+		cp "$codex_root/codex.release-recovery" . &&
+		git add codex.release-recovery &&
+		git commit -m "arm shipped recovery manifest" &&
+		git push origin master codex meta
+	) &&
+	git clone release-recovery-binding.git release-recovery-binding-runner &&
+	(
+		cd release-recovery-binding-runner &&
+		before=$(git rev-parse origin/meta) &&
+		test_expect_code 1 sh "$codex_branch" recover-release-pin \
+			--remote origin --expected-meta "$before" \
+			--authorization "user-approved exact recovery" \
+			>binding.out 2>binding.err &&
+		test_grep "ba107e0ae8c7142238bb612e530d51d42f0280d3.*is not a commit" \
+			binding.err &&
+		git switch -c tampered-meta origin/meta &&
+		printf "\n# tampered\n" >>codex.release-recovery &&
+		git add codex.release-recovery &&
+		git commit -m "tamper shipped recovery manifest" &&
+		tampered=$(git rev-parse HEAD) &&
+		git push origin "$tampered:refs/heads/meta" &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" recover-release-pin \
+			--remote origin --expected-meta "$tampered" \
+			--authorization "user-approved exact recovery" \
+			>tampered.out 2>tampered.err &&
+		test_grep "manifest is not the exact reviewed incident" \
+			tampered.err
+	)
+'
+
+test_expect_success 'one-shot release recovery pins only the exact merged source' '
+	git init --bare release-recovery.git &&
+	test_create_repo release-recovery-source &&
+	(
+		cd release-recovery-source &&
+		git remote add origin ../release-recovery.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "release recovery base" &&
+		install_reviewed_automation_topic &&
+		git switch -c tb/codex/release master &&
+		write old release-file &&
+		git add release-file &&
+		git commit -m "old release topic" &&
+		old=$(git rev-parse HEAD) &&
+		old_tree=$(git rev-parse "$old^{tree}") &&
+		codex_tip=$(make_test_integration tb/codex/release \
+			"$old" "$automation_codex_tip" "$old_tree") &&
+		git branch codex "$codex_tip" &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_pinned_meta_state meta master codex codex-unstable &&
+		baseline=$(git rev-parse meta) &&
+		source_base=$(git rev-parse master) &&
+		git switch tb/codex/release &&
+		write fixed release-file &&
+		git add release-file &&
+		git commit -m "stamp release source refs" &&
+		new=$(git rev-parse HEAD) &&
+		git switch meta &&
+		cat >codex.release-recovery <<-EOF &&
+		[recovery]
+			version = 1
+			baseline-meta = $baseline
+			lane = codex
+			topic = refs/heads/tb/codex/release
+			old-source-tip = $old
+			new-source-tip = $new
+			source-base = $source_base
+			merge = refs/heads/master
+			pull-request = 22
+			pull-request-head-ref = refs/heads/recovery-head
+			pull-request-head-tip = $new
+		EOF
+		git add codex.release-recovery &&
+		git commit -m "meta: arm exact release recovery" &&
+		git push origin --all
+	) &&
+	git clone release-recovery.git release-recovery-runner &&
+	(
+		cd release-recovery-runner &&
+		fetch_all &&
+		install_release_recovery_gh "$PWD/recovery-bin" &&
+		before=$(git rev-parse origin/meta) &&
+		manifest_blob=$(git rev-parse \
+			"$before:codex.release-recovery") &&
+		old=$(git show "$before:codex.release-recovery" |
+			git config --file /dev/stdin \
+				--get recovery.old-source-tip) &&
+		new=$(git show "$before:codex.release-recovery" |
+			git config --file /dev/stdin \
+				--get recovery.new-source-tip) &&
+		test_expect_code 1 env PATH="$PWD/recovery-bin:$PATH" \
+			GIT_TEST_CODEX_RELEASE_RECOVERY_FIXTURE=t \
+			FAKE_RECOVERY_TOPIC=tb/codex/release \
+			FAKE_RECOVERY_HEAD_REF=recovery-head \
+			FAKE_RECOVERY_HEAD_TIP="$new" \
+			FAKE_RECOVERY_NEW_TIP="$old" \
+			sh "$codex_branch" test-recover-release-pin \
+			"$manifest_blob" \
+			--remote origin --expected-meta "$before" \
+			--authorization "user-approved exact recovery" \
+			>wrong-pr.out 2>wrong-pr.err &&
+		test_grep "did not merge as $new" wrong-pr.err &&
+		test "$before" = "$(git rev-parse origin/meta)" &&
+		test_must_fail git show-ref --verify \
+			"refs/remotes/origin/codex-pins/$new" &&
+		env PATH="$PWD/recovery-bin:$PATH" \
+			GIT_TEST_CODEX_RELEASE_RECOVERY_FIXTURE=t \
+			FAKE_RECOVERY_TOPIC=tb/codex/release \
+			FAKE_RECOVERY_HEAD_REF=recovery-head \
+			FAKE_RECOVERY_HEAD_TIP="$new" \
+			FAKE_RECOVERY_NEW_TIP="$new" \
+			sh "$codex_branch" test-recover-release-pin \
+			"$manifest_blob" \
+			--remote origin --expected-meta "$before" \
+			--authorization "user-approved exact recovery" \
+			>recovery.out &&
+		fetch_all &&
+		meta=$(git rev-parse origin/meta) &&
+		test "$meta" != "$before" &&
+		test "$(git show -s \
+			--format="%(trailers:key=Codex-Plan-Recovery,valueonly)" \
+			"$meta")" = release-source-ref-2026-08-06 &&
+		test "$(git show -s \
+			--format="%(trailers:key=Codex-Plan-Authorization,valueonly)" \
+			"$meta")" = "user-approved exact recovery" &&
+		test "$(git show "$meta:codex.plan" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/release.source-tip)" = "$new" &&
+		test "$(git show "$meta:codex.plan" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/release.source-base)" = \
+			"$(git show "$before:codex.plan" |
+				git config --file /dev/stdin \
+					--get branch.tb/codex/release.source-base)" &&
+		test "$(git rev-parse "origin/codex-pins/$new")" = "$new" &&
+		test "$(git rev-parse origin/tb/codex/release)" = "$new" &&
+		test_must_fail git cat-file -e \
+			"$meta:codex.release-recovery" &&
+		git diff-tree --no-commit-id --name-only -r "$before" \
+			"$meta" | LC_ALL=C sort >changed-paths &&
+		printf "%s\n" codex.plan codex.release-recovery |
+			LC_ALL=C sort >expected-paths &&
+		test_cmp expected-paths changed-paths &&
+		test_grep "published one-shot release recovery" \
+			recovery.out &&
+		env PATH="$PWD/recovery-bin:$PATH" \
+			GIT_TEST_CODEX_RELEASE_RECOVERY_FIXTURE=t \
+			FAKE_RECOVERY_TOPIC=tb/codex/release \
+			FAKE_RECOVERY_HEAD_REF=recovery-head \
+			FAKE_RECOVERY_HEAD_TIP="$new" \
+			FAKE_RECOVERY_NEW_TIP="$new" \
+			sh "$codex_branch" test-validate-plan-transition \
+			"$manifest_blob" \
+			--remote origin --base-commit "$before" \
+			--head-commit "$meta" >validated.out &&
+		test_grep "validated pinned plan transition" validated.out &&
+		git --git-dir=../release-recovery.git update-ref -d \
+			"refs/heads/codex-pins/$new" &&
+		fetch_all &&
+		test_expect_code 1 env PATH="$PWD/recovery-bin:$PATH" \
+			GIT_TEST_CODEX_RELEASE_RECOVERY_FIXTURE=t \
+			FAKE_RECOVERY_TOPIC=tb/codex/release \
+			FAKE_RECOVERY_HEAD_REF=recovery-head \
+			FAKE_RECOVERY_HEAD_TIP="$new" \
+			FAKE_RECOVERY_NEW_TIP="$new" \
+			sh "$codex_branch" test-validate-plan-transition \
+			"$manifest_blob" \
+			--remote origin --base-commit "$before" \
+			--head-commit "$meta" >missing-pin.out 2>missing-pin.err &&
+		test_grep "has no immutable pin" missing-pin.err &&
+		git --git-dir=../release-recovery.git update-ref \
+			"refs/heads/codex-pins/$new" "$new" &&
+		fetch_all &&
+		generic_index=$PWD/generic.index &&
+		GIT_INDEX_FILE=$generic_index git read-tree "$before" &&
+		generic_plan=$(git rev-parse "$meta:codex.plan") &&
+		GIT_INDEX_FILE=$generic_index git update-index --add \
+			--cacheinfo 100644 "$generic_plan" codex.plan &&
+		generic_tree=$(GIT_INDEX_FILE=$generic_index git write-tree) &&
+		generic_source_base=$(git show "$before:codex.plan" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/release.source-base) &&
+		cat >generic-message <<-EOF &&
+		Codex plan: fake generic authorization
+
+		Codex-Plan-Lane: codex
+		Codex-Plan-Action: alter
+		Codex-Plan-Topic: tb/codex/release
+		Codex-Plan-Source-Tip: $new
+		Codex-Plan-Merge: master
+		Codex-Plan-Source-Base: $generic_source_base
+		Codex-Plan-Authorization: fake generic authorization
+		EOF
+		generic=$(git commit-tree "$generic_tree" -p "$before" \
+			<generic-message) &&
+		test_expect_code 1 sh "$codex_branch" \
+			validate-plan-transition --remote origin \
+			--base-commit "$before" --head-commit "$generic" \
+			>generic.out 2>generic.err &&
+		test_grep "authorization appears without a bootstrap marker" \
+			generic.err &&
+		test_expect_code 1 env PATH="$PWD/recovery-bin:$PATH" \
+			GIT_TEST_CODEX_RELEASE_RECOVERY_FIXTURE=t \
+			FAKE_RECOVERY_TOPIC=tb/codex/release \
+			FAKE_RECOVERY_HEAD_REF=recovery-head \
+			FAKE_RECOVERY_HEAD_TIP="$new" \
+			FAKE_RECOVERY_NEW_TIP="$new" \
+			sh "$codex_branch" test-recover-release-pin \
+			"$manifest_blob" \
+			--remote origin --expected-meta "$meta" \
+			--authorization "user-approved exact recovery" \
+			>again.out 2>again.err &&
+		test_grep "one-shot path is closed" again.err &&
+		test_must_fail git show-ref --verify \
+			refs/remotes/origin/codex-plan/release-recovery &&
+		test "$old" != "$new"
+	)
 '
 
 test_done

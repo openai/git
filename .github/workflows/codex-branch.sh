@@ -11,6 +11,7 @@ script_path=${CODEX_ENTRYPOINT:-$script_dir/$(basename "$0")}
 meta_config_path=codex.config
 stable_plan_path=codex.plan
 unstable_plan_path=codex-unstable.plan
+release_recovery_path=codex.release-recovery
 tab=$(printf '\t')
 bot_name='chatgpt-codex-connector[bot]'
 bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
@@ -57,6 +58,8 @@ usage () {
 		[--expected-meta <oid>]
 		[--plan-branch <codex-plan/name>]
 		[--bootstrap-authorization <text>] [--no-push]
+	   or: codex-branch recover-release-pin [--remote <remote>]
+		--expected-meta <oid> --authorization <text> [--no-push]
 	   or: codex-branch verify-output --inputs <path>
 		--updates <path> --result <path> [--require-automation]
 		[--stable-recovery]
@@ -335,6 +338,7 @@ legacy_control_paths_unchanged () (
 		rebuild \
 		codex.plan \
 		codex-unstable.plan \
+		codex.release-recovery \
 		codex.config \
 		t/t9905-codex-branch.sh
 )
@@ -362,6 +366,7 @@ meta_control_paths_unchanged () (
 		rebuild \
 		codex.plan \
 		codex-unstable.plan \
+		codex.release-recovery \
 		codex.config \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
@@ -5994,7 +5999,10 @@ validate_topic_review () {
 	say "validated reviewed topic pull request #$pull_number at $source_tip"
 }
 
-validate_plan_transition () {
+validate_plan_transition_core () {
+	recovery_pin_mode=$1
+	recovery_expected_blob=$2
+	shift 2
 	remote=origin
 	base_commit=
 	head_commit=
@@ -6020,6 +6028,10 @@ validate_plan_transition () {
 	git diff-tree --no-commit-id --name-only -r "$base_commit" \
 		"$head_commit" | LC_ALL=C sort >"$tmp_dir/changed-paths" ||
 		die "could not inspect plan transition paths"
+	recovery=$(plan_trailer_optional "$head_commit" Codex-Plan-Recovery \
+		"Codex-Plan-Recovery")
+	recovery_pr=$(plan_trailer_optional "$head_commit" \
+		Codex-Plan-Recovery-PR "Codex-Plan-Recovery-PR")
 
 	git show "$base_commit:$meta_config_path" >"$tmp_dir/base-config" \
 		2>/dev/null ||
@@ -6036,7 +6048,27 @@ validate_plan_transition () {
 	base_has_plan=
 	git cat-file -e "$base_commit:$stable_plan_path" 2>/dev/null &&
 		base_has_plan=t
-	if test -z "$base_has_plan"
+	base_has_unstable_plan=
+	git cat-file -e "$base_commit:$unstable_plan_path" 2>/dev/null &&
+		base_has_unstable_plan=t
+	if test -z "$recovery"
+	then
+		test -z "$recovery_pr" ||
+			die "plan recovery PR appears without a recovery marker"
+	fi
+	if test -n "$recovery"
+	then
+		test "$recovery" = release-source-ref-2026-08-06 ||
+			die "plan transition names unknown release recovery"
+		test -n "$base_has_plan" ||
+			die "release recovery requires a published v3 plan"
+		{
+			printf '%s\n' "$stable_plan_path"
+			printf '%s\n' "$release_recovery_path"
+		} >"$tmp_dir/expected-paths"
+		LC_ALL=C sort -o "$tmp_dir/expected-paths" \
+			"$tmp_dir/expected-paths"
+	elif test -z "$base_has_plan"
 	then
 		test "$version" = 1 || test "$version" = 2 ||
 			die "only a v1/v2 controller may bootstrap pinned plans"
@@ -6050,8 +6082,6 @@ validate_plan_transition () {
 		LC_ALL=C sort -o "$tmp_dir/expected-paths" \
 			"$tmp_dir/expected-paths"
 	else
-		git cat-file -e "$base_commit:$unstable_plan_path" 2>/dev/null &&
-			base_has_unstable_plan=t || base_has_unstable_plan=
 		count=$(wc -l <"$tmp_dir/changed-paths" | tr -d ' ')
 		test "$count" = 1 ||
 			die "a normal plan transition must change exactly one lane plan"
@@ -6073,14 +6103,19 @@ validate_plan_transition () {
 		legacy_sources=$tmp_dir/base-state/published-source-topics
 		legacy_unstable_sources=$tmp_dir/base-state/published-unstable-source-topics
 	fi
+	head_plan_remote=$remote
+	if test -n "$recovery" && test "$recovery_pin_mode" = will-create
+	then
+		head_plan_remote=-
+	fi
 	read_lane_plan "$head_commit" codex "$base_name" "$base_oid" \
-		"$remote" "$tmp_dir/head-topics" "$tmp_dir/head-plan" \
+		"$head_plan_remote" "$tmp_dir/head-topics" "$tmp_dir/head-plan" \
 		"$legacy_sources"
 	head_unstable_state=-
 	if test -f "$tmp_dir/base-state/published-unstable-oid"
 	then
 		read_lane_plan "$head_commit" codex-unstable "$codex_name" \
-			"$codex_oid" "$remote" "$tmp_dir/head-unstable-topics" \
+			"$codex_oid" "$head_plan_remote" "$tmp_dir/head-unstable-topics" \
 			"$tmp_dir/head-unstable-plan" "$legacy_unstable_sources"
 		head_unstable_state=$tmp_dir/head-unstable-plan
 	fi
@@ -6183,7 +6218,12 @@ validate_plan_transition () {
 	esac
 	current_prerequisites=$(plan_prerequisites "$rows" "$topic")
 	old_source_base=$(plan_source_base "$source_bases" "$topic")
-	if test -n "$bootstrap"
+	if test -n "$recovery"
+	then
+		validate_release_recovery_transition_metadata "$base_commit" \
+			"$head_commit" "$remote"
+		: # The exact recovery checks above own this authorization.
+	elif test -n "$bootstrap"
 	then
 		test "$bootstrap" = true && test -n "$authorization" &&
 			{ test "$version" = 1 || test "$version" = 2; } ||
@@ -6206,7 +6246,8 @@ validate_plan_transition () {
 	add|alter)
 		test -n "$source_tip" && test -n "$source_base" &&
 			test -n "$merge" &&
-			{ test -n "$review_pr" || test "$bootstrap" = true; } ||
+			{ test -n "$review_pr" || test "$bootstrap" = true ||
+				test -n "$recovery"; } ||
 			die "plan transition '$action' needs source-tip, source-base, merge, and review or bootstrap trailers"
 		if test -n "$review_pr"
 		then
@@ -6332,6 +6373,11 @@ validate_plan_transition () {
 			die "plan transition is not exactly one declared $action"
 	fi
 	say "validated pinned plan transition $base_commit..$head_commit"
+}
+
+validate_plan_transition () {
+	validate_plan_transition_core require-pin \
+		"$(release_recovery_expected_blob)" "$@"
 }
 
 published_plan_rows () (
@@ -6514,6 +6560,446 @@ replace_plan_source_base () (
 		printf '%s\t%s\n' "$topic" "$source_base" >>"$output"
 	fi
 )
+
+release_recovery_expected_blob () (
+	printf '%s\n' 8ef04578ac791a3499b1406a1d0ae9884bacd559
+)
+
+release_recovery_value () (
+	manifest=$1
+	key=$2
+	config_get_one "$manifest" "recovery.$key" "$release_recovery_path"
+)
+
+require_release_recovery_baseline () (
+	baseline=$1
+	meta_oid=$2
+	paths=$tmp_dir/release-recovery-intervening-paths
+
+	require_full_commit_oid "$baseline"
+	git merge-base --is-ancestor "$baseline" "$meta_oid" ||
+		die "release recovery meta does not descend from its exact baseline"
+	for path in "$meta_config_path" "$stable_plan_path" "$unstable_plan_path"
+	do
+		test "$(git rev-parse "$baseline:$path")" = \
+			"$(git rev-parse "$meta_oid:$path")" ||
+			die "release recovery is no longer at its exact pinned-plan baseline"
+	done
+	git diff --name-only "$baseline" "$meta_oid" >"$paths" ||
+		die "could not inspect release recovery controller changes"
+	while IFS= read -r path
+	do
+		case "$path" in
+		.github/CODEX.md|.github/workflows/codex-branch.sh|\
+		t/t9905-codex-branch.sh|codex.release-recovery) ;;
+		*) die "release recovery baseline has unrelated path '$path'" ;;
+		esac
+	done <"$paths"
+)
+
+validate_release_recovery_pr () {
+	pull_number=$1
+	topic=$2
+	new_tip=$3
+	head_ref=$4
+	head_tip=$5
+	head_ref=${head_ref#refs/heads/}
+	gh api --hostname github.com \
+		"repos/openai/git/pulls/$pull_number" \
+		--jq '[.state, (.merged | tostring), .base.ref,
+			(.head.repo.full_name // "-"), .head.ref, .head.sha,
+			(.merge_commit_sha // "-")] | @tsv' \
+		>"$tmp_dir/release-recovery-pr" ||
+		die "could not inspect release recovery pull request #$pull_number"
+	IFS="$tab" read -r state merged base head_repository \
+		actual_head_ref actual_head_tip merge_commit \
+		<"$tmp_dir/release-recovery-pr" ||
+		die "could not parse release recovery pull request #$pull_number"
+	test "$state" = closed && test "$merged" = true ||
+		die "release recovery pull request #$pull_number is not merged"
+	test "$base" = "$topic" ||
+		die "release recovery pull request #$pull_number targets '$base', not '$topic'"
+	test "$head_repository" = openai/git ||
+		die "release recovery pull request #$pull_number is not same-repository"
+	test "$actual_head_ref" = "$head_ref" &&
+		test "$actual_head_tip" = "$head_tip" ||
+		die "release recovery pull request #$pull_number has unexpected head"
+	test "$merge_commit" = "$new_tip" ||
+		die "release recovery pull request #$pull_number did not merge as $new_tip"
+}
+
+validate_release_recovery_transition_metadata () {
+	base_commit=$1
+	head_commit=$2
+	remote=$3
+	manifest=$tmp_dir/release-recovery-manifest
+
+	test "$version" = 3 && test -n "$base_has_plan" &&
+		test -n "$base_has_unstable_plan" ||
+		die "release recovery requires the exact published v3 plans"
+	test "$recovery" = release-source-ref-2026-08-06 ||
+		die "plan transition names unknown release recovery"
+	test "$recovery_pr" = 22 ||
+		die "release recovery names unexpected pull request"
+	test "$lane" = codex && test "$action" = alter &&
+		test "$topic" = tb/codex/release ||
+		die "release recovery is not the exact stable release transition"
+	test -z "$after" && test -z "$review_pr" &&
+		test -z "$bootstrap" ||
+		die "release recovery cannot claim review, bootstrap, or reorder"
+	test -n "$authorization" &&
+		test "$(printf '%s\n' "$authorization" | wc -l |
+			tr -d ' ')" = 1 ||
+		die "release recovery needs one-line explicit authorization"
+
+	git show "$base_commit:$release_recovery_path" >"$manifest" \
+		2>/dev/null ||
+		die "release recovery manifest is absent from its meta base"
+	expected_blob=$recovery_expected_blob
+	require_full_blob_oid "$expected_blob"
+	test "$(git hash-object "$manifest")" = "$expected_blob" ||
+		die "release recovery manifest is not the exact reviewed incident"
+	git cat-file -e "$head_commit:$release_recovery_path" 2>/dev/null &&
+		die "release recovery manifest survived its one-shot transition"
+
+	test "$(release_recovery_value "$manifest" version)" = 1 ||
+		die "release recovery manifest has unsupported version"
+	recovery_baseline=$(release_recovery_value "$manifest" baseline-meta)
+	recovery_lane=$(release_recovery_value "$manifest" lane)
+	recovery_topic=$(release_recovery_value "$manifest" topic)
+	recovery_old_tip=$(release_recovery_value "$manifest" old-source-tip)
+	recovery_new_tip=$(release_recovery_value "$manifest" new-source-tip)
+	recovery_source_base=$(release_recovery_value "$manifest" source-base)
+	recovery_merge=$(release_recovery_value "$manifest" merge)
+	recovery_pull_number=$(release_recovery_value "$manifest" pull-request)
+	recovery_head_ref=$(release_recovery_value "$manifest" \
+		pull-request-head-ref)
+	recovery_head_tip=$(release_recovery_value "$manifest" \
+		pull-request-head-tip)
+	recovery_topic=$(printf '%s\n' "$recovery_topic" |
+		sed 's|^refs/heads/||')
+	recovery_merge=$(printf '%s\n' "$recovery_merge" |
+		sed 's|^refs/heads/||')
+	test "$recovery_lane" = codex &&
+		test "$recovery_topic" = tb/codex/release &&
+		test "$recovery_merge" = master &&
+		test "$recovery_pull_number" = 22 ||
+		die "release recovery manifest is not the exact stable release incident"
+	require_full_commit_oid "$recovery_old_tip"
+	require_full_commit_oid "$recovery_new_tip"
+	require_full_commit_oid "$recovery_source_base"
+	require_full_commit_oid "$recovery_head_tip"
+	require_release_recovery_baseline "$recovery_baseline" "$base_commit"
+	test "$source_tip" = "$recovery_new_tip" &&
+		test "$source_base" = "$recovery_source_base" &&
+		test "$merge" = "$recovery_merge" ||
+		die "release recovery trailers do not match their exact manifest"
+	test "$(plan_tip "$rows" "$topic")" = "$recovery_old_tip" &&
+		test "$current_prerequisites" = "$recovery_merge" &&
+		test "$old_source_base" = "$recovery_source_base" ||
+		die "release recovery base row is not its exact reviewed row"
+	test "$(git show -s --format=%P "$recovery_new_tip")" = \
+		"$recovery_old_tip" ||
+		die "release recovery source is not its exact one-parent step"
+	recovery_live=$(git rev-parse --verify \
+		"$(remote_ref "$remote" "$topic")^{commit}" 2>/dev/null) ||
+		die "release recovery topic ref '$topic' does not exist"
+	test "$recovery_live" = "$recovery_new_tip" ||
+		die "release recovery topic ref '$topic' is $recovery_live, not $recovery_new_tip"
+	validate_release_recovery_pr "$recovery_pull_number" "$topic" \
+		"$recovery_new_tip" "$recovery_head_ref" \
+		"$recovery_head_tip"
+	recovery_pin_ref=$(pin_ref_for_tip "$recovery_new_tip")
+	recovery_pin_name=${recovery_pin_ref#refs/heads/}
+	recovery_pin_oid=$(git rev-parse --verify \
+		"$(remote_ref "$remote" "$recovery_pin_name")^{commit}" \
+		2>/dev/null || :)
+	if test "$recovery_pin_mode" = will-create
+	then
+		test -z "$recovery_pin_oid" ||
+			die "release recovery pin '$recovery_pin_ref' already exists"
+	else
+		test "$recovery_pin_oid" = "$recovery_new_tip" ||
+			die "release recovery pin '$recovery_pin_ref' is missing or wrong"
+	fi
+	test "$(git rev-parse "$base_commit:$meta_config_path")" = \
+		"$(git rev-parse "$head_commit:$meta_config_path")" &&
+		test "$(git rev-parse "$base_commit:$unstable_plan_path")" = \
+			"$(git rev-parse "$head_commit:$unstable_plan_path")" ||
+		die "release recovery changes state outside its stable plan row"
+}
+
+recover_release_pin_core () {
+	expected_blob=$1
+	shift
+	require_full_blob_oid "$expected_blob"
+	remote=origin
+	expected_meta=
+	authorization=
+	no_push=
+	while test $# -gt 0
+	do
+		case "$1" in
+		--remote) require_arg "$@"; remote=$2; shift 2 ;;
+		--expected-meta)
+			require_arg "$@"
+			expected_meta=$2
+			shift 2
+			;;
+		--authorization)
+			require_arg "$@"
+			authorization=$2
+			shift 2
+			;;
+		--no-push) no_push=t; shift ;;
+		*) die "unknown recover-release-pin option '$1'" ;;
+		esac
+	done
+	test -n "$expected_meta" && test -n "$authorization" ||
+		die "recover-release-pin requires --expected-meta and --authorization"
+	require_full_commit_oid "$expected_meta"
+	test "$(printf '%s\n' "$authorization" | wc -l | tr -d ' ')" = 1 ||
+		die "--authorization must be one line"
+
+	make_tmp_dir
+	require_full_repository
+	fetch_heads "$remote"
+	meta_oid=$(resolve_commit "$(remote_ref "$remote" meta)")
+	test "$meta_oid" = "$expected_meta" ||
+		die "meta moved from expected $expected_meta to $meta_oid"
+	git show "$meta_oid:$release_recovery_path" \
+		>"$tmp_dir/$release_recovery_path" 2>/dev/null ||
+		die "release recovery manifest is absent; this one-shot path is closed"
+	test "$(git hash-object "$tmp_dir/$release_recovery_path")" = \
+		"$expected_blob" ||
+		die "release recovery manifest is not the exact reviewed incident"
+	manifest=$tmp_dir/$release_recovery_path
+	test "$(release_recovery_value "$manifest" version)" = 1 ||
+		die "release recovery manifest has unsupported version"
+	baseline=$(release_recovery_value "$manifest" baseline-meta)
+	lane=$(release_recovery_value "$manifest" lane)
+	topic=$(release_recovery_value "$manifest" topic)
+	old_tip=$(release_recovery_value "$manifest" old-source-tip)
+	new_tip=$(release_recovery_value "$manifest" new-source-tip)
+	source_base=$(release_recovery_value "$manifest" source-base)
+	merge=$(release_recovery_value "$manifest" merge)
+	pull_number=$(release_recovery_value "$manifest" pull-request)
+	head_ref=$(release_recovery_value "$manifest" pull-request-head-ref)
+	head_tip=$(release_recovery_value "$manifest" pull-request-head-tip)
+	topic=${topic#refs/heads/}
+	merge=${merge#refs/heads/}
+	test "$lane" = codex && test "$topic" = tb/codex/release &&
+		test "$merge" = master ||
+		die "release recovery manifest is not the exact stable release incident"
+	require_full_commit_oid "$old_tip"
+	require_full_commit_oid "$new_tip"
+	require_full_commit_oid "$source_base"
+	require_full_commit_oid "$head_tip"
+	case "$pull_number" in
+	22) ;;
+	*) die "release recovery manifest has unexpected pull request" ;;
+	esac
+	require_release_recovery_baseline "$baseline" "$meta_oid"
+
+	git show "$meta_oid:$meta_config_path" >"$tmp_dir/base-config" \
+		2>/dev/null ||
+		die "meta has no $meta_config_path"
+	test "$(config_get_one "$tmp_dir/base-config" codex.version)" = 3 ||
+		die "release recovery requires a published v3 controller"
+	base_ref=$(config_get_one "$tmp_dir/base-config" codex.base-ref)
+	base_name=${base_ref#refs/heads/}
+	codex_ref=$(config_get_one "$tmp_dir/base-config" codex.output-ref)
+	codex_name=${codex_ref#refs/heads/}
+	base_oid=$(resolve_commit "$(remote_ref "$remote" "$base_name")")
+	codex_oid=$(resolve_commit "$(remote_ref "$remote" "$codex_name")")
+	mkdir -p "$tmp_dir/published-state" ||
+		die "could not prepare release recovery state"
+	read_meta_config "$meta_oid" "$base_name" "$codex_name" \
+		"$tmp_dir/published-state"
+	read_lane_plan "$meta_oid" codex "$base_name" "$base_oid" \
+		"$remote" "$tmp_dir/existing-topics" "$tmp_dir/existing-plan"
+	git cat-file -e "$meta_oid:$unstable_plan_path" 2>/dev/null ||
+		die "release recovery requires the exact unstable plan"
+	read_lane_plan "$meta_oid" codex-unstable "$codex_name" \
+		"$codex_oid" "$remote" "$tmp_dir/existing-unstable-topics" \
+		"$tmp_dir/existing-unstable-plan"
+	cp "$tmp_dir/existing-plan/desired-prerequisites" \
+		"$tmp_dir/stable-rows"
+	cp "$tmp_dir/existing-plan/desired-source-bases" \
+		"$tmp_dir/stable-source-bases"
+	cp "$tmp_dir/existing-unstable-plan/desired-prerequisites" \
+		"$tmp_dir/unstable-rows"
+	cp "$tmp_dir/existing-unstable-plan/desired-source-bases" \
+		"$tmp_dir/unstable-source-bases"
+	test "$(plan_tip "$tmp_dir/stable-rows" "$topic")" = "$old_tip" ||
+		die "release recovery old pinned source is no longer present"
+	test "$(plan_prerequisites "$tmp_dir/stable-rows" "$topic")" = \
+		"$merge" ||
+		die "release recovery would change the release prerequisite"
+	test "$(plan_source_base "$tmp_dir/stable-source-bases" "$topic")" = \
+		"$source_base" ||
+		die "release recovery would change the release source boundary"
+	live=$(git rev-parse --verify \
+		"$(remote_ref "$remote" "$topic")^{commit}" 2>/dev/null) ||
+		die "release recovery topic ref '$topic' does not exist"
+	test "$live" = "$new_tip" ||
+		die "release recovery topic ref '$topic' is $live, not $new_tip"
+	test "$(git show -s --format=%P "$new_tip")" = "$old_tip" ||
+		die "release recovery source is not the exact ba107 to 40589 step"
+	validate_release_recovery_pr "$pull_number" "$topic" "$new_tip" \
+		"$head_ref" "$head_tip"
+	pin_ref=$(pin_ref_for_tip "$new_tip")
+	pin_name=${pin_ref#refs/heads/}
+	pin_oid=$(git rev-parse --verify \
+		"$(remote_ref "$remote" "$pin_name")^{commit}" \
+		2>/dev/null || :)
+	test -z "$pin_oid" ||
+		die "release recovery pin '$pin_ref' already exists"
+
+	replace_plan_row "$tmp_dir/stable-rows" "$tmp_dir/stable-rows.next" \
+		"$topic" "$new_tip" "$merge" alter
+	mv "$tmp_dir/stable-rows.next" "$tmp_dir/stable-rows"
+	replace_plan_source_base "$tmp_dir/stable-source-bases" \
+		"$tmp_dir/stable-source-bases.next" "$topic" \
+		"$source_base" alter
+	mv "$tmp_dir/stable-source-bases.next" \
+		"$tmp_dir/stable-source-bases"
+	write_lane_plan codex "$base_name" "$tmp_dir/stable-rows" \
+		"$tmp_dir/stable-source-bases" "$tmp_dir/$stable_plan_path"
+	write_lane_plan codex-unstable "$codex_name" \
+		"$tmp_dir/unstable-rows" "$tmp_dir/unstable-source-bases" \
+		"$tmp_dir/$unstable_plan_path"
+	git show "$meta_oid:$unstable_plan_path" \
+		>"$tmp_dir/original-$unstable_plan_path" ||
+		die "could not inspect the exact unstable plan"
+	cmp -s "$tmp_dir/original-$unstable_plan_path" \
+		"$tmp_dir/$unstable_plan_path" ||
+		die "release recovery changes the unstable plan"
+
+	index=$tmp_dir/recovery.index
+	GIT_INDEX_FILE=$index git read-tree "$meta_oid" ||
+		die "could not prepare release recovery index"
+	stable_blob=$(git hash-object -w "$tmp_dir/$stable_plan_path") ||
+		die "could not write release recovery plan blob"
+	GIT_INDEX_FILE=$index git update-index --add --cacheinfo \
+		100644 "$stable_blob" "$stable_plan_path" ||
+		die "could not stage release recovery plan"
+	GIT_INDEX_FILE=$index git update-index --force-remove \
+		"$release_recovery_path" ||
+		die "could not close release recovery manifest"
+	tree=$(GIT_INDEX_FILE=$index git write-tree) ||
+		die "could not write release recovery tree"
+	message=$tmp_dir/recovery-message
+	{
+		printf 'Codex plan: recover merged release metadata pin\n\n'
+		printf 'This one-shot transition records the exact merged release\n'
+		printf 'metadata commit missed by the v2 to v3 bootstrap.\n\n'
+		printf 'Codex-Plan-Lane: codex\n'
+		printf 'Codex-Plan-Action: alter\n'
+		printf 'Codex-Plan-Topic: %s\n' "$topic"
+		printf 'Codex-Plan-Source-Tip: %s\n' "$new_tip"
+		printf 'Codex-Plan-Merge: %s\n' "$merge"
+		printf 'Codex-Plan-Source-Base: %s\n' "$source_base"
+		printf 'Codex-Plan-Recovery: release-source-ref-2026-08-06\n'
+		printf 'Codex-Plan-Recovery-PR: %s\n' "$pull_number"
+		printf 'Codex-Plan-Authorization: %s\n' "$authorization"
+	} >"$message"
+	plan_commit=$(
+		env GIT_AUTHOR_NAME="$bot_name" GIT_AUTHOR_EMAIL="$bot_email" \
+			GIT_COMMITTER_NAME="$bot_name" \
+			GIT_COMMITTER_EMAIL="$bot_email" \
+			git commit-tree "$tree" -p "$meta_oid" <"$message"
+	) || die "could not create release recovery plan commit"
+	validate_plan_transition_core will-create "$expected_blob" \
+		--remote "$remote" \
+		--base-commit "$meta_oid" --head-commit "$plan_commit"
+	git diff-tree --no-commit-id --name-only -r "$meta_oid" \
+		"$plan_commit" | LC_ALL=C sort \
+		>"$tmp_dir/recovery-changed-paths" ||
+		die "could not inspect release recovery transition"
+	{
+		printf '%s\n' "$stable_plan_path"
+		printf '%s\n' "$release_recovery_path"
+	} | LC_ALL=C sort >"$tmp_dir/recovery-expected-paths"
+	cmp -s "$tmp_dir/recovery-changed-paths" \
+		"$tmp_dir/recovery-expected-paths" ||
+		die "release recovery changes paths outside its exact manifest"
+	read_lane_plan "$plan_commit" codex "$base_name" "$base_oid" - \
+		"$tmp_dir/proposed-topics" "$tmp_dir/proposed-plan"
+	read_lane_plan "$plan_commit" codex-unstable "$codex_name" \
+		"$codex_oid" - "$tmp_dir/proposed-unstable-topics" \
+		"$tmp_dir/proposed-unstable-plan"
+	validate_pinned_plan_policy "$tmp_dir/proposed-plan" \
+		"$tmp_dir/proposed-unstable-plan" "$base_name" 3 \
+		"$tmp_dir/published-state"
+	test "$(plan_tip "$tmp_dir/proposed-plan/desired-prerequisites" \
+		"$topic")" = "$new_tip" ||
+		die "release recovery did not retain the exact new source"
+	test "$(plan_prerequisites \
+		"$tmp_dir/proposed-plan/desired-prerequisites" "$topic")" = \
+		"$merge" ||
+		die "release recovery changed the release prerequisite"
+	test "$(plan_source_base \
+		"$tmp_dir/proposed-plan/desired-source-bases" "$topic")" = \
+		"$source_base" ||
+		die "release recovery changed the release source boundary"
+
+	if test -n "$no_push"
+	then
+		say "proposed one-shot release recovery $plan_commit"
+		say "pin $pin_ref $new_tip"
+		return
+	fi
+	require_bootstrap_pin_guard
+	git push --atomic \
+		"--force-with-lease=refs/heads/meta:$meta_oid" \
+		"--force-with-lease=$pin_ref:" \
+		"$remote" "$plan_commit:refs/heads/meta" \
+		"$new_tip:$pin_ref" ||
+		die "could not atomically publish one-shot release recovery"
+	fetch_heads "$remote"
+	test "$(git rev-parse "$(remote_ref "$remote" meta)")" = \
+		"$plan_commit" ||
+		die "remote meta does not name the release recovery commit"
+	test "$(git rev-parse "$(remote_ref "$remote" "$pin_name")")" = \
+		"$new_tip" ||
+		die "remote release recovery pin does not name $new_tip"
+	validate_plan_transition_core require-pin "$expected_blob" \
+		--remote "$remote" --base-commit "$meta_oid" \
+		--head-commit "$plan_commit"
+	git cat-file -e "$plan_commit:$release_recovery_path" 2>/dev/null &&
+		die "release recovery manifest survived its one-shot transition"
+	say "published one-shot release recovery $plan_commit"
+}
+
+recover_release_pin () {
+	recover_release_pin_core "$(release_recovery_expected_blob)" "$@"
+}
+
+require_release_recovery_fixture () {
+	# t9905 needs synthetic object IDs to exercise the atomic transition.
+	# Keep that escape hatch off the public command surface and behind an
+	# explicit test-only entrypoint; recover-release-pin always uses the
+	# checked-in incident blob above.
+	test "${GIT_TEST_CODEX_RELEASE_RECOVERY_FIXTURE:-}" = t ||
+		die "release recovery fixture entrypoint is test-only"
+}
+
+recover_release_pin_fixture () {
+	require_release_recovery_fixture
+	test $# -gt 0 || die "release recovery fixture needs a manifest blob"
+	fixture_blob=$1
+	shift
+	recover_release_pin_core "$fixture_blob" "$@"
+}
+
+validate_plan_transition_fixture () {
+	require_release_recovery_fixture
+	test $# -gt 0 || die "release recovery fixture needs a manifest blob"
+	fixture_blob=$1
+	shift
+	validate_plan_transition_core require-pin "$fixture_blob" "$@"
+}
 
 propose_plan () {
 	remote=origin
@@ -7464,6 +7950,7 @@ topic_control_paths_unchanged () (
 		rebuild \
 		codex.plan \
 		codex-unstable.plan \
+		codex.release-recovery \
 		codex.config \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
@@ -9427,8 +9914,11 @@ refresh) local_refresh "$@" ;;
 rewrite) rewrite "$@" ;;
 verify-inputs) verify_inputs "$@" ;;
 validate-plan-transition) validate_plan_transition "$@" ;;
+test-validate-plan-transition) validate_plan_transition_fixture "$@" ;;
 validate-topic-review) validate_topic_review "$@" ;;
 propose-plan) propose_plan "$@" ;;
+recover-release-pin) recover_release_pin "$@" ;;
+test-recover-release-pin) recover_release_pin_fixture "$@" ;;
 verify-output) verify_output "$@" ;;
 stage) stage_candidate "$@" ;;
 promote) promote "$@" ;;

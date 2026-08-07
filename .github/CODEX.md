@@ -218,6 +218,23 @@ earlier bootstrap commit cannot lose one of its retained objects while the
 next direct transition is prepared. After the first v3 publication, ordinary
 topic approval or explicit plan review is required.
 
+The checked-in `codex.release-recovery` file is a one-shot rollout
+exception for the release-metadata commit that landed after the v2 snapshot
+but before this first v3 publication. After landing its controller support,
+run:
+
+```sh
+Meta/codex recover-release-pin --remote origin \
+  --expected-meta <exact-post-controller-meta-sha> \
+  --authorization '<explicit authorization>'
+```
+
+The command accepts only the exact reviewed manifest: unchanged v3 plan
+blobs from the recorded baseline, the `ba107` to `40589` release step, merged
+PR #22, an absent new pin, and an unchanged release row shape. It atomically
+creates that one pin, changes only `codex.plan`, and deletes the manifest.
+Once used, it cannot authorize another transition.
+
 ## Repository settings
 
 Apply the checked-in ruleset recipes after the v3 publication:
