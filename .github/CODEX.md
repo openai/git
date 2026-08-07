@@ -133,9 +133,12 @@ nothing.
 
 If a replay conflicts, the controller leaves published refs unchanged and
 prints the pinned recovery command. Resolve only in that disposable worktree,
-then run a fresh rebuild. Merge-shaped sources are preserved only when they
-already descend from the pinned lane base; a base-moving merge replay fails
-closed instead of flattening the reviewed DAG.
+then run a fresh rebuild. For a pinned merge-shaped source, the controller
+uses its reviewed `source-base` as the exact old root and preserves the DAG
+across a moved generated base only when the two changed-path sets are
+disjoint. An overlapping base move or a graph with different reviewed roots
+fails closed; restack and obtain a new exact-head review instead of flattening
+or guessing.
 
 ## Required automation topic
 
