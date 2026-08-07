@@ -6910,9 +6910,11 @@ recover_release_pin_core () {
 			GIT_COMMITTER_EMAIL="$bot_email" \
 			git commit-tree "$tree" -p "$meta_oid" <"$message"
 	) || die "could not create release recovery plan commit"
-	validate_plan_transition_core will-create "$expected_blob" \
-		--remote "$remote" \
-		--base-commit "$meta_oid" --head-commit "$plan_commit"
+	(
+		validate_plan_transition_core will-create "$expected_blob" \
+			--remote "$remote" \
+			--base-commit "$meta_oid" --head-commit "$plan_commit"
+	) || die "release recovery did not pass canonical pre-push validation"
 	git diff-tree --no-commit-id --name-only -r "$meta_oid" \
 		"$plan_commit" | LC_ALL=C sort \
 		>"$tmp_dir/recovery-changed-paths" ||
@@ -6929,9 +6931,11 @@ recover_release_pin_core () {
 	read_lane_plan "$plan_commit" codex-unstable "$codex_name" \
 		"$codex_oid" - "$tmp_dir/proposed-unstable-topics" \
 		"$tmp_dir/proposed-unstable-plan"
-	validate_pinned_plan_policy "$tmp_dir/proposed-plan" \
-		"$tmp_dir/proposed-unstable-plan" "$base_name" 3 \
-		"$tmp_dir/published-state"
+	(
+		validate_pinned_plan_policy "$tmp_dir/proposed-plan" \
+			"$tmp_dir/proposed-unstable-plan" "$base_name" 3 \
+			"$tmp_dir/published-state"
+	) || die "release recovery did not pass pinned plan policy"
 	test "$(plan_tip "$tmp_dir/proposed-plan/desired-prerequisites" \
 		"$topic")" = "$new_tip" ||
 		die "release recovery did not retain the exact new source"
@@ -6964,9 +6968,11 @@ recover_release_pin_core () {
 	test "$(git rev-parse "$(remote_ref "$remote" "$pin_name")")" = \
 		"$new_tip" ||
 		die "remote release recovery pin does not name $new_tip"
-	validate_plan_transition_core require-pin "$expected_blob" \
-		--remote "$remote" --base-commit "$meta_oid" \
-		--head-commit "$plan_commit"
+	(
+		validate_plan_transition_core require-pin "$expected_blob" \
+			--remote "$remote" --base-commit "$meta_oid" \
+			--head-commit "$plan_commit"
+	) || die "published release recovery did not pass canonical validation"
 	git cat-file -e "$plan_commit:$release_recovery_path" 2>/dev/null &&
 		die "release recovery manifest survived its one-shot transition"
 	say "published one-shot release recovery $plan_commit"

@@ -9054,6 +9054,13 @@ test_expect_success 'one-shot release recovery pins only the exact merged source
 			"$old" "$automation_codex_tip" "$old_tree") &&
 		git branch codex "$codex_tip" &&
 		create_unstable_sentinel codex &&
+		git switch -c zz/codex/extra-unstable codex &&
+		write extra extra-unstable-file &&
+		git add extra-unstable-file &&
+		git commit -m "unrelated unstable source boundary" &&
+		git switch codex-unstable &&
+		git merge --no-ff zz/codex/extra-unstable \
+			-m "Merge unrelated unstable boundary" &&
 		git branch meta master &&
 		install_pinned_meta_state meta master codex codex-unstable &&
 		baseline=$(git rev-parse meta) &&
