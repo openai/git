@@ -1,5 +1,5 @@
 {
-  "name": "Protect generated Codex branch",
+  "name": "Allow only the Codex plan bot to create pins",
   "target": "branch",
   "source_type": "Repository",
   "enforcement": "active",
@@ -7,28 +7,19 @@
     "ref_name": {
       "exclude": [],
       "include": [
-        "refs/heads/codex"
+        "refs/heads/codex-pins/*"
       ]
     }
   },
   "rules": [
     {
       "type": "creation"
-    },
-    {
-      "type": "update",
-      "parameters": {
-        "update_allows_fetch_and_merge": false
-      }
-    },
-    {
-      "type": "deletion"
     }
   ],
   "bypass_actors": [
     {
-      "actor_id": 301000140,
-      "actor_type": "User",
+      "actor_id": 1144995,
+      "actor_type": "Integration",
       "bypass_mode": "always"
     },
     {

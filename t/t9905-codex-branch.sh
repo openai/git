@@ -14,6 +14,8 @@ codex_entrypoint=${CODEX_ENTRYPOINT:-$codex_root/codex}
 codex_rebuild=${CODEX_REBUILD:-$codex_root/rebuild}
 codex_publish=${CODEX_PUBLISH:-$codex_root/publish}
 codex_admission_workflow=$codex_root/.github/workflows/codex-admission.yml
+codex_plan_admission_workflow=$codex_root/.github/workflows/codex-plan-admission.yml
+codex_plan_propose_workflow=$codex_root/.github/workflows/codex-plan-propose.yml
 codex_bot_name='chatgpt-codex-connector[bot]'
 codex_bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
@@ -76,55 +78,164 @@ write_automation_workflow () {
 
 write_reviewed_automation_workflow () {
 	cat >"$1" <<-'EOF'
-	name: Refresh codex
+name: Refresh codex
 
-	on:
-	  workflow_dispatch:
-	  pull_request:
-	    branches:
-	      - codex
-	      - codex-unstable
-	    types:
-	      - opened
-	      - reopened
-	      - synchronize
-	      - ready_for_review
-	  merge_group:
-	    types:
-	      - checks_requested
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Refresh, remove, reorder, or internal topic review
+        type: choice
+        options:
+          - refresh
+          - remove
+          - reorder
+          - topic-review
+        default: refresh
+      lane:
+        description: codex or codex-unstable for a plan operation
+        required: false
+        type: string
+      topic:
+        description: Exact topic branch for a plan operation
+        required: false
+        type: string
+      source_tip:
+        description: Exact reviewed source SHA for internal topic review
+        required: false
+        type: string
+      review_pr:
+        description: Topic PR number for internal topic review
+        required: false
+        type: string
+      after:
+        description: Existing topic or root for reorder
+        required: false
+        type: string
+      plan_branch:
+        description: Optional codex-plan/* branch name
+        required: false
+        type: string
+  pull_request_review:
+    types:
+      - submitted
+  pull_request_target:
+    branches:
+      - meta
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
 
-	permissions:
-	  actions: read
-	  contents: read
-	  pull-requests: read
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
 
-	jobs:
-	  refresh:
-	    if: github.event_name == 'workflow_dispatch'
-	    uses: openai/git/.github/workflows/codex.yml@meta
-	  admission:
-	    name: Codex admission
-	    if: >-
-	      (github.event_name == 'pull_request' &&
-	       github.event.pull_request.base.ref == 'codex') ||
-	      (github.event_name == 'merge_group' &&
-	       github.event.merge_group.base_ref == 'refs/heads/codex')
-	    permissions:
-	      contents: read
-	      pull-requests: read
-	    uses: openai/git/.github/workflows/codex-admission.yml@meta
-	  unstable_admission:
-	    name: Codex unstable admission
-	    if: >-
-	      (github.event_name == 'pull_request' &&
-	       github.event.pull_request.base.ref == 'codex-unstable') ||
-	      (github.event_name == 'merge_group' &&
-	       github.event.merge_group.base_ref == 'refs/heads/codex-unstable')
-	    permissions:
-	      contents: read
-	      pull-requests: read
-	    uses: openai/git/.github/workflows/codex-admission.yml@meta
+jobs:
+  refresh:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.operation == 'refresh'
+    uses: openai/git/.github/workflows/codex.yml@meta
+  topic_plan_dispatch:
+    name: Queue reviewed topic plan
+    if: >-
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.pull_request.base.ref == 'codex' ||
+       github.event.pull_request.base.ref == 'codex-unstable')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      LANE: ${{ github.event.pull_request.base.ref }}
+      TOPIC: ${{ github.event.pull_request.head.ref }}
+      SOURCE_TIP: ${{ github.event.pull_request.head.sha }}
+      REVIEW_PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Queue trusted plan proposal
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = openai/git
+          test "$DEFAULT_BRANCH" = codex
+          gh workflow run codex.yml --repo "$GITHUB_REPOSITORY" \
+            --ref "$DEFAULT_BRANCH" \
+            -f operation=topic-review \
+            -f lane="$LANE" \
+            -f topic="$TOPIC" \
+            -f source_tip="$SOURCE_TIP" \
+            -f review_pr="$REVIEW_PR"
+  topic_plan_propose:
+    name: Propose reviewed topic plan
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/codex' &&
+      inputs.operation == 'topic-review'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
+    with:
+      lane: ${{ inputs.lane }}
+      topic: ${{ inputs.topic }}
+      action: auto
+      source_tip: ${{ inputs.source_tip }}
+      review_pr: ${{ inputs.review_pr }}
+  policy_plan_propose:
+    name: Propose explicit plan policy
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/codex' &&
+      (inputs.operation == 'remove' || inputs.operation == 'reorder')
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
+    with:
+      lane: ${{ inputs.lane }}
+      topic: ${{ inputs.topic }}
+      action: ${{ inputs.operation }}
+      after: ${{ inputs.after }}
+      plan_branch: ${{ inputs.plan_branch }}
+  plan_admission:
+    name: Codex plan admission
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.base.ref == 'meta'
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: openai/git/.github/workflows/codex-plan-admission.yml@meta
 	EOF
+}
+
+install_reviewed_automation_topic () {
+	topic=${1:-aa/codex/automation} &&
+	style=${2:-current} &&
+	git switch -c "$topic" master &&
+	mkdir -p .github/workflows &&
+	case "$style" in
+	current)
+		write_reviewed_automation_workflow .github/workflows/codex.yml
+		;;
+	previous)
+		write_stable_reviewed_automation_workflow \
+			.github/workflows/codex.yml
+		;;
+	*) return 1 ;;
+	esac &&
+	git add .github/workflows/codex.yml &&
+	git commit -m "reviewed automation topic" &&
+	automation_tip=$(git rev-parse HEAD) &&
+	automation_tree=$(git rev-parse "$automation_tip^{tree}") &&
+	automation_codex_tip=$(make_test_integration "$topic" \
+		"$automation_tip" master "$automation_tree")
 }
 
 write_stable_reviewed_automation_workflow () {
@@ -292,6 +403,46 @@ write_dual_guarded_release_workflow () {
 	    steps:
 	      - run: echo version
 	EOF
+}
+
+install_bootstrap_pin_guard_gh () {
+	directory=$1 &&
+	mkdir -p "$directory" &&
+	cat >"$directory/gh" <<-'EOF' &&
+	#!/bin/sh
+
+	set -eu
+
+	test "${1:-}" = api || exit 90
+	shift
+	endpoint=
+	while test $# -gt 0
+	do
+		case "$1" in
+		repos/openai/git/rulesets\?*) endpoint=list ;;
+		repos/openai/git/rulesets/123) endpoint=detail ;;
+		esac
+		shift
+	done
+	test -n "$endpoint" || exit 91
+	case "$endpoint" in
+	list)
+		if test "${FAKE_BOOTSTRAP_PIN_GUARD:-active}" = active
+		then
+			printf '%s\n' 123
+		fi
+		;;
+	detail)
+		if test "${FAKE_BOOTSTRAP_PIN_GUARD:-active}" = active
+		then
+			printf '%s\n' true
+		else
+			printf '%s\n' false
+		fi
+		;;
+	esac
+	EOF
+	chmod +x "$directory/gh"
 }
 
 install_admission_gh () {
@@ -1063,6 +1214,157 @@ install_unstable_meta_state () (
 	rm -f "$state_topics" "$state_config" "$state_index"
 )
 
+write_pinned_plan () (
+	lane=$1
+	base_branch=$2
+	rows=$3
+	output=$4
+	base_tip=$(git rev-parse "$base_branch") &&
+	{
+		printf "[plan]\n" &&
+		printf "\tversion = 1\n" &&
+		printf "\tlane = %s\n" "$lane" &&
+		printf "\tbase-ref = refs/heads/%s\n" "$base_branch" &&
+		while IFS="$(printf '\t')" read -r name source_tip codex_tip prerequisite
+		do
+			printf "\ttopic = refs/heads/%s\n" "$name"
+		done <"$rows" &&
+		while IFS="$(printf '\t')" read -r name source_tip codex_tip prerequisite
+		do
+			printf "\n[branch \"%s\"]\n" "$name" &&
+			printf "\tremote = .\n" &&
+			printf "\tsource-ref = refs/heads/%s\n" "$name" &&
+			printf "\tsource-tip = %s\n" "$source_tip" &&
+			if test "$prerequisite" = "$base_branch"
+			then
+				source_base=$base_tip
+			else
+				source_base=$(awk -F "$(printf '\t')" \
+					-v name="$prerequisite" \
+					'$1 == name { print $2; exit }' "$rows") &&
+				test -n "$source_base"
+			fi &&
+			printf "\tsource-base = %s\n" "$source_base" &&
+			printf "\tmerge = refs/heads/%s\n" "$prerequisite"
+		done <"$rows"
+	} >"$output"
+)
+
+install_pinned_meta_state () (
+	meta_branch=$1
+	base_branch=$2
+	stable_branch=$3
+	unstable_branch=${4:-}
+	if test -n "$unstable_branch"
+	then
+		install_unstable_meta_state "$meta_branch" "$base_branch" \
+			"$stable_branch" "$unstable_branch"
+	else
+		install_meta_state "$meta_branch" "$base_branch" "$stable_branch"
+	fi &&
+	meta_parent=$(git rev-parse "$meta_branch") &&
+	old_config=.codex-pinned-old-config &&
+	stable_rows=.codex-pinned-stable-rows &&
+	unstable_rows=.codex-pinned-unstable-rows &&
+	stable_plan=.codex-pinned-stable-plan &&
+	unstable_plan=.codex-pinned-unstable-plan &&
+	state_config=.codex-pinned-state-config &&
+	state_index=.codex-pinned-state-index &&
+	git show "$meta_parent:codex.config" >"$old_config" &&
+	base_tip=$(git config --file "$old_config" --get codex.base-tip) &&
+	stable_tip=$(git config --file "$old_config" --get codex.output-tip) &&
+	: >"$stable_rows" &&
+	: >"$unstable_rows" &&
+	git config --file "$old_config" --get-regexp '^branch\..*\.codex-tip$' |
+	while IFS=' ' read -r key codex_tip
+	do
+		name=${key#branch.} &&
+		name=${name%.codex-tip} &&
+		source_tip=$(git rev-parse "$name") &&
+		prerequisite=$(git config --file "$old_config" \
+			--get "branch.$name.merge") &&
+		prerequisite=${prerequisite#refs/heads/} &&
+		case "$name" in
+		*-unstable)
+			printf "%s\t%s\t%s\t%s\n" "$name" "$source_tip" \
+				"$codex_tip" "$prerequisite" >>"$unstable_rows"
+			;;
+		*)
+			printf "%s\t%s\t%s\t%s\n" "$name" "$source_tip" \
+				"$codex_tip" "$prerequisite" >>"$stable_rows"
+			;;
+		esac
+	done &&
+	LC_ALL=C sort -o "$stable_rows" "$stable_rows" &&
+	LC_ALL=C sort -o "$unstable_rows" "$unstable_rows" &&
+	cat "$stable_rows" "$unstable_rows" |
+	while IFS="$(printf '\t')" read -r name source_tip codex_tip prerequisite
+	do
+		git update-ref "refs/heads/codex-pins/$source_tip" "$source_tip"
+	done &&
+	write_pinned_plan codex "$base_branch" "$stable_rows" "$stable_plan" &&
+	stable_plan_blob=$(git hash-object -w "$stable_plan") &&
+	if test -n "$unstable_branch"
+	then
+		write_pinned_plan codex-unstable codex "$unstable_rows" \
+			"$unstable_plan" &&
+		unstable_plan_blob=$(git hash-object -w "$unstable_plan") &&
+		unstable_tip=$(git config --file "$old_config" \
+			--get codex-unstable.output-tip)
+	else
+		unstable_plan_blob=
+	fi &&
+	{
+		printf "[codex]\n" &&
+		printf "\tversion = 3\n" &&
+		printf "\tbase-ref = refs/heads/%s\n" "$base_branch" &&
+		printf "\tbase-tip = %s\n" "$base_tip" &&
+		printf "\toutput-ref = refs/heads/%s\n" "$stable_branch" &&
+		printf "\toutput-tip = %s\n" "$stable_tip" &&
+		printf "\tapplied-plan = %s\n" "$stable_plan_blob" &&
+		if test -n "$unstable_branch"
+		then
+			printf "\n[codex-unstable]\n" &&
+			printf "\tbase-ref = refs/heads/%s\n" "$stable_branch" &&
+			printf "\tbase-tip = %s\n" "$stable_tip" &&
+			printf "\toutput-ref = refs/heads/codex-unstable\n" &&
+			printf "\toutput-tip = %s\n" "$unstable_tip" &&
+			printf "\tapplied-plan = %s\n" "$unstable_plan_blob"
+		fi &&
+		cat "$stable_rows" "$unstable_rows" |
+		while IFS="$(printf '\t')" read -r name source_tip codex_tip prerequisite
+		do
+			printf "\n[branch \"%s\"]\n" "$name" &&
+			printf "\tremote = .\n" &&
+			printf "\tsource-ref = refs/heads/%s\n" "$name" &&
+			printf "\tsource-tip = %s\n" "$source_tip" &&
+			printf "\tmerge = refs/heads/%s\n" "$prerequisite" &&
+			printf "\tcodex-tip = %s\n" "$codex_tip"
+		done
+	} >"$state_config" &&
+	blob=$(git hash-object -w "$state_config") &&
+	helper_blob=$(git hash-object -w "$codex_branch") &&
+	rm -f "$state_index" &&
+	GIT_INDEX_FILE=$state_index git read-tree "$meta_parent^{tree}" &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100644,"$blob",codex.config &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100644,"$stable_plan_blob",codex.plan &&
+	if test -n "$unstable_branch"
+	then
+		GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+			100644,"$unstable_plan_blob",codex-unstable.plan
+	fi &&
+	GIT_INDEX_FILE=$state_index git update-index --add --cacheinfo \
+		100755,"$helper_blob",.github/workflows/codex-branch.sh &&
+	tree=$(GIT_INDEX_FILE=$state_index git write-tree) &&
+	meta_tip=$(printf "%s\n" "meta: initialize pinned Codex plans" |
+		git commit-tree "$tree" -p "$meta_parent") &&
+	git update-ref "refs/heads/$meta_branch" "$meta_tip" "$meta_parent" &&
+	rm -f "$old_config" "$stable_rows" "$unstable_rows" \
+		"$stable_plan" "$unstable_plan" "$state_config" "$state_index"
+)
+
 create_unstable_sentinel () (
 	base=$(git rev-parse "$1") &&
 	tree=$(git rev-parse "$base^{tree}") &&
@@ -1319,105 +1621,76 @@ test_expect_success 'refresh only prepares an immutable local-publish artifact' 
 	done
 '
 
-test_expect_success 'reviewed admission requires one app-authenticated queue entry' '
-	test -f "$codex_admission_workflow" &&
-	test_grep "name: Verify reviewed topic" \
-		"$codex_admission_workflow" &&
-	test_grep "pull_request)" "$codex_admission_workflow" &&
-	test_grep "merge_group)" "$codex_admission_workflow" &&
-	test_grep "codex.output-tip" "$codex_admission_workflow" &&
-	test_grep "codex-unstable.output-tip" "$codex_admission_workflow" &&
-	test_grep "case \\\"\\\$GITHUB_REF\\\" in" \
-		"$codex_admission_workflow" &&
-	test_grep "refs/heads/gh-readonly-queue/" \
-		"$codex_admission_workflow" &&
-	test_grep "pull-requests: read" "$codex_admission_workflow" &&
-	! grep -E "contents: write|pull-requests: write|statuses: write|id-token|actions/checkout|git push" \
-		"$codex_admission_workflow" &&
-	test_grep "  pull_request:" "$codex_branch" &&
-	test_grep "  merge_group:" "$codex_branch" &&
-	test_grep "codex-admission.yml@meta" "$codex_branch" &&
+test_expect_success 'generated lanes are output-only and meta gates review in the admission check' '
+	for lane in codex codex-unstable
+	do
+		rules="$codex_root/.github/rulesets/$lane-branch.json" &&
+		jq -e --arg ref "refs/heads/$lane" "
+			.conditions.ref_name.include == [\$ref] and
+			([.rules[].type] | sort) ==
+				[\"creation\",\"deletion\",\"update\"] and
+			(.rules[] | select(.type == \"update\") |
+			 .parameters.update_allows_fetch_and_merge == false) and
+			([.rules[] | select(.type == \"merge_queue\" or
+			 .type == \"required_status_checks\" or
+			 .type == \"pull_request\")] | length) == 0
+		" "$rules" || return 1
+	done &&
 	jq -e "
-		(.rules[] | select(.type == \"merge_queue\") |
-		 .parameters.merge_method == \"MERGE\" and
-		 .parameters.grouping_strategy == \"ALLGREEN\" and
-		 .parameters.max_entries_to_build == 1 and
-		 .parameters.max_entries_to_merge == 1 and
-		 .parameters.min_entries_to_merge == 1) and
+		(.rules[] | select(.type == \"pull_request\") |
+		 .parameters.required_approving_review_count == 1 and
+		 .parameters.require_last_push_approval == true and
+		 .parameters.dismiss_stale_reviews_on_push == true) and
 		(.rules[] | select(.type == \"required_status_checks\") |
-		 .parameters.strict_required_status_checks_policy == false and
+		 .parameters.strict_required_status_checks_policy == true and
 		 .parameters.required_status_checks == [{
-		   \"context\": \"Codex admission / Verify reviewed topic\",
+		   \"context\": \"Codex plan admission / Verify pinned manifest\",
 		   \"integration_id\": 15368
-		 }])
-	" "$codex_root/.github/rulesets/codex-branch.json" &&
-	if test -n "${CODEX_AUTOMATION_TOPIC:-}"
-	then
-		test_grep "  pull_request:" "$CODEX_AUTOMATION_TOPIC" &&
-		test_grep "  merge_group:" "$CODEX_AUTOMATION_TOPIC" &&
-		test_grep "codex-admission.yml@meta" "$CODEX_AUTOMATION_TOPIC"
-	fi &&
-	if test -n "${CODEX_RELEASE_TOPIC:-}"
-	then
-		test_grep "  publication:" "$CODEX_RELEASE_TOPIC" &&
-		test_grep "    needs: publication" "$CODEX_RELEASE_TOPIC" &&
-		test_grep "codex.output-tip" "$CODEX_RELEASE_TOPIC" &&
-		! grep -F "git/ref/heads/codex" "$CODEX_RELEASE_TOPIC" &&
-		test_grep "git/ref/heads/meta" "$CODEX_RELEASE_TOPIC" &&
-		if grep -F "codex-unstable" "$CODEX_RELEASE_TOPIC" >/dev/null
-		then
-			test_grep "codex-unstable.output-tip" \
-				"$CODEX_RELEASE_TOPIC" &&
-			test_grep "case \\\"\\\$GITHUB_REF\\\" in" \
-				"$CODEX_RELEASE_TOPIC" &&
-			test_grep "github.event.deleted == false" \
-				"$CODEX_RELEASE_TOPIC"
-		fi
-	fi
+		 }]) and
+		([.bypass_actors[] | select(.actor_type == \"Integration\")] |
+		 length) == 0
+	" "$codex_root/.github/rulesets/codex-meta.json"
 '
 
-test_expect_success 'admission workflow executes both pull-request and queue checks' '
-	install_admission_gate_gh "$TRASH_DIRECTORY/admission-gate-bin" &&
-	sed -n "/^        run: |\$/,/^        [^ ]/p" \
-		"$codex_admission_workflow" |
-	sed "1d; s/^          //" >"$TRASH_DIRECTORY/admission-gate.sh" &&
-	test_grep "set -euo pipefail" "$TRASH_DIRECTORY/admission-gate.sh" &&
-	bash -n "$TRASH_DIRECTORY/admission-gate.sh" &&
-	run_admission_gate success pull_request >pull.out &&
-	test_grep "Approved pull request #42" pull.out &&
-	run_admission_gate legacy-release pull_request >legacy-release.out &&
-	test_grep "Approved pull request #42" legacy-release.out &&
-	run_admission_gate pending pull_request >pending-pull.out &&
-	test_grep "Approved pull request #42" pending-pull.out &&
-	run_admission_gate success merge_group >queue.out &&
-	test_grep "Approved pull request #42" queue.out &&
-	run_admission_gate same-tip-alias merge_group >alias.out &&
-	test_grep "Approved pull request #42" alias.out &&
-	run_admission_gate newer-master merge_group >newer-master.out &&
-	test_grep "Approved pull request #42" newer-master.out &&
-	for mode in pending wrong-parent unapproved multiple-pulls \
-		changed-topic changed-workflow hidden-prerequisite \
-		hidden-wip hidden-stale hidden-unstable hidden-enrolled-unstable
-	do
-		test_expect_code 1 run_admission_gate "$mode" merge_group \
-			>"queue-$mode.out" 2>"queue-$mode.err" || return 1
-	done &&
-	test_grep "pending topic" queue-pending.err &&
-	test_grep "unenrolled history" queue-hidden-prerequisite.err &&
-	for mode in dual-release-legacy-guard dual-release-no-delete \
-		dual-release-wrong-key
-	do
-		test_expect_code 1 run_admission_gate "$mode" merge_group \
-			>"$mode.out" 2>"$mode.err" &&
-		test_grep "controller-only release guard" "$mode.err" || return 1
-	done &&
-	test_expect_code 1 \
-		run_admission_gate success pull_request \
-			bb/codex/reviewed-unstable \
-		>unstable-pull.out 2>unstable-pull.err &&
-	test_grep "not eligible for production codex" unstable-pull.err
+test_expect_success 'plan admission checks the exact reviewed head from trusted meta' '
+	test_path_is_file "$codex_plan_admission_workflow" &&
+	test_grep "name: Codex plan admission" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "  workflow_call:" "$codex_plan_admission_workflow" &&
+	! grep -F "  pull_request_review:" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "pull_request_review:" "$codex_branch" &&
+	test_grep "pull_request_target:" "$codex_branch" &&
+	test_grep "topic_plan_dispatch:" "$codex_branch" &&
+	test_grep "actions: write" "$codex_branch" &&
+	test_grep "gh workflow run codex.yml" "$codex_branch" &&
+	test_grep "inputs.operation == .*topic-review" "$codex_branch" &&
+	sed -n "/^  topic_plan_dispatch:/,/^  topic_plan_propose:/p" "$codex_branch" >review-dispatch &&
+	! grep -E "codex-plan-propose|environment:|CODEX_PLAN_APP_PRIVATE_KEY|contents: write|pull-requests: write" review-dispatch &&
+	test_grep "action: auto" "$codex_branch" &&
+	test_grep "policy_plan_propose:" "$codex_branch" &&
+	test_grep "inputs.operation" "$codex_branch" &&
+	test_grep "codex-plan-admission.yml@meta" "$codex_branch" &&
+	! grep -E "^[[:space:]]+paths(-ignore)?:" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "contents: read" "$codex_plan_admission_workflow" &&
+	test_grep "pull-requests: write" "$codex_plan_admission_workflow" &&
+	! grep -E "contents: write|statuses: write|id-token|git push" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "github.event.pull_request.base.sha" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "validate-plan-transition" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "validate-topic-review" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "ordinary meta review applies" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "gh pr review" "$codex_plan_admission_workflow" &&
+	test_grep "Codex plan branch moved while admission was running" \
+		"$codex_plan_admission_workflow" &&
+	test_grep "meta changed while Codex plan admission was running" \
+		"$codex_plan_admission_workflow"
 '
-
 test_expect_success 'dual-lane release gate selects only the exact published output' '
 	write_dual_guarded_release_workflow \
 		"$TRASH_DIRECTORY/codex-release.yml" &&
@@ -2073,7 +2346,9 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 					--require-automation &&
 				git show "$(cat result):.github/workflows/codex.yml" \
 					>candidate-workflow &&
-				test_grep "  merge_group:" candidate-workflow
+				test_grep "  pull_request_target:" candidate-workflow &&
+				test_grep "codex-plan-admission.yml@meta" \
+					candidate-workflow
 			else
 				test_expect_code 1 \
 					sh "$codex_branch" rewrite --remote origin \
@@ -5772,56 +6047,55 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 	)
 '
 
-test_expect_success 'unstable rules require one app-authenticated queue entry' '
-	rules="$codex_root/.github/rulesets/codex-unstable-branch.json" &&
-	test_path_is_file "$rules" &&
+test_expect_success 'pins are App-created, immutable, and plan branches are App-owned' '
 	jq -e "
-		(.conditions.ref_name.include == [\"refs/heads/codex-unstable\"]) and
-		(.rules[] | select(.type == \"merge_queue\") |
-		 .parameters.merge_method == \"MERGE\" and
-		 .parameters.grouping_strategy == \"ALLGREEN\" and
-		 .parameters.max_entries_to_build == 1 and
-		 .parameters.max_entries_to_merge == 1 and
-		 .parameters.min_entries_to_merge == 1) and
-		(.rules[] | select(.type == \"required_status_checks\") |
-		 .parameters.required_status_checks == [{
-		   \"context\": \"Codex unstable admission / Verify reviewed topic\",
-		   \"integration_id\": 15368
-		 }])
-	" "$rules" &&
-	test_grep "codex-unstable.output-tip" "$codex_admission_workflow" &&
-	test_grep "codex-unstable.base-tip" "$codex_admission_workflow"
+		.conditions.ref_name.include == [\"refs/heads/codex-pins/*\"] and
+		[.rules[].type] == [\"creation\"] and
+		(any(.bypass_actors[]; .actor_type == \"Integration\" and
+		 .actor_id == 1144995))
+	" "$codex_root/.github/rulesets/codex-pins.json" &&
+	jq -e "
+		.conditions.ref_name.include == [\"refs/heads/codex-pins/*\"] and
+		([.rules[].type] | sort) == [\"deletion\",\"update\"] and
+		(.rules[] | select(.type == \"update\") |
+		 .parameters.update_allows_fetch_and_merge == false) and
+		([.bypass_actors[] | select(.actor_type == \"Integration\")] |
+		 length) == 0
+	" "$codex_root/.github/rulesets/codex-pins-immutable.json" &&
+	jq -e "
+		.conditions.ref_name.include == [\"refs/heads/codex-plan/*\"] and
+		([.rules[].type] | sort) ==
+			[\"creation\",\"deletion\",\"update\"] and
+		(.rules[] | select(.type == \"update\") |
+		 .parameters.update_allows_fetch_and_merge == false) and
+		(any(.bypass_actors[]; .actor_type == \"Integration\" and
+		 .actor_id == 1144995))
+	" "$codex_root/.github/rulesets/codex-plan-branches.json" &&
+	test_grep "codex-plan/\*/\*" "$codex_branch" &&
+	test_grep "codex-plan/\*/\*" "$codex_plan_admission_workflow"
 '
 
-test_expect_success 'unstable admission executes both lane-specific checks' '
-	install_admission_gate_gh "$TRASH_DIRECTORY/admission-gate-bin" &&
-	sed -n "/^        run: |\$/,/^        [^ ]/p" \
-		"$codex_admission_workflow" |
-	sed "1d; s/^          //" >"$TRASH_DIRECTORY/admission-gate.sh" &&
-	run_admission_gate success pull_request \
-		bb/codex/reviewed-unstable codex-unstable >unstable-pull.out &&
-	test_grep "Approved pull request #42" unstable-pull.out &&
-	run_admission_gate success merge_group \
-		bb/codex/reviewed-unstable codex-unstable >unstable-queue.out &&
-	test_grep "Approved pull request #42" unstable-queue.out &&
-	run_admission_gate descendant-checkpoint merge_group \
-		bb/codex/reviewed-unstable codex-unstable \
-		>unstable-descendant-queue.out &&
-	test_grep "Approved pull request #42" \
-		unstable-descendant-queue.out &&
-	for mode in pending wrong-parent unapproved multiple-pulls \
-		changed-topic changed-workflow hidden-prerequisite
-	do
-		test_expect_code 1 run_admission_gate "$mode" merge_group \
-			bb/codex/reviewed-unstable codex-unstable \
-			>"unstable-$mode.out" 2>"unstable-$mode.err" || return 1
-	done &&
-	test_expect_code 1 run_admission_gate success pull_request \
-		bb/codex/reviewed codex-unstable \
-		>stable-in-unstable.out 2>stable-in-unstable.err &&
-	test_grep "unstable" stable-in-unstable.err
+test_expect_success 'plan producer uses the dedicated App from trusted meta' '
+	test_path_is_file "$codex_plan_propose_workflow" &&
+	test_grep "name: Propose Codex plan" \
+		"$codex_plan_propose_workflow" &&
+	test_grep "  workflow_call:" \
+		"$codex_plan_propose_workflow" &&
+	test_grep "environment: codex-plan" \
+		"$codex_plan_propose_workflow" &&
+	test_grep "actions/create-github-app-token@" \
+		"$codex_plan_propose_workflow" &&
+	test_grep "app-id: 1144995" \
+		"$codex_plan_propose_workflow" &&
+	test_grep "CODEX_PLAN_APP_PRIVATE_KEY" \
+		"$codex_plan_propose_workflow" &&
+	test_grep "steps.meta.outputs.sha" "$codex_plan_propose_workflow" &&
+	test_grep "expected-meta" "$codex_plan_propose_workflow" &&
+	test_grep "propose-plan" "$codex_plan_propose_workflow" &&
+	test_grep "review-pr" "$codex_plan_propose_workflow" &&
+	test_grep "plan-branch" "$codex_plan_propose_workflow" &&
+	! grep -F "\$\${" "$codex_plan_propose_workflow"
 '
-
 test_expect_success 'unadmitted unstable checkpoints leave v1 output unchanged' '
 	setup_pending_admission inert-unstable-checkpoints &&
 	enrolled=$(git --git-dir=inert-unstable-checkpoints.git \
@@ -7986,6 +8260,630 @@ test_expect_success 'verify-output rejects a flattened unstable fan-in merge' '
 			>flattened.out 2>flattened.err &&
 		test_grep "merge rewrite.*topology" flattened.err
 	)
+'
+
+test_expect_success 'pinned plans keep source refs immutable while rebuilding outputs' '
+	git init --bare pinned-plan.git &&
+	test_create_repo pinned-plan-source &&
+	(
+		cd pinned-plan-source &&
+		git remote add origin ../pinned-plan.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "pinned base" &&
+		install_reviewed_automation_topic &&
+		git switch -c aa/codex/enrolled "$automation_tip" &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "pinned stable topic" &&
+		stable_topic=$(git rev-parse HEAD) &&
+		stable_tree=$(git rev-parse "$stable_topic^{tree}") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$stable_topic" "$automation_codex_tip" "$stable_tree") &&
+		git branch codex "$codex_tip" &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_pinned_meta_state meta master codex codex-unstable &&
+		git switch -c tb/codex/preview-unstable codex &&
+		write preview preview-file &&
+		git add preview-file &&
+		git commit -m "pinned preview topic" &&
+		git switch -c preview-side-a codex &&
+		write side-a side-a-file &&
+		git add side-a-file &&
+		git commit -m "preview side a" &&
+		git switch tb/codex/preview-unstable &&
+		git merge --no-ff preview-side-a -m "merge preview side a" &&
+		git switch -c preview-side-b codex &&
+		write side-b side-b-file &&
+		git add side-b-file &&
+		git commit -m "preview side b" &&
+		git switch tb/codex/preview-unstable &&
+		git merge --no-ff preview-side-b -m "merge preview side b" &&
+		pin=$(git rev-parse HEAD) &&
+		git update-ref "refs/heads/codex-pins/$pin" "$pin" &&
+		git switch meta &&
+		printf "%s\t%s\t%s\t%s\n" \
+			tb/codex/preview-unstable "$pin" "$pin" codex \
+			>pinned.rows &&
+		write_pinned_plan codex-unstable codex pinned.rows \
+			codex-unstable.plan &&
+		git add codex-unstable.plan &&
+		git commit -m "meta: pin preview topic" &&
+		git push origin --all
+	) &&
+	git clone pinned-plan.git pinned-plan-runner &&
+	(
+		cd pinned-plan-runner &&
+		fetch_all &&
+		pin=$(git rev-parse origin/tb/codex/preview-unstable) &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		tab=$(printf "\t") &&
+		! grep \
+			"^refs/heads/tb/codex/preview-unstable$tab" updates &&
+		test_grep "pin$tab""refs/heads/codex-pins/$pin$tab$pin" \
+			inputs &&
+		meta=$(updated_tip meta updates) &&
+		unstable=$(updated_tip codex-unstable updates) &&
+		test "$(git show "$meta:codex.config" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/preview-unstable.source-tip)" = \
+			"$pin" &&
+		generated=$(git show "$meta:codex.config" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/preview-unstable.codex-tip) &&
+		test "$generated" = "$pin" &&
+		test "$(git rev-list --min-parents=2 \
+			"origin/codex..$generated" | wc -l | tr -d " ")" = 2 &&
+		git merge-base --is-ancestor "$generated" "$unstable" &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates updates --result result
+	)
+'
+
+test_expect_success 'a v2 controller can bootstrap both pinned plans in one meta change' '
+	git init --bare pinned-bootstrap.git &&
+	test_create_repo pinned-bootstrap-source &&
+	(
+		cd pinned-bootstrap-source &&
+		git remote add origin ../pinned-bootstrap.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "bootstrap base" &&
+		install_reviewed_automation_topic &&
+		git switch -c aa/codex/enrolled "$automation_tip" &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "bootstrap stable topic" &&
+		stable_topic=$(git rev-parse HEAD) &&
+		stable_tree=$(git rev-parse "$stable_topic^{tree}") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$stable_topic" "$automation_codex_tip" "$stable_tree") &&
+		git branch codex "$codex_tip" &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch aa/codex/enrolled &&
+		write advanced advanced-file &&
+		git add advanced-file &&
+		git commit -m "unplanned stable advance" &&
+		git switch -c tb/codex/preview-unstable codex &&
+		write preview preview-file &&
+		git add preview-file &&
+		git commit -m "bootstrap preview topic" &&
+		preview_tip=$(git rev-parse HEAD) &&
+		git update-ref "refs/heads/codex-pins/$automation_tip" \
+			"$automation_tip" &&
+		git update-ref "refs/heads/codex-pins/$stable_topic" \
+			"$stable_topic" &&
+		git update-ref "refs/heads/codex-pins/$preview_tip" \
+			"$preview_tip" &&
+		git switch meta &&
+		printf "%s\t%s\t%s\t%s\n" aa/codex/automation \
+			"$automation_tip" "$automation_tip" master >stable.rows &&
+		printf "%s\t%s\t%s\t%s\n" aa/codex/enrolled \
+			"$stable_topic" "$stable_topic" aa/codex/automation \
+			>>stable.rows &&
+		printf "%s\t%s\t%s\t%s\n" tb/codex/preview-unstable \
+			"$preview_tip" "$preview_tip" codex >unstable.rows &&
+		write_pinned_plan codex master stable.rows codex.plan &&
+		write_pinned_plan codex-unstable codex unstable.rows \
+			codex-unstable.plan &&
+		git add codex.plan codex-unstable.plan &&
+		git commit -m "meta: bootstrap pinned plans" &&
+		git push origin --all
+	) &&
+	git clone pinned-bootstrap.git pinned-bootstrap-runner &&
+	(
+		cd pinned-bootstrap-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		meta=$(updated_tip meta updates) &&
+		test "$(git show "$meta:codex.config" |
+			git config --file /dev/stdin --get codex.version)" = 3 &&
+		test_grep "plan$(printf "\t")codex.plan" inputs &&
+		test_grep "unstable-plan$(printf "\t")codex-unstable.plan" \
+			inputs &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates updates --result result
+	)
+'
+
+test_expect_success 'propose-plan atomically creates immutable pins and a plan PR head' '
+	git init --bare proposed-plan.git &&
+	test_create_repo proposed-plan-source &&
+	(
+		cd proposed-plan-source &&
+		git remote add origin ../proposed-plan.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "proposal base" &&
+		install_reviewed_automation_topic &&
+		git switch -c aa/codex/enrolled "$automation_tip" &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "proposal stable topic" &&
+		stable_topic=$(git rev-parse HEAD) &&
+		stable_tree=$(git rev-parse "$stable_topic^{tree}") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$stable_topic" "$automation_codex_tip" "$stable_tree") &&
+		git branch codex "$codex_tip" &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch -c tb/codex/preview-unstable codex &&
+		write preview preview-file &&
+		git add preview-file &&
+		git commit -m "proposal preview topic" &&
+		git push origin --all
+	) &&
+	git clone proposed-plan.git proposed-plan-runner &&
+	(
+		cd proposed-plan-runner &&
+		fetch_all &&
+		mkdir plan-bin &&
+		cat >plan-bin/gh <<-\EOF &&
+		#!/bin/sh
+		case " $* " in
+		*"/pulls/999/reviews?"*)
+			printf "%s\t%s\t%s\t%s\n" reviewer APPROVED \
+				"$FAKE_TIP" MEMBER
+			exit 0
+			;;
+		*"/pulls/999 "*)
+			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+				open false codex-unstable openai/git \
+				"$FAKE_TOPIC" "$FAKE_TIP" author
+			exit 0
+			;;
+		esac
+		if test "$1" = pr && test "$2" = view
+		then
+			printf "%s\n" APPROVED
+			exit 0
+		fi
+		if test "$1" = pr && test "$2" = merge
+		then
+			exit 0
+		fi
+		test "$1" = pr &&
+		test "$2" = create &&
+		printf "%s\n" https://github.com/openai/git/pull/999
+		EOF
+		chmod +x plan-bin/gh &&
+		preview=$(git rev-parse origin/tb/codex/preview-unstable) &&
+		before_topic=$(git rev-parse origin/tb/codex/preview-unstable) &&
+		FAKE_TOPIC=tb/codex/preview-unstable FAKE_TIP="$preview" \
+		PATH="$PWD/plan-bin:$PATH" sh "$codex_branch" propose-plan \
+			--remote origin --lane codex-unstable \
+			--topic tb/codex/preview-unstable \
+			--source-tip "$preview" --review-pr 999 --action auto \
+			--plan-branch codex-plan/preview >out &&
+		fetch_all &&
+		plan=$(git rev-parse origin/codex-plan/preview) &&
+		test "$(git show -s --format=%P "$plan")" = \
+			"$(git rev-parse origin/meta)" &&
+		git cat-file -e "$plan:codex.plan" &&
+		git cat-file -e "$plan:codex-unstable.plan" &&
+		test "$(git rev-parse \
+			origin/codex-pins/$preview)" = "$preview" &&
+		test "$(git rev-parse \
+			origin/tb/codex/preview-unstable)" = "$before_topic" &&
+		sh "$codex_branch" validate-plan-transition --remote origin \
+			--base-commit origin/meta --head-commit "$plan" &&
+		test_grep "opened pinned plan pull request" out
+	)
+'
+
+test_expect_success 'a pinned root keeps its reviewed boundary after base and source refs move' '
+	git init --bare pinned-root-boundary.git &&
+	test_create_repo pinned-root-boundary-source &&
+	(
+		cd pinned-root-boundary-source &&
+		git remote add origin ../pinned-root-boundary.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "boundary base" &&
+		install_reviewed_automation_topic &&
+		git switch -c aa/codex/enrolled "$automation_tip" &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "boundary enrolled topic" &&
+		enrolled=$(git rev-parse HEAD) &&
+		enrolled_tree=$(git rev-parse "$enrolled^{tree}") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$enrolled" "$automation_codex_tip" "$enrolled_tree") &&
+		git branch codex "$codex_tip" &&
+		git branch meta master &&
+		install_meta_state meta master codex &&
+		git switch -c bb/codex/new-root master &&
+		write topic new-root-file &&
+		git add new-root-file &&
+		git commit -m "reviewed new root" &&
+		git push origin --all
+	) &&
+	git clone pinned-root-boundary.git pinned-root-boundary-runner &&
+	(
+		cd pinned-root-boundary-runner &&
+		fetch_all &&
+		mkdir plan-bin &&
+		cat >plan-bin/gh <<-\EOF &&
+		#!/bin/sh
+		case " $* " in
+		*"/pulls/1000/reviews?"*)
+			printf "%s\t%s\t%s\t%s\n" reviewer APPROVED \
+				"$FAKE_TIP" MEMBER
+			exit 0
+			;;
+		*"/pulls/1000 "*)
+			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+				open false codex openai/git \
+				"$FAKE_TOPIC" "$FAKE_TIP" author
+			exit 0
+			;;
+		esac
+		if test "$1" = pr && test "$2" = view
+		then
+			printf "%s\n" APPROVED
+			exit 0
+		fi
+		if test "$1" = pr && test "$2" = merge
+		then
+			exit 0
+		fi
+		test "$1" = pr &&
+		test "$2" = create &&
+		printf "%s\n" https://github.com/openai/git/pull/1000
+		EOF
+		chmod +x plan-bin/gh &&
+		reviewed=$(git rev-parse origin/bb/codex/new-root) &&
+		FAKE_TOPIC=bb/codex/new-root FAKE_TIP="$reviewed" \
+		PATH="$PWD/plan-bin:$PATH" sh "$codex_branch" propose-plan \
+			--remote origin --lane codex --topic bb/codex/new-root \
+			--source-tip "$reviewed" --review-pr 1000 --action add \
+			--plan-branch codex-plan/new-root >plan.out &&
+		fetch_all &&
+		plan=$(git rev-parse origin/codex-plan/new-root) &&
+		git push origin "$plan:refs/heads/meta" &&
+		(
+			cd ../pinned-root-boundary-source &&
+			git switch master &&
+			write advanced advanced-base &&
+			git add advanced-base &&
+			git commit -m "advance base after review" &&
+			git push origin master
+		) &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		candidate=$(cat result) &&
+		test "$(git show "$candidate:advanced-base")" = advanced &&
+		test "$(git show "$candidate:new-root-file")" = topic &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		(
+			cd ../pinned-root-boundary-source &&
+			git switch bb/codex/new-root &&
+			write unreviewed unreviewed-file &&
+			git add unreviewed-file &&
+			git commit -m "unreviewed topic advance" &&
+			git push origin bb/codex/new-root
+		) &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result next-result \
+			--updates next-updates --inputs next-inputs \
+			--failure next-failure &&
+		test "$candidate" = "$(cat next-result)" &&
+		test_grep "pin$(printf "\t")refs/heads/codex-pins/$reviewed" \
+			next-inputs &&
+		! git ls-tree -r --name-only "$(cat next-result)" |
+			grep -F unreviewed-file
+	)
+'
+
+test_expect_success 'pre-v3 bootstrap records authorization and can pin each explicit override' '
+	git init --bare pinned-bootstrap-command.git &&
+	test_create_repo pinned-bootstrap-command-source &&
+	(
+		cd pinned-bootstrap-command-source &&
+		git remote add origin ../pinned-bootstrap-command.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "bootstrap command base" &&
+		install_reviewed_automation_topic aa/codex/automation previous &&
+		git switch -c aa/codex/enrolled master &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "bootstrap command stable topic" &&
+		stable=$(git rev-parse HEAD) &&
+		codex_tree=$(git merge-tree --write-tree \
+			"$automation_codex_tip" "$stable") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$stable" "$automation_codex_tip" "$codex_tree") &&
+		git branch codex "$codex_tip" &&
+		git switch -c tb/codex/preview-unstable codex &&
+		write old preview-file &&
+		git add preview-file &&
+		git commit -m "old preview" &&
+		old_preview=$(git rev-parse HEAD) &&
+		old_tree=$(git rev-parse "$old_preview^{tree}") &&
+		unstable=$(make_test_unstable_integration \
+			tb/codex/preview-unstable "$old_preview" codex \
+			"$old_tree") &&
+		git branch codex-unstable "$unstable" &&
+		git branch meta master &&
+		install_unstable_meta_state meta master codex codex-unstable &&
+		git switch tb/codex/preview-unstable &&
+		write new new-preview-file &&
+		git add new-preview-file &&
+		git commit -m "authorized preview override" &&
+		git push origin --all
+	) &&
+	git clone pinned-bootstrap-command.git pinned-bootstrap-command-runner &&
+	(
+		cd pinned-bootstrap-command-runner &&
+		fetch_all &&
+		install_bootstrap_pin_guard_gh "$PWD/bootstrap-bin" &&
+		new_preview=$(git rev-parse origin/tb/codex/preview-unstable) &&
+		before_meta=$(git rev-parse origin/meta) &&
+		test_expect_code 1 env FAKE_BOOTSTRAP_PIN_GUARD=missing \
+			PATH="$PWD/bootstrap-bin:$PATH" \
+			sh "$codex_branch" propose-plan --remote origin \
+			--lane codex-unstable \
+			--topic tb/codex/preview-unstable \
+			--source-tip "$new_preview" --action alter \
+			--bootstrap-authorization "user-approved bootstrap" \
+			>unguarded.out 2>unguarded.err &&
+		test_grep "pre-v3 bootstrap requires active immutable Codex pin guard" \
+			unguarded.err &&
+		fetch_all &&
+		test "$before_meta" = "$(git rev-parse origin/meta)" &&
+		test_must_fail git show-ref --verify \
+			"refs/remotes/origin/codex-pins/$new_preview" &&
+		PATH="$PWD/bootstrap-bin:$PATH" \
+		sh "$codex_branch" propose-plan --remote origin \
+			--lane codex-unstable \
+			--topic tb/codex/preview-unstable \
+			--source-tip "$new_preview" --action alter \
+			--bootstrap-authorization "user-approved bootstrap" \
+			>bootstrap.out &&
+		fetch_all &&
+		meta=$(git rev-parse origin/meta) &&
+		test "$(git show -s \
+			--format="%(trailers:key=Codex-Plan-Bootstrap,valueonly)" \
+			"$meta")" = true &&
+		test "$(git show -s \
+			--format="%(trailers:key=Codex-Plan-Authorization,valueonly)" \
+			"$meta")" = "user-approved bootstrap" &&
+		test "$(git show "$meta:codex-unstable.plan" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/preview-unstable.source-tip)" = \
+			"$new_preview" &&
+		test "$(git rev-parse \
+			"origin/codex-pins/$new_preview")" = "$new_preview" &&
+		test_must_fail git show-ref --verify \
+			refs/remotes/origin/codex-plan/preview &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result blocked-result --updates blocked-updates \
+			--inputs blocked-inputs --failure blocked-failure \
+			>blocked.out 2>blocked.err &&
+		test_grep "pre-v3 pinned plan must pin the current automation workflow" \
+			blocked.err &&
+		(
+			cd ../pinned-bootstrap-command-source &&
+			git switch aa/codex/automation &&
+			write_reviewed_automation_workflow \
+				.github/workflows/codex.yml &&
+			git add .github/workflows/codex.yml &&
+			git commit -m "authorized automation trampoline" &&
+			git push origin aa/codex/automation
+		) &&
+		fetch_all &&
+		new_automation=$(git rev-parse origin/aa/codex/automation) &&
+		PATH="$PWD/bootstrap-bin:$PATH" \
+		sh "$codex_branch" propose-plan --remote origin \
+			--lane codex --topic aa/codex/automation \
+			--source-tip "$new_automation" --action alter \
+			--bootstrap-authorization "user-approved bootstrap" \
+			>second-bootstrap.out &&
+		fetch_all &&
+		second_meta=$(git rev-parse origin/meta) &&
+		test "$(git show -s --format=%P "$second_meta")" = "$meta" &&
+		test "$(git show "$second_meta:codex.plan" |
+			git config --file /dev/stdin \
+				--get branch.aa/codex/automation.source-tip)" = \
+			"$new_automation" &&
+		test "$(git rev-parse \
+			"origin/codex-pins/$new_automation")" = \
+			"$new_automation" &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		sh "$codex_branch" verify-output --inputs inputs \
+			--updates updates --result result &&
+		test_grep "published pre-v3 pinned-plan bootstrap" \
+			bootstrap.out &&
+		test_grep "published pre-v3 pinned-plan bootstrap" \
+			second-bootstrap.out
+	)
+'
+
+test_expect_success 'explicit reorder and remove stay plan-only policy changes' '
+	git init --bare pinned-plan-policy.git &&
+	test_create_repo pinned-plan-policy-source &&
+	(
+		cd pinned-plan-policy-source &&
+		git remote add origin ../pinned-plan-policy.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "policy base" &&
+		install_reviewed_automation_topic &&
+		git switch -c aa/codex/enrolled master &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "policy enrolled topic" &&
+		enrolled=$(git rev-parse HEAD) &&
+		enrolled_tree=$(git merge-tree --write-tree \
+			"$automation_codex_tip" "$enrolled") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$enrolled" "$automation_codex_tip" "$enrolled_tree") &&
+		git switch -c bb/codex/root master &&
+		write root root-file &&
+		git add root-file &&
+		git commit -m "policy independent root" &&
+		root=$(git rev-parse HEAD) &&
+		root_tree=$(git merge-tree --write-tree "$codex_tip" "$root") &&
+		codex_tip=$(make_test_integration bb/codex/root "$root" \
+			"$codex_tip" "$root_tree") &&
+		git branch codex "$codex_tip" &&
+		git branch meta master &&
+		install_pinned_meta_state meta master codex &&
+		git push origin --all
+	) &&
+	git clone pinned-plan-policy.git pinned-plan-policy-runner &&
+	(
+		cd pinned-plan-policy-runner &&
+		fetch_all &&
+		mkdir plan-bin &&
+		cat >plan-bin/gh <<-\EOF &&
+		#!/bin/sh
+		if test "$1" = pr && test "$2" = merge
+		then
+			exit 0
+		fi
+		test "$1" = pr &&
+		test "$2" = create &&
+		printf "%s\n" https://github.com/openai/git/pull/1001
+		EOF
+		chmod +x plan-bin/gh &&
+		test_expect_code 1 env PATH="$PWD/plan-bin:$PATH" \
+			sh "$codex_branch" propose-plan --remote origin \
+				--lane codex --topic aa/codex/automation \
+				--action remove \
+				--plan-branch codex-plan/remove-automation \
+				>remove-automation.out 2>remove-automation.err &&
+		test_grep "exactly one active .*automation topic is required" \
+			remove-automation.err &&
+		test_must_fail git show-ref --verify \
+			refs/remotes/origin/codex-plan/remove-automation &&
+		PATH="$PWD/plan-bin:$PATH" sh "$codex_branch" propose-plan \
+			--remote origin --lane codex --topic bb/codex/root \
+			--action reorder --after root \
+			--plan-branch codex-plan/reorder-root >reorder.out &&
+		fetch_all &&
+		reorder=$(git rev-parse origin/codex-plan/reorder-root) &&
+		sh "$codex_branch" validate-plan-transition --remote origin \
+			--base-commit origin/meta --head-commit "$reorder" &&
+		git show "$reorder:codex.plan" |
+			git config --file /dev/stdin --get-all plan.topic \
+			>reordered-topics &&
+		printf "%s\n" refs/heads/bb/codex/root \
+			refs/heads/aa/codex/automation \
+			refs/heads/aa/codex/enrolled >expected-topics &&
+		test_cmp expected-topics reordered-topics &&
+		git push origin "$reorder:refs/heads/meta" &&
+		fetch_all &&
+		PATH="$PWD/plan-bin:$PATH" sh "$codex_branch" propose-plan \
+			--remote origin --lane codex --topic bb/codex/root \
+			--action remove \
+			--plan-branch codex-plan/remove-root >remove.out &&
+		fetch_all &&
+		remove=$(git rev-parse origin/codex-plan/remove-root) &&
+		sh "$codex_branch" validate-plan-transition --remote origin \
+			--base-commit origin/meta --head-commit "$remove" &&
+		git show "$remove:codex.plan" >removed.plan &&
+		test_must_fail git config --file removed.plan \
+			--get branch.bb/codex/root.source-tip &&
+		test_grep "opened pinned plan pull request" reorder.out &&
+		test_grep "opened pinned plan pull request" remove.out
+	)
+'
+
+test_expect_success 'topic review requires the exact approved head' '
+	mkdir topic-review-bin &&
+	cat >topic-review-bin/gh <<-\EOF &&
+	#!/bin/sh
+	case " $* " in
+	*"pulls/42/reviews?"*)
+		printf "%s\t%s\t%s\t%s\n" reviewer APPROVED \
+			"$FAKE_REVIEW_HEAD" MEMBER
+		exit 0
+		;;
+	*"pulls/42 "*)
+		printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+			open false codex openai/git aa/codex/reviewed \
+			"$FAKE_HEAD" author
+		exit 0
+		;;
+	esac
+	if test "$1" = pr && test "$2" = view
+	then
+		printf "%s\n" "$FAKE_DECISION"
+		exit 0
+	fi
+	exit 1
+	EOF
+	chmod +x topic-review-bin/gh &&
+	test_commit review-source &&
+	source=$(git rev-parse HEAD) &&
+	test_commit review-moved &&
+	moved=$(git rev-parse HEAD) &&
+	test_commit review-old &&
+	old=$(git rev-parse HEAD) &&
+	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
+		FAKE_HEAD="$moved" FAKE_REVIEW_HEAD="$source" \
+		FAKE_DECISION=APPROVED sh "$codex_branch" \
+		validate-topic-review --pull-request 42 --lane codex \
+			--topic aa/codex/reviewed --source-tip "$source" \
+		>moved.out 2>moved.err &&
+	test_grep "moved from $source to $moved" moved.err &&
+	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
+		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$source" \
+		FAKE_DECISION=REVIEW_REQUIRED sh "$codex_branch" \
+		validate-topic-review --pull-request 42 --lane codex \
+			--topic aa/codex/reviewed --source-tip "$source" \
+		>decision.out 2>decision.err &&
+	test_grep "is not approved" decision.err &&
+	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
+		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$old" \
+		FAKE_DECISION=APPROVED sh "$codex_branch" \
+		validate-topic-review --pull-request 42 --lane codex \
+			--topic aa/codex/reviewed --source-tip "$source" \
+		>stale.out 2>stale.err &&
+	test_grep "has no current approval for $source" stale.err
 '
 
 test_done

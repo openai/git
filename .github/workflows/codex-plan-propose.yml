@@ -1,0 +1,111 @@
+name: Propose Codex plan
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        description: Target lane
+        required: true
+        type: string
+      topic:
+        description: Exact ??/codex/* topic branch
+        required: true
+        type: string
+      action:
+        description: auto for a reviewed topic, or an explicit plan operation
+        required: true
+        type: string
+      source_tip:
+        description: Full reviewed topic SHA for add or alter
+        required: false
+        type: string
+      review_pr:
+        description: Reviewed topic PR number for add or alter
+        required: false
+        type: string
+      merge:
+        description: Lane root or same-lane prerequisite
+        required: false
+        type: string
+      after:
+        description: Existing topic after which to place this topic, or root
+        required: false
+        type: string
+      plan_branch:
+        description: Optional codex-plan/* branch name
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  propose:
+    name: Create immutable pins and plan PR
+    runs-on: ubuntu-24.04
+    environment: codex-plan
+    steps:
+      - name: Pin trusted meta
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+            --jq .object.sha)
+          case "$sha" in
+          ''|*[!0-9a-f]*) exit 1 ;;
+          esac
+          test "${#sha}" = 40
+          printf 'sha=%s\n' "$sha" >>"$GITHUB_OUTPUT"
+
+      - name: Mint the dedicated Codex plan App token
+        id: plan-app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: 1144995
+          private-key: ${{ secrets.CODEX_PLAN_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: git
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Check out trusted meta
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.meta.outputs.sha }}
+          fetch-depth: 0
+          token: ${{ steps.plan-app.outputs.token }}
+          persist-credentials: false
+
+      - name: Propose one pinned plan transition
+        env:
+          GH_TOKEN: ${{ steps.plan-app.outputs.token }}
+          LANE: ${{ inputs.lane }}
+          TOPIC: ${{ inputs.topic }}
+          ACTION: ${{ inputs.action }}
+          SOURCE_TIP: ${{ inputs.source_tip }}
+          REVIEW_PR: ${{ inputs.review_pr }}
+          MERGE: ${{ inputs.merge }}
+          AFTER: ${{ inputs.after }}
+          PLAN_BRANCH: ${{ inputs.plan_branch }}
+          EXPECTED_META: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = openai/git
+          gh auth setup-git
+          set -- sh .github/workflows/codex-branch.sh propose-plan \
+            --remote origin --lane "$LANE" --topic "$TOPIC" \
+            --action "$ACTION" --expected-meta "$EXPECTED_META"
+          test -z "$SOURCE_TIP" ||
+            set -- "$@" --source-tip "$SOURCE_TIP"
+          test -z "$REVIEW_PR" ||
+            set -- "$@" --review-pr "$REVIEW_PR"
+          test -z "$MERGE" ||
+            set -- "$@" --merge "$MERGE"
+          test -z "$AFTER" ||
+            set -- "$@" --after "$AFTER"
+          test -z "$PLAN_BRANCH" ||
+            set -- "$@" --plan-branch "$PLAN_BRANCH"
+          "$@"
