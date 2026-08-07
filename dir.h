@@ -7,6 +7,7 @@
 #include "statinfo.h"
 #include "strbuf.h"
 
+struct exclude_source_proof;
 struct repository;
 
 /**
@@ -182,7 +183,17 @@ struct untracked_cache_dir {
 	/* all data except 'dirs' in this struct are good */
 	unsigned int valid : 1;
 	unsigned int recurse : 1;
-	/* null object ID means this directory does not have .gitignore */
+	/* this subtree contains at least one cached untracked entry */
+	unsigned int has_untracked : 1;
+	/* transient results from directory-stat preloading */
+	unsigned int stat_checked : 1;
+	unsigned int stat_matches : 1;
+	unsigned int exclude_matches : 1;
+	unsigned int valid_recursive : 1;
+	/*
+	 * A null object ID means this directory does not have .gitignore.
+	 * The empty-tree ID records a present source that could not be read.
+	 */
 	struct object_id exclude_oid;
 	char name[FLEX_ARRAY];
 };
@@ -353,6 +364,14 @@ struct dir_struct {
 		/* Stats about the traversal */
 		unsigned visited_paths;
 		unsigned visited_directories;
+		unsigned untracked_cache_preloaded : 1;
+		unsigned traversal_failed : 1;
+
+		/*
+		 * Optional borrowed proof that covers every exclusion source
+		 * consulted by this traversal.
+		 */
+		struct exclude_source_proof *exclude_source_proof;
 	} internal;
 };
 
@@ -597,6 +616,7 @@ int cmp_dir_entry(const void *p1, const void *p2);
 int check_dir_entry_contains(const struct dir_entry *out, const struct dir_entry *in);
 
 void untracked_cache_invalidate_path(struct index_state *, const char *, int safe_path);
+void untracked_cache_invalidate_all(struct index_state *);
 /*
  * Invalidate the untracked-cache for this path, but first strip
  * off a trailing slash, if present.
@@ -606,6 +626,17 @@ void untracked_cache_invalidate_trimmed_path(struct index_state *,
 					     int safe_path);
 void untracked_cache_remove_from_index(struct index_state *, const char *);
 void untracked_cache_add_to_index(struct index_state *, const char *);
+
+struct untracked_cache_preload;
+struct untracked_cache_preload *
+untracked_cache_preload_start_fsmonitor_excludes(
+	struct index_state *, unsigned int dir_flags);
+struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
+	struct index_state *, unsigned int dir_flags);
+int untracked_cache_preload_finish(struct untracked_cache_preload *,
+					   struct index_state *, unsigned int dir_flags,
+					   size_t *index_invalidated);
+void untracked_cache_preload_release(struct untracked_cache_preload *);
 
 void free_untracked_cache(struct untracked_cache *);
 struct untracked_cache *read_untracked_extension(const void *data, unsigned long sz);

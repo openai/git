@@ -6,7 +6,54 @@
 #include "fsmonitor-settings.h"
 #include "object.h"
 #include "read-cache-ll.h"
+#include "strbuf.h"
 #include "trace.h"
+
+/*
+ * Force the next stat-aware caller to verify this entry's content. Wider
+ * invalidation, such as attributes or untracked-cache state, is the caller's
+ * responsibility.
+ */
+void fsmonitor_invalidate_cache_entry(struct cache_entry *ce);
+
+enum fsmonitor_query_outcome {
+	FSMONITOR_QUERY_ERROR = 0,
+	FSMONITOR_QUERY_DELTA,
+	FSMONITOR_QUERY_TRIVIAL,
+};
+
+struct fsmonitor_query_result {
+	enum fsmonitor_query_outcome outcome;
+	struct strbuf token;
+	struct strbuf paths;
+};
+
+#define FSMONITOR_QUERY_RESULT_INIT { \
+	.outcome = FSMONITOR_QUERY_ERROR, \
+	.token = STRBUF_INIT, \
+	.paths = STRBUF_INIT, \
+}
+
+void fsmonitor_query_result_release(struct fsmonitor_query_result *result);
+enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
+	const struct strbuf *raw, struct fsmonitor_query_result *result);
+enum fsmonitor_query_outcome query_builtin_fsmonitor(
+	const char *since_token, struct fsmonitor_query_result *result);
+
+/*
+ * A pathname monitor cannot prove that every name for a multiply-linked
+ * inode is inside its watch cone. When the platform reports real link
+ * counts, keep such regular files out of the persistent valid bitmap so
+ * that every new process checks their stat data. Platforms that synthesize
+ * link counts retain their existing fsmonitor behavior. The in-process
+ * CE_UPTODATE bit is still safe after the caller's lstat().
+ */
+static inline int fsmonitor_stat_can_be_valid(const struct stat *st)
+{
+	return !S_ISREG(st->st_mode) || st->st_nlink <= 1;
+}
+
+void fsmonitor_invalidate_semantics(struct index_state *istate);
 
 /*
  * Check if refresh_fsmonitor has been called at least once.

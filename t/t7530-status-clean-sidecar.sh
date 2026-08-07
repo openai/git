@@ -1,0 +1,629 @@
+#!/bin/sh
+
+test_description='exact clean status sidecars'
+
+. ./test-lib.sh
+
+test_lazy_prereq LOCAL_APFS '
+	test_have_prereq MACOS &&
+	/bin/df -t apfs "$TRASH_DIRECTORY" >/dev/null
+'
+
+if ! test_have_prereq FSMONITOR_DAEMON,LOCAL_APFS,MACOS
+then
+	skip_all='clean status sidecars require local APFS and the macOS fsmonitor daemon'
+	test_done
+fi
+
+test_lazy_prereq DURABLE_FSMONITOR '
+	test_create_repo durable-fsmonitor-probe || return 1
+	(
+		cd durable-fsmonitor-probe &&
+		test_commit base tracked &&
+		git config core.fsmonitor true &&
+		git fsmonitor--daemon start --start-timeout=10 &&
+		git status --porcelain=v2 >/dev/null &&
+		test-tool dump-fsmonitor >token &&
+		grep "^fsmonitor last update builtin:" token
+		result=$?
+		git fsmonitor--daemon stop >/dev/null 2>&1 || :
+		exit $result
+	)
+'
+
+stop_daemon () {
+	git -C "$1" fsmonitor--daemon stop 2>/dev/null || :
+}
+
+setup_repo () {
+	repo=$1 &&
+	test_create_repo "$repo" &&
+	test_commit -C "$repo" base tracked &&
+	test-tool chmtime -120 "$repo/tracked" &&
+	git -C "$repo" update-index --refresh &&
+	git -C "$repo" config core.fsmonitor true &&
+	git -C "$repo" fsmonitor--daemon start --start-timeout=10
+}
+
+bulk_status () {
+	GIT_TEST_PRELOAD_INDEX=1 \
+	GIT_TEST_PRELOAD_INDEX_BULK=1 \
+		git "$@"
+}
+
+prime_semantic_history () {
+	repo=$1 &&
+	bulk_status -C "$repo" status --porcelain=2 >actual.1 &&
+	test_must_be_empty actual.1 &&
+	bulk_status -C "$repo" status --porcelain=2 >actual.2 &&
+	test_must_be_empty actual.2 &&
+	test_grep FSCF "$repo/.git/index"
+}
+
+issue_sidecar () {
+	repo=$1 &&
+	prime_semantic_history "$repo" &&
+	git -C "$repo" config core.autocrlf false &&
+	bulk_status -C "$repo" status --porcelain=v2 >actual.issue &&
+	test_must_be_empty actual.issue &&
+	test_path_is_file "$repo/.git/index.csts"
+}
+
+assert_fallback_matches_oracle () {
+	repo=$1 &&
+	sidecar_trace=$2 &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false -C "$repo" \
+		status --porcelain=v2 >expect &&
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/$sidecar_trace" \
+		git -C "$repo" status --porcelain=v2 >actual &&
+	test_cmp expect actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" "$sidecar_trace"
+}
+
+assert_custom_replace_fallback_matches_oracle () {
+	repo=$1 &&
+	sidecar_trace=$2 &&
+	GIT_REPLACE_REF_BASE=refs/status-replace/ \
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false -C "$repo" \
+		status --porcelain=v2 >expect &&
+	GIT_REPLACE_REF_BASE=refs/status-replace/ \
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/$sidecar_trace" \
+		git -C "$repo" status --porcelain=v2 >actual &&
+	test_cmp expect actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" "$sidecar_trace"
+}
+
+replacement_tree () {
+	repo=$1 &&
+	blob=$(printf "replacement\n" |
+		git -C "$repo" hash-object -w --stdin) &&
+	printf "100644 blob %s\ttracked\n" "$blob" |
+		git -C "$repo" mktree
+}
+
+cleanup_fast_race () {
+	if test -n "$status_pid"
+	then
+		kill "$status_pid" 2>/dev/null || :
+		wait "$status_pid" 2>/dev/null || :
+	fi &&
+	status_pid= &&
+	exec 9>&- &&
+	rm -f "$ready" "$resume"
+}
+
+wait_for_fast_ready () {
+	for i in $(test_seq 1 1000)
+	do
+		test "$(cat "$ready" 2>/dev/null)" = ready && return 0
+		kill -0 "$status_pid" 2>/dev/null || return 1
+		sleep 0.01
+	done
+	return 1
+}
+
+start_fast_raced_status () {
+	repo=$1 &&
+	ready=$TRASH_DIRECTORY/$repo.fast-ready &&
+	resume=$TRASH_DIRECTORY/$repo.fast-resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.fast-trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	: >"$ready" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_BARRIER_READY="$ready" \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			git -C "$repo" status --porcelain=v2 \
+			>raced.actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_fast_ready
+}
+
+start_issue_raced_status () {
+	repo=$1 &&
+	ready=$TRASH_DIRECTORY/$repo.issue-ready &&
+	resume=$TRASH_DIRECTORY/$repo.issue-resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.issue-trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	: >"$ready" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		test_env \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_READY="$ready" \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			bulk_status -C "$repo" status --porcelain=v2 \
+			>raced.actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_fast_ready
+}
+
+stop_after_fast_fallback () {
+	for i in $(test_seq 1 1000)
+	do
+		if grep -q "\"value\":\"fast-excludes-raced\"" \
+			"$race_trace"
+		then
+			kill "$status_pid" 2>/dev/null || return 1
+			wait "$status_pid" 2>/dev/null || :
+			status_pid=
+			return 0
+		fi
+		kill -0 "$status_pid" 2>/dev/null || return 1
+		sleep 0.01
+	done
+	return 1
+}
+
+finish_fast_raced_status () {
+	printf "resume\n" >&9 &&
+	exec 9>&- &&
+	wait "$status_pid" &&
+	status_pid=
+}
+
+test_expect_success DURABLE_FSMONITOR \
+	'exact clean status installs a sidecar without rewriting the index' '
+	test_when_finished "stop_daemon sidecar-issue" &&
+	setup_repo sidecar-issue &&
+	test_env GIT_TRACE2_EVENT="$PWD/first-scan.trace" \
+		bulk_status -C sidecar-issue status --porcelain=v2 \
+		>actual.first &&
+	test_must_be_empty actual.first &&
+	test_path_is_missing sidecar-issue/.git/index.csts &&
+	test_grep "\"value\":\"issue-coherent-history\"" first-scan.trace &&
+
+	prime_semantic_history sidecar-issue &&
+	git -C sidecar-issue config core.autocrlf false &&
+	cp sidecar-issue/.git/index index.before &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/issue.trace" \
+		bulk_status -C sidecar-issue status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_cmp index.before sidecar-issue/.git/index &&
+	test_path_is_file sidecar-issue/.git/index.csts &&
+	test_grep \
+		"\"key\":\"preload/bulk_untracked_complete\",\"value\":\"1\"" \
+		issue.trace &&
+	test_grep "\"key\":\"preload/bulk_provider_applied\"" issue.trace &&
+	test_grep "\"key\":\"clean-proof/sidecar\"" issue.trace &&
+	test_grep ! "\"label\":\"do_write_index\"" issue.trace &&
+
+	GIT_TRACE2_EVENT="$PWD/hit.trace" \
+		git -C sidecar-issue status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/hit\"" hit.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'exact clean status certifies an existing untracked cache' '
+	test_when_finished "stop_daemon sidecar-untracked-cache" &&
+	setup_repo sidecar-untracked-cache &&
+	git -C sidecar-untracked-cache config core.untrackedCache true &&
+	git -C sidecar-untracked-cache config core.autocrlf false &&
+	bulk_status -C sidecar-untracked-cache status --porcelain=2 \
+		>actual.1 &&
+	test_must_be_empty actual.1 &&
+	bulk_status -C sidecar-untracked-cache status --porcelain=2 \
+		>actual.2 &&
+	test_must_be_empty actual.2 &&
+	test_grep UNTR sidecar-untracked-cache/.git/index &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/untracked-cache-issue.trace" \
+		bulk_status -C sidecar-untracked-cache \
+			status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_file sidecar-untracked-cache/.git/index.csts &&
+	test_grep ! \
+		"\"key\":\"preload/bulk_useful\"" \
+		untracked-cache-issue.trace &&
+	test_grep \
+		"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+		untracked-cache-issue.trace >untracked-cache-read-directory &&
+	test_line_count = 1 untracked-cache-read-directory &&
+	test_grep "\"key\":\"proof_valid\",\"value\":\"1\"" \
+		untracked-cache-issue.trace &&
+	test_grep FSUC sidecar-untracked-cache/.git/index &&
+
+	GIT_TRACE2_EVENT="$PWD/untracked-cache-hit.trace" \
+		git -C sidecar-untracked-cache status --porcelain=v2 \
+			>actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/hit\"" \
+		untracked-cache-hit.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" \
+		untracked-cache-hit.trace
+'
+
+test_expect_success POSIXPERM,DURABLE_FSMONITOR \
+	'an incomplete untracked traversal cannot issue a sidecar' '
+	test_when_finished "stop_daemon sidecar-unreadable" &&
+	setup_repo sidecar-unreadable &&
+	git -C sidecar-unreadable config core.untrackedCache true &&
+	git -C sidecar-unreadable config core.autocrlf false &&
+	prime_semantic_history sidecar-unreadable &&
+	mkdir sidecar-unreadable/hidden &&
+	test_when_finished "chmod u+rwx sidecar-unreadable/hidden" &&
+	test_write_lines untracked >sidecar-unreadable/hidden/untracked &&
+	chmod a-r sidecar-unreadable/hidden &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/unreadable.trace" \
+		bulk_status -C sidecar-unreadable \
+			status --porcelain=v2 >actual 2>err &&
+	test_must_be_empty actual &&
+	test_grep "could not open directory .hidden/." err &&
+	test_path_is_missing sidecar-unreadable/.git/index.csts &&
+	test_grep "\"value\":\"issue-scan-or-index-shape\"" \
+		unreadable.trace &&
+
+	chmod u+rwx sidecar-unreadable/hidden &&
+	git -C sidecar-unreadable status --porcelain=v2 >actual &&
+	test_grep "^? hidden/" actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a replaced worktree root cannot inherit a sidecar' '
+	test_when_finished "stop_daemon sidecar-root-race" &&
+	test_when_finished "stop_daemon sidecar-root-race.scanned" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-root-race &&
+	git -C sidecar-root-race config core.untrackedCache true &&
+	prime_semantic_history sidecar-root-race &&
+	git -C sidecar-root-race config core.autocrlf false &&
+	cp -R sidecar-root-race sidecar-root-race.replacement &&
+	test_write_lines replacement-only \
+		>sidecar-root-race.replacement/replacement-only &&
+	rm -f sidecar-root-race.replacement/.git/index.csts &&
+
+	start_issue_raced_status sidecar-root-race &&
+	mv sidecar-root-race sidecar-root-race.scanned &&
+	mv sidecar-root-race.replacement sidecar-root-race &&
+	finish_fast_raced_status &&
+
+	test_must_be_empty raced.actual &&
+	test_path_is_missing sidecar-root-race/.git/index.csts &&
+	test_grep \
+		"\"category\":\"dir\",\"label\":\"read_directory\"" \
+		"$race_trace" &&
+	test_grep ! \
+		"\"key\":\"preload/bulk_untracked_complete\",\"value\":\"1\"" \
+		"$race_trace" &&
+	test_grep "\"key\":\"proof_valid\",\"value\":\"1\"" "$race_trace" &&
+	test_grep "\"value\":\"issue-pinned-inputs\"" "$race_trace"
+'
+
+test_expect_success PIPE,DURABLE_FSMONITOR \
+	'an existing per-directory exclude FIFO cannot block sidecar issuance' '
+	test_when_finished "stop_daemon sidecar-issue-fifo" &&
+	setup_repo sidecar-issue-fifo &&
+	test_when_finished "rm -f sidecar-issue-fifo/.gitignore" &&
+	git -C sidecar-issue-fifo config core.untrackedCache true &&
+	git -C sidecar-issue-fifo config core.autocrlf false &&
+	prime_semantic_history sidecar-issue-fifo &&
+	mkfifo sidecar-issue-fifo/.gitignore &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/issue-fifo.trace" \
+		bulk_status -C sidecar-issue-fifo \
+			status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_file sidecar-issue-fifo/.git/index.csts &&
+	test_grep "\"key\":\"clean-proof/sidecar\"" issue-fifo.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a clean exact status replaces a stale sidecar' '
+	test_when_finished "stop_daemon sidecar-reissue" &&
+	setup_repo sidecar-reissue &&
+	git -C sidecar-reissue config core.untrackedCache true &&
+	issue_sidecar sidecar-reissue &&
+	test_write_lines untracked >sidecar-reissue/untracked &&
+	git -C sidecar-reissue status --porcelain=2 >dirty &&
+	test_grep "^? untracked$" dirty &&
+	rm sidecar-reissue/untracked &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/reissue.trace" \
+		bulk_status -C sidecar-reissue status --porcelain=v2 \
+			>actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/sidecar\"" reissue.trace &&
+	test_grep ! \
+		"\"key\":\"preload/bulk_useful\"" \
+		reissue.trace &&
+	test_grep \
+		"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+		reissue.trace >reissue-read-directory &&
+	test_line_count = 1 reissue-read-directory &&
+	test_grep ! "\"label\":\"do_write_index\"" reissue.trace &&
+
+	GIT_TRACE2_EVENT="$PWD/reissued-hit.trace" \
+		git -C sidecar-reissue status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/hit\"" reissued-hit.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" reissued-hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'only an exact empty output installs a sidecar' '
+	test_when_finished "stop_daemon sidecar-shape" &&
+	setup_repo sidecar-shape &&
+	prime_semantic_history sidecar-shape &&
+
+	bulk_status -C sidecar-shape status --porcelain=2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_missing sidecar-shape/.git/index.csts &&
+
+	bulk_status -C sidecar-shape status --porcelain=v2 --branch >actual &&
+	test_grep "^# branch.oid " actual &&
+	test_path_is_missing sidecar-shape/.git/index.csts &&
+
+	echo changed >sidecar-shape/tracked &&
+	bulk_status -C sidecar-shape status --porcelain=v2 >actual &&
+	test_grep "^1 .M " actual &&
+	test_path_is_missing sidecar-shape/.git/index.csts
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'external attributes and alternate indexes are rejected' '
+	test_when_finished "stop_daemon sidecar-inputs" &&
+	setup_repo sidecar-inputs &&
+	prime_semantic_history sidecar-inputs &&
+
+	test_write_lines "tracked -text" \
+		>sidecar-inputs/.git/info/attributes &&
+	bulk_status -C sidecar-inputs status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_missing sidecar-inputs/.git/index.csts &&
+
+	rm sidecar-inputs/.git/info/attributes &&
+	cp sidecar-inputs/.git/index sidecar-inputs/.git/alternate-index &&
+	test_env GIT_INDEX_FILE="$PWD/sidecar-inputs/.git/alternate-index" \
+		bulk_status -C sidecar-inputs status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_missing sidecar-inputs/.git/alternate-index.csts
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a fast hit remains read-only without optional locks' '
+	test_when_finished "stop_daemon sidecar-read-only" &&
+	setup_repo sidecar-read-only &&
+	issue_sidecar sidecar-read-only &&
+	cp sidecar-read-only/.git/index.csts sidecar.before &&
+
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/read-only.trace" \
+		git -C sidecar-read-only status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/hit\"" read-only.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" read-only.trace &&
+	test_cmp sidecar.before sidecar-read-only/.git/index.csts
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'provider changes fall back for each dirty worktree shape' '
+	test_when_finished "stop_daemon sidecar-modified" &&
+	test_when_finished "stop_daemon sidecar-deleted" &&
+	test_when_finished "stop_daemon sidecar-renamed" &&
+	test_when_finished "stop_daemon sidecar-untracked" &&
+
+	setup_repo sidecar-modified &&
+	issue_sidecar sidecar-modified &&
+	echo changed >sidecar-modified/tracked &&
+	assert_fallback_matches_oracle sidecar-modified modified.trace &&
+	test_grep "^1 .M " actual &&
+
+	setup_repo sidecar-deleted &&
+	issue_sidecar sidecar-deleted &&
+	rm sidecar-deleted/tracked &&
+	assert_fallback_matches_oracle sidecar-deleted deleted.trace &&
+	test_grep "^1 .D " actual &&
+
+	setup_repo sidecar-renamed &&
+	issue_sidecar sidecar-renamed &&
+	mv sidecar-renamed/tracked sidecar-renamed/renamed &&
+	assert_fallback_matches_oracle sidecar-renamed renamed.trace &&
+	test_grep "^1 .D " actual &&
+	test_grep "^? renamed" actual &&
+
+	setup_repo sidecar-untracked &&
+	issue_sidecar sidecar-untracked &&
+	echo untracked >sidecar-untracked/new-file &&
+	assert_fallback_matches_oracle sidecar-untracked untracked.trace &&
+	test_grep "^? new-file" actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'loose and packed replace refs invalidate a sidecar' '
+	test_when_finished "stop_daemon sidecar-replace" &&
+	setup_repo sidecar-replace &&
+	issue_sidecar sidecar-replace &&
+	old_tree=$(git -C sidecar-replace rev-parse "HEAD^{tree}") &&
+	new_tree=$(replacement_tree sidecar-replace) &&
+	git -C sidecar-replace replace "$old_tree" "$new_tree" &&
+
+	assert_fallback_matches_oracle sidecar-replace replace-loose.trace &&
+	test_grep "^1 M. " actual &&
+	git -C sidecar-replace pack-refs --all &&
+	test_path_is_missing \
+		"sidecar-replace/.git/refs/replace/$old_tree" &&
+	assert_fallback_matches_oracle sidecar-replace replace-packed.trace &&
+	test_grep "^1 M. " actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a custom replace namespace invalidates a sidecar' '
+	test_when_finished "stop_daemon sidecar-custom-replace" &&
+	setup_repo sidecar-custom-replace &&
+	issue_sidecar sidecar-custom-replace &&
+	old_tree=$(git -C sidecar-custom-replace rev-parse "HEAD^{tree}") &&
+	new_tree=$(replacement_tree sidecar-custom-replace) &&
+	GIT_REPLACE_REF_BASE=refs/status-replace/ \
+		git -C sidecar-custom-replace update-ref \
+		"refs/status-replace/$old_tree" "$new_tree" &&
+
+	assert_custom_replace_fallback_matches_oracle \
+		sidecar-custom-replace replace-custom.trace &&
+	test_grep "^1 M. " actual
+'
+
+test_expect_success PIPE,DURABLE_FSMONITOR \
+	'a sidecar FIFO cannot block or supply a hit' '
+	test_when_finished "stop_daemon sidecar-fifo" &&
+	test_when_finished "rm -f sidecar-fifo/.git/index.csts" &&
+	setup_repo sidecar-fifo &&
+	issue_sidecar sidecar-fifo &&
+	rm sidecar-fifo/.git/index.csts &&
+	mkfifo sidecar-fifo/.git/index.csts &&
+
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/fifo.trace" \
+		git -C sidecar-fifo status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" fifo.trace &&
+	test_grep "\"value\":\"fast-sidecar-missing-or-corrupt\"" fifo.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'non-provider proof inputs invalidate a sidecar' '
+	test_when_finished "stop_daemon sidecar-metadata" &&
+	setup_repo sidecar-metadata &&
+	issue_sidecar sidecar-metadata &&
+
+	git -C sidecar-metadata config status.relativePaths false &&
+	assert_fallback_matches_oracle sidecar-metadata config.trace &&
+	test_grep "\"value\":\"fast-config-changed\"" config.trace &&
+	git -C sidecar-metadata config --unset status.relativePaths &&
+
+	cp sidecar-metadata/.git/info/exclude info-exclude &&
+	test_write_lines ignored >sidecar-metadata/.git/info/exclude &&
+	assert_fallback_matches_oracle sidecar-metadata exclude.trace &&
+	test_grep "\"value\":\"fast-excludes\"" exclude.trace &&
+	mv info-exclude sidecar-metadata/.git/info/exclude &&
+
+	test_write_lines "tracked ident" \
+		>sidecar-metadata/.git/info/attributes &&
+	assert_fallback_matches_oracle sidecar-metadata attributes.trace &&
+	test_grep "\"value\":\"fast-repository-unavailable\"" attributes.trace &&
+	rm sidecar-metadata/.git/info/attributes &&
+
+	blob=$(printf "different\n" |
+		git -C sidecar-metadata hash-object -w --stdin) &&
+	tree=$(printf "100644 blob %s\ttracked\n" "$blob" |
+		git -C sidecar-metadata mktree) &&
+	commit=$(printf "different tree\n" |
+		git -C sidecar-metadata commit-tree "$tree" -p HEAD) &&
+	git -C sidecar-metadata update-ref HEAD "$commit" &&
+	assert_fallback_matches_oracle sidecar-metadata head.trace &&
+	test_grep "\"value\":\"fast-head-changed\"" head.trace &&
+	test_grep "^1 M. " actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a v4 skipHash index is not certified' '
+	test_when_finished "stop_daemon sidecar-v4" &&
+	setup_repo sidecar-v4 &&
+	prime_semantic_history sidecar-v4 &&
+	git -C sidecar-v4 config index.version 4 &&
+	git -C sidecar-v4 config index.skipHash true &&
+	git -C sidecar-v4 update-index --force-write-index &&
+	git -C sidecar-v4 config core.autocrlf false &&
+
+	dd if=/dev/zero of=zeros bs=20 count=1 2>/dev/null &&
+	tail -c 20 sidecar-v4/.git/index >trailer &&
+	test_cmp_bin zeros trailer &&
+	test_env GIT_TRACE2_EVENT="$PWD/v4.trace" \
+		bulk_status -C sidecar-v4 status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_missing sidecar-v4/.git/index.csts &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" v4.trace
+'
+
+test_expect_success PIPE,DURABLE_FSMONITOR \
+	'an existing exclude FIFO cannot block fast-path capture' '
+	test_when_finished "stop_daemon sidecar-exclude-fifo" &&
+	setup_repo sidecar-exclude-fifo &&
+	exclude_file=$(mktemp \
+		"${TMPDIR:-/tmp}/git-status-exclude-fifo.XXXXXX") &&
+	test_when_finished "rm -f \"$exclude_file\"" &&
+	git -C sidecar-exclude-fifo config core.excludesFile \
+		"$exclude_file" &&
+	issue_sidecar sidecar-exclude-fifo &&
+	rm "$exclude_file" &&
+	mkfifo "$exclude_file" &&
+
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/exclude-fifo.trace" \
+		git -C sidecar-exclude-fifo status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/hit\"" exclude-fifo.trace
+'
+
+test_expect_success PIPE,DURABLE_FSMONITOR \
+	'a raced exclude FIFO cannot block sidecar validation' '
+	test_when_finished "stop_daemon sidecar-exclude-race" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-exclude-race &&
+	exclude_file=$(mktemp \
+		"${TMPDIR:-/tmp}/git-status-exclude-race.XXXXXX") &&
+	test_when_finished "rm -f \"$exclude_file\"" &&
+	test_write_lines ignored >"$exclude_file" &&
+	git -C sidecar-exclude-race config core.excludesFile \
+		"$exclude_file" &&
+	issue_sidecar sidecar-exclude-race &&
+
+	start_fast_raced_status sidecar-exclude-race &&
+	rm "$exclude_file" &&
+	mkfifo "$exclude_file" &&
+	printf "resume\n" >&9 &&
+	exec 9>&- &&
+	stop_after_fast_fallback &&
+	test_must_be_empty raced.actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" "$race_trace" &&
+	test_grep "\"value\":\"fast-excludes-raced\"" "$race_trace"
+'
+
+test_expect_success PIPE,DURABLE_FSMONITOR \
+	'a replace ref created after the provider query prevents a hit' '
+	test_when_finished "stop_daemon sidecar-replace-race" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-replace-race &&
+	issue_sidecar sidecar-replace-race &&
+	old_tree=$(git -C sidecar-replace-race rev-parse "HEAD^{tree}") &&
+	new_tree=$(replacement_tree sidecar-replace-race) &&
+
+	start_fast_raced_status sidecar-replace-race &&
+	git -C sidecar-replace-race update-ref \
+		"refs/replace/$old_tree" "$new_tree" &&
+	finish_fast_raced_status &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" "$race_trace" &&
+	test_grep "\"value\":\"fast-repository-raced\"" "$race_trace"
+'
+
+test_done

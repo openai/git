@@ -1789,4 +1789,44 @@ test_expect_success EXPENSIVE,SIZE_T_IS_64BIT 'status does not re-read unchanged
 	)
 '
 
+test_expect_success 'status uses only a matching effective cache-tree' '
+	test_when_finished "rm -rf cache-tree-status" &&
+	test_create_repo cache-tree-status &&
+	(
+		cd cache-tree-status &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines base >tracked &&
+		git add tracked &&
+		git commit -m base &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status >.git/clean &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/clean &&
+		test_trace2_data status index/cache-tree-match 1 \
+			<.git/clean.trace &&
+
+		test_write_lines staged >tracked &&
+		git add tracked &&
+		git write-tree >.git/staged-tree &&
+		GIT_TRACE2_EVENT="$PWD/.git/staged.trace" \
+			git status >.git/staged &&
+		test_grep "Changes to be committed:" .git/staged &&
+		test_grep "modified:.*tracked" .git/staged &&
+		! test_trace2_data status index/cache-tree-match 1 \
+			<.git/staged.trace &&
+
+		replacement_tree=$(cat .git/staged-tree) &&
+		git reset --hard HEAD &&
+		head_tree=$(git rev-parse HEAD^{tree}) &&
+		git replace "$head_tree" "$replacement_tree" &&
+		GIT_TRACE2_EVENT="$PWD/.git/replaced.trace" \
+			git status >.git/replaced &&
+		test_grep "Changes to be committed:" .git/replaced &&
+		test_grep "modified:.*tracked" .git/replaced &&
+		! test_trace2_data status index/cache-tree-match 1 \
+			<.git/replaced.trace
+	)
+'
+
 test_done
