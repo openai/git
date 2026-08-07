@@ -8171,17 +8171,32 @@ test_expect_success 'pinned plans keep source refs immutable while rebuilding ou
 		git add preview-file &&
 		git commit -m "pinned preview topic" &&
 		git switch -c preview-side-a codex &&
-		write side-a side-a-file &&
-		git add side-a-file &&
+		write side-a shared &&
+		git add shared &&
 		git commit -m "preview side a" &&
 		git switch tb/codex/preview-unstable &&
 		git merge --no-ff preview-side-a -m "merge preview side a" &&
 		git switch -c preview-side-b codex &&
-		write side-b side-b-file &&
-		git add side-b-file &&
+		write side-b shared &&
+		git add shared &&
 		git commit -m "preview side b" &&
 		git switch tb/codex/preview-unstable &&
-		git merge --no-ff preview-side-b -m "merge preview side b" &&
+		test_must_fail git merge --no-ff preview-side-b \
+			-m "merge preview side b" &&
+		write resolved shared &&
+		git add shared &&
+		git commit -m "merge preview side b" &&
+		git switch -c preview-side-c codex &&
+		write side-c side-c-file &&
+		git add side-c-file &&
+		git commit -m "preview side c" &&
+		git switch -c preview-side-d codex &&
+		write side-d side-d-file &&
+		git add side-d-file &&
+		git commit -m "preview side d" &&
+		git switch tb/codex/preview-unstable &&
+		git merge --no-ff preview-side-c preview-side-d \
+			-m "octopus preview sides" &&
 		pin=$(git rev-parse HEAD) &&
 		git update-ref "refs/heads/codex-pins/$pin" "$pin" &&
 		git switch meta &&
@@ -8199,6 +8214,10 @@ test_expect_success 'pinned plans keep source refs immutable while rebuilding ou
 		cd pinned-plan-runner &&
 		fetch_all &&
 		pin=$(git rev-parse origin/tb/codex/preview-unstable) &&
+		old_codex=$(git rev-parse origin/codex) &&
+		old_octopus=$(git rev-list --min-parents=3 \
+			"$old_codex..$pin" | sed -n "1p") &&
+		test -n "$old_octopus" &&
 		sh "$codex_branch" rewrite --remote origin \
 			--base master --codex codex --result result \
 			--updates updates --inputs inputs --failure failure &&
@@ -8218,10 +8237,131 @@ test_expect_success 'pinned plans keep source refs immutable while rebuilding ou
 				--get branch.tb/codex/preview-unstable.codex-tip) &&
 		test "$generated" = "$pin" &&
 		test "$(git rev-list --min-parents=2 \
-			"origin/codex..$generated" | wc -l | tr -d " ")" = 2 &&
+			"origin/codex..$generated" | wc -l | tr -d " ")" = 3 &&
 		git merge-base --is-ancestor "$generated" "$unstable" &&
 		sh "$codex_branch" verify-output --inputs inputs \
-			--updates updates --result result
+			--updates updates --result result &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		(
+			cd ../pinned-plan-source &&
+			git switch master &&
+			write moved moved-base-file &&
+			git add moved-base-file &&
+			git commit -m "move the stable lane base" &&
+			git push origin master
+		) &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result moved-result \
+			--updates moved-updates --inputs moved-inputs \
+			--failure moved-failure &&
+		stable=$(updated_tip codex moved-updates) &&
+		moved_meta=$(updated_tip meta moved-updates) &&
+		moved_unstable=$(updated_tip codex-unstable moved-updates) &&
+		moved_generated=$(git show "$moved_meta:codex.config" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/preview-unstable.codex-tip) &&
+		moved_octopus=$(git rev-list --min-parents=3 \
+			"$stable..$moved_generated" | sed -n "1p") &&
+		test -n "$stable" &&
+		test -n "$moved_meta" &&
+		test -n "$moved_unstable" &&
+		test -n "$moved_generated" &&
+		test -n "$moved_octopus" &&
+		test_must_fail git merge-base --is-ancestor \
+			"$old_codex" "$stable" &&
+		test "$moved_generated" != "$pin" &&
+		git merge-base --is-ancestor "$stable" "$moved_generated" &&
+		git merge-base --is-ancestor "$moved_generated" \
+			"$moved_unstable" &&
+		test "$(git rev-list "$old_codex..$pin" |
+			wc -l | tr -d " ")" = \
+			"$(git rev-list "$stable..$moved_generated" |
+			wc -l | tr -d " ")" &&
+		test "$(git show -s --format=%P "$old_octopus" |
+			wc -w | tr -d " ")" = 3 &&
+		test "$(git show -s --format=%P "$moved_octopus" |
+			wc -w | tr -d " ")" = 3 &&
+		for parent in $(git show -s --format=%P "$old_octopus")
+		do
+			git show -s --format=%s "$parent" || return 1
+		done >old-octopus-parents &&
+		for parent in $(git show -s --format=%P "$moved_octopus")
+		do
+			git show -s --format=%s "$parent" || return 1
+		done >moved-octopus-parents &&
+		test_cmp old-octopus-parents moved-octopus-parents &&
+		test "$(git show "$pin:shared")" = \
+			"$(git show "$moved_generated:shared")" &&
+		test "$(git show "$stable:moved-base-file")" = \
+			"$(git show "$moved_generated:moved-base-file")" &&
+		test "$(git show "$moved_meta:codex.config" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/preview-unstable.source-tip)" = \
+			"$pin" &&
+		test "$(git rev-parse origin/tb/codex/preview-unstable)" = \
+			"$pin" &&
+		! grep \
+			"^refs/heads/tb/codex/preview-unstable$tab" \
+			moved-updates &&
+		sh "$codex_branch" verify-output --inputs moved-inputs \
+			--updates moved-updates --result moved-result &&
+		apply_test_updates origin moved-updates &&
+		fetch_all &&
+		(
+			cd ../pinned-plan-source &&
+			git switch master &&
+			write overlap preview-file &&
+			git add preview-file &&
+			git commit -m "move an overlapping stable path" &&
+			git push origin master
+		) &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result overlap-result --updates overlap-updates \
+			--inputs overlap-inputs --failure overlap-failure \
+			>overlap.out 2>overlap.err &&
+		test_grep "pinned merge graph overlaps its moved base" \
+			overlap.err &&
+		(
+			cd ../pinned-plan-source &&
+			git fetch origin meta codex-unstable &&
+			git switch --detach origin/meta &&
+			leak=$moved_unstable &&
+			git branch -f bb/codex/leak "$leak" &&
+			git update-ref "refs/heads/codex-pins/$leak" "$leak" &&
+			git show HEAD:codex.plan >leak.plan &&
+			git config --file leak.plan --add plan.topic \
+				refs/heads/bb/codex/leak &&
+			printf "\\n" >>leak.plan &&
+			git config --file leak.plan \
+				branch.bb/codex/leak.remote . &&
+			git config --file leak.plan \
+				branch.bb/codex/leak.source-ref \
+				refs/heads/bb/codex/leak &&
+			git config --file leak.plan \
+				branch.bb/codex/leak.source-tip "$leak" &&
+			git config --file leak.plan \
+				branch.bb/codex/leak.source-base "$stable" &&
+			git config --file leak.plan \
+				branch.bb/codex/leak.merge \
+				refs/heads/aa/codex/enrolled &&
+			cp leak.plan codex.plan &&
+			git add codex.plan &&
+			git commit -m "pin a generated unstable leak" &&
+			git push origin HEAD:meta bb/codex/leak \
+				"refs/heads/codex-pins/$leak:refs/heads/codex-pins/$leak"
+		) &&
+		fetch_all &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result leak-result --updates leak-updates \
+			--inputs leak-inputs --failure leak-failure \
+			>leak.out 2>leak.err &&
+		test_grep "stable topic .* contains private commits from unstable topic" \
+			leak.err
 	)
 '
 
@@ -8296,7 +8436,7 @@ test_expect_success 'a v2 controller can bootstrap both pinned plans in one meta
 	)
 '
 
-test_expect_success 'propose-plan atomically creates immutable pins and a plan PR head' '
+test_expect_success 'plan admission pins exact heads and enforces cross-lane source boundaries' '
 	git init --bare proposed-plan.git &&
 	test_create_repo proposed-plan-source &&
 	(
@@ -8340,7 +8480,7 @@ test_expect_success 'propose-plan atomically creates immutable pins and a plan P
 			;;
 		*"/pulls/999 "*)
 			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-				open false codex-unstable openai/git \
+				open false "${FAKE_BASE:-codex-unstable}" openai/git \
 				"$FAKE_TOPIC" "$FAKE_TIP" author
 			exit 0
 			;;
@@ -8379,7 +8519,60 @@ test_expect_success 'propose-plan atomically creates immutable pins and a plan P
 			origin/tb/codex/preview-unstable)" = "$before_topic" &&
 		sh "$codex_branch" validate-plan-transition --remote origin \
 			--base-commit origin/meta --head-commit "$plan" &&
-		test_grep "opened pinned plan pull request" out
+		test_grep "opened pinned plan pull request" out &&
+		git push origin "$plan:refs/heads/meta" &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --result result \
+			--updates updates --inputs inputs --failure failure &&
+		apply_test_updates origin updates &&
+		fetch_all &&
+		published_codex=$(git rev-parse origin/codex) &&
+		published_unstable=$(git rev-parse origin/codex-unstable) &&
+		(
+			cd ../proposed-plan-source &&
+			git fetch origin &&
+			git switch -c bb/codex/shared origin/codex &&
+			write shared stable-shared-file &&
+			git add stable-shared-file &&
+			git commit -m "stable source sharing reviewed boundary" &&
+			git switch -c cc/codex/leak origin/codex-unstable &&
+			write leak stable-leak-file &&
+			git add stable-leak-file &&
+			git commit -m "stable source cut from generated unstable" &&
+			git push origin bb/codex/shared cc/codex/leak
+		) &&
+		fetch_all &&
+		shared=$(git rev-parse origin/bb/codex/shared) &&
+		FAKE_BASE=codex FAKE_TOPIC=bb/codex/shared \
+		FAKE_TIP="$shared" PATH="$PWD/plan-bin:$PATH" \
+		sh "$codex_branch" propose-plan --remote origin \
+			--lane codex --topic bb/codex/shared \
+			--source-tip "$shared" --review-pr 999 --action add \
+			--plan-branch codex-plan/shared >shared.out &&
+		fetch_all &&
+		shared_plan=$(git rev-parse origin/codex-plan/shared) &&
+		sh "$codex_branch" validate-plan-transition --remote origin \
+			--base-commit origin/meta --head-commit "$shared_plan" &&
+		test "$(git show "$shared_plan:codex-unstable.plan" |
+			git config --file /dev/stdin \
+				--get branch.tb/codex/preview-unstable.source-base)" = \
+			"$published_codex" &&
+		test "$(git merge-base "$shared" "$preview")" = \
+			"$published_codex" &&
+		leak=$(git rev-parse origin/cc/codex/leak) &&
+		git merge-base --is-ancestor "$published_unstable" "$leak" &&
+		test_expect_code 1 env FAKE_BASE=codex \
+			FAKE_TOPIC=cc/codex/leak FAKE_TIP="$leak" \
+			PATH="$PWD/plan-bin:$PATH" \
+			sh "$codex_branch" propose-plan --remote origin \
+			--lane codex --topic cc/codex/leak \
+			--source-tip "$leak" --review-pr 999 --action add \
+			--plan-branch codex-plan/leak \
+			>leak.out 2>leak.err &&
+		test_grep \
+			"stable topic .* contains private commits from unstable topic" \
+			leak.err
 	)
 '
 

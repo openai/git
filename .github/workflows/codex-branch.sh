@@ -3433,6 +3433,7 @@ prepare_pinned_plan () (
 	published_sources=$state/published-source-topics
 	published_base=$(state_value "$state" published-base-oid)
 	source_base=$(state_value "$state" source-base-oid)
+	pinned_merge_root=$state/pinned-merge-root
 	plan=$state/plan
 
 	: >"$plan"
@@ -3458,14 +3459,36 @@ prepare_pinned_plan () (
 			test -n "$desired_source_base" ||
 				die "pinned plan topic '$name' has missing prerequisite '$prerequisite'"
 		fi
+		published_generated=$(published_tip "$published" "$name")
+		published_source=$(published_tip "$published_sources" "$name")
 		merge_commit=$(git rev-list --min-parents=2 \
 			"$reviewed_source_base..$current_tip" | sed -n '1p')
 		if test -n "$merge_commit"
 		then
+			git merge-base --is-ancestor "$reviewed_source_base" \
+				"$current_tip" ||
+				die "pinned merge-shaped topic '$name' is outside its reviewed source boundary"
+			# A previously generated root is already safe when neither its
+			# reviewed source nor its generated lane base moved.  Reuse it
+			# instead of needlessly replaying the same merge graph.
+			if test -n "$published_generated" &&
+				test "$current_tip" = "$published_source" &&
+				test "$prerequisites" = \
+					"$(published_prerequisites "$published" "$name")" &&
+				test "$prerequisite" = "$base_name" &&
+				test "$published_base" = "$base_oid"
+			then
+				printf '%s\t%s\t%s\t%s\t%s\n' "$name" \
+					"$published_generated" "$prerequisite" \
+					"$base_oid" "$desired_source_base" >>"$plan" ||
+					die "could not retain merge-shaped pinned topic '$name'"
+				continue
+			fi
 			# Keep a reviewed merge-shaped source byte-for-byte only when
-			# it already sits on the exact generated lane base.  Rebasing
-			# such a DAG needs the dedicated merge replay path; guessing a
-			# linear range would flatten reviewed topology.
+			# it already sits on the exact generated lane base.  Otherwise
+			# replay the reviewed graph from its explicit source boundary;
+			# inferring a merge base against a moved generated lane would
+			# accidentally replay old integration commits.
 			if test "$reviewed_source_base" = "$base_oid" &&
 				git merge-base --is-ancestor "$base_oid" "$current_tip"
 			then
@@ -3475,11 +3498,25 @@ prepare_pinned_plan () (
 					die "could not record merge-shaped pinned topic '$name'"
 				continue
 			fi
-			die "pinned merge-shaped topic '$name' needs a base move; restack it explicitly before publication"
+			if test -f "$pinned_merge_root"
+			then
+				test "$(state_value "$state" pinned-merge-root)" = \
+					"$reviewed_source_base" ||
+					die "pinned merge-shaped topics have different reviewed source boundaries; split them before publication"
+			else
+				printf '%s\n' "$reviewed_source_base" \
+					>"$pinned_merge_root" ||
+					die "could not retain the pinned merge replay root"
+			fi
+			: >"$state/merge-graph"
+			printf '%s\t%s\t%s\t%s\t%s\n' "$name" \
+				"$current_tip" "$prerequisite" \
+				"$reviewed_source_base" "$desired_source_base" \
+				>>"$plan" ||
+				die "could not record merge-shaped pinned topic '$name'"
+			continue
 		fi
 
-		published_generated=$(published_tip "$published" "$name")
-		published_source=$(published_tip "$published_sources" "$name")
 		if test -n "$published_generated"
 		then
 			test -n "$published_source" ||
@@ -3567,6 +3604,22 @@ prepare_pinned_plan () (
 			die "pinned plan removes '$old_name' while an active topic still depends on it"
 		fi
 	done <"$published"
+	if test -f "$pinned_merge_root"
+	then
+		root=$(state_value "$state" pinned-merge-root)
+		while IFS="$tab" read -r name current_tip
+		do
+			topic_source_base=$(plan_source_base \
+				"$desired_source_bases" "$name")
+			test -n "$topic_source_base" ||
+				die "pinned merge graph has no source boundary for '$name'"
+			test "$topic_source_base" = "$root" ||
+				die "pinned merge graph topic '$name' has a different reviewed source boundary; split it before publication"
+			git merge-base --is-ancestor "$topic_source_base" \
+				"$current_tip" ||
+				die "pinned merge graph topic '$name' is outside its reviewed source boundary"
+		done <"$topics"
+	fi
 	: >"$state/map"
 	: >"$state/results"
 )
@@ -4039,6 +4092,151 @@ process_planned_graph () {
 	fi
 }
 
+prepare_pinned_merge_overlay () (
+	state=$1
+	root=$2
+	base=$3
+	topics=$state/topics
+	base_paths=$state/pinned-merge-base-paths
+	topic_paths=$state/pinned-merge-topic-paths
+	overlap=$state/pinned-merge-overlap
+	commits=$state/pinned-merge-source-commits
+
+	rm -f "$state/pinned-merge-disjoint-base" ||
+		die "could not reset pinned merge overlap state"
+	git diff --no-renames --name-only "$root" "$base" >"$base_paths" ||
+		die "could not inspect the moved pinned merge base"
+	: >"$topic_paths"
+	: >"$commits"
+	while IFS="$tab" read -r name oid
+	do
+		git rev-list "$root..$oid" >>"$commits" ||
+			die "could not enumerate pinned merge commits for '$name'"
+	done <"$topics"
+	LC_ALL=C sort -u -o "$commits" "$commits" ||
+		die "could not retain pinned merge commits"
+	git diff-tree --stdin -m --no-renames --no-commit-id --name-only -r \
+		<"$commits" >"$topic_paths" ||
+		die "could not inspect pinned merge paths"
+	LC_ALL=C sort -u -o "$topic_paths" "$topic_paths" ||
+		die "could not retain pinned merge paths"
+	: >"$overlap"
+	while IFS= read -r path
+	do
+		grep -F -x -- "$path" "$topic_paths" >/dev/null 2>&1 &&
+			printf '%s\n' "$path" >>"$overlap"
+	done <"$base_paths"
+	if ! test -s "$overlap"
+	then
+		: >"$state/pinned-merge-disjoint-base"
+	fi
+)
+
+write_pinned_merge_overlay_trees () (
+	root=$1
+	base=$2
+	commits=$3
+	trees=$4
+	input=$trees.input
+	raw=$trees.raw
+
+	: >"$input"
+	while IFS= read -r old
+	do
+		printf '%s -- %s %s\n' "$root" "$base" "$old" \
+			>>"$input" ||
+			die "could not prepare pinned merge tree input"
+	done <"$commits"
+	git merge-tree --write-tree --stdin -z <"$input" |
+		tr '\000' '\n' >"$raw" ||
+		die "could not compute pinned merge overlay trees"
+	awk 'NR % 3 == 1 && $0 != "1" { bad=1 }
+		END { exit bad }' "$raw" ||
+		die "pinned merge graph overlaps its moved base"
+	awk 'NR % 3 == 2 { print }' "$raw" >"$trees" ||
+		die "could not retain pinned merge overlay trees"
+	test "$(wc -l <"$trees" | tr -d ' ')" = \
+		"$(wc -l <"$commits" | tr -d ' ')" ||
+		die "pinned merge overlay tree count changed"
+)
+
+process_disjoint_pinned_merge_graph () (
+	state=$1
+	base_oid=$(state_value "$state" base-oid)
+	root=$(state_value "$state" pinned-merge-root)
+	output_name=$(state_value "$state" codex-name)
+	topics=$state/topics
+	commits=$state/pinned-merge-topological-commits
+	trees=$state/pinned-merge-topological-trees
+	map=$state/pinned-merge-replay-map
+
+	set -- git rev-list --topo-order --reverse
+	while IFS="$tab" read -r name oid
+	do
+		set -- "$@" "$oid"
+	done <"$topics"
+	set -- "$@" "^$root"
+	"$@" >"$commits" ||
+		die "could not order the pinned merge graph"
+	write_pinned_merge_overlay_trees "$root" "$base_oid" \
+		"$commits" "$trees"
+	: >"$map"
+	printf '%s\t%s\n' "$root" "$base_oid" >>"$map" ||
+		die "could not map the pinned merge root"
+	exec 3<"$trees"
+	while IFS= read -r old
+	do
+		IFS= read -r tree <&3 ||
+			die "could not read the replayed tree for $old"
+		git show -s --format='%P%n%an%n%ae%n%aI%n%B' "$old" \
+			>"$state/pinned-merge-commit" ||
+			die "could not inspect pinned merge commit $old"
+		{
+			IFS= read -r parents ||
+				die "could not read parents for $old"
+			IFS= read -r author_name ||
+				die "could not read author for $old"
+			IFS= read -r author_email ||
+				die "could not read author email for $old"
+			IFS= read -r author_date ||
+				die "could not read author date for $old"
+			set -- git -c commit.gpgSign=false commit-tree "$tree"
+			for parent in $parents
+			do
+				new_parent=$(awk -F '\t' -v oid="$parent" \
+					'$1 == oid { print $2; exit }' "$map")
+				if test -z "$new_parent"
+				then
+					git merge-base --is-ancestor "$parent" "$root" &&
+						die "$output_name pinned merge graph crosses its reviewed replay root"
+					die "$output_name pinned merge graph has an unmapped parent"
+				fi
+				set -- "$@" -p "$new_parent"
+			done
+			new=$(GIT_AUTHOR_NAME=$author_name \
+				GIT_AUTHOR_EMAIL=$author_email \
+				GIT_AUTHOR_DATE=$author_date \
+				GIT_COMMITTER_NAME=$bot_name \
+				GIT_COMMITTER_EMAIL=$bot_email \
+				"$@") ||
+				die "could not replay pinned merge commit $old"
+		} <"$state/pinned-merge-commit"
+		printf '%s\t%s\n' "$old" "$new" >>"$map" ||
+			die "could not retain pinned merge replay mapping"
+	done <"$commits"
+	exec 3<&-
+	while IFS="$tab" read -r name old
+	do
+		new=$(awk -F '\t' -v oid="$old" \
+			'$1 == oid { print $2; exit }' "$map")
+		test -n "$new" ||
+			die "could not find replayed pinned topic '$name'"
+		result_record "$state/results" "$name" "$new"
+	done <"$topics"
+	finish_updates "$state" ||
+		die "could not finish pinned merge updates"
+)
+
 process_merge_graph () (
 	worktree=$1
 	state=$2
@@ -4056,18 +4254,39 @@ process_merge_graph () (
 		--path-format=absolute --git-common-dir) ||
 		die "could not locate the merge-replay source repository"
 
-	set -- git merge-base --all --octopus "$base_oid"
-	while IFS="$tab" read -r name oid
-	do
-		set -- "$@" "$oid"
-	done <"$topics"
-	"$@" >"$common" ||
-		die "$output_name merge graph has no common production ancestor"
-	test "$(wc -l <"$common" | tr -d ' ')" = 1 ||
-		die "$output_name merge graph has more than one production boundary"
-	root=$(sed -n '1p' "$common")
-	git merge-base --is-ancestor "$root" "$base_oid" ||
-		die "$output_name merge graph is not rooted in the production candidate"
+	if test -f "$state/pinned-merge-root"
+	then
+		root=$(state_value "$state" pinned-merge-root)
+		require_full_commit_oid "$root"
+		printf '%s\n' "$root" >"$common" ||
+			die "could not retain the pinned merge replay root"
+		while IFS="$tab" read -r name oid
+		do
+			git merge-base --is-ancestor "$root" "$oid" ||
+				die "pinned merge graph topic '$name' is outside its reviewed source boundary"
+		done <"$topics"
+	else
+		set -- git merge-base --all --octopus "$base_oid"
+		while IFS="$tab" read -r name oid
+		do
+			set -- "$@" "$oid"
+		done <"$topics"
+		"$@" >"$common" ||
+			die "$output_name merge graph has no common production ancestor"
+		test "$(wc -l <"$common" | tr -d ' ')" = 1 ||
+			die "$output_name merge graph has more than one production boundary"
+		root=$(sed -n '1p' "$common")
+		git merge-base --is-ancestor "$root" "$base_oid" ||
+			die "$output_name merge graph is not rooted in the production candidate"
+	fi
+	if test -f "$state/pinned-merge-root"
+	then
+		prepare_pinned_merge_overlay "$state" "$root" "$base_oid"
+		test -f "$state/pinned-merge-disjoint-base" ||
+			die "pinned merge graph overlaps its moved base; restack it explicitly before publication"
+		process_disjoint_pinned_merge_graph "$state"
+		return 0
+	fi
 
 	if test "$root" = "$base_oid"
 	then
@@ -4184,16 +4403,29 @@ verify_merge_topology () (
 	pending=$state/verified-pending-commits
 	round=$state/verified-current-commits
 
-	set -- git merge-base --all --octopus "$base"
-	while IFS="$tab" read -r name oid
-	do
-		set -- "$@" "$oid"
-	done <"$topics"
-	"$@" >"$root_file" ||
-		die "could not reconstruct the original merge-graph root"
-	test "$(wc -l <"$root_file" | tr -d ' ')" = 1 ||
-		die "merge graph has no unique verified production root"
-	root=$(sed -n '1p' "$root_file")
+	if test -f "$state/pinned-merge-root"
+	then
+		root=$(state_value "$state" pinned-merge-root)
+		require_full_commit_oid "$root"
+		printf '%s\n' "$root" >"$root_file" ||
+			die "could not retain the verified pinned merge root"
+		while IFS="$tab" read -r name oid
+		do
+			git merge-base --is-ancestor "$root" "$oid" ||
+				die "pinned merge graph topic '$name' is outside its reviewed source boundary"
+		done <"$topics"
+	else
+		set -- git merge-base --all --octopus "$base"
+		while IFS="$tab" read -r name oid
+		do
+			set -- "$@" "$oid"
+		done <"$topics"
+		"$@" >"$root_file" ||
+			die "could not reconstruct the original merge-graph root"
+		test "$(wc -l <"$root_file" | tr -d ' ')" = 1 ||
+			die "merge graph has no unique verified production root"
+		root=$(sed -n '1p' "$root_file")
+	fi
 
 	set -- git rev-list
 	while IFS="$tab" read -r name oid
@@ -4288,6 +4520,34 @@ verify_merge_topology () (
 			done
 		done <"$round"
 	done
+
+	if test -f "$state/pinned-merge-root"
+	then
+		prepare_pinned_merge_overlay "$state" "$root" "$base"
+		test -f "$state/pinned-merge-disjoint-base" ||
+			die "pinned merge graph overlaps its moved base"
+		LC_ALL=C sort -u "$source" \
+				>"$state/verified-tree-commits" ||
+			die "could not sort verified merge commits"
+		write_pinned_merge_overlay_trees "$root" "$base" \
+				"$state/verified-tree-commits" \
+				"$state/verified-expected-trees"
+		exec 3<"$state/verified-expected-trees"
+		while IFS= read -r old
+		do
+			IFS= read -r expected_tree <&3 ||
+				die "could not read the expected replayed tree for $old"
+			new=$(awk -F '\t' -v oid="$old" \
+				'$1 == oid { print $2; exit }' "$map")
+			test -n "$new" ||
+				die "merge rewrite has no tree mapping for $old"
+			actual_tree=$(git rev-parse "$new^{tree}") ||
+				die "could not inspect replayed tree $new"
+			test "$actual_tree" = "$expected_tree" ||
+				die "pinned merge replay changes its reviewed tree outside the moved base"
+		done <"$state/verified-tree-commits"
+		exec 3<&-
+	fi
 
 	LC_ALL=C sort "$source" >"$source.sorted" ||
 		die "could not sort the original merge graph"
@@ -4800,6 +5060,62 @@ validate_lane_isolation () (
 	stable_topics=$2
 	unstable_topics=$3
 	codex_oid=$4
+	unstable_source_bases=${5:-}
+	published_unstable_state=${6:-$state}
+
+	if test -n "$unstable_source_bases"
+	then
+		# Pinned source refs remain immutable when their generated lane
+		# moves.  A raw stable source therefore need not be an ancestor of
+		# the current generated codex tip.  The reviewed source-base of
+		# each active unstable topic is the ownership boundary: stable
+		# sources may share history at or below it, but not private
+		# unstable commits above it.
+		while IFS="$tab" read -r unstable_name unstable_tip unstable_prerequisites
+		do
+			unstable_source_base=$(plan_source_base \
+				"$unstable_source_bases" "$unstable_name")
+			test -n "$unstable_source_base" ||
+				die "pinned unstable topic '$unstable_name' has no reviewed source boundary"
+			while IFS="$tab" read -r stable_name stable_tip stable_prerequisites
+			do
+				git merge-base --all "$unstable_tip" "$stable_tip" \
+					>"$state/cross-lane-bases" ||
+					die "could not compare stable topic '$stable_name' with unstable topic '$unstable_name'"
+				while read -r shared
+				do
+					git merge-base --is-ancestor "$shared" \
+						"$unstable_source_base" ||
+						die "stable topic '$stable_name' contains private commits from unstable topic '$unstable_name'"
+				done <"$state/cross-lane-bases"
+			done <"$stable_topics"
+		done <"$unstable_topics"
+		# The raw pins above do not cover a stable source that was cut
+		# directly from a previously generated unstable output.  Keep the
+		# old generated-output ownership check too, but bound it by the
+		# published unstable base rather than today's regenerated codex.
+		if test -f "$published_unstable_state/published-unstable-base-oid"
+		then
+			published_unstable_base=$(state_value "$published_unstable_state" \
+				published-unstable-base-oid)
+			while IFS="$tab" read -r unstable_name unstable_tip prerequisites
+			do
+				while IFS="$tab" read -r stable_name stable_tip stable_prerequisites
+				do
+					git merge-base --all "$unstable_tip" \
+						"$stable_tip" >"$state/cross-lane-bases" ||
+						die "could not compare stable topic '$stable_name' with unstable topic '$unstable_name'"
+					while read -r shared
+					do
+						git merge-base --is-ancestor "$shared" \
+							"$published_unstable_base" ||
+							die "stable topic '$stable_name' contains private commits from unstable topic '$unstable_name'"
+					done <"$state/cross-lane-bases"
+				done <"$stable_topics"
+			done <"$published_unstable_state/published-unstable-topics"
+		fi
+		return
+	fi
 
 	cp "$unstable_topics" "$state/cross-lane-unstable-tips" ||
 		die "could not prepare current unstable ownership checks"
@@ -4888,6 +5204,7 @@ initialize_rewrite () {
 		published_codex_oid=$(state_value "$state" published-codex-oid)
 		test "$codex_oid" = "$published_codex_oid" ||
 			die "generated codex moved outside its published pinned-plan output"
+		unstable_plan_state=
 		if test -f "$state/published-unstable-oid"
 		then
 			unstable_plan_state=$state/desired-unstable-plan
@@ -4899,7 +5216,8 @@ initialize_rewrite () {
 				die "input snapshot does not match the pinned unstable plan"
 		fi
 		validate_lane_isolation "$state" "$state/topics" \
-			"$state/unstable-topics" "$codex_oid"
+			"$state/unstable-topics" "$codex_oid" \
+			"${unstable_plan_state:+$unstable_plan_state/desired-source-bases}"
 		prepare_pinned_plan "$base_name" "$base_oid" "$state/topics" \
 			"$state"
 		if test -n "$rerere_name" && test "$codex_oid" != "$base_oid" &&
@@ -5767,7 +6085,8 @@ validate_plan_transition () {
 		head_unstable_state=$tmp_dir/head-unstable-plan
 	fi
 	validate_pinned_plan_policy "$tmp_dir/head-plan" \
-		"$head_unstable_state" "$base_name" "$version"
+		"$head_unstable_state" "$base_name" "$version" \
+		"$tmp_dir/base-state"
 
 	base_stable_rows=$tmp_dir/base-stable-rows
 	base_unstable_rows=$tmp_dir/base-unstable-rows
@@ -6558,7 +6877,8 @@ propose_plan () {
 		proposed_unstable_state=$tmp_dir/proposed-unstable-plan
 	fi
 	validate_pinned_plan_policy "$tmp_dir/proposed-plan" \
-		"$proposed_unstable_state" "$base_name" "$version"
+		"$proposed_unstable_state" "$base_name" "$version" \
+		"$tmp_dir/published-state"
 	{
 		cut -f2 "$stable_rows"
 		test -z "$has_unstable" || cut -f2 "$unstable_rows"
@@ -6828,8 +7148,6 @@ prepare_input_graph () {
 			printf "%s\t%s\n", name, $3
 		}' "$inputs" >"$graph/unstable-current-topics" ||
 			die "could not prepare pinned unstable ownership verification"
-		validate_lane_isolation "$graph" "$graph/topics" \
-			"$graph/unstable-current-topics" "$codex_oid"
 		prepare_pinned_plan "$base_name" "$base_oid" "$graph/topics" \
 			"$graph"
 		return
@@ -7201,6 +7519,7 @@ validate_pinned_plan_policy () {
 	unstable_state=$2
 	base_name=$3
 	version=$4
+	published_state=${5:-$stable_state}
 	automation_count=0
 	while IFS="$tab" read -r name source_tip prerequisites
 	do
@@ -7254,6 +7573,11 @@ validate_pinned_plan_policy () {
 			':(glob).github/workflows/*.yaml' ||
 			die "unstable topic '$name' changes a GitHub Actions workflow"
 	done <"$unstable_state/desired-prerequisites"
+	validate_lane_isolation "$stable_state" \
+		"$stable_state/desired-prerequisites" \
+		"$unstable_state/desired-prerequisites" - \
+		"$unstable_state/desired-source-bases" \
+		"$published_state"
 }
 
 verify_control_paths () {
@@ -7703,6 +8027,15 @@ verify_output () {
 		unstable_graph=$tmp_dir/unstable-topic-graph
 		prepare_unstable_input_graph "$inputs" "$candidate" \
 			"$tmp_dir/topic-graph" "$unstable_graph"
+	fi
+	if test -f "$tmp_dir/topic-graph/pinned-plan-mode" &&
+		test -n "$unstable_graph" &&
+		test -f "$unstable_graph/pinned-plan-mode"
+	then
+		validate_lane_isolation "$tmp_dir/topic-graph" \
+			"$tmp_dir/topic-graph/topics" \
+			"$unstable_graph/topics" "$candidate" \
+			"$unstable_graph/desired-source-bases"
 	fi
 	git merge-base --is-ancestor "$base_oid" "$candidate" ||
 		die "candidate is not based on the snapshotted master"
