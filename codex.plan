@@ -25,7 +25,7 @@
 [branch "tb/codex/release"]
 	remote = .
 	source-ref = refs/heads/tb/codex/release
-	source-tip = ba107e0ae8c7142238bb612e530d51d42f0280d3
+	source-tip = 40589b5333835ecd5e1b6187cbcec45d8382303e
 	source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7
 	merge = refs/heads/master
 
