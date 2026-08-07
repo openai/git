@@ -1681,6 +1681,23 @@ test_expect_success '--no-optional-locks prevents index update' '
 	! test_is_magic_mtime .git/index
 '
 
+test_expect_success '--no-optional-locks prevents diff index update' '
+	test_when_finished "rm -rf optional-locks-diff" &&
+	test_create_repo optional-locks-diff &&
+	(
+		cd optional-locks-diff &&
+		test_commit base tracked &&
+		test_set_magic_mtime tracked &&
+		test_set_magic_mtime .git/index +1 &&
+		git --no-optional-locks diff -- tracked >actual &&
+		test_must_be_empty actual &&
+		test_is_magic_mtime .git/index +1 &&
+		git diff -- tracked >actual &&
+		test_must_be_empty actual &&
+		! test_is_magic_mtime .git/index +1
+	)
+'
+
 test_expect_success 'racy timestamps will be fixed for clean worktree' '
 	echo content >racy-dirty &&
 	echo content >racy-racy &&
