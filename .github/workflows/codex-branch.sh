@@ -1065,22 +1065,8 @@ authenticate_pending_codex_merge () (
 	then
 		die "could not authenticate the merged Codex pull request"
 	fi
-	awk -F '\t' -v author="$author" -v head="$head" '
-		NF == 4 && $2 ~ /^(APPROVED|CHANGES_REQUESTED|DISMISSED)$/ {
-			state[$1] = $2
-			commit[$1] = $3
-			association[$1] = $4
-		}
-		END {
-			for (reviewer in state)
-				if (reviewer != author &&
-					state[reviewer] == "APPROVED" &&
-					commit[reviewer] == head &&
-					association[reviewer] ~ /^(OWNER|MEMBER|COLLABORATOR)$/)
-					approved++
-			exit !approved
-		}
-	' "$state/reviews" ||
+	has_qualifying_current_review "$state/reviews" "$author" "$head" \
+		openai/git "$state/review-candidates" ||
 		die "pending Codex pull request has no qualifying approval"
 	printf '%s\t%s\t%s\t%s\n' "$name" "$head" "$number" "$merge" \
 		>"$output" || die "could not record the reviewed Codex admission"
@@ -5912,6 +5898,44 @@ plan_trailer_optional () (
 	printf '%s\n' "$values" | sed -n '1p'
 )
 
+has_qualifying_current_review () {
+	reviews=$1
+	author=$2
+	head=$3
+	repository=$4
+	candidates=$5
+	awk -F '\t' -v author="$author" -v head="$head" '
+		NF == 4 && $2 ~ /^(APPROVED|CHANGES_REQUESTED|DISMISSED)$/ {
+			state[$1] = $2
+			commit[$1] = $3
+			association[$1] = $4
+		}
+		END {
+			for (reviewer in state)
+				if (reviewer != author &&
+					state[reviewer] == "APPROVED" &&
+					commit[reviewer] == head)
+					print reviewer "\t" association[reviewer]
+		}
+	' "$reviews" >"$candidates" || return 1
+	while IFS="$tab" read -r reviewer association
+	do
+		case "$association" in
+		OWNER|MEMBER|COLLABORATOR) return 0 ;;
+		esac
+		# author_association is relative to the API caller.  The
+		# Actions token can see an organization member as NONE, so
+		# fall back to the repository-scoped collaborator check.
+		if gh api --hostname github.com \
+			"repos/$repository/collaborators/$reviewer" \
+			--silent >/dev/null 2>&1
+		then
+			return 0
+		fi
+	done <"$candidates"
+	return 1
+}
+
 validate_topic_review () {
 	repository=openai/git
 	pull_number=
@@ -5979,22 +6003,8 @@ validate_topic_review () {
 		--jq '.[] | [.user.login, .state, (.commit_id // "-"),
 			.author_association] | @tsv' >"$tmp_dir/topic-reviews" ||
 		die "could not inspect reviews for topic pull request #$pull_number"
-	awk -F '\t' -v author="$author" -v head="$source_tip" '
-		NF == 4 && $2 ~ /^(APPROVED|CHANGES_REQUESTED|DISMISSED)$/ {
-			state[$1] = $2
-			commit[$1] = $3
-			association[$1] = $4
-		}
-		END {
-			for (reviewer in state)
-				if (reviewer != author &&
-					state[reviewer] == "APPROVED" &&
-					commit[reviewer] == head &&
-					association[reviewer] ~ /^(OWNER|MEMBER|COLLABORATOR)$/)
-					approved++
-			exit !approved
-		}
-	' "$tmp_dir/topic-reviews" ||
+	has_qualifying_current_review "$tmp_dir/topic-reviews" "$author" \
+		"$source_tip" "$repository" "$tmp_dir/topic-review-candidates" ||
 		die "topic pull request #$pull_number has no current approval for $source_tip"
 	say "validated reviewed topic pull request #$pull_number at $source_tip"
 }
