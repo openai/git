@@ -8940,9 +8940,13 @@ test_expect_success 'topic review requires the exact approved head' '
 	cat >topic-review-bin/gh <<-\EOF &&
 	#!/bin/sh
 	case " $* " in
-	*"repos/openai/git/collaborators/reviewer "*)
-		test "$FAKE_COLLABORATOR" = yes
-		exit
+	*" graphql "*)
+		if test "$FAKE_WRITER" = yes
+		then
+			printf "%s\t%s\t%s\n" reviewer APPROVED \
+				"$FAKE_WRITER_HEAD"
+		fi
+		exit 0
 		;;
 	*"pulls/42/reviews?"*)
 		printf "%s\t%s\t%s\t%s\n" reviewer APPROVED \
@@ -8993,20 +8997,21 @@ test_expect_success 'topic review requires the exact approved head' '
 	test_grep "has no current approval for $source" stale.err &&
 	env PATH="$PWD/topic-review-bin:$PATH" \
 		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$source" \
-		FAKE_ASSOCIATION=NONE FAKE_COLLABORATOR=yes \
+		FAKE_ASSOCIATION=NONE FAKE_WRITER=yes \
+		FAKE_WRITER_HEAD="$source" \
 		FAKE_DECISION=APPROVED sh "$codex_branch" \
 		validate-topic-review --pull-request 42 --lane codex \
 			--topic aa/codex/reviewed --source-tip "$source" \
-		>collaborator.out &&
-	test_grep "validated reviewed topic" collaborator.out &&
+		>writer.out &&
+	test_grep "validated reviewed topic" writer.out &&
 	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
 		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$source" \
-		FAKE_ASSOCIATION=NONE FAKE_COLLABORATOR=no \
+		FAKE_ASSOCIATION=NONE FAKE_WRITER=no \
 		FAKE_DECISION=APPROVED sh "$codex_branch" \
 		validate-topic-review --pull-request 42 --lane codex \
 			--topic aa/codex/reviewed --source-tip "$source" \
-		>outsider.out 2>outsider.err &&
-	test_grep "has no current approval for $source" outsider.err
+		>nonwriter.out 2>nonwriter.err &&
+	test_grep "has no current approval for $source" nonwriter.err
 '
 
 test_expect_success 'checked-in release recovery manifest is the bound incident' '
