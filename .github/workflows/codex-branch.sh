@@ -1066,7 +1066,7 @@ authenticate_pending_codex_merge () (
 		die "could not authenticate the merged Codex pull request"
 	fi
 	has_qualifying_current_review "$state/reviews" "$author" "$head" \
-		openai/git "$state/review-candidates" ||
+		openai/git "$number" "$state/review-candidates" ||
 		die "pending Codex pull request has no qualifying approval"
 	printf '%s\t%s\t%s\t%s\n' "$name" "$head" "$number" "$merge" \
 		>"$output" || die "could not record the reviewed Codex admission"
@@ -5903,7 +5903,8 @@ has_qualifying_current_review () {
 	author=$2
 	head=$3
 	repository=$4
-	candidates=$5
+	pull_number=$5
+	candidates=$6
 	awk -F '\t' -v author="$author" -v head="$head" '
 		NF == 4 && $2 ~ /^(APPROVED|CHANGES_REQUESTED|DISMISSED)$/ {
 			state[$1] = $2
@@ -5923,17 +5924,24 @@ has_qualifying_current_review () {
 		case "$association" in
 		OWNER|MEMBER|COLLABORATOR) return 0 ;;
 		esac
-		# author_association is relative to the API caller.  The
-		# Actions token can see an organization member as NONE, so
-		# fall back to the repository-scoped collaborator check.
-		if gh api --hostname github.com \
-			"repos/$repository/collaborators/$reviewer" \
-			--silent >/dev/null 2>&1
-		then
-			return 0
-		fi
 	done <"$candidates"
-	return 1
+	# author_association is relative to the API caller.  The Actions
+	# token can see an organization member as NONE, so ask GitHub for
+	# the latest reviews from writers instead of trusting that field.
+	owner=${repository%%/*}
+	name=${repository#*/}
+	gh api --hostname github.com graphql \
+		-f 'query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){latestOpinionatedReviews(first:100,writersOnly:true){nodes{author{login}state commit{oid}}}}}}' \
+		-F owner="$owner" -F name="$name" -F number="$pull_number" \
+		--jq '.data.repository.pullRequest.latestOpinionatedReviews.nodes[] |
+			[(.author.login // "-"), .state,
+			(.commit.oid // "-")] | @tsv' \
+		>"$candidates-writers" 2>/dev/null || return 1
+	awk -F '\t' -v author="$author" -v head="$head" '
+		NF == 3 && $1 != author && $2 == "APPROVED" &&
+			$3 == head { approved++ }
+		END { exit !approved }
+	' "$candidates-writers"
 }
 
 validate_topic_review () {
@@ -6004,7 +6012,8 @@ validate_topic_review () {
 			.author_association] | @tsv' >"$tmp_dir/topic-reviews" ||
 		die "could not inspect reviews for topic pull request #$pull_number"
 	has_qualifying_current_review "$tmp_dir/topic-reviews" "$author" \
-		"$source_tip" "$repository" "$tmp_dir/topic-review-candidates" ||
+		"$source_tip" "$repository" "$pull_number" \
+		"$tmp_dir/topic-review-candidates" ||
 		die "topic pull request #$pull_number has no current approval for $source_tip"
 	say "validated reviewed topic pull request #$pull_number at $source_tip"
 }
