@@ -62,8 +62,8 @@ prime_semantic_history () {
 
 issue_sidecar () {
 	repo=$1 &&
-	prime_semantic_history "$repo" &&
 	git -C "$repo" config core.autocrlf false &&
+	prime_semantic_history "$repo" &&
 	bulk_status -C "$repo" status --porcelain=v2 >actual.issue &&
 	test_must_be_empty actual.issue &&
 	test_path_is_file "$repo/.git/index.csts"
@@ -201,10 +201,9 @@ test_expect_success DURABLE_FSMONITOR \
 		>actual.first &&
 	test_must_be_empty actual.first &&
 	test_path_is_missing sidecar-issue/.git/index.csts &&
-	test_grep "\"value\":\"issue-coherent-history\"" first-scan.trace &&
 
-	prime_semantic_history sidecar-issue &&
 	git -C sidecar-issue config core.autocrlf false &&
+	prime_semantic_history sidecar-issue &&
 	cp sidecar-issue/.git/index index.before &&
 
 	test_env GIT_TRACE2_EVENT="$PWD/issue.trace" \
@@ -212,6 +211,8 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_cmp index.before sidecar-issue/.git/index &&
 	test_path_is_file sidecar-issue/.git/index.csts &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<issue.trace &&
 	test_grep \
 		"\"key\":\"preload/bulk_untracked_complete\",\"value\":\"1\"" \
 		issue.trace &&
@@ -224,6 +225,52 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_grep "\"key\":\"clean-proof/hit\"" hit.trace &&
 	test_grep ! "\"label\":\"do_read_index\"" hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'normal status persists bootstrap stat repairs' '
+	test_when_finished "stop_daemon external-stat-bootstrap" &&
+	setup_repo external-stat-bootstrap &&
+	git -C external-stat-bootstrap update-index --fsmonitor &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-stat-bootstrap.trace" \
+		git -C external-stat-bootstrap status >actual &&
+	! test_trace2_data fsmonitor history/external-stored 1 \
+		<external-stat-bootstrap.trace &&
+	test_grep "\"label\":\"do_write_index\"" \
+		external-stat-bootstrap.trace &&
+	git -C external-stat-bootstrap -c core.fsmonitor=false \
+		diff-index --quiet HEAD
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'exact status persists stat repairs before a sidecar' '
+	test_when_finished "stop_daemon external-stat-exact" &&
+	setup_repo external-stat-exact &&
+	git -C external-stat-exact config core.autocrlf false &&
+	prime_semantic_history external-stat-exact &&
+	test-tool chmtime -60 external-stat-exact/tracked &&
+	test-tool -C external-stat-exact fsmonitor-client flush >flush.out &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-stat-exact.trace" \
+		bulk_status -C external-stat-exact status --porcelain=v2 \
+		>actual &&
+	test_must_be_empty actual &&
+	! test_trace2_data fsmonitor history/external-stored 1 \
+		<external-stat-exact.trace &&
+	test_path_is_missing external-stat-exact/.git/index.csts &&
+	test_grep "\"label\":\"do_write_index\"" \
+		external-stat-exact.trace &&
+	git -C external-stat-exact -c core.fsmonitor=false \
+		diff-index --quiet HEAD &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/external-stat-exact-issue.trace" \
+		bulk_status -C external-stat-exact status --porcelain=v2 \
+		>actual &&
+	test_must_be_empty actual &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<external-stat-exact-issue.trace &&
+	test_path_is_file external-stat-exact/.git/index.csts &&
+	test_grep ! "\"label\":\"do_write_index\"" \
+		external-stat-exact-issue.trace
 '
 
 test_expect_success DURABLE_FSMONITOR \
@@ -299,8 +346,8 @@ test_expect_success DURABLE_FSMONITOR \
 	test_when_finished "cleanup_fast_race" &&
 	setup_repo sidecar-root-race &&
 	git -C sidecar-root-race config core.untrackedCache true &&
-	prime_semantic_history sidecar-root-race &&
 	git -C sidecar-root-race config core.autocrlf false &&
+	prime_semantic_history sidecar-root-race &&
 	cp -R sidecar-root-race sidecar-root-race.replacement &&
 	test_write_lines replacement-only \
 		>sidecar-root-race.replacement/replacement-only &&
@@ -554,8 +601,8 @@ test_expect_success DURABLE_FSMONITOR \
 	git -C sidecar-v4 config index.version 4 &&
 	git -C sidecar-v4 config index.skipHash true &&
 	git -C sidecar-v4 update-index --force-write-index &&
-	prime_semantic_history sidecar-v4 &&
 	git -C sidecar-v4 config core.autocrlf false &&
+	prime_semantic_history sidecar-v4 &&
 
 	dd if=/dev/zero of=zeros bs=20 count=1 2>/dev/null &&
 	tail -c 20 sidecar-v4/.git/index >trailer &&
