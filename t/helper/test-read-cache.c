@@ -66,6 +66,8 @@ static int test_fsuc_parser(void)
 	struct index_state truncated = INDEX_STATE_INIT(the_repository);
 	struct untracked_cache untracked = { 0 };
 	struct untracked_cache_dir root = { 0 };
+	struct untracked_cache_dir child = { 0 };
+	struct untracked_cache_dir *dirs[] = { &child };
 	struct strbuf encoded = STRBUF_INIT;
 	struct strbuf written = STRBUF_INIT;
 	uint32_t version;
@@ -89,9 +91,14 @@ static int test_fsuc_parser(void)
 	duplicate.fsmonitor_token_valid = 1;
 	duplicate.untracked = &untracked;
 	untracked.root = &root;
+	root.valid = child.valid = 1;
+	root.dirs = dirs;
+	root.dirs_nr = ARRAY_SIZE(dirs);
 	prepare_fsmonitor_untracked(&duplicate);
 	if (!duplicate.fsmonitor_untracked_valid)
 		return error("matching FSMN and FSUC tokens were not paired");
+	if (!root.valid_recursive || !child.valid_recursive)
+		return error("matching FSUC did not restore recursive validity");
 	free(duplicate.fsmonitor_last_update);
 	duplicate.fsmonitor_last_update = xstrdup("other");
 	prepare_fsmonitor_untracked(&duplicate);
