@@ -86,7 +86,8 @@ int clean_status_verify_null_index(const struct index_state *istate,
 int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
-	struct lock_file *index_lock);
+	struct lock_file *index_lock,
+	int normal_clean_query);
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config);

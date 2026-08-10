@@ -33,6 +33,7 @@
 #include "path.h"
 #include "preload-index.h"
 #include "read-cache.h"
+#include "refs.h"
 #include "repository.h"
 #include "string-list.h"
 #include "rerere.h"
@@ -1603,6 +1604,37 @@ static int git_status_config(const char *k, const char *v,
 	return git_diff_ui_config(k, v, ctx, NULL);
 }
 
+/*
+ * A clean-proof hit certifies the tracked and untracked lists, but it
+ * deliberately does not cache human-readable status output.  Refresh the
+ * cheap state which the long printer derives from refs and administrative
+ * files before printing those empty lists.
+ */
+static int print_normal_clean_sidecar(struct wt_status *s,
+				      const char *prefix)
+{
+	struct object_id oid;
+
+	if (repo_get_oid(s->repo, s->reference, &oid))
+		return 0;
+	s->is_initial = 0;
+	oidcpy(&s->oid_commit, &oid);
+	s->ignore_submodule_arg = ignore_submodule_arg;
+	s->status_format = status_format;
+	s->verbose = verbose;
+	FREE_AND_NULL(s->branch);
+	s->branch = refs_resolve_refdup(get_main_ref_store(s->repo),
+					"HEAD", 0, NULL, NULL);
+	wt_status_get_state(s->repo, &s->state,
+			    s->branch && !strcmp(s->branch, "HEAD"));
+	if (s->state.merge_in_progress)
+		s->committable = 1;
+	if (s->relative_paths)
+		s->prefix = prefix;
+	wt_status_print(s);
+	return 1;
+}
+
 int cmd_status(int argc,
 const char **argv,
 const char *prefix,
@@ -1618,6 +1650,8 @@ struct repository *repo UNUSED)
 	int exact_clean_command = argc == 2 &&
 		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
 	int exact_clean_query;
+	int normal_clean_query;
+	int normal_has_head;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1704,22 +1738,38 @@ struct repository *repo UNUSED)
 		default_status_command && !s.pathspec.nr;
 	if (s.allow_clean_status_shortcuts)
 		clean_status_enable_external_history(the_repository);
+	normal_has_head = default_status_command &&
+		!repo_get_oid(the_repository, s.reference, &oid);
 	exact_clean_query = exact_clean_command &&
 		status_format == STATUS_FORMAT_PORCELAIN_V2 &&
 		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
 		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES;
+	normal_clean_query = default_status_command &&
+		status_format == STATUS_FORMAT_NONE && normal_has_head &&
+		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
+		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
+		!s.submodule_summary &&
+		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
 	s.certify_clean_status = exact_clean_query;
-	if (exact_clean_query &&
+	if ((exact_clean_query || normal_clean_query) &&
 	    clean_status_try_sidecar(the_repository, &clean_digest)) {
-		wt_status_collect_free_buffers(&s);
-		return 0;
+		if (!normal_clean_query ||
+		    print_normal_clean_sidecar(&s, prefix)) {
+			wt_status_collect_free_buffers(&s);
+			return 0;
+		}
 	}
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2)
 		progress_flag = REFRESH_PROGRESS;
 	repo_read_index(the_repository);
+	if (normal_clean_query && use_optional_locks() &&
+	    clean_status_external_history_was_restored(
+		    the_repository->index))
+		s.certify_clean_status = 1;
 	wt_status_start_untracked_cache_preload(&s);
 	wt_status_refresh_index(
 		&s, REFRESH_QUIET | REFRESH_UNMERGED | progress_flag |
@@ -1751,7 +1801,8 @@ struct repository *repo UNUSED)
 	wt_status_collect(&s);
 
 	if (exact_clean_command && 0 <= fd &&
-	    clean_status_issue_sidecar(&s, &clean_digest, &index_lock))
+	    clean_status_issue_sidecar(
+		    &s, &clean_digest, &index_lock, 0))
 		fd = -1;
 	if (0 <= fd) {
 		int external_restored =
@@ -1761,7 +1812,11 @@ struct repository *repo UNUSED)
 			clean_status_save_external_history(
 				the_repository->index);
 
-		if (external_restored || external_saved) {
+		if (normal_clean_query && external_restored &&
+		    clean_status_issue_sidecar(
+			    &s, &clean_digest, &index_lock, 1))
+			fd = -1;
+		else if (external_restored || external_saved) {
 			rollback_lock_file(&index_lock);
 			fd = -1;
 		}
