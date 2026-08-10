@@ -53,7 +53,8 @@ static int proof_valid(const struct clean_status_proof *proof,
 		       const struct git_hash_algo *algo)
 {
 	return proof->index_version >= 2 && proof->index_version <= 4 &&
-		!is_null_oid(&proof->index_checksum) &&
+		(!is_null_oid(&proof->index_checksum) ||
+		 clean_status_identity_is_durable()) &&
 		!is_null_oid(&proof->head_tree) &&
 		!is_null_oid(&proof->exclude_source_digest) &&
 		proof->index_checksum.algo == hash_algo_by_ptr(algo) &&
@@ -252,7 +253,8 @@ int clean_status_sidecar_pin_source(
 	const struct git_hash_algo *algo,
 	struct clean_status_index_snapshot *snapshot)
 {
-	if (clean_status_index_snapshot_open(snapshot, index_path, algo))
+	if (clean_status_index_snapshot_open_allow_null_checksum(
+		    snapshot, index_path, algo))
 		return -1;
 	if (sidecar_matches_snapshot(
 		    index_path, sidecar, snapshot, algo))
