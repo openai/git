@@ -201,7 +201,6 @@ test_expect_success DURABLE_FSMONITOR \
 		>actual.first &&
 	test_must_be_empty actual.first &&
 	test_path_is_missing sidecar-issue/.git/index.csts &&
-	test_grep "\"value\":\"issue-coherent-history\"" first-scan.trace &&
 
 	prime_semantic_history sidecar-issue &&
 	git -C sidecar-issue config core.autocrlf false &&
@@ -212,6 +211,8 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_cmp index.before sidecar-issue/.git/index &&
 	test_path_is_file sidecar-issue/.git/index.csts &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<issue.trace &&
 	test_grep \
 		"\"key\":\"preload/bulk_untracked_complete\",\"value\":\"1\"" \
 		issue.trace &&
