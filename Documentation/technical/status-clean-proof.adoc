@@ -124,6 +124,9 @@ implementation has rewritten or re-encoded the index. The store is
 consulted only after the ordinary index entries have been read. It
 cannot answer a status command by itself, but a successful restore can
 publish a new physical proof for the next unchanged-index plain status.
+The exact clean porcelain-v2 producer also refreshes this checkpoint
+before publishing its physical proof, so both files name the same
+provider boundary after a later foreign index rewrite.
 
 For an index at `<index>`, a checkpoint is stored as
 `<index>.csh1.<namespace-hash>`.  The namespace covers the checkpoint
@@ -172,6 +175,7 @@ succeeds, status rolls back the pending acceleration-only index update.
 After an external restore, status also leaves the main index untouched
 if republication fails, so one proof namespace is not copied over
 another implementation's index extensions.  Only literal normal status
-enables this lane; commands capable of logical index changes retain the
-normal index-writing path.  Optional-lock-free commands neither publish
-checkpoints nor use this rollback path.
+and the exact clean porcelain-v2 producer enable this lane; commands
+capable of logical index changes retain the normal index-writing path.
+Optional-lock-free commands neither publish checkpoints nor use this
+rollback path.
