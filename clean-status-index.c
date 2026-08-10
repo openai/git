@@ -83,6 +83,13 @@ int clean_status_index_snapshot_open(
 	return snapshot_open(snapshot, path, algo, 0);
 }
 
+int clean_status_index_snapshot_open_allow_null_checksum(
+	struct clean_status_index_snapshot *snapshot, const char *path,
+	const struct git_hash_algo *algo)
+{
+	return snapshot_open(snapshot, path, algo, 1);
+}
+
 int clean_status_index_snapshot_still_matches_path(
 	const struct clean_status_index_snapshot *snapshot, const char *path,
 	const struct git_hash_algo *algo)
@@ -231,7 +238,13 @@ int clean_status_index_entries_are_certifiable(
 
 int clean_status_index_is_certifiable(const struct index_state *istate)
 {
-	return !is_null_oid(&istate->oid) &&
+	const struct clean_status_state *state = istate->clean_status;
+	int checksum_is_bound =
+		!is_null_oid(&istate->oid) ||
+		(clean_status_identity_is_durable() && state &&
+		 state->source_identity_valid);
+
+	return checksum_is_bound &&
 		clean_status_index_entries_are_certifiable(istate);
 }
 

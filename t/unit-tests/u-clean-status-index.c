@@ -149,6 +149,30 @@ void test_clean_status_index__rejects_null_checksums(void)
 	assert_rejects_null_checksum(&hash_algos[GIT_HASH_SHA256]);
 }
 
+static void assert_opens_null_checksum_for_durable_callers(
+	const struct git_hash_algo *algo)
+{
+	struct clean_status_index_snapshot snapshot;
+	struct index_fixture fixture;
+
+	fixture_init(&fixture, algo);
+	fixture_clear_checksum(&fixture, algo);
+	cl_assert_equal_i(
+		clean_status_index_snapshot_open_allow_null_checksum(
+			&snapshot, fixture.path, algo), 0);
+	cl_assert(is_null_oid(&snapshot.checksum));
+	clean_status_index_snapshot_release(&snapshot);
+	fixture_release(&fixture);
+}
+
+void test_clean_status_index__opens_null_checksum_for_durable_callers(void)
+{
+	assert_opens_null_checksum_for_durable_callers(
+		&hash_algos[GIT_HASH_SHA1]);
+	assert_opens_null_checksum_for_durable_callers(
+		&hash_algos[GIT_HASH_SHA256]);
+}
+
 static void assert_pins_null_checksum_source(
 	const struct git_hash_algo *algo)
 {
