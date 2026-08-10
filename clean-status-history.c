@@ -343,6 +343,49 @@ done:
 	return ret;
 }
 
+void clean_status_capture_external_history_source(
+	struct index_state *istate)
+{
+	struct clean_status_history_store_record record =
+		CLEAN_STATUS_HISTORY_STORE_RECORD_INIT;
+	struct clean_status_index_snapshot snapshot = { .fd = -1 };
+	struct clean_status_state *state = istate->clean_status;
+	char proof_namespace[GIT_MAX_HEXSZ + 1];
+
+	if (!clean_status_external_history_enabled(istate) ||
+	    getenv(INDEX_ENVIRONMENT) || istate != istate->repo->index ||
+	    !state)
+		goto done;
+	if (state->source_logical_hash_valid)
+		goto done;
+	if (!clean_status_has_persistent_fsmonitor_semantic_history(istate))
+		goto done;
+	if (clean_status_index_snapshot_pin(&snapshot, istate))
+		goto done;
+	if (!external_history_namespace(istate, proof_namespace) &&
+	    !clean_status_history_store_load(
+		    istate->repo->index_file, proof_namespace,
+		    istate->repo->hash_algo, &record) &&
+	    clean_status_index_can_reuse_source_logical_hash(istate) &&
+	    clean_status_history_checkpoint_source_matches(
+		    istate->repo->index_file, &record.checkpoint,
+		    &snapshot, istate->repo->hash_algo)) {
+		memcpy(state->source_logical_hash,
+		       record.checkpoint.index_hash,
+		       istate->repo->hash_algo->rawsz);
+	} else if (clean_status_index_logical_digest(
+			   istate, state->source_logical_hash)) {
+		goto done;
+	}
+	if (!clean_status_index_snapshot_still_matches(&snapshot, istate))
+		goto done;
+	state->source_logical_hash_valid = 1;
+
+done:
+	clean_status_index_snapshot_release(&snapshot);
+	clean_status_history_store_record_release(&record);
+}
+
 static struct clean_status_external_checkpoint *
 clean_status_prepare_external_history(struct index_state *istate)
 {
@@ -408,7 +451,9 @@ clean_status_prepare_external_history(struct index_state *istate)
 		(const unsigned char *)checkpoint->fsmonitor.buf;
 	checkpoint->checkpoint.fsmonitor_len = checkpoint->fsmonitor.len;
 	checkpoint->checkpoint.untracked_cache =
-		(const unsigned char *)checkpoint->untracked_cache.buf;
+		checkpoint->untracked_cache.len ?
+			(const unsigned char *)checkpoint->untracked_cache.buf :
+			NULL;
 	checkpoint->checkpoint.untracked_cache_len =
 		checkpoint->untracked_cache.len;
 	checkpoint->checkpoint.fsmonitor_config =
@@ -416,7 +461,9 @@ clean_status_prepare_external_history(struct index_state *istate)
 	checkpoint->checkpoint.fsmonitor_config_len =
 		checkpoint->fsmonitor_config.len;
 	checkpoint->checkpoint.fsmonitor_untracked =
-		(const unsigned char *)checkpoint->fsmonitor_untracked.buf;
+		checkpoint->fsmonitor_untracked.len ?
+			(const unsigned char *)checkpoint->fsmonitor_untracked.buf :
+			NULL;
 	checkpoint->checkpoint.fsmonitor_untracked_len =
 		checkpoint->fsmonitor_untracked.len;
 	return checkpoint;
