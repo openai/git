@@ -59,6 +59,22 @@ bulk_status () {
 		git -C "$repo" status --porcelain=v2 >"$output"
 }
 
+writable_ordinary_status () {
+	git -C "$1" -c core.preloadIndex=false \
+		status --porcelain=v2 >"$2"
+}
+
+writable_bulk_status () {
+	repo=$1 &&
+	output=$2 &&
+	writable_trace=$TRASH_DIRECTORY/$3 &&
+	rm -f "$writable_trace" &&
+	GIT_TEST_PRELOAD_INDEX=1 \
+	GIT_TEST_PRELOAD_INDEX_BULK=1 \
+	GIT_TRACE2_EVENT="$writable_trace" \
+		git -C "$repo" status --porcelain=v2 >"$output"
+}
+
 check_data () {
 	test_trace2_data index "$2" "$3" <"$TRASH_DIRECTORY/$1"
 }
@@ -382,6 +398,20 @@ test_expect_success PIPE \
 	check_data tracked-types.trace preload/bulk_fallback 2 &&
 	check_lstat_data tracked-types.trace 2 &&
 	check_data tracked-types.trace refresh/sum_lstat 2
+'
+
+test_expect_success 'writable status retains refreshed stat data' '
+	setup_repo writable-stat &&
+	test-tool chmtime +60 writable-stat/root &&
+	cp writable-stat/.git/index before.index &&
+	writable_ordinary_status writable-stat expect &&
+	cp writable-stat/.git/index ordinary.index &&
+	cp before.index writable-stat/.git/index &&
+	writable_bulk_status writable-stat actual writable-stat.trace &&
+	test_cmp expect actual &&
+	test_cmp ordinary.index writable-stat/.git/index &&
+	check_data writable-stat.trace preload/bulk_content_check 1 &&
+	check_data writable-stat.trace refresh/sum_lstat 0
 '
 
 test_expect_success CASE_INSENSITIVE_FS \
