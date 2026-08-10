@@ -839,7 +839,6 @@ test_expect_success DURABLE_FSMONITOR \
 	# A failed checkpoint refresh must not spill namespace B into main.
 	cp namespace-a-v2.index namespace-a-v2.rewrite &&
 	mv namespace-a-v2.rewrite external-history/.git/index &&
-	test-tool -C external-history fsmonitor-client flush >flush.out &&
 	: >"$sidecar.lock" &&
 	test_when_finished "rm -f \"$sidecar.lock\"" &&
 	cp external-history/.git/index locked.before &&
@@ -851,7 +850,36 @@ test_expect_success DURABLE_FSMONITOR \
 		<external-locked.trace &&
 	! test_trace2_data fsmonitor history/external-stored \
 		<external-locked.trace &&
-	test_grep ! "\"label\":\"do_write_index\"" external-locked.trace
+	test_grep ! "\"label\":\"do_write_index\"" external-locked.trace &&
+
+	# A foreign writer can leave a usable FSMN token from a new provider epoch
+	# while preserving only an older, unreplayable external checkpoint.
+	# Do not replace the named index provider boundary in that case.
+	rm -f external-history/.git/index.csts &&
+	rm -f "$sidecar.lock" &&
+	test-tool -C external-history fsmonitor-client flush >flush.out &&
+	git -C external-history config status.renameLimit 100 &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-main-token.trace" \
+		git -C external-history status --porcelain=v2 \
+			--untracked-files=normal >actual.main-token &&
+	test_grep "\"label\":\"do_write_index\"" \
+		external-main-token.trace &&
+	test-tool -C external-history dump-fsmonitor >main-token &&
+	main_token=$(sed -n "s/^fsmonitor last update //p" main-token) &&
+
+	git -C external-history config status.renameLimit 200 &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-token.trace" \
+		git -C external-history status >actual.token &&
+	test_grep "nothing to commit, working tree clean" actual.token &&
+	test_trace2_data fsmonitor history/external-token-unreplayable 1 \
+		<external-token.trace &&
+	! test_trace2_data fsmonitor history/external-restored 1 \
+		<external-token.trace &&
+	! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+		<external-token.trace &&
+	test_grep -F \
+		"\"key\":\"query/command\",\"value\":\"$main_token\"" \
+		external-token.trace
 '
 
 test_done

@@ -6,8 +6,10 @@
 #include "clean-status-internal.h"
 #include "dir.h"
 #include "environment.h"
+#include "fsmonitor.h"
 #include "fsmonitor-clean-proof.h"
 #include "fsmonitor-ll.h"
+#include "fsmonitor-settings.h"
 #include "hash-framing.h"
 #include "hex.h"
 #include "read-cache-ll.h"
@@ -530,6 +532,28 @@ static int on_index_history_is_coherent(struct index_state *istate)
 		(!istate->untracked || istate->fsmonitor_untracked_valid);
 }
 
+static int has_usable_on_index_builtin_token(
+	const struct index_state *istate)
+{
+	return istate->fsmonitor_token_valid &&
+		istate->fsmonitor_last_update &&
+		*istate->fsmonitor_last_update &&
+		starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		strcmp(istate->fsmonitor_last_update, "builtin:fake");
+}
+
+static int external_token_is_replayable(const char *token)
+{
+	struct fsmonitor_query_result result =
+		FSMONITOR_QUERY_RESULT_INIT;
+	int replayable =
+		query_builtin_fsmonitor(token, &result) ==
+			FSMONITOR_QUERY_DELTA;
+
+	fsmonitor_query_result_release(&result);
+	return replayable;
+}
+
 int clean_status_restore_external_history(struct index_state *istate)
 {
 	struct clean_status_history_store_record record =
@@ -608,6 +632,26 @@ have_index_hash:
 	if (!current_proof_is_writable(&parsed) ||
 	    (!!parsed.untracked && !parsed.fsmonitor_untracked_valid))
 		goto done;
+	/*
+	 * Provider tokens are opaque.  A logical-index match says that the
+	 * checkpoint names the same staged entries; it does not say that its
+	 * token can still replay the interval which the named index already
+	 * crossed.  Probe a differing checkpoint token before replacing a
+	 * usable on-index boundary when builtin IPC can answer that question.
+	 * A successful delta is queried again by the normal refresh path; a
+	 * trivial or failed probe leaves the named index intact so its token
+	 * can take the forward-baseline fallback.
+	 */
+	if (fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+	    has_usable_on_index_builtin_token(istate) &&
+	    starts_with(parsed.fsmonitor_last_update, "builtin:") &&
+	    strcmp(istate->fsmonitor_last_update,
+		   parsed.fsmonitor_last_update) &&
+	    !external_token_is_replayable(parsed.fsmonitor_last_update)) {
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "history/external-token-unreplayable", 1);
+		goto done;
+	}
 	if (!clean_status_index_snapshot_still_matches(&snapshot, istate))
 		goto done;
 	clean_status_invalidate_current_proof(istate);
