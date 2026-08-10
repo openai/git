@@ -645,6 +645,10 @@ test_expect_success DURABLE_FSMONITOR \
 	'normal status restores namespace-specific history outside the index' '
 	test_when_finished "stop_daemon external-history" &&
 	setup_repo external-history &&
+	mkdir -p external-history/cached/deep &&
+	test_commit -C external-history nested cached/deep/tracked &&
+	test-tool -C external-history chmtime =-60 cached/deep/tracked &&
+	git -C external-history update-index --refresh &&
 	git -C external-history config core.untrackedCache true &&
 	git -C external-history config index.skipHash true &&
 	git -C external-history config status.renameLimit 100 &&
@@ -762,6 +766,28 @@ test_expect_success DURABLE_FSMONITOR \
 		<external-merge.trace &&
 	test_grep ! "\"label\":\"do_read_index\"" external-merge.trace &&
 	rm external-history/.git/MERGE_HEAD &&
+
+	# A root-only dirty event stays shallow after external FSUC restore and
+	# advances only the external acceleration history.
+	rm -f external-history/.git/index.csts &&
+	cp "$sidecar" sidecar.before-dirty &&
+	: >external-history/root-probe &&
+	sleep 1 &&
+	test_env GIT_TRACE2_EVENT_NESTING=10 \
+		GIT_TRACE2_EVENT="$PWD/external-dirty.trace" \
+		git -C external-history status >actual.dirty &&
+	test_grep root-probe actual.dirty &&
+	test_trace2_data fsmonitor history/external-physical-alias 1 \
+		<external-dirty.trace &&
+	test_grep ! "\"label\":\"history_logical_digest\"" \
+		external-dirty.trace &&
+	test_trace2_data read_directory directories-visited 1 \
+		<external-dirty.trace &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<external-dirty.trace &&
+	test_grep ! "\"label\":\"do_write_index\"" external-dirty.trace &&
+	! test_cmp sidecar.before-dirty "$sidecar" &&
+	rm external-history/root-probe &&
 
 	# A failed checkpoint refresh must not spill namespace B into main.
 	cp namespace-a-v2.index namespace-a-v2.rewrite &&
