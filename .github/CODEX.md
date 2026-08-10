@@ -67,6 +67,43 @@ that PR as closed rather than merged. Staging alone never closes a PR, and a
 closure failure cannot undo an otherwise successful publication. A later
 change to the same topic needs another topic PR.
 
+## Pull request labels
+
+Topic pull requests are review-only: approve them, but do not merge them.
+Automatic add/alter plans, human remove/reorder plans, and ordinary controller
+changes are distinct `meta` changes. Every open PR against `codex`,
+`codex-unstable`, or `meta`, plus retained plan history, receives one role,
+one build, and one lifecycle state:
+
+- `kind:review-only`, `kind:auto-plan`, `kind:plan-policy`, or
+  `kind:controller` identifies why the PR exists.
+- `build:codex-stable`, `build:codex-unstable`, or
+  `build:codex-controller` identifies what it affects.
+- `codex:draft`, `codex:needs-review`, `codex:ready`,
+  `codex:awaiting-plan`, `codex:planned`, `codex:staged`,
+  `codex:integrated`, or `codex:superseded` identifies its lifecycle state.
+- `codex:blocked` is additional when an invalid topic name, failed admission,
+  merge conflict, or merge policy prevents the PR from advancing.
+
+Labels are derived presentation, not admission or release policy. A topic is
+planned only when its exact current head is recorded in its build plan, and
+integrated only when `codex.config` records that same source head and its
+output tip matches the live build branch. Staging a rebased topic requires
+the frozen generation's verified candidate ledger; a rewritten integration
+commit is not confused with the reviewed source commit. A moved source head
+falls back to review or admission instead of inheriting an earlier state. The
+reconciler refuses missing, duplicate, or contradictory classifications before
+writing any labels.
+
+The trusted default-branch scanner refreshes labels periodically. The local
+publisher refreshes them after each candidate is staged and again after
+atomic promotion; presentation failures warn but never change publication.
+To inspect the current projection without changing labels:
+
+```sh
+Meta/codex reconcile-pr-state --dry-run
+```
+
 Remove and reorder are policy decisions rather than projections of a reviewed
 topic head. Run **Actions > Refresh codex > Run workflow** with
 `operation=remove` or `operation=reorder`; the resulting plan PR needs the
@@ -165,6 +202,7 @@ default-branch trampoline:
 - dispatches ordinary refresh;
 - scans approved topic PRs from the trusted default branch and creates
   one automatic add/alter proposal at a time;
+- reconciles derived PR labels from the trusted `meta` controller;
 - offers explicit remove/reorder dispatch inputs; and
 - runs plan admission through `pull_request_target` while loading the
   reusable implementation from `meta`.
@@ -173,6 +211,11 @@ The reusable plan workflows stay on `meta`; the default branch contains only
 that trampoline. During migration, the controller accepts the previous
 trampoline as published history, but it refuses the first v3 refresh until the
 plan pins the current trampoline.
+
+The label-aware trampoline is a backward-compatible upgrade: the already
+published pinned-plan trampoline remains valid while its reviewed automation
+topic is updated. Once the label-aware trampoline is published, moving back to
+the earlier version is rejected.
 
 No topic merge ref runs the pinning path. The default-branch scanner checks
 each open approved PR with the trusted `meta` controller, skips tips already

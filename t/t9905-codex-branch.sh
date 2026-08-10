@@ -16,6 +16,8 @@ codex_publish=${CODEX_PUBLISH:-$codex_root/publish}
 codex_admission_workflow=$codex_root/.github/workflows/codex-admission.yml
 codex_plan_admission_workflow=$codex_root/.github/workflows/codex-plan-admission.yml
 codex_plan_propose_workflow=$codex_root/.github/workflows/codex-plan-propose.yml
+codex_pr_state=$codex_root/.github/workflows/codex-pr-state.sh
+codex_pr_state_workflow=$codex_root/.github/workflows/codex-pr-state.yml
 codex_bot_name='chatgpt-codex-connector[bot]'
 codex_bot_email='199175422+chatgpt-codex-connector[bot]@users.noreply.github.com'
 
@@ -83,6 +85,13 @@ write_reviewed_automation_workflow () {
 	sed '1,2d;$d' | sed '$d;s/^\t//' >"$output"
 }
 
+write_previous_pinned_reviewed_automation_workflow () {
+	output=$1 &&
+	write_reviewed_automation_workflow "$output" &&
+	sed '/^  pr_state:$/,$d' "$output" >"$output.previous" &&
+	mv "$output.previous" "$output"
+}
+
 install_reviewed_automation_topic () {
 	topic=${1:-aa/codex/automation} &&
 	style=${2:-current} &&
@@ -94,6 +103,10 @@ install_reviewed_automation_topic () {
 		;;
 	previous)
 		write_stable_reviewed_automation_workflow \
+			.github/workflows/codex.yml
+		;;
+	pinned-previous)
+		write_previous_pinned_reviewed_automation_workflow \
 			.github/workflows/codex.yml
 		;;
 	*) return 1 ;;
@@ -435,6 +448,327 @@ install_admission_gh () {
 	EOF
 	chmod +x "$directory/gh"
 }
+
+install_pr_state_gh () {
+	directory=$1 &&
+	mkdir -p "$directory" &&
+	cat >"$directory/gh" <<-'EOF' &&
+	#!/bin/sh
+
+	set -eu
+
+	command=${1:-}
+	shift
+	case "$command" in
+	pr)
+		action=${1:-}
+		shift
+		case "$action" in
+		list)
+			base=
+			while test $# -gt 0
+			do
+				case "$1" in
+				--base) base=$2; shift 2 ;;
+				*) shift ;;
+				esac
+			done
+			case "$base" in
+			codex|codex-unstable)
+				cat "$FAKE_PR_STATE_DATA/$base.json"
+				;;
+			meta) cat "$FAKE_PR_STATE_DATA/plans.json" ;;
+			*) exit 91 ;;
+			esac
+			;;
+		view)
+			printf '%s\n' "${FAKE_PR_STATE_REVIEW_DECISION:-APPROVED}"
+			;;
+		*) exit 92 ;;
+		esac
+		;;
+	api)
+		method=GET
+		endpoint=
+		filter=
+		label=
+		while test $# -gt 0
+		do
+			case "$1" in
+			--hostname) shift 2 ;;
+			--method) method=$2; shift 2 ;;
+			--jq) filter=$2; shift 2 ;;
+			--paginate) shift ;;
+			-f|-F)
+				case "$2" in
+				name=*|labels\[\]=*) label=${2#*=} ;;
+				esac
+				shift 2
+				;;
+			graphql|repos/*) endpoint=$1; shift ;;
+			*) shift ;;
+			esac
+		done
+		case "$endpoint" in
+		graphql)
+			printf '%s\t%s\t%s\t%s\t%s\n' \
+				"$FAKE_PR_STATE_META" "$FAKE_PR_STATE_STABLE" \
+				"$FAKE_PR_STATE_UNSTABLE" \
+				"${FAKE_PR_STATE_STABLE_STAGE:--}" \
+				"${FAKE_PR_STATE_UNSTABLE_STAGE:--}"
+			;;
+		repos/openai/git/labels\?*)
+			cat "$FAKE_PR_STATE_DATA/repository-labels"
+			;;
+		repos/openai/git/labels)
+			test "$method" = POST || exit 93
+			printf 'CREATE\t%s\n' "$label" \
+				>>"$FAKE_PR_STATE_LOG"
+			;;
+		repos/openai/git/pulls/*/reviews\?*)
+			pull_number=${endpoint#repos/openai/git/pulls/}
+			pull_number=${pull_number%%/*}
+			head=$(jq -r --arg number "$pull_number" '
+				.[] | select((.number | tostring) == $number) |
+				.headRefOid
+			' "$FAKE_PR_STATE_DATA/codex.json" \
+				"$FAKE_PR_STATE_DATA/codex-unstable.json")
+			printf 'reviewer\tAPPROVED\t%s\tMEMBER\n' \
+				"${FAKE_PR_STATE_REVIEW_SHA:-$head}"
+			;;
+		repos/openai/git/pulls/*)
+			pull_number=${endpoint#repos/openai/git/pulls/}
+			if test "$filter" = .head.sha
+			then
+				if test -n "${FAKE_PR_STATE_MOVED_HEAD:-}"
+				then
+					printf '%s\n' "$FAKE_PR_STATE_MOVED_HEAD"
+				else
+					jq -r --arg number "$pull_number" '
+						.[] |
+						select((.number | tostring) == $number) |
+						.headRefOid
+					' "$FAKE_PR_STATE_DATA/codex.json" \
+						"$FAKE_PR_STATE_DATA/codex-unstable.json" \
+						"$FAKE_PR_STATE_DATA/plans.json"
+				fi
+			else
+				jq -r --arg number "$pull_number" '
+					.[] |
+					select((.number | tostring) == $number) |
+					["open", (.isDraft | tostring), .baseRefName,
+					 .headRepository.nameWithOwner, .headRefName,
+					 .headRefOid, "author"] | @tsv
+				' "$FAKE_PR_STATE_DATA/codex.json" \
+					"$FAKE_PR_STATE_DATA/codex-unstable.json"
+			fi
+			;;
+		repos/openai/git/issues/*/labels*)
+			pull_number=${endpoint#repos/openai/git/issues/}
+			pull_number=${pull_number%%/*}
+			case "$method" in
+			POST) printf 'ADD\t%s\t%s\n' "$pull_number" "$label" ;;
+			DELETE)
+				removed=${endpoint##*/}
+				printf 'REMOVE\t%s\t%s\n' "$pull_number" "$removed"
+				;;
+			*) exit 94 ;;
+			esac >>"$FAKE_PR_STATE_LOG"
+			;;
+		*)
+			printf 'unexpected gh endpoint: %s\n' "$endpoint" >&2
+			exit 95
+			;;
+		esac
+		;;
+	*) exit 96 ;;
+	esac
+	EOF
+	chmod +x "$directory/gh"
+}
+
+setup_pr_state_fixture () {
+	fixture=$1 &&
+	test_create_repo "$fixture" &&
+	(
+		cd "$fixture" &&
+		write base tracked &&
+		git add tracked &&
+		git commit -m "pull request state base" &&
+		output=$(git rev-parse HEAD) &&
+		git branch codex "$output" &&
+		git branch codex-unstable "$output" &&
+		git switch -c aa/codex/stable master &&
+		write stable stable-file &&
+		git add stable-file &&
+		git commit -m "stable topic source" &&
+		stable_tip=$(git rev-parse HEAD) &&
+		git switch -c bb/codex/preview-unstable master &&
+		write preview preview-file &&
+		git add preview-file &&
+		git commit -m "unstable topic source" &&
+		unstable_tip=$(git rev-parse HEAD) &&
+		git switch -c meta master &&
+		cat >codex.plan <<-EOF &&
+		[plan]
+			version = 1
+			lane = codex
+			topic = refs/heads/aa/codex/stable
+		[branch "aa/codex/stable"]
+			source-tip = $stable_tip
+		EOF
+		cat >codex-unstable.plan <<-EOF &&
+		[plan]
+			version = 1
+			lane = codex-unstable
+			topic = refs/heads/bb/codex/preview-unstable
+		[branch "bb/codex/preview-unstable"]
+			source-tip = $unstable_tip
+		EOF
+		cat >codex.config <<-EOF &&
+		[codex]
+			version = 3
+			output-tip = $output
+		[codex-unstable]
+			output-tip = $output
+		EOF
+		git add codex.plan codex-unstable.plan codex.config &&
+		git commit -m "meta: record desired pull request state" &&
+		mkdir pr-state-data &&
+		jq -n --arg head "$stable_tip" \
+			'[{number:28,isDraft:false,
+			   baseRefName:"codex",
+			   headRefName:"aa/codex/stable",headRefOid:$head,
+			   headRepository:{nameWithOwner:"openai/git"},
+			   reviewDecision:"APPROVED",labels:[]}]' \
+			>pr-state-data/codex.json &&
+		jq -n --arg head "$unstable_tip" \
+			'[{number:21,isDraft:false,
+			   baseRefName:"codex-unstable",
+			   headRefName:"bb/codex/preview-unstable",headRefOid:$head,
+			   headRepository:{nameWithOwner:"openai/git"},
+			   reviewDecision:"APPROVED",labels:[]}]' \
+			>pr-state-data/codex-unstable.json &&
+		printf '[]\n' >pr-state-data/plans.json &&
+		printf '%s\n' kind:review-only kind:auto-plan \
+			kind:plan-policy kind:controller \
+			build:codex-stable build:codex-unstable \
+			build:codex-controller codex:draft codex:needs-review \
+			codex:ready \
+			codex:awaiting-plan codex:planned codex:staged \
+			codex:integrated codex:superseded codex:blocked \
+			>pr-state-data/repository-labels &&
+		: >pr-state-data/mutations &&
+		install_pr_state_gh "$PWD/pr-state-bin"
+	)
+}
+
+run_pr_state_fixture () (
+	fixture=$1
+	shift
+	cd "$fixture" || exit 1
+	stable_stage=$(git rev-parse --verify refs/heads/codex-staging \
+		2>/dev/null || printf '%s' -)
+	unstable_stage=$(git rev-parse --verify \
+		refs/heads/codex-unstable-staging \
+		2>/dev/null || printf '%s' -)
+	env PATH="$PWD/pr-state-bin:$PATH" \
+		FAKE_PR_STATE_DATA="$PWD/pr-state-data" \
+		FAKE_PR_STATE_LOG="$PWD/pr-state-data/mutations" \
+		FAKE_PR_STATE_META="$(git rev-parse meta)" \
+		FAKE_PR_STATE_STABLE="$(git rev-parse codex)" \
+		FAKE_PR_STATE_UNSTABLE="$(git rev-parse codex-unstable)" \
+		FAKE_PR_STATE_STABLE_STAGE="$stable_stage" \
+		FAKE_PR_STATE_UNSTABLE_STAGE="$unstable_stage" \
+		sh "$codex_pr_state" "$@"
+)
+
+stage_pr_state_fixture () (
+	fixture=$1
+	cd "$fixture" || exit 1
+	meta=$(git rev-parse meta) &&
+	output=$(git rev-parse codex) &&
+	stable_tip=$(git rev-parse aa/codex/stable) &&
+	unstable_tip=$(git rev-parse bb/codex/preview-unstable) &&
+	stable_tree=$(git rev-parse "$stable_tip^{tree}") &&
+	stable_stage=$(make_test_integration aa/codex/stable \
+		"$stable_tip" "$output" "$stable_tree") &&
+	git update-ref refs/heads/codex-staging "$stable_stage" &&
+	unstable_tree=$(git merge-tree --write-tree \
+		"$stable_stage" "$unstable_tip") &&
+	rewritten=$(printf '%s\n' "replay preview onto staged stable" |
+		git -c commit.gpgSign=false commit-tree "$unstable_tree" \
+			-p "$stable_stage") &&
+	unstable_stage=$(make_test_unstable_integration \
+		bb/codex/preview-unstable "$rewritten" "$stable_stage" \
+		"$unstable_tree") &&
+	git update-ref refs/heads/codex-unstable-staging \
+		"$unstable_stage" &&
+	stable_plan=$(git rev-parse "$meta:codex.plan") &&
+	unstable_plan=$(git rev-parse "$meta:codex-unstable.plan") &&
+	git switch --detach "$meta" &&
+	cat >codex.config <<-EOF &&
+	[codex]
+		version = 3
+		output-tip = $stable_stage
+		applied-plan = $stable_plan
+	[codex-unstable]
+		output-tip = $unstable_stage
+		applied-plan = $unstable_plan
+	[branch "aa/codex/stable"]
+		source-tip = $stable_tip
+	[branch "bb/codex/preview-unstable"]
+		source-tip = $unstable_tip
+	EOF
+	git add codex.config &&
+	git commit -m "meta: record staged source provenance" &&
+	candidate_meta=$(git rev-parse HEAD) &&
+	git switch meta &&
+	printf 'controller\trefs/heads/meta\t%s\n' "$meta" >inputs &&
+	{
+		printf 'refs/heads/meta\t%s\t%s\n' "$meta" \
+			"$candidate_meta" &&
+		printf 'refs/heads/codex\t%s\t%s\n' "$output" \
+			"$stable_stage" &&
+		printf 'refs/heads/codex-unstable\t%s\t%s\n' "$output" \
+			"$unstable_stage"
+	} >updates
+)
+
+write_pr_state_plan_fixture () (
+	fixture=$1
+	cd "$fixture" || exit 1
+	meta=$(git rev-parse meta) &&
+	stable_tip=$(git rev-parse aa/codex/stable) &&
+	unstable_tip=$(git rev-parse bb/codex/preview-unstable) &&
+	jq -n --arg head "$meta" --arg stable "$stable_tip" \
+		--arg other "$unstable_tip" '
+		def body($action; $source):
+			"Bot-generated pinned plan transition.\n\n" +
+			"- Lane: `codex`\n" +
+			"- Action: `" + $action + "`\n" +
+			"- Topic: `refs/heads/aa/codex/stable`\n" +
+			(if $source == "" then ""
+			 else "- Source tip: `" + $source + "`\n" end);
+		def failure:
+			[{name:"Codex plan admission / Verify pinned manifest",
+			  conclusion:"FAILURE"}];
+		[
+		 {number:90,state:"MERGED",headRefName:"codex-plan/merged",
+		  headRefOid:$head,body:body("add";$stable),labels:[],
+		  reviewDecision:"APPROVED",statusCheckRollup:[]},
+		 {number:91,state:"CLOSED",headRefName:"codex-plan/replaced",
+		  headRefOid:$head,body:body("add";$stable),labels:[],
+		  reviewDecision:"REVIEW_REQUIRED",statusCheckRollup:failure},
+		 {number:92,state:"OPEN",headRefName:"codex-plan/blocked",
+		  headRefOid:$head,body:body("alter";$other),labels:[],
+		  reviewDecision:"REVIEW_REQUIRED",statusCheckRollup:failure},
+		 {number:93,state:"OPEN",headRefName:"codex-plan/remove",
+		  headRefOid:$head,body:body("remove";""),labels:[],
+		  reviewDecision:"REVIEW_REQUIRED",statusCheckRollup:[]}
+		]
+	' >pr-state-data/plans.json
+)
 
 install_admission_gate_gh () {
 	directory=$1 &&
@@ -1601,6 +1935,25 @@ test_expect_success 'plan admission checks pinned topic heads from trusted meta'
 	test_grep "meta changed while Codex plan admission was running" \
 		"$codex_plan_admission_workflow"
 '
+
+test_expect_success 'pull request labels run from pinned meta without publisher credentials' '
+	test_path_is_file "$codex_pr_state" &&
+	test_path_is_file "$codex_pr_state_workflow" &&
+	sh -n "$codex_pr_state" &&
+	test_grep "  workflow_call:" "$codex_pr_state_workflow" &&
+	test_grep "github.ref == .refs/heads/codex." \
+		"$codex_pr_state_workflow" &&
+	test_grep "issues: write" "$codex_pr_state_workflow" &&
+	test_grep "pull-requests: write" "$codex_pr_state_workflow" &&
+	test_grep "steps.meta.outputs.sha" "$codex_pr_state_workflow" &&
+	test_grep "expected-meta" "$codex_pr_state_workflow" &&
+	! grep -E "contents: write|environment:|PRIVATE_KEY|git push" \
+		"$codex_pr_state_workflow" &&
+	test_grep "pr_state:" "$codex_branch" &&
+	test_grep "codex-pr-state.yml@meta" "$codex_branch" &&
+	test_grep "reconcile-pr-state" "$codex_branch"
+'
+
 test_expect_success 'dual-lane release gate selects only the exact published output' '
 	write_dual_guarded_release_workflow \
 		"$TRASH_DIRECTORY/codex-release.yml" &&
@@ -2190,8 +2543,8 @@ test_expect_success 'topics cannot change the convenience wrappers' '
 '
 
 test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
-	for direction in upgrade stable-upgrade downgrade \
-		stable-downgrade dual-downgrade
+	for direction in upgrade stable-upgrade label-upgrade downgrade \
+		stable-downgrade dual-downgrade label-downgrade
 	do
 		fixture="automation-$direction" &&
 		git init --bare "$fixture.git" &&
@@ -2214,7 +2567,11 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 				write_stable_reviewed_automation_workflow \
 					.github/workflows/codex.yml
 				;;
-			downgrade|dual-downgrade)
+			label-upgrade)
+				write_previous_pinned_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+				;;
+			downgrade|dual-downgrade|label-downgrade)
 				write_reviewed_automation_workflow \
 					.github/workflows/codex.yml
 				;;
@@ -2225,7 +2582,7 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 			git branch meta master &&
 			install_meta_state meta master codex &&
 			case "$direction" in
-			upgrade|stable-upgrade)
+			upgrade|stable-upgrade|label-upgrade)
 				write_reviewed_automation_workflow \
 					.github/workflows/codex.yml
 				;;
@@ -2235,6 +2592,10 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 				;;
 			dual-downgrade)
 				write_stable_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+				;;
+			label-downgrade)
+				write_previous_pinned_reviewed_automation_workflow \
 					.github/workflows/codex.yml
 				;;
 			esac &&
@@ -2247,7 +2608,8 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 			cd "$fixture-runner" &&
 			fetch_all &&
 			if test "$direction" = upgrade ||
-				test "$direction" = stable-upgrade
+				test "$direction" = stable-upgrade ||
+				test "$direction" = label-upgrade
 			then
 				sh "$codex_branch" rewrite --remote origin \
 					--base master --codex codex \
@@ -2272,6 +2634,38 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 			fi
 		) || return 1
 	done
+'
+
+test_expect_success 'the deployed pinned trampoline remains valid during the label rollout' '
+	git init --bare previous-pinned-automation.git &&
+	test_create_repo previous-pinned-automation-source &&
+	(
+		cd previous-pinned-automation-source &&
+		git remote add origin ../previous-pinned-automation.git &&
+		write base tracked &&
+		git add tracked &&
+		install_rerere_train &&
+		git commit -m "previous pinned automation base" &&
+		install_reviewed_automation_topic aa/codex/automation \
+			pinned-previous &&
+		git branch codex "$automation_codex_tip" &&
+		git branch meta master &&
+		install_pinned_meta_state meta master codex &&
+		git push origin --all
+	) &&
+	git clone previous-pinned-automation.git \
+		previous-pinned-automation-runner &&
+	(
+		cd previous-pinned-automation-runner &&
+		fetch_all &&
+		sh "$codex_branch" rewrite --remote origin \
+			--base master --codex codex --require-automation \
+			--result result --updates updates \
+			--inputs inputs --failure failure &&
+		git show "$(cat result):.github/workflows/codex.yml" \
+			>candidate-workflow &&
+		! grep -F "pr_state:" candidate-workflow
+	)
 '
 
 test_expect_success 'published release provenance gates cannot be removed' '
@@ -9985,6 +10379,185 @@ test_expect_success 'one-shot release recovery pins only the exact merged source
 			refs/remotes/origin/codex-plan/release-recovery &&
 		test "$old" != "$new"
 	)
+'
+
+test_expect_success 'pull request state follows the planned head and effective approval' '
+	setup_pr_state_fixture pr-state-head &&
+	run_pr_state_fixture pr-state-head --dry-run >planned.out &&
+	printf "#28\tkind:review-only\tbuild:codex-stable\tcodex:planned\n#21\tkind:review-only\tbuild:codex-unstable\tcodex:planned\n" \
+		>planned.expect &&
+	test_cmp planned.expect planned.out &&
+	test_must_be_empty pr-state-head/pr-state-data/mutations &&
+	old_head=$(git -C pr-state-head rev-parse aa/codex/stable) &&
+	(
+		cd pr-state-head &&
+		git switch aa/codex/stable &&
+		write advanced stable-file &&
+		git add stable-file &&
+		git commit -m "advance reviewed topic source" &&
+		new_head=$(git rev-parse HEAD) &&
+		git switch meta &&
+		jq --arg head "$new_head" ".[].headRefOid = \$head" \
+			pr-state-data/codex.json >pr-state-data/advanced.json &&
+		mv pr-state-data/advanced.json pr-state-data/codex.json
+	) &&
+	FAKE_PR_STATE_REVIEW_SHA="$old_head" \
+		run_pr_state_fixture pr-state-head --dry-run >stale.out &&
+	test_grep "#28.*build:codex-stable.*codex:awaiting-plan" stale.out &&
+	FAKE_PR_STATE_REVIEW_DECISION=REVIEW_REQUIRED \
+		run_pr_state_fixture pr-state-head --dry-run >unapproved.out &&
+	test_grep "#28.*build:codex-stable.*codex:needs-review" \
+		unapproved.out &&
+	new_head=$(git -C pr-state-head rev-parse aa/codex/stable) &&
+	FAKE_PR_STATE_REVIEW_SHA="$new_head" \
+		run_pr_state_fixture pr-state-head --dry-run >approved.out &&
+	test_grep "#28.*build:codex-stable.*codex:awaiting-plan" approved.out &&
+	test_must_be_empty pr-state-head/pr-state-data/mutations
+'
+
+test_expect_success 'every open Codex pull request receives one exact classification' '
+	setup_pr_state_fixture pr-state-inventory &&
+	(
+		cd pr-state-inventory &&
+		stable_tip=$(git rev-parse aa/codex/stable) &&
+		unstable_tip=$(git rev-parse bb/codex/preview-unstable) &&
+		meta=$(git rev-parse meta) &&
+		jq --arg head "$stable_tip" ". += [{
+			number:67,isDraft:true,baseRefName:\"codex\",
+			headRefName:\"aa/codex/perf-wip\",headRefOid:\$head,
+			headRepository:{nameWithOwner:\"openai/git\"},
+			reviewDecision:\"\",labels:[]}]" \
+			pr-state-data/codex.json >pr-state-data/updated.json &&
+		mv pr-state-data/updated.json pr-state-data/codex.json &&
+		jq --arg head "$unstable_tip" ". += [{
+			number:66,isDraft:true,baseRefName:\"codex-unstable\",
+			headRefName:\"long-owner/codex/feedback-fixes\",
+			headRefOid:\$head,
+			headRepository:{nameWithOwner:\"openai/git\"},
+			reviewDecision:\"\",labels:[]}]" \
+			pr-state-data/codex-unstable.json \
+			>pr-state-data/updated.json &&
+		mv pr-state-data/updated.json \
+			pr-state-data/codex-unstable.json &&
+		jq -n --arg head "$meta" "[
+			{number:42,state:\"OPEN\",isDraft:true,
+			 headRefName:\"aa/codex-controller-draft\",
+			 headRefOid:\$head,body:\"\",labels:[],
+			 reviewDecision:\"\",mergeStateStatus:\"UNKNOWN\",
+			 statusCheckRollup:[]},
+			{number:71,state:\"OPEN\",isDraft:false,
+			 headRefName:\"aa/codex-controller-ready\",
+			 headRefOid:\$head,body:\"\",labels:[],
+			 reviewDecision:\"APPROVED\",mergeStateStatus:\"CLEAN\",
+			 statusCheckRollup:[]},
+			{number:72,state:\"OPEN\",isDraft:false,
+			 headRefName:\"aa/codex-controller-conflict\",
+			 headRefOid:\$head,body:\"\",labels:[],
+			 reviewDecision:\"APPROVED\",mergeStateStatus:\"DIRTY\",
+			 statusCheckRollup:[]}
+		]" >pr-state-data/plans.json
+	) &&
+	run_pr_state_fixture pr-state-inventory --dry-run >inventory.out &&
+	test_line_count = 7 inventory.out &&
+	test_grep "#67.*kind:review-only.*build:codex-stable.*codex:draft.*codex:blocked.*blocked:invalid-topic-name" \
+		inventory.out &&
+	test_grep "#66.*kind:review-only.*build:codex-unstable.*codex:draft.*codex:blocked.*blocked:invalid-topic-name" \
+		inventory.out &&
+	test_grep "#42.*kind:controller.*build:codex-controller.*codex:draft" \
+		inventory.out &&
+	test_grep "#71.*kind:controller.*build:codex-controller.*codex:ready" \
+		inventory.out &&
+	test_grep "#72.*kind:controller.*build:codex-controller.*codex:ready.*codex:blocked.*blocked:merge-conflict" \
+		inventory.out &&
+	test_must_be_empty pr-state-inventory/pr-state-data/mutations &&
+	(
+		cd pr-state-inventory &&
+		meta=$(git rev-parse meta) &&
+		jq --arg head "$meta" ". += [{
+			number:28,state:\"OPEN\",isDraft:true,
+			headRefName:\"aa/codex-duplicate-controller\",
+			headRefOid:\$head,body:\"\",labels:[],reviewDecision:\"\",
+			mergeStateStatus:\"UNKNOWN\",statusCheckRollup:[]}]" \
+			pr-state-data/plans.json >pr-state-data/duplicate.json &&
+		mv pr-state-data/duplicate.json pr-state-data/plans.json
+	) &&
+	test_expect_code 1 run_pr_state_fixture pr-state-inventory \
+		>duplicate.out 2>duplicate.err &&
+	test_grep "more than one classification" duplicate.err &&
+	test_must_be_empty pr-state-inventory/pr-state-data/mutations
+'
+
+test_expect_success 'rebased staging requires the frozen source and generation metadata' '
+	setup_pr_state_fixture pr-state-staging &&
+	stage_pr_state_fixture pr-state-staging &&
+	run_pr_state_fixture pr-state-staging --dry-run >unverified.out &&
+	test_grep "#28.*build:codex-stable.*codex:staged" unverified.out &&
+	test_grep "#21.*build:codex-unstable.*codex:planned" \
+		unverified.out &&
+	run_pr_state_fixture pr-state-staging \
+		--inputs inputs --updates updates --dry-run >verified.out &&
+	test_grep "#21.*build:codex-unstable.*codex:staged" verified.out &&
+	(
+		cd pr-state-staging &&
+		candidate_meta=$(awk -F "$(printf "\t")" \
+			"\$1 == \"refs/heads/meta\" { print \$3 }" updates) &&
+		stable_stage=$(git rev-parse codex-staging) &&
+		unstable_stage=$(git rev-parse codex-unstable-staging) &&
+		git switch --detach "$candidate_meta" &&
+		git update-ref refs/heads/meta "$candidate_meta" &&
+		git update-ref refs/heads/codex "$stable_stage" &&
+		git update-ref refs/heads/codex-unstable "$unstable_stage"
+	) &&
+	run_pr_state_fixture pr-state-staging --dry-run >published.out &&
+	test_grep "#28.*build:codex-stable.*codex:integrated" published.out &&
+	test_grep "#21.*build:codex-unstable.*codex:integrated" \
+		published.out
+'
+
+test_expect_success 'automatic plans, obsolete proposals, and human policy remain distinct' '
+	setup_pr_state_fixture pr-state-plans &&
+	write_pr_state_plan_fixture pr-state-plans &&
+	run_pr_state_fixture pr-state-plans --dry-run >plans.out &&
+	test_grep "#90.*kind:auto-plan.*codex:planned" plans.out &&
+	test_grep "#91.*kind:auto-plan.*codex:superseded" plans.out &&
+	test_grep "#92.*kind:auto-plan.*codex:awaiting-plan.*codex:blocked" \
+		plans.out &&
+	test_grep "#93.*kind:plan-policy.*build:codex-stable.*codex:needs-review" \
+		plans.out &&
+	! grep "#91.*codex:blocked" plans.out
+'
+
+test_expect_success 'label reconciliation preserves unrelated labels and rejects moved heads' '
+	setup_pr_state_fixture pr-state-mutations &&
+	(
+		cd pr-state-mutations &&
+		jq ".[].labels = [{name:\"keep-me\"},
+			{name:\"build:codex-unstable\"},
+			{name:\"codex:needs-review\"}]" \
+			pr-state-data/codex.json >pr-state-data/labeled.json &&
+		mv pr-state-data/labeled.json pr-state-data/codex.json
+	) &&
+	wrong_head=$(git -C pr-state-mutations rev-parse master) &&
+	FAKE_PR_STATE_MOVED_HEAD="$wrong_head" \
+		run_pr_state_fixture pr-state-mutations >moved.out 2>moved.err &&
+	test_grep "pull request #28: its head moved" moved.err &&
+	test_must_be_empty pr-state-mutations/pr-state-data/mutations &&
+	test_expect_code 1 run_pr_state_fixture pr-state-mutations \
+		--expected-meta "$wrong_head" --dry-run \
+		>wrong-meta.out 2>wrong-meta.err &&
+	test_grep "meta moved" wrong-meta.err &&
+	run_pr_state_fixture pr-state-mutations >reconciled.out &&
+	test_grep "ADD.*28.*kind:review-only" \
+		pr-state-mutations/pr-state-data/mutations &&
+	test_grep "ADD.*28.*build:codex-stable" \
+		pr-state-mutations/pr-state-data/mutations &&
+	test_grep "ADD.*28.*codex:planned" \
+		pr-state-mutations/pr-state-data/mutations &&
+	test_grep "REMOVE.*28.*build%3Acodex-unstable" \
+		pr-state-mutations/pr-state-data/mutations &&
+	test_grep "REMOVE.*28.*codex%3Aneeds-review" \
+		pr-state-mutations/pr-state-data/mutations &&
+	! grep -F keep-me pr-state-mutations/pr-state-data/mutations
 '
 
 test_done
