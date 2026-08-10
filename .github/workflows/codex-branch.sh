@@ -50,6 +50,8 @@ usage () {
 	   or: codex-branch validate-topic-review
 		--pull-request <number> --lane <codex|codex-unstable>
 		--topic <branch> --source-tip <oid>
+	   or: codex-branch reconcile-pr-state [--expected-meta <oid>]
+		[--inputs <path> --updates <path>] [--dry-run]
 	   or: codex-branch propose-plan [--remote <remote>]
 		--lane <codex|codex-unstable> --topic <branch>
 		[--source-tip <oid>] [--review-pr <number>]
@@ -330,6 +332,8 @@ legacy_control_paths_unchanged () (
 		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-plan-admission.yml \
 		.github/workflows/codex-plan-propose.yml \
+		.github/workflows/codex-pr-state.sh \
+		.github/workflows/codex-pr-state.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
@@ -358,6 +362,8 @@ meta_control_paths_unchanged () (
 		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-plan-admission.yml \
 		.github/workflows/codex-plan-propose.yml \
+		.github/workflows/codex-pr-state.sh \
+		.github/workflows/codex-pr-state.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex-branch.sh \
 		.github/workflows/main.yml \
@@ -621,7 +627,23 @@ jobs:
       contents: read
       pull-requests: write
     uses: openai/git/.github/workflows/codex-plan-admission.yml@meta
+  pr_state:
+    name: Reconcile Codex pull request state
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/codex' &&
+       inputs.operation == 'scan')
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: openai/git/.github/workflows/codex-pr-state.yml@meta
 	EOF
+}
+
+write_previous_pinned_automation_workflow () {
+	write_automation_workflow | sed '/^  pr_state:$/,$d'
 }
 
 write_previous_automation_workflow () {
@@ -730,12 +752,23 @@ write_legacy_automation_workflow () {
 	EOF
 }
 
-automation_workflow_is_current () {
+automation_workflow_is_latest () {
 	head_oid=$1
 	make_tmp_dir
 	git show "$head_oid:.github/workflows/codex.yml" \
 		>"$tmp_dir/actual-automation.yml" 2>/dev/null || return 1
 	write_automation_workflow >"$tmp_dir/expected-automation.yml"
+	cmp -s "$tmp_dir/expected-automation.yml" \
+		"$tmp_dir/actual-automation.yml"
+}
+
+automation_workflow_is_current () {
+	if automation_workflow_is_latest "$1"
+	then
+		return 0
+	fi
+	write_previous_pinned_automation_workflow \
+		>"$tmp_dir/expected-automation.yml"
 	cmp -s "$tmp_dir/expected-automation.yml" \
 		"$tmp_dir/actual-automation.yml"
 }
@@ -7995,6 +8028,8 @@ topic_control_paths_unchanged () (
 		.github/workflows/codex-admission.yml \
 		.github/workflows/codex-plan-admission.yml \
 		.github/workflows/codex-plan-propose.yml \
+		.github/workflows/codex-pr-state.sh \
+		.github/workflows/codex-pr-state.yml \
 		.github/workflows/codex-topic.yml \
 		.github/workflows/codex.yml \
 		.github/workflows/codex-branch.sh \
@@ -8136,6 +8171,11 @@ verify_control_paths () {
 		release_publication_controls_preserved "$published_codex" \
 			"$candidate" ||
 			die "candidate changes the controller-only release publication guard"
+		if automation_workflow_is_latest "$published_codex" &&
+			! automation_workflow_is_latest "$candidate"
+		then
+			die "candidate downgrades the canonical Codex admission workflow"
+		fi
 		if automation_workflow_is_current "$published_codex" &&
 			! automation_workflow_is_current "$candidate"
 		then
@@ -9540,6 +9580,19 @@ prepare_local_candidate () {
 	freeze_local_candidate "$session" "$local_candidate_dir"
 }
 
+reconcile_candidate_pr_state () (
+	inputs=$1
+	updates=$2
+	helper=$script_dir/codex-pr-state.sh
+	test -f "$helper" || return 0
+	if ! sh "$helper" --inputs "$inputs" --updates "$updates"
+	then
+		printf '%s\n' \
+			'warning: could not reconcile derived Codex pull request labels' \
+			>&2
+	fi
+)
+
 stage_and_wait_for_ci () {
 	repository=$1
 	candidate=$2
@@ -9560,6 +9613,7 @@ stage_and_wait_for_ci () {
 	say "GitHub API user: $publisher"
 	stage_candidate --remote origin --staging "$staging" \
 		--inputs "$inputs" --updates "$updates" --require-automation
+	reconcile_candidate_pr_state "$inputs" "$updates"
 	wait_for_staging_ci gh "$repository" "$candidate" "$baseline" \
 		"$staging"
 	unstable_candidate=$(awk -F '\t' \
@@ -9577,6 +9631,7 @@ stage_and_wait_for_ci () {
 		esac
 		stage_candidate --remote origin --staging "$staging" \
 			--inputs "$inputs" --updates "$updates" --require-automation
+		reconcile_candidate_pr_state "$inputs" "$updates"
 		wait_for_staging_ci gh "$repository" "$unstable_candidate" \
 			"$baseline" "$staging"
 	fi
@@ -9690,6 +9745,8 @@ rebuild_codex_locally () {
 		--inputs "$local_candidate_dir/codex-inputs" \
 		--updates "$local_candidate_dir/codex-updates" \
 		--require-automation
+	reconcile_candidate_pr_state "$local_candidate_dir/codex-inputs" \
+		"$local_candidate_dir/codex-updates"
 	say "Published codex candidate $candidate from local preparation session $session."
 	if ! close_published_topic_reviews "$controller_oid" \
 		"$local_candidate_dir/codex-updates"
@@ -9814,6 +9871,8 @@ publish_run () {
 	promote --remote origin --staging codex-staging \
 		--inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" --require-automation
+	reconcile_candidate_pr_state "$metadata/codex-inputs" \
+		"$metadata/codex-updates"
 	say "Published codex candidate $artifact_candidate from Actions run $run_id."
 	if ! close_published_topic_reviews "$run_controller" \
 		"$metadata/codex-updates"
@@ -10125,6 +10184,7 @@ verify-inputs) verify_inputs "$@" ;;
 validate-plan-transition) validate_plan_transition "$@" ;;
 test-validate-plan-transition) validate_plan_transition_fixture "$@" ;;
 validate-topic-review) validate_topic_review "$@" ;;
+reconcile-pr-state) sh "$script_dir/codex-pr-state.sh" "$@" ;;
 propose-plan) propose_plan "$@" ;;
 recover-release-pin) recover_release_pin "$@" ;;
 test-recover-release-pin) recover_release_pin_fixture "$@" ;;

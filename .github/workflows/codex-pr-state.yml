@@ -1,0 +1,66 @@
+name: Codex pull request state
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: codex-pull-request-state
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: Reconcile Codex topic, plan, and controller labels
+    if: >-
+      github.repository == 'openai/git' &&
+      github.ref == 'refs/heads/codex'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Pin trusted meta
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+            --jq .object.sha)
+          case "$sha" in
+          ''|*[!0-9a-f]*) exit 1 ;;
+          esac
+          test "${#sha}" = 40
+          printf 'sha=%s\n' "$sha" >>"$GITHUB_OUTPUT"
+
+      - name: Check out trusted meta
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.meta.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the source, output, and staging refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_META: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          basic=$(printf 'x-access-token:%s' "$GH_TOKEN" |
+            base64 | tr -d '\n')
+          git -c http.extraheader="AUTHORIZATION: basic $basic" \
+            fetch --force --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*'
+          test "$(git rev-parse HEAD)" = "$EXPECTED_META"
+          test "$(git rev-parse refs/remotes/origin/meta)" = "$EXPECTED_META"
+
+      - name: Reconcile derived pull request labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_META: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          sh .github/workflows/codex-pr-state.sh \
+            --expected-meta "$EXPECTED_META"
