@@ -48,5 +48,7 @@ int clean_status_index_logical_digest(const struct index_state *istate,
 				      unsigned char *out);
 int clean_status_index_logical_digest_after_status(
 	const struct index_state *istate, unsigned char *out);
+int clean_status_index_can_reuse_source_logical_hash(
+	const struct index_state *istate);
 
 #endif /* CLEAN_STATUS_INDEX_H */
