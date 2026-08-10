@@ -9,6 +9,11 @@
 #include "trace2.h"
 #include "wrapper.h"
 
+#define LOGICAL_INDEX_PERSISTENT_FLAGS \
+	(CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS)
+#define LOGICAL_INDEX_BENIGN_FLAGS \
+	(CE_UPTODATE | CE_HASHED | CE_FSMONITOR_VALID)
+
 static int snapshot_read(
 	int fd, const struct stat *st, const struct git_hash_algo *algo,
 	uint32_t *version, uint32_t *cache_nr, struct object_id *checksum)
@@ -248,15 +253,56 @@ int clean_status_index_is_certifiable(const struct index_state *istate)
 		clean_status_index_entries_are_certifiable(istate);
 }
 
+static int index_entry_logical_state_is_supported(
+	const struct cache_entry *ce, unsigned int extra_benign_flags)
+{
+	return !(ce->ce_flags & ~(LOGICAL_INDEX_PERSISTENT_FLAGS |
+				 LOGICAL_INDEX_BENIGN_FLAGS |
+				 extra_benign_flags));
+}
+
+static int index_logical_state_is_supported(
+	const struct index_state *istate, unsigned int extra_benign_flags)
+{
+	if (!istate->repo || !istate->repo->hash_algo || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    istate->cache_nr > UINT32_MAX)
+		return 0;
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *ce = istate->cache[i];
+
+		if (!index_entry_logical_state_is_supported(
+			    ce, extra_benign_flags))
+			return 0;
+	}
+	return 1;
+}
+
+int clean_status_index_can_reuse_source_logical_hash(
+	const struct index_state *istate)
+{
+	const unsigned int acceleration_changes =
+		FSMONITOR_CHANGED | UNTRACKED_CHANGED;
+
+	/*
+	 * Reading or refreshing acceleration extensions may mark only FSMN/UNTR
+	 * state dirty.  Reject any cache-entry change, while the flag walk
+	 * preserves every reject condition which the logical digest enforced
+	 * before a physical alias could skip it.  Sparse-checkout post-processing
+	 * may clear CE_SKIP_WORKTREE without setting cache_changed, so leave that
+	 * mode on the digest path.
+	 */
+	return istate->repo && istate->repo->initialized &&
+		!repo_config_values(istate->repo)->apply_sparse_checkout &&
+		!(istate->cache_changed & ~acceleration_changes) &&
+		index_logical_state_is_supported(istate, 0);
+}
+
 static int index_logical_digest(const struct index_state *istate,
 				unsigned int extra_benign_flags,
 				unsigned char *out)
 {
 	static const char domain[] = "git-clean-status-logical-index-v1";
-	const unsigned int persistent_flags =
-		CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS;
-	const unsigned int benign_flags =
-		CE_UPTODATE | CE_HASHED | CE_FSMONITOR_VALID;
 	struct git_hash_ctx ctx;
 	uint32_t value;
 	int initialized = 0, ret = -1;
@@ -282,12 +328,13 @@ static int index_logical_digest(const struct index_state *istate,
 		 * CE_CONTENT_CHECK_REQUIRED must not disappear with the process
 		 * which raised it.
 		 */
-		if (ce->ce_flags & ~(persistent_flags | benign_flags |
-				     extra_benign_flags))
+		if (!index_entry_logical_state_is_supported(
+			    ce, extra_benign_flags))
 			goto done;
 		put_be32(&value, ce->ce_mode);
 		hash_length_delimited(&ctx, &value, sizeof(value));
-		put_be32(&value, ce->ce_flags & persistent_flags);
+		put_be32(&value,
+			 ce->ce_flags & LOGICAL_INDEX_PERSISTENT_FLAGS);
 		hash_length_delimited(&ctx, &value, sizeof(value));
 		hash_length_delimited(&ctx, ce->oid.hash,
 				      istate->repo->hash_algo->rawsz);
