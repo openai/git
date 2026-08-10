@@ -156,6 +156,7 @@ void test_clean_status_history_store__rejects_incomplete_checkpoints(void)
 	cl_assert(!memcmp(parsed.fsmonitor_config, fscf, sizeof(fscf) - 1));
 	cl_assert_equal_i(parsed.fsmonitor_untracked_len, 0);
 	cl_assert(parsed.fsmonitor_untracked == NULL);
+	cl_assert(!parsed.source_alias_valid);
 
 	/* A checkpoint must contain both FSMN and FSCF. */
 	put_be32(encoded.buf + flags_offset, 1U << 1);
@@ -236,6 +237,8 @@ void test_clean_status_history_store__does_not_rewrite_unchanged_checkpoint(void
 	static const unsigned char fsmn[] = "fsmn";
 	static const unsigned char fscf[] = "fscf";
 	struct clean_status_history_checkpoint checkpoint = { 0 };
+	struct clean_status_history_store_record record =
+		CLEAN_STATUS_HISTORY_STORE_RECORD_INIT;
 	struct clean_status_index_snapshot snapshot;
 	struct history_store_fixture fixture;
 	struct strbuf path;
@@ -255,6 +258,11 @@ void test_clean_status_history_store__does_not_rewrite_unchanged_checkpoint(void
 	cl_assert_equal_i(clean_status_history_store_install(
 		fixture.index_path.buf, "proof-schema", &checkpoint,
 		&snapshot, algo), 0);
+	cl_assert_equal_i(clean_status_history_store_load(
+		fixture.index_path.buf, "proof-schema", algo, &record), 0);
+	cl_assert(record.checkpoint.source_alias_valid);
+	cl_assert(clean_status_history_checkpoint_source_matches(
+		fixture.index_path.buf, &record.checkpoint, &snapshot, algo));
 	cl_assert_equal_i(lstat(path.buf, &before), 0);
 	cl_assert_equal_i(clean_status_history_store_install(
 		fixture.index_path.buf, "proof-schema", &checkpoint,
@@ -262,6 +270,7 @@ void test_clean_status_history_store__does_not_rewrite_unchanged_checkpoint(void
 	cl_assert_equal_i(lstat(path.buf, &after), 0);
 	cl_assert_equal_i(before.st_ino, after.st_ino);
 
+	clean_status_history_store_record_release(&record);
 	clean_status_index_snapshot_release(&snapshot);
 	strbuf_release(&path);
 	fixture_release(&fixture);
