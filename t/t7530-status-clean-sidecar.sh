@@ -547,13 +547,14 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
-	'a v4 skipHash index is not certified' '
+	'a v4 skipHash index uses durable identity for a clean proof' '
 	test_when_finished "stop_daemon sidecar-v4" &&
 	setup_repo sidecar-v4 &&
 	prime_semantic_history sidecar-v4 &&
 	git -C sidecar-v4 config index.version 4 &&
 	git -C sidecar-v4 config index.skipHash true &&
 	git -C sidecar-v4 update-index --force-write-index &&
+	prime_semantic_history sidecar-v4 &&
 	git -C sidecar-v4 config core.autocrlf false &&
 
 	dd if=/dev/zero of=zeros bs=20 count=1 2>/dev/null &&
@@ -562,8 +563,22 @@ test_expect_success DURABLE_FSMONITOR \
 	test_env GIT_TRACE2_EVENT="$PWD/v4.trace" \
 		bulk_status -C sidecar-v4 status --porcelain=v2 >actual &&
 	test_must_be_empty actual &&
-	test_path_is_missing sidecar-v4/.git/index.csts &&
-	test_grep ! "\"key\":\"clean-proof/hit\"" v4.trace
+	test_path_is_file sidecar-v4/.git/index.csts &&
+	test_grep "\"key\":\"clean-proof/sidecar\"" v4.trace &&
+
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/v4-hit.trace" \
+		git -C sidecar-v4 status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep "\"key\":\"clean-proof/hit\"" v4-hit.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" v4-hit.trace &&
+
+	# Rewriting the same zero-checksum entries changes the durable identity.
+	git -C sidecar-v4 update-index --force-write-index &&
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/v4-rewrite.trace" \
+		git -C sidecar-v4 status --porcelain=v2 >actual &&
+	test_must_be_empty actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" v4-rewrite.trace &&
+	test_grep "\"value\":\"fast-index-mismatch\"" v4-rewrite.trace
 '
 
 test_expect_success PIPE,DURABLE_FSMONITOR \
@@ -631,6 +646,7 @@ test_expect_success DURABLE_FSMONITOR \
 	test_when_finished "stop_daemon external-history" &&
 	setup_repo external-history &&
 	git -C external-history config core.untrackedCache true &&
+	git -C external-history config index.skipHash true &&
 	git -C external-history config status.renameLimit 100 &&
 	git -C external-history update-index \
 		--index-version=4 --force-write-index &&
@@ -641,6 +657,9 @@ test_expect_success DURABLE_FSMONITOR \
 	test_grep UNTR external-history/.git/index &&
 	test_grep FSCF external-history/.git/index &&
 	test_grep FSUC external-history/.git/index &&
+	dd if=/dev/zero of=external-zeros bs=20 count=1 2>/dev/null &&
+	tail -c 20 external-history/.git/index >external-trailer &&
+	test_cmp_bin external-zeros external-trailer &&
 	git -C external-history ls-files --stage >baseline.stage &&
 	cp external-history/.git/index namespace-a-v4.index &&
 
@@ -653,6 +672,7 @@ test_expect_success DURABLE_FSMONITOR \
 	test_cmp seed.before external-history/.git/index &&
 	test_trace2_data fsmonitor history/external-stored 1 \
 		<external-seed.trace &&
+	test_path_is_missing external-history/.git/index.csts &&
 	test_grep ! "\"label\":\"do_write_index\"" external-seed.trace &&
 	find external-history/.git -maxdepth 1 -type f \
 		-name "index.csh1.*" >external-sidecars &&
@@ -673,6 +693,8 @@ test_expect_success DURABLE_FSMONITOR \
 	test_grep UNTR external-history/.git/index &&
 	test_grep FSCF external-history/.git/index &&
 	test_grep FSUC external-history/.git/index &&
+	tail -c 20 external-history/.git/index >external-trailer &&
+	test_cmp_bin external-zeros external-trailer &&
 	test_cmp sidecar.before-rewrite "$sidecar" &&
 
 	git -C external-history config status.renameLimit 200 &&
@@ -688,6 +710,9 @@ test_expect_success DURABLE_FSMONITOR \
 		<external-restore.trace &&
 	test_trace2_data fsmonitor config/coherent 1 \
 		<external-restore.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<external-restore.trace &&
+	test_path_is_file external-history/.git/index.csts &&
 	test_grep ! \
 		"\"key\":\"refresh/sum_lstat\",\"value\":\"[1-9]" \
 		external-restore.trace &&
@@ -698,6 +723,45 @@ test_expect_success DURABLE_FSMONITOR \
 	test_trace2_data read_directory opendir 0 \
 		<external-restore.trace &&
 	test_grep ! "\"label\":\"do_write_index\"" external-restore.trace &&
+
+	# The physical proof skips both logical digests on the next plain status,
+	# while still using the normal long-status printer.
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/external-fast.trace" \
+		git -C external-history status >actual.fast &&
+	test_cmp actual.restore actual.fast &&
+	test_trace2_data status clean-proof/hit 1 \
+		<external-fast.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" external-fast.trace &&
+	test_grep ! "\"label\":\"history_logical_digest\"" \
+		external-fast.trace &&
+	test_grep ! "\"key\":\"preload/sum_lstat\"" external-fast.trace &&
+	test_grep ! "\"key\":\"refresh/sum_lstat\"" external-fast.trace &&
+	test_grep ! \
+		"\"event\":\"region_enter\".*\"category\":\"dir\",\"label\":\"read_directory\"" \
+		external-fast.trace &&
+
+	# The proof does not cache long output: same-tree branch metadata stays
+	# live without reading the index.
+	git -C external-history branch sidecar-live &&
+	git -C external-history symbolic-ref HEAD refs/heads/sidecar-live &&
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/external-branch.trace" \
+		git -C external-history status >actual.branch &&
+	test_grep "^On branch sidecar-live$" actual.branch &&
+	test_trace2_data status clean-proof/hit 1 \
+		<external-branch.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" external-branch.trace &&
+
+	# In-progress operation state is also read live on a fast hit.
+	git -C external-history rev-parse HEAD \
+		>external-history/.git/MERGE_HEAD &&
+	GIT_OPTIONAL_LOCKS=0 GIT_TRACE2_EVENT="$PWD/external-merge.trace" \
+		git -C external-history status >actual.merge &&
+	test_grep "All conflicts fixed but you are still merging" \
+		actual.merge &&
+	test_trace2_data status clean-proof/hit 1 \
+		<external-merge.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" external-merge.trace &&
+	rm external-history/.git/MERGE_HEAD &&
 
 	# A failed checkpoint refresh must not spill namespace B into main.
 	cp namespace-a-v2.index namespace-a-v2.rewrite &&
