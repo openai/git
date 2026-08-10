@@ -163,7 +163,10 @@ which can change entry membership or persistent flags.
 On a valid hit, status installs all checkpoint sections together in a
 scratch index, rechecks the pinned index, and only then replaces the
 in-memory acceleration state.  It queries the builtin file-system
-monitor from the stored token.  A trivial response, provider restart,
+monitor from the stored token.  If the named index already carries a
+different usable builtin token, status first requires the stored token
+to return a delta; otherwise it keeps the named boundary for the
+forward-baseline fallback.  A trivial response, provider restart,
 malformed section, token mismatch, namespace mismatch, or index race
 falls back to ordinary validation.
 
