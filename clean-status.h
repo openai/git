@@ -105,6 +105,8 @@ void clean_status_write_fsmonitor_config(struct strbuf *out,
 int clean_status_restore_external_history(struct index_state *istate);
 int clean_status_external_history_was_restored(
 	const struct index_state *istate);
+void clean_status_capture_external_history_source(
+	struct index_state *istate);
 int clean_status_save_external_history(struct index_state *istate);
 void clean_status_copy_fsmonitor_history(struct index_state *dst,
 					 const struct index_state *src);
