@@ -624,6 +624,8 @@ void untracked_cache_invalidate_all(struct index_state *);
 void untracked_cache_invalidate_trimmed_path(struct index_state *,
 					     const char *path,
 					     int safe_path);
+void untracked_cache_recompute_fsmonitor_valid_recursive(
+	struct untracked_cache *);
 void untracked_cache_remove_from_index(struct index_state *, const char *);
 void untracked_cache_add_to_index(struct index_state *, const char *);
 
