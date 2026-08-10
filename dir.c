@@ -608,6 +608,14 @@ static int compute_untracked_cache_fsmonitor_valid_recursive(
 	return valid;
 }
 
+void untracked_cache_recompute_fsmonitor_valid_recursive(
+	struct untracked_cache *uc)
+{
+	if (!uc || !uc->root)
+		return;
+	compute_untracked_cache_fsmonitor_valid_recursive(uc->root);
+}
+
 static void untracked_cache_preload_join(
 	struct untracked_cache_preload *preload)
 {

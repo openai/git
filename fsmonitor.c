@@ -261,6 +261,9 @@ void prepare_fsmonitor_untracked(struct index_state *istate)
 		  istate->fsmonitor_untracked_token &&
 		  !strcmp(istate->fsmonitor_last_update,
 			  istate->fsmonitor_untracked_token)));
+	if (istate->fsmonitor_untracked_valid)
+		untracked_cache_recompute_fsmonitor_valid_recursive(
+			istate->untracked);
 }
 
 static struct ewah_bitmap *fsmonitor_bitmap_from_index(
