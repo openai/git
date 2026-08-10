@@ -520,6 +520,12 @@ int refs_for_each_remote_ref(struct ref_store *refs,
 			     refs_for_each_cb fn, void *cb_data);
 int refs_for_each_replace_ref(struct ref_store *refs,
 			      refs_for_each_cb fn, void *cb_data);
+/*
+ * Iterate replacement refs through a fresh read-only ref store, without
+ * consulting caches held by the repository's main ref store.
+ */
+int refs_for_each_replace_ref_uncached(struct repository *repo,
+				       refs_for_each_cb fn, void *cb_data);
 
 /**
  * Iterate all refs in "prefixes" by partitioning prefixes into disjoint sets

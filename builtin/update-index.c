@@ -8,6 +8,8 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -53,6 +55,28 @@ static int ignore_skip_worktree_entries;
 #define MARK_FLAG 1
 #define UNMARK_FLAG 2
 static struct strbuf mtime_dir = STRBUF_INIT;
+
+static int update_index_config(const char *key, const char *value,
+			       const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
+static int is_proof_preserving_rewrite(int argc, const char **argv)
+{
+	if (argc == 2)
+		return !strcmp(argv[1], "--refresh") ||
+			!strcmp(argv[1], "--force-write-index");
+
+	if (argc != 3)
+		return 0;
+
+	return (!strcmp(argv[1], "--refresh") &&
+		!strcmp(argv[2], "--force-write-index")) ||
+		(!strcmp(argv[1], "--force-write-index") &&
+		 !strcmp(argv[2], "--refresh"));
+}
 
 /* Untracked cache mode */
 enum uc_mode {
@@ -917,6 +941,7 @@ int cmd_update_index(int argc,
 		     const char *prefix,
 		     struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	int newfd, entries, has_errors = 0, nul_term_line = 0;
 	enum uc_mode untracked_cache = UC_UNSPECIFIED;
 	int read_from_stdin = 0;
@@ -932,6 +957,8 @@ int cmd_update_index(int argc,
 	struct parse_opt_ctx_t ctx;
 	strbuf_getline_fn getline_fn;
 	int parseopt_state = PARSE_OPT_UNKNOWN;
+	int preserve_clean_history =
+		is_proof_preserving_rewrite(argc, argv);
 	struct repository *r = the_repository;
 	struct odb_transaction *transaction;
 	struct option options[] = {
@@ -1097,7 +1124,20 @@ int cmd_update_index(int argc,
 	show_usage_with_options_if_asked(argc, argv,
 					 update_index_usage, options);
 
-	repo_config(the_repository, git_default_config, NULL);
+	if (preserve_clean_history) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, update_index_config,
+			    &clean_digest);
+		clean_status_config_final(&clean_digest);
+		/*
+		 * These exact forms can refresh stat data, or no data at all,
+		 * but cannot change the logical contents of the index.
+		 */
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	} else {
+		repo_config(the_repository, git_default_config, NULL);
+	}
 
 	prepare_repo_settings(r);
 	the_repository->settings.command_requires_full_index = 0;

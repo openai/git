@@ -6,6 +6,8 @@
 
 #include "builtin.h"
 #include "advice.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "lockfile.h"
@@ -285,18 +287,20 @@ static struct option builtin_add_options[] = {
 };
 
 static int add_config(const char *var, const char *value,
-		      const struct config_context *ctx, void *cb)
+		      const struct config_context *ctx, void *data)
 {
+	clean_status_config_add(data, var, value, ctx);
+
 	if (!strcmp(var, "add.ignoreerrors") ||
 	    !strcmp(var, "add.ignore-errors")) {
 		ignore_add_errors = git_config_bool(var, value);
 		return 0;
 	}
 
-	if (git_color_config(var, value, cb) < 0)
+	if (git_color_config(var, value, NULL) < 0)
 		return -1;
 
-	return git_default_config(var, value, ctx, cb);
+	return git_default_config(var, value, ctx, NULL);
 }
 
 static const char embedded_advice[] = N_(
@@ -384,18 +388,25 @@ int cmd_add(int argc,
 	    const char *prefix,
 	    struct repository *repo)
 {
+	struct clean_status_config_digest clean_digest;
 	int exit_status = 0;
 	struct pathspec pathspec;
 	struct dir_struct dir = DIR_INIT;
 	int flags;
 	int add_new_files;
+	int preserve_add_history = 0;
 	int require_pathspec;
 	char *seen = NULL;
 	char *ps_matched = NULL;
 	struct lock_file lock_file = LOCK_INIT;
 	struct odb_transaction *transaction;
 
-	repo_config(repo, add_config, NULL);
+	show_usage_with_options_if_asked(argc, argv,
+					 builtin_add_usage, builtin_add_options);
+
+	clean_status_config_init(&clean_digest, repo->hash_algo);
+	repo_config(repo, add_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
 
 	argc = parse_options(argc, argv, prefix, builtin_add_options,
 			  builtin_add_usage, PARSE_OPT_KEEP_ARGV0);
@@ -492,8 +503,27 @@ int cmd_add(int argc,
 		 (!(addremove || take_worktree_changes)
 		  ? ADD_CACHE_IGNORE_REMOVAL : 0));
 
+	/*
+	 * The refresh-only path below updates stat data and fsmonitor
+	 * validity, but does not change the logical contents of the index.
+	 * Ordinary add can do the same after an mtime-only change. Ask
+	 * ADD_CACHE_TRACK_CLEAN_HISTORY to invalidate on any persistent
+	 * add/remove decision below.
+	 */
+	if (refresh_only) {
+		clean_status_set_config_digest(repo, &clean_digest);
+	} else if (!show_only && !intent_to_add && !add_renormalize &&
+		   !chmod_arg && !include_sparse && !ignore_add_errors) {
+		preserve_add_history = 1;
+		flags |= ADD_CACHE_TRACK_CLEAN_HISTORY;
+		clean_status_set_config_digest(repo, &clean_digest);
+	}
+
 	if (repo_read_index_preload(repo, &pathspec, 0) < 0)
 		die(_("index file corrupt"));
+	if (preserve_add_history &&
+	    (repo->index->split_index || repo->index->sparse_index))
+		clean_status_invalidate_current_proof(repo->index);
 
 	die_in_unpopulated_submodule(repo->index, prefix);
 	die_path_inside_submodule(repo->index, &pathspec);
@@ -603,6 +633,8 @@ int cmd_add(int argc,
 	odb_transaction_commit(transaction);
 
 finish:
+	if (preserve_add_history && exit_status)
+		clean_status_invalidate_current_proof(repo->index);
 	if (write_locked_index(repo->index, &lock_file,
 			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
 		die(_("unable to write new index file"));
