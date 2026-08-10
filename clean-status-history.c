@@ -369,8 +369,12 @@ clean_status_prepare_external_history(struct index_state *istate)
 				   "history/external-save-reject", "namespace");
 		goto fail;
 	}
-	if (clean_status_index_logical_digest_after_status(
-		    istate, checkpoint->checkpoint.index_hash)) {
+	if (clean_status_index_can_reuse_source_logical_hash(istate)) {
+		memcpy(checkpoint->checkpoint.index_hash,
+		       state->source_logical_hash,
+		       istate->repo->hash_algo->rawsz);
+	} else if (clean_status_index_logical_digest_after_status(
+			   istate, checkpoint->checkpoint.index_hash)) {
 		trace2_data_string("fsmonitor", istate->repo,
 				   "history/external-save-reject", "logical-flags");
 		goto fail;
@@ -488,6 +492,7 @@ int clean_status_restore_external_history(struct index_state *istate)
 	struct index_state parsed = INDEX_STATE_INIT(istate->repo);
 	unsigned char index_hash[GIT_MAX_RAWSZ];
 	char proof_namespace[GIT_MAX_HEXSZ + 1];
+	int record_loaded = 0;
 	int restored = 0;
 
 	if (!clean_status_external_history_enabled(istate) || !state ||
@@ -496,16 +501,33 @@ int clean_status_restore_external_history(struct index_state *istate)
 	    !state->current_attr_valid || getenv(INDEX_ENVIRONMENT) ||
 	    istate != istate->repo->index ||
 	    on_index_history_is_coherent(istate) ||
-	    clean_status_index_snapshot_pin(&snapshot, istate) ||
-	    clean_status_index_logical_digest(istate, index_hash))
+	    clean_status_index_snapshot_pin(&snapshot, istate))
 		goto done;
+	if (external_history_namespace(istate, proof_namespace))
+		goto done;
+	if (!clean_status_history_store_load(
+		    istate->repo->index_file, proof_namespace,
+		    istate->repo->hash_algo, &record)) {
+		record_loaded = 1;
+		if (clean_status_index_can_reuse_source_logical_hash(istate) &&
+		    clean_status_history_checkpoint_source_matches(
+			    istate->repo->index_file, &record.checkpoint,
+			    &snapshot, istate->repo->hash_algo)) {
+			memcpy(index_hash, record.checkpoint.index_hash,
+			       istate->repo->hash_algo->rawsz);
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "history/external-physical-alias", 1);
+			goto have_index_hash;
+		}
+	}
+	if (clean_status_index_logical_digest(istate, index_hash))
+		goto done;
+
+have_index_hash:
 	memcpy(state->source_logical_hash, index_hash,
 	       istate->repo->hash_algo->rawsz);
 	state->source_logical_hash_valid = 1;
-	if (external_history_namespace(istate, proof_namespace) ||
-	    clean_status_history_store_load(
-		    istate->repo->index_file, proof_namespace,
-		    istate->repo->hash_algo, &record) ||
+	if (!record_loaded ||
 	    memcmp(index_hash, record.checkpoint.index_hash,
 		   istate->repo->hash_algo->rawsz))
 		goto done;
