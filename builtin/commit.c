@@ -1736,8 +1736,6 @@ struct repository *repo UNUSED)
 		       prefix, argv);
 	s.allow_clean_status_shortcuts =
 		default_status_command && !s.pathspec.nr;
-	if (s.allow_clean_status_shortcuts)
-		clean_status_enable_external_history(the_repository);
 	normal_has_head = default_status_command &&
 		!repo_get_oid(the_repository, s.reference, &oid);
 	exact_clean_query = exact_clean_command &&
@@ -1752,6 +1750,8 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
+	if (s.allow_clean_status_shortcuts || exact_clean_query)
+		clean_status_enable_external_history(the_repository);
 	s.certify_clean_status = exact_clean_query;
 	if ((exact_clean_query || normal_clean_query) &&
 	    clean_status_try_sidecar(the_repository, &clean_digest)) {
@@ -1766,6 +1766,9 @@ struct repository *repo UNUSED)
 	    status_format != STATUS_FORMAT_PORCELAIN_V2)
 		progress_flag = REFRESH_PROGRESS;
 	repo_read_index(the_repository);
+	if (exact_clean_query && use_optional_locks())
+		clean_status_capture_external_history_source(
+			the_repository->index);
 	if (normal_clean_query && use_optional_locks() &&
 	    clean_status_external_history_was_restored(
 		    the_repository->index))
@@ -1800,23 +1803,49 @@ struct repository *repo UNUSED)
 
 	wt_status_collect(&s);
 
-	if (exact_clean_command && 0 <= fd &&
-	    clean_status_issue_sidecar(
-		    &s, &clean_digest, &index_lock, 0))
-		fd = -1;
 	if (0 <= fd) {
 		int external_restored =
 			clean_status_external_history_was_restored(
 				the_repository->index);
-		int external_saved =
-			clean_status_save_external_history(
+		int external_saved = 0;
+		int preserve_entry_changes =
+			!external_restored &&
+			(the_repository->index->cache_changed &
+			 CE_ENTRY_CHANGED);
+
+		/*
+		 * Publish resumable history before the physical clean proof.
+		 * A later foreign index rewrite can only recover the proof if
+		 * both files name the same provider boundary.
+		 *
+		 * CSH1 carries acceleration state, not refreshed stat data.
+		 * A fresh checkpoint names the pre-repair physical index; do
+		 * not let publishing it roll back the write which makes an
+		 * entry repair durable.  Restored checkpoints stay no-spill
+		 * for foreign index writers.
+		 */
+		if (!preserve_entry_changes &&
+		    (!exact_clean_query ||
+		     (clean_status_has_persistent_fsmonitor_semantic_history(
+			      the_repository->index) &&
+		      !s.change.nr && !s.untracked.nr && !s.ignored.nr)))
+			external_saved = clean_status_save_external_history(
 				the_repository->index);
 
-		if (normal_clean_query && external_restored &&
-		    clean_status_issue_sidecar(
-			    &s, &clean_digest, &index_lock, 1))
+		if (exact_clean_query) {
+			if (external_saved &&
+			    clean_status_issue_sidecar(
+				    &s, &clean_digest, &index_lock, 0))
+				fd = -1;
+			else if (external_restored || external_saved) {
+				rollback_lock_file(&index_lock);
+				fd = -1;
+			}
+		} else if (normal_clean_query && external_restored &&
+			   clean_status_issue_sidecar(
+				   &s, &clean_digest, &index_lock, 1)) {
 			fd = -1;
-		else if (external_restored || external_saved) {
+		} else if (external_restored || external_saved) {
 			rollback_lock_file(&index_lock);
 			fd = -1;
 		}
