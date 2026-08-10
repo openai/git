@@ -40,9 +40,12 @@ static int issue_test_barrier(void)
 	return ret;
 }
 
-static int output_is_certifiable(const struct wt_status *status)
+static int output_is_certifiable(const struct wt_status *status,
+				 int normal_clean_query)
 {
-	return status->status_format == STATUS_FORMAT_PORCELAIN_V2 &&
+	return (status->status_format == STATUS_FORMAT_PORCELAIN_V2 ||
+		(normal_clean_query &&
+		 status->status_format == STATUS_FORMAT_NONE)) &&
 		!status->pathspec.nr && !status->show_branch &&
 		!status->show_stash && !status->show_ignored_mode &&
 		!status->null_termination && !status->verbose &&
@@ -94,7 +97,8 @@ static int untracked_scan_is_certifiable(
 int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
-	struct lock_file *index_lock)
+	struct lock_file *index_lock,
+	int normal_clean_query)
 {
 	struct repository *repo = status->repo;
 	struct index_state *istate = repo->index;
@@ -107,7 +111,7 @@ int clean_status_issue_sidecar(
 
 	if (!is_lock_file_locked(index_lock) ||
 	    !config->finalized || config->filter_configured ||
-	    !output_is_certifiable(status)) {
+	    !output_is_certifiable(status, normal_clean_query)) {
 		trace_miss(repo, "issue-command-or-output");
 		goto done;
 	}

@@ -183,10 +183,6 @@ void test_clean_status_sidecar__rejects_invalid_proofs(void)
 	assert_parse_fails(&fixture, algo);
 	put_be32(fixture.encoded.buf + proof_offset(), 4);
 
-	memset(fixture.encoded.buf + index_checksum_offset(), 0, algo->rawsz);
-	assert_parse_fails(&fixture, algo);
-	memset(fixture.encoded.buf + index_checksum_offset(), 2, algo->rawsz);
-
 	memset(fixture.encoded.buf + head_tree_offset(algo), 0, algo->rawsz);
 	assert_parse_fails(&fixture, algo);
 	memset(fixture.encoded.buf + head_tree_offset(algo), 3, algo->rawsz);
@@ -194,6 +190,26 @@ void test_clean_status_sidecar__rejects_invalid_proofs(void)
 	memset(fixture.encoded.buf + exclude_digest_offset(algo), 0,
 	       algo->rawsz);
 	assert_parse_fails(&fixture, algo);
+	fixture_release(&fixture);
+}
+
+void test_clean_status_sidecar__accepts_null_checksum_with_durable_identity(void)
+{
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	struct sidecar_fixture fixture;
+	struct clean_status_sidecar parsed;
+
+	fixture_init(&fixture, algo);
+	oidclr(&fixture.sidecar.proof.index_checksum, algo);
+	cl_assert_equal_i(clean_status_sidecar_write(
+		&fixture.encoded, &fixture.sidecar, algo),
+		clean_status_identity_is_durable() ? 0 : -1);
+	if (clean_status_identity_is_durable()) {
+		cl_assert_equal_i(clean_status_sidecar_parse(
+			&parsed, fixture.encoded.buf,
+			fixture.encoded.len, algo), 0);
+		cl_assert(is_null_oid(&parsed.proof.index_checksum));
+	}
 	fixture_release(&fixture);
 }
 
@@ -270,11 +286,6 @@ void test_clean_status_sidecar__rejects_invalid_writes(void)
 	unsigned char *token;
 
 	fixture_init(&fixture, algo);
-	oidclr(&fixture.sidecar.proof.index_checksum, algo);
-	cl_assert_equal_i(clean_status_sidecar_write(
-		&fixture.encoded, &fixture.sidecar, algo), -1);
-	fill_oid(&fixture.sidecar.proof.index_checksum, 2, algo);
-
 	token = xmalloc(FSMONITOR_CLEAN_PROOF_TOKEN_MAX + 1);
 	memset(token, 'x', FSMONITOR_CLEAN_PROOF_TOKEN_MAX + 1);
 	memcpy(token, "builtin:", strlen("builtin:"));

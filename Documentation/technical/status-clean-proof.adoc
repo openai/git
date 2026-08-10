@@ -1,10 +1,13 @@
 Status clean-proof sidecar
 ==========================
 
-The status clean-proof sidecar is an optional cache for one exact clean
-`git status --porcelain=v2` result. It is never a source of repository
-state. A missing, stale, malformed, unsupported, or raced sidecar makes
-status read the index and scan the worktree normally.
+The status clean-proof sidecar is an optional proof for one empty clean
+scan. It can answer the exact empty `git status --porcelain=v2` query,
+or let a literal plain `git status` print its live long-format metadata
+without repeating the scan. It is never a source of repository state or
+cached human-readable output. A missing, stale, malformed, unsupported,
+or raced sidecar makes status read the index and scan the worktree
+normally.
 
 Location and scope
 ------------------
@@ -39,7 +42,8 @@ repository's object-format hash algorithm. Version 1 consists of:
 
 * The 32-bit index format version and 32-bit cache-entry count.
 
-* The index checksum and `HEAD` tree object ID.
+* The index checksum, which is all zero for an `index.skipHash` index,
+  and the `HEAD` tree object ID.
 
 * Hashes of status-relevant configuration and repository identity. The
   repository identity covers the worktree and Git directory paths, the
@@ -60,19 +64,23 @@ repository's object-format hash algorithm. Version 1 consists of:
 Issuance
 --------
 
-Only a literal, top-level `status --porcelain=v2` invocation can issue a
+Only a literal, top-level `status --porcelain=v2` invocation, or a
+literal plain `status` after it restored external history, can issue a
 sidecar. Status first completes the tracked and untracked scan,
 semantic-conversion checks, and provider-token closure. The result must
 be empty and use the bulk scanner's complete standard-exclude result.
 The index must also contain persistent semantic history from an earlier
-scan, so the first scan cannot certify itself.
+scan, so the first scan cannot certify itself. For plain status,
+external checkpoint publication is attempted before the physical-index
+proof is installed.
 
 Status then uses the held attribute snapshot and the scanner-sourced
 standard-exclude digest, pins the named index, and checks its ordinary
 expanded entries, `HEAD`, and the cache tree. External attribute
-sources, effective replacement refs, untracked-cache results, null
-index checksums, and other unsupported repository or index shapes
-prevent issuance.
+sources, effective replacement refs, untracked-cache results, and other
+unsupported repository or index shapes prevent issuance. A null index
+checksum is accepted only when the pinned index is bound by the durable
+local-APFS identity used for raced-input checks.
 
 The sidecar is installed while the index lock remains held and after
 the pinned index is rechecked. Status then rolls back the index lock, so
@@ -82,9 +90,9 @@ disabled, status does not issue a sidecar.
 Validation and races
 --------------------
 
-For the same literal command, status attempts validation before loading
-the index entries. It checks the bounded sidecar, pins the named index,
-and recreates the configuration, attribute, standard-exclude,
+For either eligible literal command, status attempts validation before
+loading the index entries. It checks the bounded sidecar, pins the named
+index, and recreates the configuration, attribute, standard-exclude,
 repository, and `HEAD` inputs. It then queries the builtin file system
 monitor from the recorded token and accepts only an empty delta
 response.
@@ -97,20 +105,25 @@ The sidecar's exclude-source opens pass `O_NONBLOCK` and fail closed
 when the source cannot be opened and validated; standard-exclude
 symbolic links retain their normal lookup behavior.
 
-A hit produces no output and reads only the 12-byte index header and
-the 20- or 32-byte checksum trailer; it does not deserialize cache
-entries, write the index, replace the sidecar, or advance its provider
-token. Any failed check falls through to ordinary status.
+An exact porcelain hit produces no output. A plain-status hit refreshes
+branch, tracking, and in-progress-operation metadata and passes the
+empty tracked and untracked lists to the normal long-status printer.
+Either hit reads only the 12-byte index header and the 20- or 32-byte
+checksum trailer; for a null trailer, the durable local-APFS identity
+is the physical binding. It does not deserialize cache entries, write
+the index, replace the sidecar, or advance its provider token. Any
+failed check falls through to ordinary status.
 
 Resumable history checkpoints
 -----------------------------
 
-The exact-result sidecar above is deliberately tied to one physical
-index file.  A normal, top-level `git status` has a separate checkpoint
-store for resuming clean-status history after another Git implementation
-has rewritten or re-encoded the index.  The store is consulted only
-after the ordinary index entries have been read.  It cannot answer a
-status command by itself.
+The physical clean-proof sidecar above is deliberately tied to one
+physical index file. A normal, top-level `git status` has a separate
+checkpoint store for resuming clean-status history after another Git
+implementation has rewritten or re-encoded the index. The store is
+consulted only after the ordinary index entries have been read. It
+cannot answer a status command by itself, but a successful restore can
+publish a new physical proof for the next unchanged-index plain status.
 
 For an index at `<index>`, a checkpoint is stored as
 `<index>.csh1.<namespace-hash>`.  The namespace covers the checkpoint
