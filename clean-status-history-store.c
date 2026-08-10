@@ -15,7 +15,8 @@
 #include "wrapper.h"
 
 #define CLEAN_STATUS_HISTORY_CHECKPOINT_MAGIC "CSHS"
-#define CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION 1
+#define CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION 2
+#define CLEAN_STATUS_HISTORY_CHECKPOINT_LEGACY_VERSION 1
 #define CLEAN_STATUS_HISTORY_CHECKPOINT_MAX_SIZE (16 * 1024 * 1024)
 #define CLEAN_STATUS_HISTORY_STORE_MAX_FILES 8
 #define CLEAN_STATUS_HISTORY_HAS_FSMN (1U << 0)
@@ -195,7 +196,7 @@ int clean_status_history_checkpoint_parse(
 	unsigned char expected_namespace[GIT_MAX_RAWSZ];
 	size_t minimum = 4 + 2 * sizeof(uint32_t) + 2 * algo->rawsz +
 		4 * sizeof(uint32_t) + algo->rawsz;
-	uint32_t flags, lengths[4];
+	uint32_t version, flags, lengths[4];
 
 	memset(checkpoint, 0, sizeof(*checkpoint));
 	if (!proof_namespace || !*proof_namespace || len < minimum ||
@@ -205,9 +206,17 @@ int clean_status_history_checkpoint_parse(
 		return -1;
 	end = p + len - algo->rawsz;
 	p += 4;
-	if (get_be32(p) != CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION)
+	version = get_be32(p);
+	if (version != CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION &&
+	    version != CLEAN_STATUS_HISTORY_CHECKPOINT_LEGACY_VERSION)
 		return -1;
 	p += sizeof(uint32_t);
+	if (version == CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION) {
+		minimum += CLEAN_STATUS_IDENTITY_SIZE +
+			2 * sizeof(uint32_t) + algo->rawsz;
+		if (len < minimum)
+			return -1;
+	}
 	flags = get_be32(p);
 	p += sizeof(uint32_t);
 	if ((flags & (CLEAN_STATUS_HISTORY_HAS_FSMN |
@@ -227,6 +236,21 @@ int clean_status_history_checkpoint_parse(
 	p += algo->rawsz;
 	memcpy(checkpoint->index_hash, p, algo->rawsz);
 	p += algo->rawsz;
+	if (version == CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION) {
+		if (clean_status_identity_read(
+			    &p, end, &checkpoint->source_identity))
+			return -1;
+		checkpoint->source_version = get_be32(p);
+		p += sizeof(uint32_t);
+		checkpoint->source_cache_nr = get_be32(p);
+		p += sizeof(uint32_t);
+		oidread(&checkpoint->source_checksum, p, algo);
+		p += algo->rawsz;
+		if (checkpoint->source_version < 2 ||
+		    checkpoint->source_version > 4)
+			return -1;
+		checkpoint->source_alias_valid = 1;
+	}
 	for (size_t i = 0; i < ARRAY_SIZE(lengths); i++) {
 		lengths[i] = get_be32(p);
 		p += sizeof(uint32_t);
@@ -274,6 +298,9 @@ int clean_status_history_checkpoint_write(
 {
 	unsigned char namespace_hash[GIT_MAX_RAWSZ];
 	uint32_t value, flags = 0;
+	uint32_t version = checkpoint->source_alias_valid ?
+		CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION :
+		CLEAN_STATUS_HISTORY_CHECKPOINT_LEGACY_VERSION;
 
 	strbuf_reset(out);
 	if (!proof_namespace || !*proof_namespace ||
@@ -288,6 +315,10 @@ int clean_status_history_checkpoint_write(
 	     !!checkpoint->fsmonitor_config_len) ||
 	    (!!checkpoint->fsmonitor_untracked !=
 	     !!checkpoint->fsmonitor_untracked_len) ||
+	    (checkpoint->source_alias_valid &&
+	     (checkpoint->source_version < 2 ||
+	      checkpoint->source_version > 4 ||
+	      checkpoint->source_checksum.algo != hash_algo_by_ptr(algo))) ||
 	    !checkpoint->fsmonitor_len || !checkpoint->fsmonitor_config_len ||
 	    (!!checkpoint->untracked_cache_len !=
 	     !!checkpoint->fsmonitor_untracked_len))
@@ -301,12 +332,21 @@ int clean_status_history_checkpoint_write(
 		flags |= CLEAN_STATUS_HISTORY_HAS_FSUC;
 	proof_namespace_hash(proof_namespace, algo, namespace_hash);
 	strbuf_add(out, CLEAN_STATUS_HISTORY_CHECKPOINT_MAGIC, 4);
-	put_be32(&value, CLEAN_STATUS_HISTORY_CHECKPOINT_VERSION);
+	put_be32(&value, version);
 	strbuf_add(out, &value, sizeof(value));
 	put_be32(&value, flags);
 	strbuf_add(out, &value, sizeof(value));
 	strbuf_add(out, namespace_hash, algo->rawsz);
 	strbuf_add(out, checkpoint->index_hash, algo->rawsz);
+	if (checkpoint->source_alias_valid) {
+		clean_status_identity_write(out, &checkpoint->source_identity);
+		put_be32(&value, checkpoint->source_version);
+		strbuf_add(out, &value, sizeof(value));
+		put_be32(&value, checkpoint->source_cache_nr);
+		strbuf_add(out, &value, sizeof(value));
+		strbuf_add(out, checkpoint->source_checksum.hash,
+			   algo->rawsz);
+	}
 	put_be32(&value, checkpoint->fsmonitor_len);
 	strbuf_add(out, &value, sizeof(value));
 	put_be32(&value, checkpoint->untracked_cache_len);
@@ -397,6 +437,27 @@ static int local_apfs_id(int fd MAYBE_UNUSED,
 #endif
 }
 
+int clean_status_history_checkpoint_source_matches(
+	const char *index_path,
+	const struct clean_status_history_checkpoint *checkpoint,
+	const struct clean_status_index_snapshot *snapshot,
+	const struct git_hash_algo *algo)
+{
+	struct clean_status_filesystem_id fsid;
+
+	return checkpoint && checkpoint->source_alias_valid &&
+		clean_status_identity_is_durable() &&
+		snapshot && snapshot->fd >= 0 &&
+		!local_apfs_id(snapshot->fd, &fsid) &&
+		clean_status_identity_equal(
+			&checkpoint->source_identity, &snapshot->identity) &&
+		checkpoint->source_version == snapshot->version &&
+		checkpoint->source_cache_nr == snapshot->cache_nr &&
+		oideq(&checkpoint->source_checksum, &snapshot->checksum) &&
+		clean_status_index_snapshot_still_matches_path(
+			snapshot, index_path, algo);
+}
+
 int clean_status_history_store_install(
 	const char *index_path, const char *proof_namespace,
 	const struct clean_status_history_checkpoint *checkpoint,
@@ -404,6 +465,7 @@ int clean_status_history_store_install(
 	const struct git_hash_algo *algo)
 {
 	struct clean_status_filesystem_id fsid;
+	struct clean_status_history_checkpoint aliased;
 	struct clean_status_history_store_record current =
 		CLEAN_STATUS_HISTORY_STORE_RECORD_INIT;
 	struct strbuf encoded = STRBUF_INIT;
@@ -416,9 +478,16 @@ int clean_status_history_store_install(
 	if (!clean_status_identity_is_durable() || !snapshot ||
 	    snapshot->fd < 0 || local_apfs_id(snapshot->fd, &fsid) ||
 	    !clean_status_index_snapshot_still_matches_path(
-		    snapshot, index_path, algo) ||
-	    clean_status_history_checkpoint_write(
-		    &encoded, proof_namespace, checkpoint, algo))
+		    snapshot, index_path, algo))
+		goto done;
+	aliased = *checkpoint;
+	aliased.source_alias_valid = 1;
+	aliased.source_identity = snapshot->identity;
+	aliased.source_version = snapshot->version;
+	aliased.source_cache_nr = snapshot->cache_nr;
+	oidcpy(&aliased.source_checksum, &snapshot->checksum);
+	if (clean_status_history_checkpoint_write(
+		    &encoded, proof_namespace, &aliased, algo))
 		goto done;
 	current_is_regular = !lstat(path, &st) && S_ISREG(st.st_mode);
 	if (!clean_status_history_store_load(
@@ -430,7 +499,7 @@ int clean_status_history_store_install(
 	/*
 	 * If this namespace is new, make room before the atomic install so a
 	 * successful publication never takes the bounded store above eight
-	 * regular schema-v1 slots.  No other checkpoint schema is considered.
+	 * regular checkpoint slots.  No other checkpoint schema is considered.
 	 */
 	if (prune_history_store(
 		    index_path, path, algo,
