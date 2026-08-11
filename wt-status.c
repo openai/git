@@ -1229,7 +1229,7 @@ static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
 	int ret;
 
 	if (!fstat_is_reliable() || istate->split_index ||
-	    s->show_ignored_mode || s->pathspec.nr ||
+	    s->show_ignored_mode ||
 	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC ||
 	    istate->sparse_index != INDEX_EXPANDED ||
 	    !fsmonitor_has_pending_token(istate) ||
@@ -1296,12 +1296,24 @@ static void wt_status_discard_staged_untracked(
 static int wt_status_stage_untracked(
 	struct wt_status_token_closure *closure)
 {
+	struct wt_status *s = closure->status;
+	struct pathspec pathspec = s->pathspec;
+
 	wt_status_discard_staged_untracked(closure);
+	/* A provider token can certify only a complete untracked traversal. */
+	if (pathspec.nr)
+		memset(&s->pathspec, 0, sizeof(s->pathspec));
 	closure->staged_untracked_ready =
 		wt_status_collect_untracked_1(
-			closure->status,
+			s,
 			&closure->staged_untracked,
 			&closure->staged_ignored);
+	if (pathspec.nr) {
+		s->pathspec = pathspec;
+		/* The ordinary scoped traversal supplies the displayed results. */
+		string_list_clear(&closure->staged_untracked, 0);
+		string_list_clear(&closure->staged_ignored, 0);
+	}
 	if (!closure->staged_untracked_ready)
 		wt_status_discard_staged_untracked(closure);
 	return closure->staged_untracked_ready;
@@ -1312,7 +1324,7 @@ static void wt_status_publish_staged_untracked(
 {
 	struct wt_status *s = closure->status;
 
-	if (!closure->staged_untracked_ready)
+	if (!closure->staged_untracked_ready || s->pathspec.nr)
 		return;
 	if (s->untracked.nr || s->ignored.nr)
 		BUG("publishing untracked results over collected status");
@@ -1663,7 +1675,7 @@ static int wt_status_close_fsmonitor_token(
 	enum wt_status_token_closure_result result;
 
 	refresh_fsmonitor(istate);
-	if (!fsmonitor_has_pending_token(istate) || s->pathspec.nr ||
+	if (!fsmonitor_has_pending_token(istate) ||
 	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC) {
 		int attr_inputs_match =
 			wt_status_attr_snapshot_matches(s) &&
