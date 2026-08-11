@@ -211,7 +211,8 @@ static int exclude_path_matches_fd(const char *path,
 static int cached_exclude_file_matches(
 	const struct git_hash_algo *algo,
 	const char *path, const struct object_id *cached_oid,
-	struct object_id *raw_oid_out, unsigned int *mode_out)
+	struct object_id *raw_oid_out, struct object_id *normalized_oid_out,
+	unsigned int *mode_out)
 {
 	struct object_id raw_oid, normalized_oid;
 	struct stat st, st_after;
@@ -242,14 +243,17 @@ static int cached_exclude_file_matches(
 	hash_object_file(algo, buf, size, OBJ_BLOB, &raw_oid);
 	if (raw_oid_out)
 		oidcpy(raw_oid_out, &raw_oid);
-	if (oideq(&raw_oid, cached_oid)) {
+	if (oideq(&raw_oid, cached_oid) && !normalized_oid_out) {
 		ret = 1;
 		goto out;
 	}
 	buf[size] = '\n';
 	hash_object_file(algo, buf, size + 1, OBJ_BLOB,
 			 &normalized_oid);
-	ret = oideq(&normalized_oid, cached_oid);
+	if (normalized_oid_out)
+		oidcpy(normalized_oid_out, &normalized_oid);
+	ret = oideq(&raw_oid, cached_oid) ||
+		oideq(&normalized_oid, cached_oid);
 out:
 	free(buf);
 out_close:
@@ -481,11 +485,11 @@ static void *preload_untracked_cache_thread(void *_data)
 				strbuf_release(&exclude_path);
 				continue;
 			}
-			task->exclude_matches = cached_exclude_file_matches(
+		task->exclude_matches = cached_exclude_file_matches(
 				preload->repo->hash_algo,
 				exclude_path.buf,
 				&task->exclude_oid, &raw_oid,
-				&task->exclude_mode);
+				NULL, &task->exclude_mode);
 			if (task->exclude_matches &&
 			    task->exclude_index_present &&
 			    oideq(&preload->exclude_index_oids[i],
@@ -527,7 +531,7 @@ static void *preload_untracked_cache_thread(void *_data)
 		strbuf_addstr(&exclude_path, preload->exclude_per_dir);
 		task->exclude_matches = cached_exclude_file_matches(
 			preload->repo->hash_algo, exclude_path.buf,
-			&task->exclude_oid, NULL, NULL);
+			&task->exclude_oid, NULL, NULL, NULL);
 		strbuf_release(&exclude_path);
 	}
 	return NULL;
@@ -598,13 +602,18 @@ static int compute_untracked_cache_fsmonitor_valid_recursive(
 	struct untracked_cache_dir *ucd)
 {
 	size_t i;
-	int valid = ucd->valid;
+	int valid = ucd->valid && !ucd->fsmonitor_dirty;
+	int has_untracked = !!ucd->untracked_nr;
 
-	for (i = 0; i < ucd->dirs_nr; i++)
+	for (i = 0; i < ucd->dirs_nr; i++) {
 		if (!compute_untracked_cache_fsmonitor_valid_recursive(
 			    ucd->dirs[i]))
 			valid = 0;
+		if (ucd->dirs[i]->recurse && ucd->dirs[i]->has_untracked)
+			has_untracked = 1;
+	}
 	ucd->valid_recursive = valid;
+	ucd->has_untracked = has_untracked;
 	return valid;
 }
 
@@ -1967,6 +1976,7 @@ static void do_invalidate_gitignore(struct untracked_cache_dir *dir)
 	int i;
 	dir->valid = 0;
 	dir->valid_recursive = 0;
+	dir->fsmonitor_dirty = 0;
 	dir->has_untracked = 0;
 	for (size_t i = 0; i < dir->untracked_nr; i++)
 		free(dir->untracked[i]);
@@ -2007,6 +2017,7 @@ static void invalidate_directory(struct untracked_cache *uc,
 
 	dir->valid = 0;
 	dir->valid_recursive = 0;
+	dir->fsmonitor_dirty = 0;
 	for (size_t i = 0; i < dir->untracked_nr; i++)
 		free(dir->untracked[i]);
 	dir->untracked_nr = 0;
@@ -2729,7 +2740,19 @@ static void prep_exclude(struct dir_struct *dir,
 		 */
 		if (untracked &&
 		    !oideq(&oid_stat.oid, &untracked->exclude_oid)) {
-			invalidate_gitignore(dir->untracked, untracked);
+			struct object_id raw_oid, normalized_oid;
+			int compatible;
+
+			/* Older caches include the parser's synthetic final LF. */
+			compatible = oid_stat.valid &&
+				cached_exclude_file_matches(the_hash_algo, pl->src,
+							    &untracked->exclude_oid,
+							    &raw_oid, &normalized_oid,
+							    NULL) &&
+				(oideq(&raw_oid, &oid_stat.oid) ||
+				 oideq(&normalized_oid, &oid_stat.oid));
+			if (!compatible)
+				invalidate_gitignore(dir->untracked, untracked);
 			oidcpy(&untracked->exclude_oid, &oid_stat.oid);
 		}
 		dir->internal.exclude_stack = stk;
@@ -3474,6 +3497,88 @@ static void add_untracked(struct untracked_cache_dir *dir, const char *name)
 	dir->has_untracked = 1;
 }
 
+static int refresh_cached_fsmonitor_files(
+	struct dir_struct *dir,
+	struct index_state *istate,
+	struct untracked_cache_dir *untracked,
+	struct strbuf *directory)
+{
+	struct untracked_cache *uc = dir->untracked;
+	struct strbuf path = STRBUF_INIT;
+	const char *event, *end;
+	size_t base_len, refreshed = 0;
+	int valid;
+
+	if (!uc || !untracked->valid || !untracked->fsmonitor_dirty ||
+	    !uc->fsmonitor_dirty_paths.len)
+		return 0;
+
+	strbuf_addbuf(&path, directory);
+	strbuf_complete(&path, '/');
+	base_len = path.len;
+	event = uc->fsmonitor_dirty_paths.buf;
+	end = event + uc->fsmonitor_dirty_paths.len;
+	while (event < end) {
+		struct cached_dir cdir = { 0 };
+		enum path_treatment state;
+		const char *name;
+		size_t i;
+
+		if (strncmp(event, path.buf, base_len))
+			goto next;
+		name = event + base_len;
+		if (!*name || strchr(name, '/'))
+			goto next;
+
+		for (i = 0; i < untracked->untracked_nr; i++) {
+			if (strcmp(untracked->untracked[i], name))
+				continue;
+			free(untracked->untracked[i]);
+			MOVE_ARRAY(untracked->untracked + i,
+				   untracked->untracked + i + 1,
+				   untracked->untracked_nr - i - 1);
+			untracked->untracked_nr--;
+			break;
+		}
+
+		cdir.d_name = name;
+		cdir.d_type = DT_UNKNOWN;
+		state = treat_path(dir, untracked, &cdir, istate, &path,
+				   base_len, NULL);
+		dir->internal.visited_paths++;
+		if (state == path_recurse) {
+			strbuf_release(&path);
+			return 0;
+		}
+		if (state == path_untracked)
+			add_untracked(untracked, name);
+		refreshed++;
+
+next:
+		event += strlen(event) + 1;
+		strbuf_setlen(&path, base_len);
+	}
+	strbuf_release(&path);
+	if (!refreshed || !untracked->valid)
+		return 0;
+
+	untracked->fsmonitor_dirty = 0;
+	untracked->has_untracked = !!untracked->untracked_nr;
+	valid = untracked->valid;
+	for (size_t i = 0; i < untracked->dirs_nr; i++) {
+		struct untracked_cache_dir *child = untracked->dirs[i];
+
+		if (!child->valid_recursive)
+			valid = 0;
+		if (child->recurse && child->has_untracked)
+			untracked->has_untracked = 1;
+	}
+	untracked->valid_recursive = valid;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "untracked/targeted-refresh", refreshed);
+	return 1;
+}
+
 static int valid_cached_dir(struct dir_struct *dir,
 			    struct untracked_cache_dir *untracked,
 			    struct index_state *istate,
@@ -3529,7 +3634,12 @@ static int valid_cached_dir(struct dir_struct *dir,
 		prep_exclude(dir, istate, path->buf, path->len);
 
 	/* hopefully prep_exclude() haven't invalidated this entry... */
-	return untracked->valid;
+	if (!untracked->valid)
+		return 0;
+	if (untracked->fsmonitor_dirty &&
+	    !refresh_cached_fsmonitor_files(dir, istate, untracked, path))
+		return 0;
+	return 1;
 }
 
 static int open_cached_dir(struct cached_dir *cdir,
@@ -4214,6 +4324,96 @@ int read_directory(struct dir_struct *dir, struct index_state *istate,
 	return dir->nr;
 }
 
+static void recompute_cached_fsmonitor_ancestors(
+	struct untracked_cache *uc,
+	const char *path,
+	int len)
+{
+	struct untracked_cache_dir **parents = NULL;
+	struct untracked_cache_dir *current = uc->root;
+	size_t nr = 0, alloc = 0;
+	int offset = 0;
+
+	ALLOC_GROW(parents, nr + 1, alloc);
+	parents[nr++] = current;
+	while (offset < len) {
+		const char *slash;
+		int component_len;
+
+		while (offset < len && path[offset] == '/')
+			offset++;
+		if (offset == len)
+			break;
+		slash = memchr(path + offset, '/', len - offset);
+		component_len = slash ? slash - (path + offset) : len - offset;
+		current = lookup_untracked(uc, current,
+					   path + offset, component_len);
+		ALLOC_GROW(parents, nr + 1, alloc);
+		parents[nr++] = current;
+		offset += component_len;
+	}
+
+	while (nr) {
+		struct untracked_cache_dir *parent = parents[--nr];
+		int valid = parent->valid && !parent->fsmonitor_dirty;
+		int has_untracked = !!parent->untracked_nr;
+
+		for (size_t i = 0; i < parent->dirs_nr; i++) {
+			struct untracked_cache_dir *child = parent->dirs[i];
+
+			if (!child->valid_recursive)
+				valid = 0;
+			if (child->recurse && child->has_untracked)
+				has_untracked = 1;
+		}
+		parent->valid_recursive = valid;
+		parent->has_untracked = has_untracked;
+	}
+	free(parents);
+}
+
+int read_directory_cached_subtree(struct dir_struct *dir,
+				  struct index_state *istate,
+				  struct untracked_cache_dir *untracked,
+				  const char *path, int len,
+				  const struct pathspec *pathspec)
+{
+	int repaired = 0;
+
+	if (!untracked || !dir->untracked ||
+	    dir->untracked != istate->untracked ||
+	    !dir->untracked->use_fsmonitor ||
+	    !istate->fsmonitor_untracked_valid ||
+	    has_symlink_leading_path(path, len))
+		return -1;
+
+	trace2_region_enter("dir", "read_cached_subtree", istate->repo);
+	dir->internal.visited_paths = 0;
+	dir->internal.visited_directories = 0;
+	if (treat_leading_path(dir, istate, path, len, pathspec)) {
+		if (untracked->valid && untracked->fsmonitor_dirty) {
+			struct strbuf directory = STRBUF_INIT;
+
+			strbuf_add(&directory, path, len);
+			repaired = valid_cached_dir(
+				dir, untracked, istate, &directory, 0) &&
+				untracked->valid_recursive;
+			strbuf_release(&directory);
+		}
+		if (!repaired) {
+			read_directory_recursive(dir, istate, path, len,
+						 untracked, 0, 0, pathspec);
+			compute_untracked_cache_fsmonitor_valid_recursive(untracked);
+		}
+	}
+	QSORT(dir->entries, dir->nr, cmp_dir_entry);
+	QSORT(dir->ignored, dir->ignored_nr, cmp_dir_entry);
+	recompute_cached_fsmonitor_ancestors(dir->untracked, path, len);
+	emit_traversal_statistics(dir, istate->repo, path, len);
+	trace2_region_leave("dir", "read_cached_subtree", istate->repo);
+	return dir->internal.traversal_failed ? -1 : dir->nr;
+}
+
 int file_exists(const char *f)
 {
 	struct stat sb;
@@ -4781,6 +4981,7 @@ void free_untracked_cache(struct untracked_cache *uc)
 
 	free(uc->exclude_per_dir_to_free);
 	strbuf_release(&uc->ident);
+	strbuf_release(&uc->fsmonitor_dirty_paths);
 	free_untracked(uc->root);
 	free(uc);
 }
@@ -5011,9 +5212,88 @@ static void invalidate_one_directory(struct untracked_cache *uc,
 	uc->dir_invalidated++;
 	ucd->valid = 0;
 	ucd->valid_recursive = 0;
+	ucd->fsmonitor_dirty = 0;
 	for (size_t i = 0; i < ucd->untracked_nr; i++)
 		free(ucd->untracked[i]);
 	ucd->untracked_nr = 0;
+}
+
+static int directory_has_indexed_children(
+	struct index_state *istate,
+	const char *path,
+	size_t len)
+{
+	int pos = index_name_pos(istate, path, len);
+
+	if (pos >= 0)
+		return 0;
+	pos = -pos - 1;
+	return pos < istate->cache_nr &&
+		ce_namelen(istate->cache[pos]) > len &&
+		istate->cache[pos]->name[len] == '/' &&
+		!strncmp(istate->cache[pos]->name, path, len);
+}
+
+static int record_cached_fsmonitor_file(
+	struct untracked_cache *uc,
+	struct untracked_cache_dir *dir,
+	struct index_state *istate,
+	const char *full_path,
+	const char *name)
+{
+	struct stat st;
+	const char *event, *end;
+	size_t parent_len, path_len = strlen(full_path);
+	int first, last;
+
+	if (!istate->fsmonitor_untracked_valid ||
+	    istate->fsmonitor_legacy_untracked_fallback ||
+	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC ||
+	    !dir->valid || !dir->recurse ||
+	    dir->check_only || name == full_path ||
+	    (uc->exclude_per_dir && !strcmp(name, uc->exclude_per_dir)))
+		return 0;
+	parent_len = name - full_path - 1;
+	if (!directory_has_indexed_children(istate, full_path, parent_len) ||
+	    directory_has_indexed_children(istate, full_path, path_len))
+		return 0;
+	if (lstat(full_path, &st)) {
+		if (!is_missing_file_error(errno))
+			return 0;
+	} else if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) {
+		return 0;
+	}
+
+	first = 0;
+	last = dir->dirs_nr;
+	while (last > first) {
+		int next = first + ((last - first) >> 1);
+		int compare = strcmp(name, dir->dirs[next]->name);
+
+		if (!compare)
+			return 0;
+		if (compare < 0)
+			last = next;
+		else
+			first = next + 1;
+	}
+
+	if (uc->fsmonitor_dirty_paths.len) {
+		event = uc->fsmonitor_dirty_paths.buf;
+		end = event + uc->fsmonitor_dirty_paths.len;
+		while (event < end) {
+			if (!strcmp(event, full_path))
+				goto recorded;
+			event += strlen(event) + 1;
+		}
+	}
+	strbuf_addstr(&uc->fsmonitor_dirty_paths, full_path);
+	strbuf_addch(&uc->fsmonitor_dirty_paths, '\0');
+
+recorded:
+	dir->fsmonitor_dirty = 1;
+	dir->valid_recursive = 0;
+	return 1;
 }
 
 /*
@@ -5042,7 +5322,10 @@ static void invalidate_one_directory(struct untracked_cache *uc,
  */
 static int invalidate_one_component(struct untracked_cache *uc,
 				    struct untracked_cache_dir *dir,
-				    const char *path, int len)
+				    struct index_state *istate,
+				    const char *path, int len,
+				    const char *full_path,
+				    int allow_tracked_stop)
 {
 	const char *rest = strchr(path, '/');
 
@@ -5051,14 +5334,30 @@ static int invalidate_one_component(struct untracked_cache *uc,
 		struct untracked_cache_dir *d =
 			lookup_untracked(uc, dir, path, component_len);
 		int ret =
-			invalidate_one_component(uc, d, rest + 1,
-						 len - (component_len + 1));
-		if (ret)
-			invalidate_one_directory(uc, dir);
+			invalidate_one_component(uc, d, istate, rest + 1,
+						 len - (component_len + 1),
+						 full_path, allow_tracked_stop);
+		if (ret) {
+			size_t directory_len = rest - full_path;
+			if (allow_tracked_stop && uc->use_fsmonitor &&
+			    directory_has_indexed_children(
+				    istate, full_path, directory_len)) {
+				dir->valid_recursive = 0;
+				ret = 0;
+			} else {
+				invalidate_one_directory(uc, dir);
+			}
+		}
+		if (!d->valid_recursive)
+			dir->valid_recursive = 0;
 		return ret;
 	}
 
-	invalidate_one_directory(uc, dir);
+	if (!allow_tracked_stop ||
+	    !record_cached_fsmonitor_file(uc, dir, istate, full_path, path))
+		invalidate_one_directory(uc, dir);
+	else
+		return 0;
 	return uc->dir_flags & DIR_SHOW_OTHER_DIRECTORIES;
 }
 
@@ -5070,7 +5369,7 @@ void untracked_cache_invalidate_path(struct index_state *istate,
 	if (!safe_path && !verify_path(path, 0))
 		return;
 	invalidate_one_component(istate->untracked, istate->untracked->root,
-				 path, strlen(path));
+				 istate, path, strlen(path), path, !safe_path);
 }
 
 void untracked_cache_invalidate_trimmed_path(struct index_state *istate,
