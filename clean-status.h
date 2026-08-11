@@ -5,6 +5,7 @@
 
 struct index_state;
 struct attr_source_snapshot;
+struct clean_status_progress;
 struct clean_status_proof_epoch;
 struct lock_file;
 struct repository;
@@ -22,6 +23,12 @@ void clean_status_set_config_digest(
 	const struct clean_status_config_digest *digest);
 void clean_status_enable_external_history(struct repository *repo);
 int clean_status_external_history_enabled(const struct index_state *istate);
+void clean_status_enable_progress(struct repository *repo);
+struct clean_status_progress *clean_status_start_progress(
+	struct repository *repo, const char *title, uint64_t total);
+void clean_status_update_progress(struct clean_status_progress *progress,
+				  uint64_t completed);
+void clean_status_stop_progress(struct clean_status_progress **progress);
 void clean_status_attach_config(struct index_state *istate);
 int clean_status_filter_scope_needs_validation(
 	const struct index_state *istate);

@@ -1,7 +1,9 @@
 #include "git-compat-util.h"
 #include "attr-manifest.h"
+#include "clean-status.h"
 #include "dir.h"
 #include "environment.h"
+#include "gettext.h"
 #include "hash-framing.h"
 #include "object.h"
 #include "odb.h"
@@ -17,6 +19,7 @@
 
 #define ATTR_MANIFEST_FILES_PER_THREAD 256
 #define ATTR_MANIFEST_MAX_THREADS 32
+#define ATTR_MANIFEST_PROGRESS_BATCH 128
 
 struct attr_manifest_candidate {
 	unsigned char worktree_hash[GIT_MAX_RAWSZ];
@@ -30,6 +33,7 @@ struct attr_manifest_probe_data {
 	struct string_list *candidates;
 	struct semantic_verify_root *root;
 	const struct git_hash_algo *algo;
+	struct clean_status_progress *progress;
 	size_t start;
 	size_t end;
 	unsigned int namespace_unstable;
@@ -130,7 +134,7 @@ static void *probe_attr_manifest_candidates(void *cb_data)
 	struct attr_manifest_probe_data *data = cb_data;
 	struct semantic_verify_path *path =
 		semantic_verify_path_new(data->root);
-	size_t i;
+	size_t i, completed = 0;
 
 	for (i = data->start; i < data->end; i++) {
 		struct string_list_item *item = &data->candidates->items[i];
@@ -142,7 +146,12 @@ static void *probe_attr_manifest_candidates(void *cb_data)
 			candidate->error = 1;
 		else
 			candidate->worktree_present = found;
+		if (++completed == ATTR_MANIFEST_PROGRESS_BATCH) {
+			clean_status_update_progress(data->progress, completed);
+			completed = 0;
+		}
 	}
+	clean_status_update_progress(data->progress, completed);
 	semantic_verify_path_free(path, &data->namespace_unstable, NULL);
 	return NULL;
 }
@@ -178,15 +187,19 @@ static int create_probe_thread(struct attr_manifest_thread *worker,
 }
 
 static int probe_candidates(struct string_list *candidates,
+			    struct repository *repo,
 			    struct semantic_verify_root *root,
 			    const struct git_hash_algo *algo,
 			    struct worktree_attr_manifest_stats *stats)
 {
 	struct attr_manifest_thread *workers;
+	struct clean_status_progress *progress;
 	size_t thread_id, threads = select_thread_count(candidates->nr);
 	int create_threads = HAVE_THREADS;
 	int ret = 0;
 
+	progress = clean_status_start_progress(
+		repo, _("Refreshing worktree metadata"), candidates->nr);
 	CALLOC_ARRAY(workers, threads);
 	for (thread_id = 0; thread_id < threads; thread_id++) {
 		struct attr_manifest_thread *worker = &workers[thread_id];
@@ -196,6 +209,7 @@ static int probe_candidates(struct string_list *candidates,
 		data->candidates = candidates;
 		data->root = root;
 		data->algo = algo;
+		data->progress = progress;
 		data->start = st_mult(candidates->nr, thread_id) / threads;
 		data->end = st_mult(candidates->nr, thread_id + 1) / threads;
 		if (threads == 1 || !create_threads) {
@@ -219,6 +233,7 @@ static int probe_candidates(struct string_list *candidates,
 		ret |= worker->probe.namespace_unstable;
 	}
 	stats->threads = threads;
+	clean_status_stop_progress(&progress);
 	free(workers);
 	return ret ? -1 : 0;
 }
@@ -243,7 +258,7 @@ int worktree_attr_manifest_build(
 	    collect_index_sources(istate, &candidates))
 		goto done;
 	stats->candidates = candidates.nr;
-	if (probe_candidates(&candidates, root, algo, stats))
+	if (probe_candidates(&candidates, istate->repo, root, algo, stats))
 		goto done;
 	attr_manifest_writer_init(&writer, manifest, algo);
 	for (i = 0; i < candidates.nr; i++) {
