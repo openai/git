@@ -1750,8 +1750,7 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
-	if (!s.pathspec.nr)
-		clean_status_enable_external_history(the_repository);
+	clean_status_enable_external_history(the_repository);
 	s.certify_clean_status = exact_clean_query;
 	if ((exact_clean_query || normal_clean_query) &&
 	    clean_status_try_sidecar(the_repository, &clean_digest)) {
@@ -1769,7 +1768,7 @@ struct repository *repo UNUSED)
 			clean_status_enable_progress(the_repository);
 	}
 	repo_read_index(the_repository);
-	if (!s.pathspec.nr && use_optional_locks())
+	if (use_optional_locks())
 		clean_status_capture_external_history_source(
 			the_repository->index);
 	if (normal_clean_query && use_optional_locks() &&
@@ -1827,9 +1826,8 @@ struct repository *repo UNUSED)
 		 * entry repair durable.  Restored checkpoints stay no-spill
 		 * for foreign index writers.
 		 */
-		if (!s.pathspec.nr)
-			external_saved = clean_status_save_external_history(
-				the_repository->index);
+		external_saved = clean_status_save_external_history(
+			the_repository->index);
 
 		if (exact_clean_query) {
 			if (!preserve_entry_changes && external_saved &&
