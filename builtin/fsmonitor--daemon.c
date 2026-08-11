@@ -710,7 +710,8 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 
 	if (strcmp(command, "quit") &&
 	    strcmp(command, "flush") &&
-	    strcmp(command, FSMONITOR_IPC_CAPABILITY_COMMAND)) {
+	    strcmp(command, FSMONITOR_IPC_CAPABILITY_COMMAND) &&
+	    !starts_with(command, "builtin:")) {
 		const char *identity;
 		const char *query;
 
