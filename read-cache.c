@@ -3300,7 +3300,8 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	if (write_extensions & WRITE_FSMONITOR_EXTENSION &&
 	    istate->untracked &&
 	    istate->fsmonitor_last_update &&
-	    istate->fsmonitor_untracked_valid) {
+	    istate->fsmonitor_untracked_valid &&
+	    !istate->fsmonitor_legacy_untracked_fallback) {
 		strbuf_reset(&sb);
 
 		write_fsmonitor_untracked_extension(&sb, istate);
@@ -3314,6 +3315,7 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 		}
 	}
 	if (write_extensions & WRITE_FSCF_EXTENSION &&
+	    !istate->fsmonitor_legacy_untracked_fallback &&
 	    clean_status_should_write_fsmonitor_config(istate)) {
 		strbuf_reset(&sb);
 		clean_status_write_fsmonitor_config(&sb, istate);

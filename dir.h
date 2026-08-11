@@ -652,6 +652,8 @@ struct untracked_cache *read_untracked_extension(const void *data, unsigned long
 void write_untracked_extension(struct strbuf *out, struct untracked_cache *untracked);
 void add_untracked_cache(struct index_state *istate);
 void remove_untracked_cache(struct index_state *istate);
+int untracked_cache_adopt_legacy(struct index_state *istate);
+void untracked_cache_discard_legacy(struct index_state *istate);
 
 /*
  * Connect a worktree to a git directory by creating (or overwriting) a
