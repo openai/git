@@ -7,6 +7,6 @@
 [branch "tb/codex/status-preview-unstable"]
 	remote = .
 	source-ref = refs/heads/tb/codex/status-preview-unstable
-	source-tip = f81994a390a0089630ab8c4e9d5c3262e9e9a70f
+	source-tip = 68a9ce9137c688d8dca4d09937086c4ce49fed60
 	source-base = 71a27108a1835b8d45bf1ade49706e4ff18a5e1d
 	merge = refs/heads/codex
