@@ -592,6 +592,19 @@ int clean_status_restore_external_history(struct index_state *istate)
 	    on_index_history_is_coherent(istate) ||
 	    clean_status_index_snapshot_pin_proof_epoch(&snapshot, istate))
 		goto done;
+	/*
+	 * An unbound proof for the current configuration records deliberate
+	 * invalidation. A legacy writer removes FSCF entirely, while a proof
+	 * from another configuration must not hide this namespace's checkpoint.
+	 */
+	if (state->disk_config_valid &&
+	    !memcmp(state->disk_config_hash, state->current_config_hash,
+		    istate->repo->hash_algo->rawsz) &&
+	    !clean_status_has_persistent_fsmonitor_semantic_history(istate)) {
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "history/external-proof-invalidated", 1);
+		goto done;
+	}
 	if (external_history_namespace(istate, proof_namespace))
 		goto done;
 	if (!clean_status_history_store_load(
