@@ -1869,9 +1869,14 @@ static int wt_status_close_fsmonitor_token(
 	closure.use_bulk_provider =
 		wt_status_can_use_bulk_provider(s, refresh_flags);
 	closure.untracked_ready = !istate->untracked ||
-		!istate->untracked->root;
+		!istate->untracked->root ||
+		(istate->fsmonitor_legacy_untracked_adopted &&
+		 istate->fsmonitor_untracked_valid &&
+		 istate->untracked->root->valid_recursive);
 	closure.untracked_proof_complete =
-		!require_untracked || !istate->untracked;
+		!require_untracked || !istate->untracked ||
+		(istate->fsmonitor_legacy_untracked_adopted &&
+		 closure.untracked_ready);
 	if (require_untracked && !closure.can_prime &&
 	    !closure.untracked_ready)
 		BUG("cannot close required untracked scan");

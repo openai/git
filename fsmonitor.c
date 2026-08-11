@@ -848,6 +848,7 @@ enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	const char *test_sequence =
 		getenv("GIT_TEST_FSMONITOR_QUERY_SEQUENCE");
 	struct strbuf raw = STRBUF_INIT;
+	int legacy_authenticated = 0;
 
 	/*
 	 * Tests may script clean, delta, trivial, and error responses with
@@ -883,8 +884,12 @@ enum fsmonitor_query_outcome query_builtin_fsmonitor(
 		return result->outcome;
 	}
 
-	if (!fsmonitor_ipc__send_query(since_token, &raw))
+	if (!fsmonitor_ipc__send_query(
+		    since_token, &raw, &legacy_authenticated)) {
 		fsmonitor_parse_builtin_response(&raw, result);
+		result->legacy_worktree_authenticated =
+			legacy_authenticated;
+	}
 	strbuf_release(&raw);
 	return result->outcome;
 }
@@ -904,6 +909,34 @@ static int apply_fsmonitor_paths(struct index_state *istate,
 		p += len + 1;
 	}
 	return count;
+}
+
+static void adopt_legacy_untracked_cache(
+	struct index_state *istate,
+	const struct fsmonitor_query_result *result,
+	int semantic_baseline_needed)
+{
+	if (!semantic_baseline_needed ||
+	    !result->legacy_worktree_authenticated ||
+	    result->outcome != FSMONITOR_QUERY_DELTA ||
+	    !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_last_update ||
+	    istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_extension_invalid ||
+	    !istate->untracked || !istate->untracked->root) {
+		untracked_cache_discard_legacy(istate);
+		return;
+	}
+	if (!untracked_cache_adopt_legacy(istate))
+		return;
+	FREE_AND_NULL(istate->fsmonitor_untracked_token);
+	istate->fsmonitor_untracked_token =
+		xstrdup(istate->fsmonitor_last_update);
+	istate->fsmonitor_untracked_valid = 1;
+	istate->fsmonitor_legacy_untracked_adopted = 1;
+	istate->untracked->use_fsmonitor = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "untracked/legacy-adopted", 1);
 }
 
 static void invalidate_all_fsmonitor(struct index_state *istate)
@@ -933,8 +966,14 @@ static void invalidate_all_fsmonitor_for_baseline(
 	struct index_state *istate)
 {
 	unsigned int i;
+	int preserve_untracked = istate->fsmonitor_legacy_untracked_adopted &&
+		istate->fsmonitor_untracked_valid;
 
 	invalidate_all_fsmonitor(istate);
+	if (preserve_untracked) {
+		istate->fsmonitor_untracked_valid = 1;
+		istate->untracked->use_fsmonitor = 1;
+	}
 	for (i = 0; i < istate->cache_nr; i++)
 		istate->cache[i]->ce_flags &= ~CE_UPTODATE;
 }
@@ -957,6 +996,7 @@ static void invalidate_all_fsmonitor_strong(struct index_state *istate)
 
 void fsmonitor_invalidate_semantics(struct index_state *istate)
 {
+	istate->fsmonitor_legacy_untracked_adopted = 0;
 	clean_status_invalidate_current_proof(istate);
 	git_attr_invalidate_all();
 	invalidate_all_fsmonitor_strong(istate);
@@ -1053,6 +1093,8 @@ void refresh_fsmonitor(struct index_state *istate)
 			istate->fsmonitor_last_update ?
 			istate->fsmonitor_last_update : "builtin:fake",
 			&result);
+		adopt_legacy_untracked_cache(
+			istate, &result, semantic_baseline_needed);
 		if (result.outcome != FSMONITOR_QUERY_ERROR) {
 			query_success = 1;
 			strbuf_addbuf(&last_update_token, &result.token);
@@ -1288,7 +1330,13 @@ apply_results:
 		istate->fsmonitor_pending_token_from_provider =
 			query_success &&
 			(fsm_mode == FSMONITOR_MODE_IPC || !is_trivial);
-		istate->fsmonitor_untracked_valid = 0;
+		if (istate->fsmonitor_legacy_untracked_adopted) {
+			FREE_AND_NULL(istate->fsmonitor_untracked_token);
+			istate->fsmonitor_untracked_token =
+				xstrdup(istate->fsmonitor_last_update_pending);
+		} else {
+			istate->fsmonitor_untracked_valid = 0;
+		}
 	} else {
 		/*
 		 * The applied delta carries an existing proof forward:
