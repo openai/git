@@ -1651,6 +1651,7 @@ struct repository *repo UNUSED)
 		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
 	int exact_clean_query;
 	int normal_clean_query;
+	int scoped_clean_query;
 	int normal_has_head;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
@@ -1750,11 +1751,18 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
+	scoped_clean_query = s.pathspec.nr &&
+		status_format == STATUS_FORMAT_NONE &&
+		!s.show_branch && !s.show_stash && !s.show_ignored_mode &&
+		!s.null_termination && !s.verbose && !s.submodule_summary &&
+		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
+		!repo_config_values(the_repository)->apply_sparse_checkout &&
+		!repo_get_oid(the_repository, s.reference, &oid);
 	clean_status_enable_external_history(the_repository);
 	s.certify_clean_status = exact_clean_query;
-	if ((exact_clean_query || normal_clean_query) &&
+	if ((exact_clean_query || normal_clean_query || scoped_clean_query) &&
 	    clean_status_try_sidecar(the_repository, &clean_digest)) {
-		if (!normal_clean_query ||
+		if (exact_clean_query ||
 		    print_normal_clean_sidecar(&s, prefix)) {
 			wt_status_collect_free_buffers(&s);
 			return 0;

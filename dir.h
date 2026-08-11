@@ -190,6 +190,7 @@ struct untracked_cache_dir {
 	unsigned int stat_matches : 1;
 	unsigned int exclude_matches : 1;
 	unsigned int valid_recursive : 1;
+	unsigned int fsmonitor_dirty : 1;
 	/*
 	 * A null object ID means this directory does not have .gitignore.
 	 * The empty-tree ID records a present source that could not be read.
@@ -215,6 +216,7 @@ struct untracked_cache {
 	int gitignore_invalidated;
 	int dir_invalidated;
 	int dir_opened;
+	struct strbuf fsmonitor_dirty_paths;
 	/* fsmonitor invalidation data */
 	unsigned int use_fsmonitor : 1;
 };
@@ -420,6 +422,11 @@ int fill_directory(struct dir_struct *dir,
 int read_directory(struct dir_struct *, struct index_state *istate,
 		   const char *path, int len,
 		   const struct pathspec *pathspec);
+int read_directory_cached_subtree(struct dir_struct *,
+				  struct index_state *istate,
+				  struct untracked_cache_dir *untracked,
+				  const char *path, int len,
+				  const struct pathspec *pathspec);
 
 enum pattern_match_result {
 	UNDECIDED = -1,
