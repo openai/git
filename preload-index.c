@@ -33,6 +33,7 @@
 #define THREAD_COST (500)
 #define BULK_MAX_PARALLEL (32)
 #define BULK_ENTRIES_PER_THREAD (5000)
+#define BULK_MIN_CANDIDATE_DIVISOR (8)
 
 struct progress_data {
 	unsigned long n;
@@ -454,17 +455,25 @@ int preload_index_bulk_can_close_provider(struct index_state *index)
 {
 #ifdef HAVE_PRELOAD_INDEX_BULK
 	int core_preload_index = 1;
+	size_t useful;
 
 	repo_config_get_bool(index->repo, "core.preloadindex",
 			     &core_preload_index);
-	return core_preload_index &&
-		preload_bulk_config_enabled(index) &&
-		preload_bulk_available() &&
-		index->sparse_index == INDEX_EXPANDED &&
-		fsm_settings__get_mode(index->repo) == FSMONITOR_MODE_IPC &&
-		fsmonitor_pending_token_from_provider(index) &&
-		(preload_bulk_useful_candidates(index, 1) ||
-		 index->preload_untracked);
+	if (!core_preload_index || !preload_bulk_config_enabled(index) ||
+	    !preload_bulk_available() ||
+	    index->sparse_index != INDEX_EXPANDED ||
+	    fsm_settings__get_mode(index->repo) != FSMONITOR_MODE_IPC ||
+	    !fsmonitor_pending_token_from_provider(index))
+		return 0;
+	useful = preload_bulk_useful_candidates(index, 1);
+	if (!index->preload_untracked &&
+	    useful < DIV_ROUND_UP(index->cache_nr,
+				  BULK_MIN_CANDIDATE_DIVISOR)) {
+		trace2_data_intmax("index", index->repo,
+				   "preload/bulk_sparse_skip", useful);
+		return 0;
+	}
+	return useful || index->preload_untracked;
 #else
 	(void)index;
 	return 0;
