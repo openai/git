@@ -16,6 +16,15 @@
 #include "strbuf.h"
 #include "trace2.h"
 
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/un.h>
+#endif
+
+#ifdef __linux__
+#include <sys/sysmacros.h>
+#endif
+
 int fsmonitor_ipc__get_worktree_identity(struct repository *r,
 					 struct strbuf *identity)
 {
@@ -79,7 +88,8 @@ enum ipc_active_state fsmonitor_ipc__get_state(void)
 }
 
 int fsmonitor_ipc__send_query(const char *since_token UNUSED,
-			      struct strbuf *answer UNUSED)
+			      struct strbuf *answer UNUSED,
+			      int *legacy_worktree_authenticated UNUSED)
 {
 	return -1;
 }
@@ -251,12 +261,297 @@ static int server_supports_bound_queries(void)
 	return ret;
 }
 
-static int wait_for_daemon_exit(void)
+#if defined(__APPLE__) || defined(__linux__)
+static int legacy_peer_credentials(
+	struct ipc_client_connection *connection, pid_t *pid)
+{
+#ifdef __APPLE__
+	uid_t uid;
+	gid_t gid;
+	socklen_t size = sizeof(*pid);
+
+	if (getpeereid(connection->fd, &uid, &gid) ||
+	    uid != geteuid() ||
+	    getsockopt(connection->fd, SOL_LOCAL, LOCAL_PEERPID,
+		       pid, &size) || size != sizeof(*pid))
+		return 0;
+#else
+	struct ucred peer;
+	socklen_t size = sizeof(peer);
+
+	if (getsockopt(connection->fd, SOL_SOCKET, SO_PEERCRED,
+		       &peer, &size) || size != sizeof(peer) ||
+	    peer.uid != geteuid())
+		return 0;
+	*pid = peer.pid;
+#endif
+	return *pid > 0;
+}
+
+static int legacy_peer_start_identity(pid_t pid, struct strbuf *identity)
+{
+#ifdef __APPLE__
+	struct proc_bsdinfo info;
+
+	if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0,
+			 &info, sizeof(info)) != sizeof(info) ||
+	    info.pbi_pid != (uint32_t)pid ||
+	    info.pbi_uid != geteuid())
+		return 0;
+	strbuf_addf(identity, "%"PRIu64".%"PRIu64,
+		    info.pbi_start_tvsec, info.pbi_start_tvusec);
+#else
+	struct strbuf path = STRBUF_INIT;
+	struct strbuf stat = STRBUF_INIT;
+	const char *value, *end;
+	int valid = 0;
+
+	strbuf_addf(&path, "/proc/%"PRIuMAX"/stat", (uintmax_t)pid);
+	if (strbuf_read_file(&stat, path.buf, 4096) < 0 ||
+	    !(value = strrchr(stat.buf, ')')) ||
+	    value[1] != ' ')
+		goto done;
+	value += 2;
+	for (int field = 3; field < 22; field++) {
+		value = strchr(value, ' ');
+		if (!value)
+			goto done;
+		while (*value == ' ')
+			value++;
+	}
+	end = strchr(value, ' ');
+	if (!end || end == value)
+		goto done;
+	for (const char *p = value; p < end; p++)
+		if (!isdigit(*p))
+			goto done;
+	strbuf_add(identity, value, end - value);
+	valid = 1;
+done:
+	strbuf_release(&path);
+	strbuf_release(&stat);
+	return valid;
+#endif
+	return 1;
+}
+
+#ifdef __APPLE__
+static int legacy_peer_watches_worktree(
+	pid_t pid, const char *worktree, const struct stat *root)
+{
+	struct proc_fdinfo *fds = NULL;
+	int size, bytes, matches = 0;
+
+	size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+	if (size <= 0 || size > 1024 * 1024 -
+			      16 * (int)sizeof(*fds))
+		return 0;
+	size += 16 * sizeof(*fds);
+	fds = xmalloc(size);
+	bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, size);
+	if (bytes < 0 || bytes % sizeof(*fds))
+		goto done;
+	for (int i = 0; i < bytes / (int)sizeof(*fds); i++) {
+		struct vnode_fdinfowithpath vnode;
+		const struct vinfo_stat *stat;
+
+		if (fds[i].proc_fdtype != PROX_FDTYPE_VNODE ||
+		    proc_pidfdinfo(pid, fds[i].proc_fd,
+				   PROC_PIDFDVNODEPATHINFO,
+				   &vnode, sizeof(vnode)) != sizeof(vnode))
+			continue;
+		stat = &vnode.pvip.vip_vi.vi_stat;
+		if ((uintmax_t)stat->vst_dev == (uintmax_t)root->st_dev &&
+		    (uintmax_t)stat->vst_ino == (uintmax_t)root->st_ino &&
+		    !strcmp(vnode.pvip.vip_path, worktree)) {
+			matches = 1;
+			break;
+		}
+	}
+done:
+	free(fds);
+	return matches;
+}
+#else
+static int legacy_peer_watches_worktree(
+	pid_t pid, const char *worktree UNUSED, const struct stat *root)
+{
+	struct strbuf directory = STRBUF_INIT;
+	struct strbuf path = STRBUF_INIT;
+	struct strbuf target = STRBUF_INIT;
+	struct strbuf line = STRBUF_INIT;
+	uintmax_t device = ((uintmax_t)major(root->st_dev) << 20) |
+		(uintmax_t)minor(root->st_dev);
+	DIR *fds = NULL;
+	struct dirent *entry;
+	int matches = 0;
+
+	strbuf_addf(&directory, "/proc/%"PRIuMAX"/fd", (uintmax_t)pid);
+	fds = opendir(directory.buf);
+	if (!fds)
+		goto done;
+	while ((entry = readdir(fds)) != NULL) {
+		FILE *info;
+
+		if (!strcmp(entry->d_name, ".") ||
+		    !strcmp(entry->d_name, ".."))
+			continue;
+		strbuf_reset(&path);
+		strbuf_addf(&path, "%s/%s", directory.buf, entry->d_name);
+		strbuf_reset(&target);
+		if (strbuf_readlink(&target, path.buf, 32) < 0 ||
+		    strcmp(target.buf, "anon_inode:inotify"))
+			continue;
+		strbuf_reset(&path);
+		strbuf_addf(&path, "/proc/%"PRIuMAX"/fdinfo/%s",
+			    (uintmax_t)pid, entry->d_name);
+		info = fopen(path.buf, "r");
+		if (!info)
+			continue;
+		while (!strbuf_getline_lf(&line, info)) {
+			uintmax_t inode, source_device;
+			unsigned int watch;
+
+			if (!starts_with(line.buf, "inotify wd:1 "))
+				continue;
+			if (sscanf(line.buf,
+				   "inotify wd:%x ino:%"SCNxMAX" sdev:%"SCNxMAX,
+				   &watch, &inode, &source_device) == 3 &&
+			    watch == 1 && inode == (uintmax_t)root->st_ino &&
+			    source_device == device)
+				matches = 1;
+			break;
+		}
+		fclose(info);
+		if (matches)
+			break;
+	}
+done:
+	if (fds)
+		closedir(fds);
+	strbuf_release(&directory);
+	strbuf_release(&path);
+	strbuf_release(&target);
+	strbuf_release(&line);
+	return matches;
+}
+#endif
+
+static int legacy_identity_cache_matches(
+	const char *path, const struct strbuf *expected)
+{
+	struct strbuf actual = STRBUF_INIT;
+	struct stat st;
+	int fd, matches = 0;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return 0;
+	if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
+	    st.st_uid == geteuid() && !(st.st_mode & 022) &&
+	    st.st_size >= 0 && (uintmax_t)st.st_size == expected->len &&
+	    strbuf_read(&actual, fd, expected->len) == (ssize_t)expected->len)
+		matches = !strbuf_cmp(&actual, expected);
+	close(fd);
+	strbuf_release(&actual);
+	return matches;
+}
+
+static void cache_legacy_peer_identity(
+	const char *path, const struct strbuf *identity)
+{
+	struct lock_file lock = LOCK_INIT;
+	int fd = hold_lock_file_for_update(&lock, path, LOCK_NO_DEREF);
+
+	if (fd < 0)
+		return;
+	if (fchmod(fd, 0600) ||
+	    write_in_full(fd, identity->buf, identity->len) !=
+		(ssize_t)identity->len ||
+	    commit_lock_file(&lock))
+		rollback_lock_file(&lock);
+}
+
+static int try_send_attested_legacy_query(
+	const char *token, const struct strbuf *identity,
+	struct strbuf *answer)
+{
+	struct ipc_client_connect_options options =
+		IPC_CLIENT_CONNECT_OPTIONS_INIT;
+	struct ipc_client_connection *connection = NULL;
+	struct strbuf worktree = STRBUF_INIT;
+	struct strbuf path = STRBUF_INIT;
+	struct strbuf expected = STRBUF_INIT;
+	struct strbuf peer_start = STRBUF_INIT;
+	struct stat root, socket;
+	pid_t pid;
+	int cached, ret = -1;
+
+	if (!token || !starts_with(token, "builtin:") ||
+	    !repo_get_work_tree(the_repository) ||
+	    !strbuf_realpath(&worktree,
+			     repo_get_work_tree(the_repository), 0) ||
+	    stat(worktree.buf, &root) || !S_ISDIR(root.st_mode))
+		goto done;
+	options.wait_if_busy = 1;
+	if (ipc_client_try_connect(
+		    fsmonitor_ipc__get_path(the_repository),
+		    &options, &connection) != IPC_STATE__LISTENING ||
+	    !legacy_peer_credentials(connection, &pid) ||
+	    !legacy_peer_start_identity(pid, &peer_start) ||
+	    lstat(fsmonitor_ipc__get_path(the_repository), &socket) ||
+	    !S_ISSOCK(socket.st_mode))
+		goto done;
+	strbuf_addf(&path, "%s.legacy-identity",
+		    fsmonitor_ipc__get_path(the_repository));
+	strbuf_addf(&expected,
+		    "v1\n%s\n%"PRIuMAX"\n%"PRIuMAX"\n%s\n%"PRIuMAX"\n%"PRIuMAX"\n",
+		    identity->buf, (uintmax_t)geteuid(), (uintmax_t)pid,
+		    peer_start.buf,
+		    (uintmax_t)socket.st_dev, (uintmax_t)socket.st_ino);
+	cached = legacy_identity_cache_matches(path.buf, &expected);
+	if (!cached &&
+	    !legacy_peer_watches_worktree(pid, worktree.buf, &root))
+		goto done;
+	if (!cached)
+		cache_legacy_peer_identity(path.buf, &expected);
+	trace2_data_intmax("fsm_client", NULL,
+			   cached ? "query/legacy-peer-cached" :
+				    "query/legacy-peer-authenticated", 1);
+	ret = ipc_client_send_command_to_connection(
+		connection, token, strlen(token), answer);
+done:
+	ipc_client_close_connection(connection);
+	strbuf_release(&worktree);
+	strbuf_release(&path);
+	strbuf_release(&expected);
+	strbuf_release(&peer_start);
+	return ret;
+}
+#else
+static int try_send_attested_legacy_query(
+	const char *token UNUSED, const struct strbuf *identity UNUSED,
+	struct strbuf *answer UNUSED)
+{
+	return -1;
+}
+#endif
+
+static int wait_for_daemon_exit(const struct stat *original_socket)
 {
 	uintmax_t elapsed_ms = 0;
 	uintmax_t timeout_ms = (uintmax_t)get_start_timeout() * 1000;
 
 	while (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
+		if (original_socket) {
+			struct stat current_socket;
+
+			if (!lstat(fsmonitor_ipc__get_path(the_repository),
+				   &current_socket) &&
+			    (current_socket.st_dev != original_socket->st_dev ||
+			     current_socket.st_ino != original_socket->st_ino))
+				return 1;
+		}
 		if (elapsed_ms >= timeout_ms)
 			return -1;
 		sleep_millisec(50);
@@ -273,6 +568,7 @@ static int restart_incompatible_daemon(void)
 	uintmax_t timeout_ms = (uintmax_t)get_start_timeout() * 1000;
 	long lock_timeout_ms = timeout_ms > LONG_MAX ?
 		LONG_MAX : (long)timeout_ms;
+	unsigned int restart_attempts = 0;
 	int have_lock = 0;
 	int ret = -1;
 
@@ -291,35 +587,47 @@ static int restart_incompatible_daemon(void)
 	}
 	have_lock = 1;
 
-	/* Another client may have replaced the daemon while we waited. */
-	if (server_supports_bound_queries())
-		goto success;
-
 	trace2_data_intmax("fsm_client", NULL,
 			   "query/incompatible-daemon", 1);
-	if (try_send_command("quit", &answer, NULL)) {
-		/*
-		 * The connection state describes the failed attempt, not
-		 * necessarily the state after the failure.  Re-read it before
-		 * deciding whether there is still a daemon to replace.
-		 */
-		if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
-			if (server_supports_bound_queries())
-				ret = 0;
-			goto done;
+	while (restart_attempts++ < 32) {
+		struct stat socket_stat;
+		const struct stat *original_socket = NULL;
+		int wait_result;
+
+		/* Another client may have replaced the daemon while we waited. */
+		if (server_supports_bound_queries())
+			goto success;
+		if (!lstat(fsmonitor_ipc__get_path(the_repository),
+			   &socket_stat))
+			original_socket = &socket_stat;
+		if (try_send_command("quit", &answer, NULL)) {
+			/*
+			 * The failed connection may already have been replaced.
+			 * Re-read its state before abandoning the upgrade.
+			 */
+			if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
+				if (server_supports_bound_queries())
+					ret = 0;
+				goto done;
+			}
 		}
+
+		wait_result = wait_for_daemon_exit(original_socket);
+		if (wait_result < 0)
+			goto done;
+		if (wait_result > 0) {
+			trace2_data_intmax("fsm_client", NULL,
+					   "query/restart-raced", 1);
+			continue;
+		}
+
+		/* The retried bound query still verifies any raced replacement. */
+		if (fsmonitor_ipc__get_state() != IPC_STATE__LISTENING &&
+		    spawn_daemon())
+			goto done;
+		goto success;
 	}
-
-	if (wait_for_daemon_exit())
-		goto done;
-
-	/*
-	 * A concurrent client may already have started a replacement.
-	 * The retried bound query will verify its capability if needed.
-	 */
-	if (fsmonitor_ipc__get_state() != IPC_STATE__LISTENING &&
-	    spawn_daemon())
-		goto done;
+	goto done;
 
 success:
 	ret = 0;
@@ -333,7 +641,8 @@ done:
 }
 
 int fsmonitor_ipc__send_query(const char *since_token,
-			      struct strbuf *answer)
+			      struct strbuf *answer,
+			      int *legacy_worktree_authenticated)
 {
 	struct strbuf command = STRBUF_INIT;
 	struct strbuf identity = STRBUF_INIT;
@@ -345,6 +654,8 @@ int fsmonitor_ipc__send_query(const char *since_token,
 		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
 	const char *tok = since_token ? since_token : "";
 
+	if (legacy_worktree_authenticated)
+		*legacy_worktree_authenticated = 0;
 	trace2_region_enter("fsm_client", "query", NULL);
 	if (fsmonitor_ipc__get_worktree_identity(the_repository, &identity)) {
 		trace2_data_intmax("fsm_client", NULL,
@@ -377,6 +688,13 @@ try_again:
 				   "query/response-length", answer->len);
 		if (!ret && is_trivial_response(answer) &&
 		    !server_supports_bound_queries()) {
+			if (!try_send_attested_legacy_query(
+				    tok, &identity, answer)) {
+				if (legacy_worktree_authenticated)
+					*legacy_worktree_authenticated = 1;
+				ret = 0;
+				goto done;
+			}
 			/*
 			 * A daemon predating bound queries treats query-v1 as
 			 * garbage and returns a valid trivial response.  Never

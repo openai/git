@@ -1562,6 +1562,37 @@ test_expect_success 'bound query replaces a legacy daemon' '
 	)
 '
 
+test_expect_success 'bound daemon also serves legacy token queries' '
+	test_when_finished "stop_daemon_delete_repo legacy-client-query" &&
+	test_create_repo legacy-client-query &&
+	(
+		cd legacy-client-query &&
+		test_commit base tracked &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TRACE2_EVENT="$PWD/.git/daemon.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		token=$(sed -n "s/^fsmonitor last update //p" \
+			.git/fsmonitor) &&
+		test -n "$token" &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc send --name="$ipc_path" \
+			--token="$token" >.git/legacy-response &&
+		test_grep "^builtin:" .git/legacy-response &&
+		! test_trace2_data fsmonitor query/worktree-mismatch 1 \
+			<.git/daemon.trace &&
+		GIT_TRACE2_EVENT="$PWD/.git/legacy-client.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/legacy-client.trace
+	)
+'
+
 test_expect_success MACOS 'daemon token reset closes a skipHash index' '
 	test_when_finished \
 		"stop_daemon_delete_repo daemon-token-reset" &&
