@@ -2300,6 +2300,48 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
+	'pathspec status preserves global history without hiding outside dirt' '
+	test_when_finished "rm -rf pathspec-checkpoint-history" &&
+	test_create_repo pathspec-checkpoint-history &&
+	(
+		cd pathspec-checkpoint-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		mkdir scoped &&
+		test_commit selected scoped/tracked &&
+		test-tool chmtime -120 tracked scoped/tracked &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		test_write_lines changed >tracked &&
+		test_write_lines selected >scoped/new &&
+		test_write_lines outside >outside-new &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git status --porcelain=v2 -- scoped >.git/first &&
+		test_grep "^? scoped/new$" .git/first &&
+		! test_grep "tracked\|outside-new" .git/first &&
+		test_path_is_missing .git/index.csts &&
+		cp .git/index .git/before &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 -- scoped >.git/second &&
+		test_cmp .git/first .git/second &&
+		test_cmp .git/before .git/index &&
+		test_trace2_data fsmonitor history/external-stored 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			<.git/status.trace &&
+		test_path_is_missing .git/index.csts &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/root &&
+		test_grep "^1 \.M .* tracked$" .git/root
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'mixed reset to a same-tree commit preserves closed history' '
 	test_when_finished "rm -rf reset-mixed-same-tree" &&
