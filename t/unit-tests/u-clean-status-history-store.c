@@ -128,6 +128,13 @@ static void require_local_apfs(const char *path MAYBE_UNUSED)
 #endif
 }
 
+static void require_supported_history_store(void)
+{
+#ifdef GIT_WINDOWS_NATIVE
+	cl_skip();
+#endif
+}
+
 void test_clean_status_history_store__rejects_incomplete_checkpoints(void)
 {
 	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
@@ -189,6 +196,7 @@ void test_clean_status_history_store__keeps_namespaces_independent(void)
 	static const unsigned char second_fsmn[] = "second-fsmn";
 	static const unsigned char second_fscf[] = "second-fscf";
 
+	require_supported_history_store();
 	fixture_init(&fixture, algo);
 	memset(first.index_hash, 1, algo->rawsz);
 	first.fsmonitor = first_fsmn;
@@ -291,6 +299,7 @@ void test_clean_status_history_store__bounds_namespaces(void)
 	struct utimbuf times;
 	char namespace[32];
 
+	require_supported_history_store();
 	fixture_init(&fixture, algo);
 	checkpoint.fsmonitor = fsmn;
 	checkpoint.fsmonitor_len = sizeof(fsmn) - 1;
