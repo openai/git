@@ -313,7 +313,7 @@ test_expect_success DURABLE_FSMONITOR \
 	bulk_status -C external-pathspec-status \
 		status --porcelain=v2 -- scoped >external-pathspec-status.first &&
 	test_grep "^? scoped/new$" external-pathspec-status.first &&
-	! test_grep "tracked\|outside-new" external-pathspec-status.first &&
+	test_grep ! "tracked\|outside-new" external-pathspec-status.first &&
 	test_path_is_missing external-pathspec-status/.git/index.csts &&
 	cp external-pathspec-status/.git/index \
 		external-pathspec-status.before &&
@@ -333,6 +333,105 @@ test_expect_success DURABLE_FSMONITOR \
 	bulk_status -C external-pathspec-status status --porcelain=v2 \
 		>external-pathspec-status.root &&
 	test_grep "^1 \.M .* tracked$" external-pathspec-status.root
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'clean pathspec status reuses an existing root-wide clean proof' '
+	test_when_finished "stop_daemon clean-pathspec-status" &&
+	setup_repo clean-pathspec-status &&
+	mkdir clean-pathspec-status/scoped &&
+	test_commit -C clean-pathspec-status scoped scoped/tracked &&
+	test-tool -C clean-pathspec-status chmtime -120 \
+		tracked scoped/tracked &&
+	git -C clean-pathspec-status update-index --refresh &&
+	git -C clean-pathspec-status config core.untrackedCache true &&
+	issue_sidecar clean-pathspec-status &&
+	cp clean-pathspec-status/.git/index clean-pathspec-status.before &&
+	git -C clean-pathspec-status status >clean-pathspec-status.expect &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/clean-pathspec-status.trace" \
+		git -C clean-pathspec-status status -- scoped \
+			>clean-pathspec-status.actual &&
+	test_cmp clean-pathspec-status.expect clean-pathspec-status.actual &&
+	test_cmp clean-pathspec-status.before clean-pathspec-status/.git/index &&
+	test_trace2_data status clean-proof/hit 1 \
+		<clean-pathspec-status.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" \
+		clean-pathspec-status.trace &&
+	test_grep ! "\"label\":\"read_directory\"" \
+		clean-pathspec-status.trace &&
+
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/clean-pathspec-nested.trace" \
+		git -C clean-pathspec-status/scoped status -- tracked \
+			>clean-pathspec-nested.actual &&
+	test_cmp clean-pathspec-status.expect clean-pathspec-nested.actual &&
+	test_trace2_data status clean-proof/hit 1 \
+		<clean-pathspec-nested.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" \
+		clean-pathspec-nested.trace &&
+
+	test_write_lines changed >clean-pathspec-status/tracked &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/clean-pathspec-outside.trace" \
+		git -C clean-pathspec-status status -- scoped \
+			>clean-pathspec-outside.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		clean-pathspec-outside.actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" \
+		clean-pathspec-outside.trace &&
+	git -C clean-pathspec-status status --porcelain=v2 \
+		>clean-pathspec-outside.root &&
+	test_grep "^1 \.M .* tracked$" clean-pathspec-outside.root &&
+
+	test_write_lines selected >clean-pathspec-status/scoped/new &&
+	mkdir clean-pathspec-status/scoped/newdir &&
+	test_write_lines nested >clean-pathspec-status/scoped/newdir/file &&
+	test_write_lines outside >clean-pathspec-status/outside-new &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/clean-pathspec-selected.trace" \
+		git -C clean-pathspec-status status -- scoped \
+			>clean-pathspec-selected.actual &&
+	test_grep "scoped/new" clean-pathspec-selected.actual &&
+	test_grep "scoped/newdir/" clean-pathspec-selected.actual &&
+	test_grep ! "outside-new" clean-pathspec-selected.actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" \
+		clean-pathspec-selected.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'tracked-directory pathspec reuses a valid untracked-cache subtree' '
+	test_when_finished "stop_daemon cached-pathspec-status" &&
+	setup_repo cached-pathspec-status &&
+	mkdir cached-pathspec-status/scoped &&
+	test_commit -C cached-pathspec-status scoped scoped/tracked &&
+	test-tool -C cached-pathspec-status chmtime -120 \
+		tracked scoped/tracked &&
+	git -C cached-pathspec-status update-index --refresh &&
+	git -C cached-pathspec-status config core.untrackedCache true &&
+	test_write_lines selected >cached-pathspec-status/scoped/new &&
+	test_write_lines outside >cached-pathspec-status/outside-new &&
+	git -C cached-pathspec-status status >cached-pathspec-status.root &&
+	git -C cached-pathspec-status status >/dev/null &&
+	cp cached-pathspec-status/.git/index cached-pathspec-status.before &&
+	GIT_TRACE2_EVENT="$PWD/cached-pathspec-status.trace" \
+		git -C cached-pathspec-status status -- scoped \
+			>cached-pathspec-status.actual &&
+	test_grep "scoped/new" cached-pathspec-status.actual &&
+	test_grep ! "outside-new" cached-pathspec-status.actual &&
+	test_cmp cached-pathspec-status.before \
+		cached-pathspec-status/.git/index &&
+	test_trace2_data status untracked/pathspec-cache 1 \
+		<cached-pathspec-status.trace &&
+	test_grep ! "\"label\":\"read_directory\"" \
+		cached-pathspec-status.trace &&
+	GIT_TRACE2_EVENT="$PWD/cached-pathspec-nested.trace" \
+		git -C cached-pathspec-status/scoped status -- . \
+			>cached-pathspec-nested.actual &&
+	test_grep "new" cached-pathspec-nested.actual &&
+	test_grep ! "outside-new" cached-pathspec-nested.actual &&
+	test_trace2_data status untracked/pathspec-cache 1 \
+		<cached-pathspec-nested.trace
 '
 
 test_expect_success DURABLE_FSMONITOR \
