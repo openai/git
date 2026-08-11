@@ -1738,6 +1738,874 @@ test_expect_success MACOS 'worktree binding rejects same-gitdir aliases' '
 	git -C binding-a fsmonitor--daemon stop
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'ordinary deltas advance only attribute-stable proofs' '
+	test_when_finished "rm -rf token-carry" &&
+	test_create_repo token-carry &&
+	(
+		cd token-carry &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines "*.txt text" >.gitattributes &&
+		git add .gitattributes &&
+		git commit -m attributes &&
+		git config core.untrackedCache true &&
+		git -c core.fsmonitor=false status --porcelain=v2 \
+			>.git/initial &&
+		test_must_be_empty .git/initial &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+
+		touch x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/created.trace" \
+			git status --porcelain=v2 >.git/created &&
+		test_grep "^? x$" .git/created &&
+		test_trace2_data fsmonitor config/token-advanced 1 \
+			<.git/created.trace &&
+
+		rm x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/deleted.trace" \
+			git status --porcelain=v2 >.git/deleted &&
+		test_must_be_empty .git/deleted &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/deleted.trace &&
+		test_trace2_data fsmonitor config/token-advanced 1 \
+			<.git/deleted.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes &&
+		test_must_be_empty .git/attributes &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/attributes.trace &&
+		test_trace2_data fsmonitor apply_count 1 \
+			<.git/attributes.trace &&
+		! test_trace2_data fsmonitor config/token-advanced 1 \
+			<.git/attributes.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'worktree-only checkout preserves closed semantic history' '
+	test_when_finished "rm -rf checkout-history" &&
+	test_create_repo checkout-history &&
+	(
+		cd checkout-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit other other &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git checkout -- tracked &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'source-tree checkout preserves closed semantic history' '
+	test_when_finished "rm -rf checkout-source-history" &&
+	test_create_repo checkout-source-history &&
+	(
+		cd checkout-source-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git checkout HEAD -- tracked &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'source-tree checkout drops history after an index change' '
+	test_when_finished "rm -rf checkout-source-changed" &&
+	test_create_repo checkout-source-changed &&
+	(
+		cd checkout-source-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines next >tracked &&
+		git add tracked &&
+		git commit -m next &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git checkout HEAD^ -- tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 M\." .git/actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'checkout-index -u preserves closed semantic history' '
+	test_when_finished "rm -rf checkout-index-history" &&
+	test_create_repo checkout-index-history &&
+	(
+		cd checkout-index-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git checkout-index -f -u tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'stat-only update-index preserves closed semantic history' '
+	test_when_finished "rm -rf update-index-history" &&
+	test_create_repo update-index-history &&
+	(
+		cd update-index-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test-tool chmtime +1 tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git update-index --refresh --force-write-index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'add --refresh preserves closed semantic history' '
+	test_when_finished "rm -rf add-refresh-history" &&
+	test_create_repo add-refresh-history &&
+	(
+		cd add-refresh-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test-tool chmtime +1 tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add --refresh tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'mtime-only ordinary add preserves closed semantic history' '
+	test_when_finished "rm -rf add-ordinary-history" &&
+	test_create_repo add-ordinary-history &&
+	(
+		cd add-ordinary-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test-tool chmtime +1 tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/path.trace" \
+			git status >.git/path &&
+		test_grep "nothing to commit, working tree clean" .git/path &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/path.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/path.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'ordinary add drops history after a logical index change' '
+	test_when_finished "rm -rf add-ordinary-changed" &&
+	test_create_repo add-ordinary-changed &&
+	(
+		cd add-ordinary-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 M\." .git/actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'ordinary add drops history after ITA resolution' '
+	test_when_finished "rm -rf add-ordinary-ita" &&
+	test_create_repo add-ordinary-ita &&
+	(
+		cd add-ordinary-ita &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		touch empty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=empty \
+			git add -N empty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=empty \
+			git status --porcelain=v2 >.git/ita &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git add empty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 A\\." .git/actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'describe --dirty preserves closed semantic history' '
+	test_when_finished "rm -rf describe-dirty-history" &&
+	test_create_repo describe-dirty-history &&
+	(
+		cd describe-dirty-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test-tool chmtime +1 tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git describe --always --dirty >.git/describe &&
+		test_grep ! dirty .git/describe &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'clean stash push preserves closed semantic history' '
+	test_when_finished "rm -rf stash-clean-history" &&
+	test_create_repo stash-clean-history &&
+	(
+		cd stash-clean-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git stash push >.git/stash &&
+		test_grep "No local changes to save" .git/stash &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'dirty stash push drops closed semantic history' '
+	test_when_finished "rm -rf stash-dirty-history" &&
+	test_create_repo stash-dirty-history &&
+	(
+		cd stash-dirty-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git stash push >.git/stash &&
+		test_grep "Saved working directory" .git/stash &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
+	'dirty stash cannot resurrect an invalidated external checkpoint' '
+	test_when_finished "rm -rf stash-checkpoint-history" &&
+	test_create_repo stash-checkpoint-history &&
+	(
+		cd stash-checkpoint-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime -120 tracked &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/checkpoint.trace" \
+			git status --porcelain=v2 >.git/checkpoint &&
+		test_must_be_empty .git/checkpoint &&
+		test_trace2_data fsmonitor history/external-stored 1 \
+			<.git/checkpoint.trace &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git stash push >.git/stash &&
+		test_grep "Saved working directory" .git/stash &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor history/external-proof-invalidated 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor history/external-restored 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'mixed reset to a same-tree commit preserves closed history' '
+	test_when_finished "rm -rf reset-mixed-same-tree" &&
+	test_create_repo reset-mixed-same-tree &&
+	(
+		cd reset-mixed-same-tree &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git commit --allow-empty -m same-tree &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test-tool chmtime +1 tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git reset --mixed HEAD^ >.git/reset &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'mixed reset drops history after a logical index change' '
+	test_when_finished "rm -rf reset-mixed-changed" &&
+	test_create_repo reset-mixed-changed &&
+	(
+		cd reset-mixed-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines staged >tracked &&
+		git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/staged &&
+		test_grep "^1 M\." .git/staged &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git reset --mixed HEAD >.git/reset &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "modified:.*tracked" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'hard reset to a same-tree commit preserves closed history' '
+	test_when_finished "rm -rf reset-hard-same-tree" &&
+	test_create_repo reset-hard-same-tree &&
+	(
+		cd reset-hard-same-tree &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git commit --allow-empty -m same-tree &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git reset --hard HEAD^ >.git/reset &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'hard reset to a different tree drops closed semantic history' '
+	test_when_finished "rm -rf reset-hard-changed" &&
+	test_create_repo reset-hard-changed &&
+	(
+		cd reset-hard-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines next >tracked &&
+		git add tracked &&
+		git commit -m next &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git reset --hard HEAD^ >.git/reset &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'forced same-tree checkout preserves closed semantic history' '
+	test_when_finished "rm -rf checkout-same-tree" &&
+	test_create_repo checkout-same-tree &&
+	(
+		cd checkout-same-tree &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git branch same &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git checkout -f same >.git/checkout &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'one-tree read-tree reset preserves closed semantic history' '
+	test_when_finished "rm -rf read-tree-reset-history" &&
+	test_create_repo read-tree-reset-history &&
+	(
+		cd read-tree-reset-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git status >.git/dirty &&
+		test_grep "modified:.*tracked" .git/dirty &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git read-tree --reset -u HEAD >.git/read-tree &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		test_trace2_data index refresh/sum_lstat 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'missing semantic history seeds a forward baseline' '
+	test_when_finished \
+		"stop_daemon_delete_repo missing-semantic-baseline" &&
+	test_create_repo missing-semantic-baseline &&
+	(
+		cd missing-semantic-baseline &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid tracked &&
+		test_grep ! FSCF .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep FSCF .git/index &&
+		test_trace2_data fsmonitor semantic/adoption-baseline 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'missing semantic history with weak stat identity forces content verification' '
+	test_when_finished \
+		"stop_daemon_delete_repo missing-semantic-history" &&
+	test_create_repo missing-semantic-history &&
+	(
+		cd missing-semantic-history &&
+		printf "aaaa\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		test-tool chmtime =-60 tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get tracked) &&
+		printf "bbbb\n" >tracked &&
+		test-tool chmtime =$mtime tracked &&
+		git config core.fsmonitor true &&
+		git update-index --fsmonitor &&
+		git update-index --fsmonitor-valid tracked &&
+		test_grep FSMN .git/index &&
+		test_grep ! FSCF .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_line_count = 1 .git/actual &&
+		test_grep "^1 \.M .* tracked$" .git/actual &&
+		test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+			<.git/status.trace
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'token closure refresh starts inside its proof epoch' '
+	test_when_finished "rm -rf proof-epoch-refresh" &&
+	test_create_repo proof-epoch-refresh &&
+	(
+		cd proof-epoch-refresh &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+
+		# Leave the next refresh with untracked history to bootstrap.
+		git update-index --no-untracked-cache 2>.git/no-uc.err &&
+		test_grep FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			test_must_fail git commit --dry-run --porcelain \
+			>.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		captured=$(test_grep -n \
+			"\"key\":\"semantic/proof-epoch-captured\"" \
+			.git/status.trace | sed -n "1s/:.*//p") &&
+		refreshed=$(test_grep -n \
+			"\"category\":\"index\",\"label\":\"refresh\"" \
+			.git/status.trace | sed -n "\$s/:.*//p") &&
+		test -n "$captured" &&
+		test -n "$refreshed" &&
+		test "$captured" -lt "$refreshed"
+	)
+'
+
+test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'trivial query closes zero-trailer unbound history' '
+	test_when_finished "rm -rf unbound-trivial" &&
+	test_create_repo unbound-trivial &&
+	(
+		cd unbound-trivial &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config index.version 4 &&
+		git config feature.manyFiles true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			test-tool read-cache --test-fscf-round-trip &&
+		test_grep FSMN .git/index &&
+		test_grep FSCF .git/index &&
+		test_trailing_hash .git/index >.git/index.hash &&
+		test_oid zero >.git/zero &&
+		test_cmp .git/zero .git/index.hash &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TC \
+		GIT_TRACE2_EVENT="$PWD/.git/recovery.trace" \
+			git status \
+			>.git/recovery.out &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/recovery.out &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/recovery.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9]" <.git/recovery.trace &&
+		test_trace2_data fsmonitor semantic/proof-epoch-captured 1 \
+			<.git/recovery.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/recovery.trace &&
+		! test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/recovery.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CC \
+		GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
+			git status \
+			>.git/warm.out &&
+		test_grep "nothing to commit, working tree clean" \
+			.git/warm.out &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/warm.trace &&
+		! test_trace2_data index refresh/sum_lstat \
+			"[1-9][0-9]*" <.git/warm.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9]" <.git/warm.trace &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/warm.trace &&
+		! test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/warm.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'configured unused filters establish scoped history' '
 	test_when_finished "rm -rf configured-filter" &&
