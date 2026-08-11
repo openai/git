@@ -2257,6 +2257,48 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
+	'dirty stash cannot resurrect an invalidated external checkpoint' '
+	test_when_finished "rm -rf stash-checkpoint-history" &&
+	test_create_repo stash-checkpoint-history &&
+	(
+		cd stash-checkpoint-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime -120 tracked &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/checkpoint.trace" \
+			git status --porcelain=v2 >.git/checkpoint &&
+		test_must_be_empty .git/checkpoint &&
+		test_trace2_data fsmonitor history/external-stored 1 \
+			<.git/checkpoint.trace &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git stash push >.git/stash &&
+		test_grep "Saved working directory" .git/stash &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status >.git/actual &&
+		test_grep "nothing to commit, working tree clean" .git/actual &&
+		test_trace2_data fsmonitor history/external-proof-invalidated 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor history/external-restored 1 \
+			<.git/status.trace
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'mixed reset to a same-tree commit preserves closed history' '
 	test_when_finished "rm -rf reset-mixed-same-tree" &&
