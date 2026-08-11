@@ -31,6 +31,7 @@
 struct attr_check;
 struct repository;
 struct clean_status_proof_epoch;
+struct clean_status_progress;
 struct cache_entry;
 struct git_hash_algo;
 struct index_state;
@@ -107,6 +108,7 @@ struct semantic_verify_worker {
 	struct index_state *istate;
 	struct semantic_verify_root *root;
 	struct semantic_verify_result *results;
+	struct clean_status_progress *progress;
 	struct attr_check *check;
 	size_t start;
 	size_t end;

@@ -2,12 +2,15 @@
 
 #include "git-compat-util.h"
 #include "attr.h"
+#include "clean-status.h"
 #include "convert.h"
 #include "object.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "semantic-verify.h"
 #include "semantic-verify-internal.h"
+
+#define SEMANTIC_VERIFY_PROGRESS_BATCH 128
 
 static void record_stat_update(struct semantic_verify_worker *worker,
 			       uint32_t cache_pos,
@@ -58,7 +61,7 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 		semantic_verify_path_new(worker->root);
 	struct attr_check *check = worker->check;
 	void *buffer = xmalloc(SEMANTIC_VERIFY_HASH_BUFFER_SIZE);
-	size_t unstable_from = SIZE_MAX;
+	size_t unstable_from = SIZE_MAX, completed = 0;
 
 	worker->check = NULL;
 	if (!check)
@@ -79,7 +82,7 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 				worker->active_filters++;
 			}
 			count_result(worker, result->kind);
-			continue;
+			goto counted;
 		}
 		active_filter = file.active_filter;
 
@@ -103,7 +106,13 @@ void semantic_verify_worker_run(struct semantic_verify_worker *worker)
 				record_stat_update(worker, i, &file.stat_data);
 		}
 		count_result(worker, result->kind);
+	counted:
+		if (++completed == SEMANTIC_VERIFY_PROGRESS_BATCH) {
+			clean_status_update_progress(worker->progress, completed);
+			completed = 0;
+		}
 	}
+	clean_status_update_progress(worker->progress, completed);
 
 	semantic_verify_path_free(path, &worker->namespace_unstable,
 				  &unstable_from);
