@@ -42,9 +42,15 @@ static int fsmonitor__start_timeout_sec = 60;
 #define FSMONITOR__ANNOUNCE_STARTUP "fsmonitor.announcestartup"
 static int fsmonitor__announce_startup = 0;
 
+struct fsmonitor_config_data {
+	unsigned int ignore_start_timeout : 1;
+};
+
 static int fsmonitor_config(const char *var, const char *value,
 			    const struct config_context *ctx, void *cb)
 {
+	struct fsmonitor_config_data *data = cb;
+
 	if (!strcmp(var, FSMONITOR__IPC_THREADS)) {
 		int i = git_config_int(var, value, ctx->kvi);
 		if (i < 1)
@@ -55,7 +61,12 @@ static int fsmonitor_config(const char *var, const char *value,
 	}
 
 	if (!strcmp(var, FSMONITOR__START_TIMEOUT)) {
-		int i = git_config_int(var, value, ctx->kvi);
+		int i;
+
+		/* The run process does not consume this client-only setting. */
+		if (data && data->ignore_start_timeout)
+			return 0;
+		i = git_config_int(var, value, ctx->kvi);
 		if (i < 0)
 			return error(_("value of '%s' out of range: %d"),
 				     FSMONITOR__START_TIMEOUT, i);
@@ -73,7 +84,7 @@ static int fsmonitor_config(const char *var, const char *value,
 		return 0;
 	}
 
-	return git_default_config(var, value, ctx, cb);
+	return git_default_config(var, value, ctx, NULL);
 }
 
 /*
@@ -694,18 +705,49 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	int do_trivial = 0;
 	int do_flush = 0;
 	int do_cookie = 0;
+	int invalid_binding = 0;
 	enum fsmonitor_cookie_item_result cookie_result;
+
+	if (strcmp(command, "quit") &&
+	    strcmp(command, "flush") &&
+	    strcmp(command, FSMONITOR_IPC_CAPABILITY_COMMAND) &&
+	    !starts_with(command, "builtin:")) {
+		const char *identity;
+		const char *query;
+
+		if (!skip_prefix(command, FSMONITOR_IPC_QUERY_PREFIX,
+				 &identity) ||
+		    !(query = strchr(identity, '\n')) ||
+		    query - identity != FSMONITOR_IPC_WORKTREE_ID_HEX ||
+		    state->worktree_identity.len != FSMONITOR_IPC_WORKTREE_ID_HEX ||
+		    memcmp(identity, state->worktree_identity.buf,
+			   FSMONITOR_IPC_WORKTREE_ID_HEX)) {
+			invalid_binding = 1;
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "query/worktree-mismatch", 1);
+		} else {
+			command = query + 1;
+		}
+	}
 
 	/*
 	 * We expect `command` to be of the form:
 	 *
-	 * <command> := quit NUL
+	 * <command> := get-capabilities NUL
+	 *            | quit NUL
 	 *            | flush NUL
 	 *            | <V1-time-since-epoch-ns> NUL
 	 *            | <V2-opaque-fsmonitor-token> NUL
 	 */
 
-	if (!strcmp(command, "quit")) {
+	if (!strcmp(command, FSMONITOR_IPC_CAPABILITY_COMMAND)) {
+		static const char capabilities[] =
+			FSMONITOR_IPC_QUERY_VERSION "\n";
+
+		return reply(reply_data, capabilities,
+			     sizeof(capabilities) - 1);
+
+	} else if (!strcmp(command, "quit")) {
 		/*
 		 * A client has requested over the socket/pipe that the
 		 * daemon shutdown.
@@ -727,6 +769,11 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 		 */
 		do_flush = 1;
 		do_trivial = 1;
+
+	} else if (invalid_binding) {
+		/* Never trust a token from an unbound or different worktree. */
+		do_trivial = 1;
+		do_cookie = 1;
 
 	} else if (!skip_prefix(command, "builtin:", &p)) {
 		/* assume V1 timestamp or garbage */
@@ -1311,6 +1358,12 @@ static int fsmonitor_run_daemon(void)
 	strbuf_init(&state.path_worktree_watch, 0);
 	strbuf_addstr(&state.path_worktree_watch,
 		      absolute_path(repo_get_work_tree(the_repository)));
+	strbuf_init(&state.worktree_identity, 0);
+	if (fsmonitor_ipc__get_worktree_identity(the_repository,
+					       &state.worktree_identity)) {
+		err = error(_("could not identify worktree root"));
+		goto done;
+	}
 	state.nr_paths_watching = 1;
 
 	strbuf_init(&state.alias.alias, 0);
@@ -1437,6 +1490,7 @@ done:
 	ipc_server_free(state.ipc_server_data);
 
 	strbuf_release(&state.path_worktree_watch);
+	strbuf_release(&state.worktree_identity);
 	strbuf_release(&state.path_gitdir_watch);
 	strbuf_release(&state.path_cookie_prefix);
 	strbuf_release(&state.path_ipc);
@@ -1570,6 +1624,9 @@ int cmd_fsmonitor__daemon(int argc,
 			  const char *prefix,
 			  struct repository *repo UNUSED)
 {
+	struct fsmonitor_config_data config_data = {
+		.ignore_start_timeout = argc > 1 && !strcmp(argv[1], "run"),
+	};
 	const char *subcmd;
 	enum fsmonitor_reason reason;
 	int detach_console = 0;
@@ -1586,7 +1643,7 @@ int cmd_fsmonitor__daemon(int argc,
 		OPT_END()
 	};
 
-	repo_config(the_repository, fsmonitor_config, NULL);
+	repo_config(the_repository, fsmonitor_config, &config_data);
 
 	argc = parse_options(argc, argv, prefix, options,
 			     builtin_fsmonitor__daemon_usage, 0);
