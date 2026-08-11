@@ -57,7 +57,8 @@ prime_semantic_history () {
 	test_must_be_empty actual.1 &&
 	bulk_status -C "$repo" status --porcelain=2 >actual.2 &&
 	test_must_be_empty actual.2 &&
-	test_grep FSCF "$repo/.git/index"
+	test_grep FSCF "$repo/.git/index" &&
+	rm -f "$repo"/.git/index.csh1.*
 }
 
 issue_sidecar () {
@@ -228,13 +229,80 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'dirty exact status checkpoints history without certifying cleanliness' '
+	test_when_finished "stop_daemon external-dirty-exact" &&
+	setup_repo external-dirty-exact &&
+	git -C external-dirty-exact config core.untrackedCache true &&
+	prime_semantic_history external-dirty-exact &&
+	test_write_lines changed >external-dirty-exact/tracked &&
+	test-tool chmtime -60 external-dirty-exact/tracked &&
+	bulk_status -C external-dirty-exact status --porcelain=2 \
+		>external-dirty-exact.primed &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-dirty-exact.trace" \
+		bulk_status -C external-dirty-exact status --porcelain=v2 \
+		>actual &&
+	test_grep "^1 \.M .* tracked$" actual &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<external-dirty-exact.trace &&
+	test_path_is_missing external-dirty-exact/.git/index.csts &&
+	find external-dirty-exact/.git -maxdepth 1 -type f \
+		-name "index.csh1.*" >external-dirty-exact.checkpoints &&
+	test_line_count = 1 external-dirty-exact.checkpoints
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'daemon-shaped dirty status checkpoints resumable history' '
+	test_when_finished "stop_daemon external-daemon-shape" &&
+	setup_repo external-daemon-shape &&
+	git -C external-daemon-shape config core.untrackedCache true &&
+	prime_semantic_history external-daemon-shape &&
+	test_write_lines changed >external-daemon-shape/tracked &&
+	test-tool chmtime -60 external-daemon-shape/tracked &&
+	bulk_status -C external-daemon-shape status --porcelain=2 \
+		>external-daemon-shape.primed &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-daemon-shape.trace" \
+		bulk_status -C external-daemon-shape \
+			status --porcelain=v2 -z --branch --show-stash \
+			--no-ahead-behind --untracked-files=normal \
+			--ignore-submodules=all >actual &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<external-daemon-shape.trace &&
+	test_path_is_missing external-daemon-shape/.git/index.csts &&
+	find external-daemon-shape/.git -maxdepth 1 -type f \
+		-name "index.csh1.*" >external-daemon-shape.checkpoints &&
+	test_line_count = 1 external-daemon-shape.checkpoints
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'nested status uses root-wide resumable history' '
+	test_when_finished "stop_daemon external-nested-status" &&
+	setup_repo external-nested-status &&
+	git -C external-nested-status config core.untrackedCache true &&
+	prime_semantic_history external-nested-status &&
+	mkdir -p external-nested-status/deep/inside &&
+	test_write_lines changed >external-nested-status/tracked &&
+	test-tool chmtime -60 external-nested-status/tracked &&
+	bulk_status -C external-nested-status status --porcelain=2 \
+		>external-nested-status.primed &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-nested-status.trace" \
+		bulk_status -C external-nested-status/deep/inside \
+			status --porcelain=v2 >actual &&
+	test_grep "^1 \.M .* \.\./\.\./tracked$" actual &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<external-nested-status.trace &&
+	find external-nested-status/.git -maxdepth 1 -type f \
+		-name "index.csh1.*" >external-nested-status.checkpoints &&
+	test_line_count = 1 external-nested-status.checkpoints
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'normal status persists bootstrap stat repairs' '
 	test_when_finished "stop_daemon external-stat-bootstrap" &&
 	setup_repo external-stat-bootstrap &&
 	git -C external-stat-bootstrap update-index --fsmonitor &&
 	test_env GIT_TRACE2_EVENT="$PWD/external-stat-bootstrap.trace" \
 		git -C external-stat-bootstrap status >actual &&
-	! test_trace2_data fsmonitor history/external-stored 1 \
+	test_trace2_data fsmonitor history/external-stored 1 \
 		<external-stat-bootstrap.trace &&
 	test_grep "\"label\":\"do_write_index\"" \
 		external-stat-bootstrap.trace &&
@@ -859,7 +927,8 @@ test_expect_success DURABLE_FSMONITOR \
 	rm -f "$sidecar.lock" &&
 	test-tool -C external-history fsmonitor-client flush >flush.out &&
 	git -C external-history config status.renameLimit 100 &&
-	test_env GIT_TRACE2_EVENT="$PWD/external-main-token.trace" \
+	test_env GIT_INDEX_FILE="$PWD/external-history/.git/index" \
+		GIT_TRACE2_EVENT="$PWD/external-main-token.trace" \
 		git -C external-history status --porcelain=v2 \
 			--untracked-files=normal >actual.main-token &&
 	test_grep "\"label\":\"do_write_index\"" \
