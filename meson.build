@@ -317,6 +317,8 @@ libgit_sources = [
   'archive-tar.c',
   'archive-zip.c',
   'archive.c',
+  'attr-fingerprint.c',
+  'attr-manifest.c',
   'attr.c',
   'base85.c',
   'bisect.c',
@@ -331,6 +333,17 @@ libgit_sources = [
   'chdir-notify.c',
   'checkout.c',
   'chunk-format.c',
+  'clean-status.c',
+  'clean-status-config.c',
+  'clean-status-epoch.c',
+  'clean-status-history-store.c',
+  'clean-status-history.c',
+  'clean-status-identity.c',
+  'clean-status-index.c',
+  'clean-status-manifest.c',
+  'clean-status-sidecar.c',
+  'clean-status-fast.c',
+  'clean-status-sidecar-issue.c',
   'color.c',
   'column.c',
   'combine-diff.c',
@@ -368,6 +381,7 @@ libgit_sources = [
   'editor.c',
   'entry.c',
   'environment.c',
+  'exclude-source-proof.c',
   'ewah/bitmap.c',
   'ewah/ewah_bitmap.c',
   'ewah/ewah_io.c',
@@ -378,6 +392,7 @@ libgit_sources = [
   'fetch-pack.c',
   'fmt-merge-msg.c',
   'fsck.c',
+  'fsmonitor-clean-proof.c',
   'fsmonitor.c',
   'fsmonitor-ipc.c',
   'fsmonitor-settings.c',
@@ -460,6 +475,7 @@ libgit_sources = [
   'patch-delta.c',
   'patch-ids.c',
   'path.c',
+  'path-namespace.c',
   'path-walk.c',
   'pathspec.c',
   'pkt-line.c',
@@ -522,6 +538,11 @@ libgit_sources = [
   'run-command.c',
   'send-pack.c',
   'sequencer.c',
+  'semantic-verify-file.c',
+  'semantic-verify-path.c',
+  'semantic-verify-root.c',
+  'semantic-verify-worker.c',
+  'semantic-verify.c',
   'serve.c',
   'server-info.c',
   'setup.c',
@@ -576,6 +597,8 @@ libgit_sources = [
   'walker.c',
   'wildmatch.c',
   'worktree.c',
+  'worktree-attr-manifest.c',
+  'worktree-attr-source.c',
   'wrapper.c',
   'write-or-die.c',
   'ws.c',
@@ -1296,8 +1319,11 @@ endif
 
 if host_machine.system() == 'darwin'
   compat_sources += 'compat/precompose_utf8.c'
+  libgit_c_args += '-DHAVE_PRELOAD_INDEX_BULK'
   libgit_c_args += '-DPRECOMPOSE_UNICODE'
   libgit_c_args += '-DPROTECT_HFS_DEFAULT'
+elif host_machine.system() == 'linux'
+  libgit_c_args += '-DHAVE_PRELOAD_INDEX_BULK'
 endif
 
 # Configure general compatibility wrappers.
@@ -1339,11 +1365,33 @@ elif host_machine.system() == 'windows'
 endif
 
 if host_machine.system() == 'linux'
-  compat_sources += 'compat/linux/procinfo.c'
+  compat_sources += [
+    'compat/linux/procinfo.c',
+    'compat/preload-index/bulk-linux.c',
+    'compat/preload-index/bulk-linux-entry.c',
+    'compat/preload-index/bulk-linux-open.c',
+    'compat/preload-index/bulk-linux-scan.c',
+    'compat/preload-index/bulk-linux-stat.c',
+    'compat/preload-index/bulk-linux-topology.c',
+  ]
+  libgit_sources += [
+    'preload-index-bulk-index.c',
+    'preload-index-bulk-thread.c',
+    'preload-index-bulk.c',
+  ]
 elif host_machine.system() == 'windows'
   compat_sources += 'compat/win32/trace2_win32_process_info.c'
 elif host_machine.system() == 'darwin'
-  compat_sources += 'compat/darwin/procinfo.c'
+  compat_sources += [
+    'compat/darwin/procinfo.c',
+    'compat/preload-index/bulk-darwin.c',
+    'compat/preload-index/bulk-darwin-root.c',
+  ]
+  libgit_sources += [
+    'preload-index-bulk-index.c',
+    'preload-index-bulk-thread.c',
+    'preload-index-bulk.c',
+  ]
 else
   compat_sources += 'compat/stub/procinfo.c'
 endif

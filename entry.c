@@ -512,8 +512,9 @@ int checkout_entry_ca(struct cache_entry *ce, struct conv_attrs *ca,
 
 	if (!check_path(path.buf, path.len, &st, state->base_dir_len)) {
 		const struct submodule *sub;
-		unsigned changed = ie_match_stat(state->istate, ce, &st,
-						 CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE);
+		unsigned changed = ie_match_stat_with_content_check(
+			state->istate, ce, &st,
+			CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE);
 		/*
 		 * Needs to be checked before !changed returns early,
 		 * as the possibly empty directory was not changed

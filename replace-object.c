@@ -107,3 +107,16 @@ int replace_refs_enabled(struct repository *r)
 	/* repository has no objects or refs. */
 	return 0;
 }
+
+static int has_replace_ref(const struct reference *ref UNUSED,
+			   void *data UNUSED)
+{
+	return 1;
+}
+
+int repo_has_replace_refs_uncached(struct repository *r)
+{
+	if (!replace_refs_enabled(r))
+		return 0;
+	return refs_for_each_replace_ref_uncached(r, has_replace_ref, NULL) != 0;
+}

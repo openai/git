@@ -90,7 +90,10 @@ static int match_stat_with_submodule(struct diff_options *diffopt,
 				     struct stat *st, unsigned ce_option,
 				     unsigned *dirty_submodule)
 {
-	int changed = ie_match_stat(diffopt->repo->index, ce, st, ce_option);
+	int changed;
+
+	changed = ie_match_stat_with_content_check(
+		diffopt->repo->index, ce, st, ce_option);
 	if (S_ISGITLINK(ce->ce_mode)) {
 		struct diff_flags orig_flags = diffopt->flags;
 		if (!diffopt->flags.override_submodule_config)
@@ -127,7 +130,10 @@ void run_diff_files(struct rev_info *revs, unsigned int option)
 	entries = istate->cache_nr;
 	for (i = 0; i < entries; i++) {
 		unsigned int oldmode, newmode;
+		int fsmonitor_valid = 0;
 		struct cache_entry *ce = istate->cache[i];
+		struct stat st;
+		int has_stat = 0;
 		int changed;
 		unsigned dirty_submodule = 0;
 		const struct object_id *old_oid, *new_oid;
@@ -246,9 +252,9 @@ void run_diff_files(struct rev_info *revs, unsigned int option)
 		if (ce->ce_flags & (CE_VALID | CE_FSMONITOR_VALID)) {
 			changed = 0;
 			newmode = ce->ce_mode;
+			fsmonitor_valid =
+				!!(ce->ce_flags & CE_FSMONITOR_VALID);
 		} else {
-			struct stat st;
-
 			changed = check_removed(ce, &st);
 			if (changed) {
 				if (changed < 0) {
@@ -270,12 +276,20 @@ void run_diff_files(struct rev_info *revs, unsigned int option)
 
 			changed = match_stat_with_submodule(&revs->diffopt, ce, &st,
 							    ce_option, &dirty_submodule);
+			has_stat = 1;
 			newmode = ce_mode_from_stat(revs->repo, ce, st.st_mode);
+			fsmonitor_valid = fsmonitor_stat_can_be_valid(&st);
 		}
 
 		if (!changed && !dirty_submodule) {
+			if ((option & DIFF_UPDATE_INDEX_STAT) && has_stat &&
+			    (ce->ce_flags & CE_CONTENT_CHECK_REQUIRED)) {
+				refresh_index_entry_stat(istate, i, &st);
+				ce = istate->cache[i];
+			}
 			ce_mark_uptodate(ce);
-			mark_fsmonitor_valid(istate, ce);
+			if (fsmonitor_valid)
+				mark_fsmonitor_valid(istate, ce);
 			if (revs->diffopt.flags.find_copies_harder)
 				diff_same(&revs->diffopt, newmode,
 					  &ce->oid, ce->name);
