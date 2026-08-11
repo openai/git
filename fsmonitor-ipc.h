@@ -44,7 +44,8 @@ enum ipc_active_state fsmonitor_ipc__get_state(void);
  * Returns -1 on error; 0 on success.
  */
 int fsmonitor_ipc__send_query(const char *since_token,
-			      struct strbuf *answer);
+			      struct strbuf *answer,
+			      int *legacy_worktree_authenticated);
 
 /*
  * Connect to a `git-fsmonitor--daemon` process via simple-ipc and

@@ -1841,7 +1841,11 @@ struct repository *repo UNUSED)
 		external_saved = clean_status_save_external_history(
 			the_repository->index);
 
-		if (exact_clean_query) {
+		if (the_repository->index->fsmonitor_legacy_untracked_fallback &&
+		    !preserve_entry_changes && !external_saved) {
+			rollback_lock_file(&index_lock);
+			fd = -1;
+		} else if (exact_clean_query) {
 			if (!preserve_entry_changes && external_saved &&
 			    clean_status_issue_sidecar(
 				    &s, &clean_digest, &index_lock, 0))
