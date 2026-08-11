@@ -2,6 +2,8 @@
 
 #include "builtin.h"
 #include "abspath.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -150,6 +152,7 @@ static int show_stat = 1;
 static int show_patch;
 static int show_include_untracked;
 static int use_index;
+static struct clean_status_config_digest stash_clean_digest;
 
 /*
  * w_commit is set to the commit containing the working tree
@@ -975,6 +978,8 @@ static int list_stash(int argc, const char **argv, const char *prefix,
 static int git_stash_config(const char *var, const char *value,
 			    const struct config_context *ctx, void *cb)
 {
+	clean_status_config_add(cb, var, value, ctx);
+
 	if (!strcmp(var, "stash.showstat")) {
 		show_stat = git_config_bool(var, value);
 		return 0;
@@ -991,7 +996,7 @@ static int git_stash_config(const char *var, const char *value,
 		use_index = git_config_bool(var, value);
 		return 0;
 	}
-	return git_diff_basic_config(var, value, ctx, cb);
+	return git_diff_basic_config(var, value, ctx, NULL);
 }
 
 static void diff_include_untracked(const struct stash_info *info, struct diff_options *diff_opt)
@@ -1671,6 +1676,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			 int include_untracked, int only_staged)
 {
 	int ret = 0;
+	int preserve_clean_history = !ps->nr && !include_untracked;
 	struct stash_info info = STASH_INFO_INIT;
 	struct strbuf patch = STRBUF_INIT;
 	struct strbuf stash_msg_buf = STRBUF_INIT;
@@ -1698,6 +1704,16 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		goto done;
 	}
 
+	/*
+	 * A clean stash push returns after its initial stat refresh. Keep
+	 * that rewrite bound only for whole-worktree forms; paths and
+	 * untracked discovery can change the index or its status inputs.
+	 * If changes are found below, invalidate before the real stash
+	 * machinery mutates the index or worktree.
+	 */
+	if (preserve_clean_history)
+		clean_status_set_config_digest(the_repository,
+					       &stash_clean_digest);
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
@@ -1728,6 +1744,8 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			printf_ln(_("No local changes to save"));
 		goto done;
 	}
+	if (preserve_clean_history)
+		clean_status_invalidate_current_proof(the_repository->index);
 
 	if (!refs_reflog_exists(get_main_ref_store(the_repository), ref_stash) && do_clear_stash()) {
 		ret = -1;
@@ -2478,7 +2496,12 @@ int cmd_stash(int argc,
 	const char **args_copy;
 	int ret;
 
-	repo_config(the_repository, git_stash_config, NULL);
+	show_usage_with_options_if_asked(argc, argv, git_stash_usage, options);
+
+	clean_status_config_init(&stash_clean_digest,
+				 the_repository->hash_algo);
+	repo_config(the_repository, git_stash_config, &stash_clean_digest);
+	clean_status_config_final(&stash_clean_digest);
 
 	argc = parse_options(argc, argv, prefix, options, git_stash_usage,
 			     PARSE_OPT_SUBCOMMAND_OPTIONAL |
