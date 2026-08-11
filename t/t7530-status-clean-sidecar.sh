@@ -296,6 +296,46 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'pathspec status preserves history without certifying outside paths' '
+	test_when_finished "stop_daemon external-pathspec-status" &&
+	setup_repo external-pathspec-status &&
+	mkdir external-pathspec-status/scoped &&
+	test_commit -C external-pathspec-status scoped scoped/tracked &&
+	test-tool -C external-pathspec-status chmtime -120 \
+		tracked scoped/tracked &&
+	git -C external-pathspec-status update-index --refresh &&
+	git -C external-pathspec-status config core.untrackedCache true &&
+	prime_semantic_history external-pathspec-status &&
+	git -C external-pathspec-status config core.autocrlf false &&
+	test_write_lines changed >external-pathspec-status/tracked &&
+	test_write_lines selected >external-pathspec-status/scoped/new &&
+	test_write_lines outside >external-pathspec-status/outside-new &&
+	bulk_status -C external-pathspec-status \
+		status --porcelain=v2 -- scoped >external-pathspec-status.first &&
+	test_grep "^? scoped/new$" external-pathspec-status.first &&
+	! test_grep "tracked\|outside-new" external-pathspec-status.first &&
+	test_path_is_missing external-pathspec-status/.git/index.csts &&
+	cp external-pathspec-status/.git/index \
+		external-pathspec-status.before &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-pathspec-status.trace" \
+		bulk_status -C external-pathspec-status \
+			status --porcelain=v2 -- scoped \
+			>external-pathspec-status.second &&
+	test_cmp external-pathspec-status.first \
+		external-pathspec-status.second &&
+	test_cmp external-pathspec-status.before \
+		external-pathspec-status/.git/index &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<external-pathspec-status.trace &&
+	! test_trace2_data fsmonitor semantic/manifest-scan-count \
+		<external-pathspec-status.trace &&
+	test_path_is_missing external-pathspec-status/.git/index.csts &&
+	bulk_status -C external-pathspec-status status --porcelain=v2 \
+		>external-pathspec-status.root &&
+	test_grep "^1 \.M .* tracked$" external-pathspec-status.root
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'exact dirty status avoids a sparse full-worktree bulk scan' '
 	test_when_finished "stop_daemon external-sparse-exact" &&
 	setup_repo external-sparse-exact &&
