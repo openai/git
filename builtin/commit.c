@@ -1750,7 +1750,7 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
-	if (s.allow_clean_status_shortcuts || exact_clean_query)
+	if (!s.pathspec.nr)
 		clean_status_enable_external_history(the_repository);
 	s.certify_clean_status = exact_clean_query;
 	if ((exact_clean_query || normal_clean_query) &&
@@ -1766,7 +1766,7 @@ struct repository *repo UNUSED)
 	    status_format != STATUS_FORMAT_PORCELAIN_V2)
 		progress_flag = REFRESH_PROGRESS;
 	repo_read_index(the_repository);
-	if (exact_clean_query && use_optional_locks())
+	if (!s.pathspec.nr && use_optional_locks())
 		clean_status_capture_external_history_source(
 			the_repository->index);
 	if (normal_clean_query && use_optional_locks() &&
@@ -1824,28 +1824,27 @@ struct repository *repo UNUSED)
 		 * entry repair durable.  Restored checkpoints stay no-spill
 		 * for foreign index writers.
 		 */
-		if (!preserve_entry_changes &&
-		    (!exact_clean_query ||
-		     (clean_status_has_persistent_fsmonitor_semantic_history(
-			      the_repository->index) &&
-		      !s.change.nr && !s.untracked.nr && !s.ignored.nr)))
+		if (!s.pathspec.nr)
 			external_saved = clean_status_save_external_history(
 				the_repository->index);
 
 		if (exact_clean_query) {
-			if (external_saved &&
+			if (!preserve_entry_changes && external_saved &&
 			    clean_status_issue_sidecar(
 				    &s, &clean_digest, &index_lock, 0))
 				fd = -1;
-			else if (external_restored || external_saved) {
+			else if (!preserve_entry_changes &&
+				 (external_restored || external_saved)) {
 				rollback_lock_file(&index_lock);
 				fd = -1;
 			}
-		} else if (normal_clean_query && external_restored &&
+		} else if (!preserve_entry_changes &&
+			   normal_clean_query && external_restored &&
 			   clean_status_issue_sidecar(
 				   &s, &clean_digest, &index_lock, 1)) {
 			fd = -1;
-		} else if (external_restored || external_saved) {
+		} else if (!preserve_entry_changes &&
+			   (external_restored || external_saved)) {
 			rollback_lock_file(&index_lock);
 			fd = -1;
 		}
