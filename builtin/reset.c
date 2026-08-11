@@ -494,7 +494,8 @@ int cmd_reset(int argc,
 	 * transfer only an equal logical index.
 	 */
 	if ((reset_type == MIXED || reset_type == HARD) &&
-	    !pathspec.nr && !intent_to_add && !unborn) {
+	    !pathspec.nr && !intent_to_add &&
+	    !unborn) {
 		preserve_mixed_history = reset_type == MIXED;
 		clean_status_set_config_digest(the_repository, &clean_digest);
 	}
