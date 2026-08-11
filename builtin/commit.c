@@ -1763,8 +1763,11 @@ struct repository *repo UNUSED)
 	}
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
-	    status_format != STATUS_FORMAT_PORCELAIN_V2)
+	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
 		progress_flag = REFRESH_PROGRESS;
+		if (isatty(2))
+			clean_status_enable_progress(the_repository);
+	}
 	repo_read_index(the_repository);
 	if (!s.pathspec.nr && use_optional_locks())
 		clean_status_capture_external_history_source(
