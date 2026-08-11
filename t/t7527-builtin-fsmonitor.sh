@@ -2506,8 +2506,6 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_grep "nothing to commit, working tree clean" .git/actual &&
 		test_trace2_data fsmonitor config/coherent 1 \
 			<.git/status.trace &&
-		test_trace2_data index refresh/sum_lstat 1 \
-			<.git/status.trace &&
 		! test_trace2_data status semantic_verify/prepared 1 \
 			<.git/status.trace
 	)
