@@ -26,6 +26,7 @@ struct fsmonitor_query_result {
 	enum fsmonitor_query_outcome outcome;
 	struct strbuf token;
 	struct strbuf paths;
+	unsigned int legacy_worktree_authenticated : 1;
 };
 
 #define FSMONITOR_QUERY_RESULT_INIT { \

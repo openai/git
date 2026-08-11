@@ -1059,11 +1059,12 @@ static int wt_status_begin_attr_snapshot(struct wt_status *s)
 	}
 	if (s->attr_source_snapshot)
 		git_attr_source_snapshot_begin(s->attr_source_snapshot);
-	if ((ret > 0 &&
-	     (!hook_provider ||
-	      (ret & CLEAN_STATUS_ATTR_CONTENT_CHANGED))) ||
-	    (clean_status_fsmonitor_strong_mismatch(s->repo->index) &&
-	     !hook_provider)) {
+	if (!s->repo->index->fsmonitor_legacy_untracked_fallback &&
+	    ((ret > 0 &&
+	      (!hook_provider ||
+	       (ret & CLEAN_STATUS_ATTR_CONTENT_CHANGED))) ||
+	     (clean_status_fsmonitor_strong_mismatch(s->repo->index) &&
+	      !hook_provider))) {
 		/*
 		 * Hook providers have no closing query with which to adopt
 		 * missing semantic history, so absence alone must preserve
@@ -1371,6 +1372,7 @@ static int wt_status_can_use_bulk_provider(
 	struct wt_status *s, unsigned int refresh_flags)
 {
 	return !s->show_ignored_mode && !s->pathspec.nr &&
+		!s->repo->index->fsmonitor_legacy_untracked_fallback &&
 		!clean_status_filter_scope_needs_validation(s->repo->index) &&
 		(refresh_flags & REFRESH_DEFER_BULK_DIRTY) &&
 		preload_index_bulk_can_close_provider(s->repo->index);
@@ -1385,6 +1387,7 @@ static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
 	int ret;
 
 	if (!fstat_is_reliable() || istate->split_index ||
+	    istate->fsmonitor_legacy_untracked_fallback ||
 	    s->show_ignored_mode ||
 	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC ||
 	    istate->sparse_index != INDEX_EXPANDED ||
@@ -1582,20 +1585,23 @@ static int wt_status_close_ordinary_fsmonitor_token(
 	struct index_state *istate = s->repo->index;
 	struct clean_status_proof_epoch *scan_epoch = NULL;
 	int reliable_stat = fstat_is_reliable();
+	int validate_epoch = reliable_stat &&
+		!istate->fsmonitor_legacy_untracked_fallback;
 
 	/*
 	 * A pending token must close a refresh begun after its epoch was
 	 * captured. A refresh performed before entering token closure cannot
 	 * be validated by capturing its inputs afterward.
 	 */
-	if (reliable_stat) {
+	if (validate_epoch) {
 		wt_status_refresh_for_token(
 			s, closure->refresh_flags, &scan_epoch,
 			closure->use_bulk_provider,
 			&closure->refresh_result);
 		if (!scan_epoch)
 			return 0;
-	} else if (!refreshed_before_closure) {
+	} else if (!refreshed_before_closure ||
+		   istate->fsmonitor_legacy_untracked_fallback) {
 		closure->refresh_result |= refresh_index(
 			istate, closure->refresh_flags, &s->pathspec,
 			NULL, NULL);
@@ -1616,7 +1622,7 @@ static int wt_status_close_ordinary_fsmonitor_token(
 	while (closure->queries < FSMONITOR_TOKEN_MAX_QUERIES) {
 		enum fsmonitor_token_result result;
 
-		if (reliable_stat &&
+		if (validate_epoch &&
 		    !clean_status_proof_epoch_start_token_matches(
 			    istate, scan_epoch))
 			break;
@@ -1625,7 +1631,7 @@ static int wt_status_close_ordinary_fsmonitor_token(
 			istate,
 			wt_status_untracked_cache_valid(closure));
 		if (result == FSMONITOR_TOKEN_CLEAN) {
-			if (reliable_stat &&
+			if (validate_epoch &&
 			    !clean_status_proof_epoch_matches(
 				    istate, scan_epoch)) {
 				wt_status_reset_attr_snapshot_if_changed(s);
@@ -1635,7 +1641,7 @@ static int wt_status_close_ordinary_fsmonitor_token(
 			    !closure->require_untracked) {
 				if (preload_index_bulk_result_accept(istate) < 0)
 					break;
-				if (reliable_stat)
+				if (validate_epoch)
 					clean_status_mark_fsmonitor_config_valid(
 						istate,
 						istate->fsmonitor_last_update_pending);
@@ -1661,7 +1667,7 @@ static int wt_status_close_ordinary_fsmonitor_token(
 		wt_status_reset_attr_snapshot_if_changed(s);
 		if (wt_status_refresh_invalidated_manifest(s))
 			break;
-		if (reliable_stat) {
+		if (validate_epoch) {
 			wt_status_refresh_for_token(
 				s, closure->refresh_flags, &scan_epoch,
 				closure->use_bulk_provider,
@@ -1878,9 +1884,14 @@ static int wt_status_close_fsmonitor_token(
 	closure.use_bulk_provider =
 		wt_status_can_use_bulk_provider(s, refresh_flags);
 	closure.untracked_ready = !istate->untracked ||
-		!istate->untracked->root;
+		!istate->untracked->root ||
+		(istate->fsmonitor_legacy_untracked_adopted &&
+		 istate->fsmonitor_untracked_valid &&
+		 istate->untracked->root->valid_recursive);
 	closure.untracked_proof_complete =
-		!require_untracked || !istate->untracked;
+		!require_untracked || !istate->untracked ||
+		(istate->fsmonitor_legacy_untracked_adopted &&
+		 closure.untracked_ready);
 	if (require_untracked && !closure.can_prime &&
 	    !closure.untracked_ready)
 		BUG("cannot close required untracked scan");
