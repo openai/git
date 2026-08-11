@@ -5931,7 +5931,9 @@ has_qualifying_current_review () {
 	repository=$4
 	pull_number=$5
 	candidates=$6
-	awk -F '\t' -v author="$author" -v head="$head" '
+	require_exact_head=${7:-true}
+	awk -F '\t' -v author="$author" -v head="$head" \
+		-v exact="$require_exact_head" '
 		NF == 4 && $2 ~ /^(APPROVED|CHANGES_REQUESTED|DISMISSED)$/ {
 			state[$1] = $2
 			commit[$1] = $3
@@ -5941,7 +5943,7 @@ has_qualifying_current_review () {
 			for (reviewer in state)
 				if (reviewer != author &&
 					state[reviewer] == "APPROVED" &&
-					commit[reviewer] == head)
+					(exact == "false" || commit[reviewer] == head))
 					print reviewer "\t" association[reviewer]
 		}
 	' "$reviews" >"$candidates" || return 1
@@ -5963,9 +5965,10 @@ has_qualifying_current_review () {
 			[(.author.login // "-"), .state,
 			(.commit.oid // "-")] | @tsv' \
 		>"$candidates-writers" 2>/dev/null || return 1
-	awk -F '\t' -v author="$author" -v head="$head" '
+	awk -F '\t' -v author="$author" -v head="$head" \
+		-v exact="$require_exact_head" '
 		NF == 3 && $1 != author && $2 == "APPROVED" &&
-			$3 == head { approved++ }
+			(exact == "false" || $3 == head) { approved++ }
 		END { exit !approved }
 	' "$candidates-writers"
 }
@@ -6039,8 +6042,8 @@ validate_topic_review () {
 		die "could not inspect reviews for topic pull request #$pull_number"
 	has_qualifying_current_review "$tmp_dir/topic-reviews" "$author" \
 		"$source_tip" "$repository" "$pull_number" \
-		"$tmp_dir/topic-review-candidates" ||
-		die "topic pull request #$pull_number has no current approval for $source_tip"
+		"$tmp_dir/topic-review-candidates" false ||
+		die "topic pull request #$pull_number has no qualifying approval"
 	say "validated reviewed topic pull request #$pull_number at $source_tip"
 }
 
@@ -9579,6 +9582,101 @@ stage_and_wait_for_ci () {
 	fi
 }
 
+close_published_topic_review () (
+	controller=$1
+	updates=$2
+	plan_commit=$3
+	seen=$4
+	review=$(plan_trailer_optional "$plan_commit" Codex-Plan-Review \
+		"Codex-Plan-Review") || return 1
+	test -n "$review" || return 0
+	case "$review" in
+	*[!0-9]*) return 1 ;;
+	esac
+	action=$(plan_trailer_one "$plan_commit" Codex-Plan-Action \
+		"Codex-Plan-Action") || return 1
+	case "$action" in
+	add|alter) ;;
+	*) return 0 ;;
+	esac
+	lane=$(plan_trailer_one "$plan_commit" Codex-Plan-Lane \
+		"Codex-Plan-Lane") || return 1
+	case "$lane" in
+	codex|codex-unstable) ;;
+	*) return 1 ;;
+	esac
+	topic=$(plan_trailer_one "$plan_commit" Codex-Plan-Topic \
+		"Codex-Plan-Topic") || return 1
+	topic=${topic#refs/heads/}
+	source_tip=$(plan_trailer_one "$plan_commit" Codex-Plan-Source-Tip \
+		"Codex-Plan-Source-Tip") || return 1
+	published_meta=$(awk -F '\t' \
+		'$1 == "refs/heads/meta" { print $3 }' "$updates") || return 1
+	published_output=$(awk -F '\t' -v ref="refs/heads/$lane" \
+		'$1 == ref { print $3 }' "$updates") || return 1
+	test -n "$published_meta" && test -n "$published_output" || return 1
+	make_tmp_dir
+	review_state=$tmp_dir/published-topic-review
+	mkdir -p "$review_state" || return 1
+	git show "$published_meta:$lane.plan" >"$review_state/plan" || return 1
+	git show "$published_meta:$meta_config_path" \
+		>"$review_state/config" || return 1
+	planned_tip=$(git config --no-includes --file "$review_state/plan" \
+		--get "branch.$topic.source-tip" || :)
+	test "$planned_tip" = "$source_tip" || return 0
+	ledger_tip=$(git config --no-includes --file "$review_state/config" \
+		--get "branch.$topic.source-tip" || :)
+	ledger_output=$(git config --no-includes --file "$review_state/config" \
+		--get "$lane.output-tip" || :)
+	generated_tip=$(git config --no-includes --file "$review_state/config" \
+		--get "branch.$topic.codex-tip" || :)
+	test "$ledger_tip" = "$source_tip" &&
+		test "$ledger_output" = "$published_output" &&
+		test -n "$generated_tip" || return 1
+	git merge-base --is-ancestor "$generated_tip" \
+		"$published_output" || return 1
+	test "$(remote_head_oid origin refs/heads/meta)" = \
+		"$published_meta" || return 1
+	test "$(remote_head_oid origin "refs/heads/$lane")" = \
+		"$published_output" || return 1
+	test "$(remote_head_oid origin "refs/heads/$topic")" = \
+		"$source_tip" || return 0
+	if grep -F -x "$review" "$seen" >/dev/null
+	then
+		return 0
+	fi
+	printf '%s\n' "$review" >>"$seen" || return 1
+	gh api --hostname github.com "repos/openai/git/pulls/$review" \
+		--jq '[.state, (.draft | tostring), .base.ref,
+			(.head.repo.full_name // "-"), .head.ref, .head.sha] | @tsv' \
+		>"$review_state/pull-request" || return 1
+	IFS="$tab" read -r pull_state draft base head_repository \
+		head_ref head_sha <"$review_state/pull-request" || return 1
+	test "$pull_state" != closed || return 0
+	test "$pull_state" = open && test "$draft" = false &&
+		test "$base" = "$lane" && test "$head_repository" = openai/git &&
+		test "$head_ref" = "$topic" && test "$head_sha" = "$source_tip" ||
+		return 0
+	gh pr close "$review" --repo github.com/openai/git || return 1
+	say "Closed reviewed topic pull request #$review after publishing $lane."
+)
+
+close_published_topic_reviews () (
+	controller=$1
+	updates=$2
+	make_tmp_dir
+	review_history=$tmp_dir/published-topic-review-history
+	reviewed=$tmp_dir/published-topic-review-seen
+	: >"$reviewed" || return 1
+	git rev-list --first-parent --max-count=64 "$controller" -- \
+		codex.plan codex-unstable.plan >"$review_history" || return 1
+	while IFS= read -r plan_commit
+	do
+		close_published_topic_review "$controller" "$updates" \
+			"$plan_commit" "$reviewed" || return 1
+	done <"$review_history"
+)
+
 rebuild_codex_locally () {
 	prepare_local_candidate
 	verify_local_candidate "$local_candidate_dir"
@@ -9593,6 +9691,11 @@ rebuild_codex_locally () {
 		--updates "$local_candidate_dir/codex-updates" \
 		--require-automation
 	say "Published codex candidate $candidate from local preparation session $session."
+	if ! close_published_topic_reviews "$controller_oid" \
+		"$local_candidate_dir/codex-updates"
+	then
+		say "warning: publication succeeded, but its reviewed topic pull request could not be closed."
+	fi
 	say "Generated commits identify $bot_name <$bot_email>; the push uses your configured origin credentials."
 }
 
@@ -9712,6 +9815,11 @@ publish_run () {
 		--inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" --require-automation
 	say "Published codex candidate $artifact_candidate from Actions run $run_id."
+	if ! close_published_topic_reviews "$run_controller" \
+		"$metadata/codex-updates"
+	then
+		say "warning: publication succeeded, but its reviewed topic pull request could not be closed."
+	fi
 	say "Generated commits identify $bot_name <$bot_email>; the push uses your configured origin credentials."
 }
 
