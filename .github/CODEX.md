@@ -12,11 +12,11 @@ two ordered desired-state files:
 - `codex.plan` for production;
 - `codex-unstable.plan` for preview.
 
-Each plan row names a topic ref, its exact reviewed source SHA, the source
+Each plan row names a topic ref, its exact admitted source SHA, the source
 boundary used to replay it, and one prerequisite. The controller retains each
-reviewed source object at `refs/heads/codex-pins/<sha>`. A mutable topic ref
+admitted source object at `refs/heads/codex-pins/<sha>`. A mutable topic ref
 may advance later; that does not change a published generation until another
-reviewed plan transition pins the new head.
+approved plan transition pins the new head.
 
 `codex.config` is the realized ledger. Version 3 records the plan blob,
 source pins, generated topic tips, and lane output tips produced by the last
@@ -31,31 +31,41 @@ active topics belong in `codex`.
 
 | Change | Human review | Bot action | Plan effect |
 | --- | --- | --- | --- |
-| Add | Review the topic PR against its lane | Pin the approved head and open a plan PR | Append one topic with its uniquely inferred prerequisite |
-| Alter | Review the updated topic PR against its lane | Pin the approved head and open a plan PR | Replace only that topic's source SHA and source boundary |
+| Add | Review the topic PR against its lane | Pin its current head and open a plan PR | Append one topic with its uniquely inferred prerequisite |
+| Alter | Keep the topic PR approved against its lane | Pin its current head and open a plan PR | Replace only that topic's source SHA and source boundary |
 | Remove | Review the generated plan PR | Open a plan PR from the explicit workflow dispatch | Delete one plan row |
 | Reorder | Review the generated plan PR | Open a plan PR from the explicit workflow dispatch | Move one existing row; keep its SHA, boundary, and prerequisite |
 
 An add or alter has one human decision: the topic PR. The pull request is
 review-only because the output-lane rulesets reject ordinary updates. When an
 approval is submitted, a scheduled scanner on the trusted default branch
-notices the exact approved head and runs the plan producer. Operators can
-dispatch the same scan immediately when waiting five minutes is undesirable.
-That trusted run:
+notices the approved topic and freezes its current head before running the
+plan producer. Operators can dispatch the same scan immediately when waiting
+five minutes is undesirable. That trusted run:
 
 1. rechecks that the PR is open, same-repository, non-draft, aimed at the
    matching lane, and overall `APPROVED`;
-2. requires an effective approval at the exact current head SHA;
+2. requires an effective approval from a different repository writer;
 3. asks the dedicated plan App to create immutable pins and a
    `codex-plan/*` branch;
 4. opens a one-row plan PR against `meta`; and
 5. runs the trusted admission check, which rechecks the topic approval and
    gives the mechanical plan approval.
 
-The plan PR auto-merges with rebase after its required check passes. If the
-topic head changes before that happens, the exact-head check fails. A new
-approval produces a new pin and a new plan transition. Once the plan merges,
-the immutable pin remains authoritative even if the source branch moves.
+An approval remains effective across later topic updates unless it is
+dismissed or the reviewer supersedes it with a request for changes. The plan PR
+auto-merges with rebase after its required check passes. If the topic head
+changes before that happens, the pinned-head check fails; the next scan can
+reuse the effective approval and create a new pin and plan transition. Once
+the plan merges, the immutable pin remains authoritative even if the source
+branch moves.
+
+After publication, the publisher closes a review-only topic PR only when its
+head still matches both the approved plan and the published source pin. A
+rebased topic may not appear verbatim in the generated lane, so GitHub shows
+that PR as closed rather than merged. Staging alone never closes a PR, and a
+closure failure cannot undo an otherwise successful publication. A later
+change to the same topic needs another topic PR.
 
 Remove and reorder are policy decisions rather than projections of a reviewed
 topic head. Run **Actions > Refresh codex > Run workflow** with
@@ -100,7 +110,7 @@ For a local diagnostic of the same projection:
 Meta/codex propose-plan --remote origin \
   --lane codex-unstable \
   --topic tb/codex/my-topic-unstable \
-  --source-tip <full-approved-sha> \
+  --source-tip <full-current-sha> \
   --review-pr <topic-pr-number> \
   --action auto --no-push
 ```
@@ -143,8 +153,8 @@ only when the two changed-path sets are disjoint. A linear dependent topic
 can extend that graph when its reviewed boundary is the exact pinned source
 tip of a prerequisite already rooted in the graph. An overlapping base move,
 an unrelated boundary, or another merge-shaped source with a different
-reviewed root fails closed; restack and obtain a new exact-head review instead
-of flattening or guessing.
+reviewed root fails closed; restack the approved topic and pin its new head
+instead of flattening or guessing.
 
 ## Required automation topic
 
@@ -153,7 +163,7 @@ on `master` and change only `.github/workflows/codex.yml`. Its canonical
 default-branch trampoline:
 
 - dispatches ordinary refresh;
-- scans exact approved topic PRs from the trusted default branch and creates
+- scans approved topic PRs from the trusted default branch and creates
   one automatic add/alter proposal at a time;
 - offers explicit remove/reorder dispatch inputs; and
 - runs plan admission through `pull_request_target` while loading the

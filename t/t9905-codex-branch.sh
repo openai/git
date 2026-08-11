@@ -1549,7 +1549,7 @@ test_expect_success 'generated lanes are output-only and meta gates review in th
 	" "$codex_root/.github/rulesets/codex-meta.json"
 '
 
-test_expect_success 'plan admission checks exact reviewed heads from trusted meta' '
+test_expect_success 'plan admission checks pinned topic heads from trusted meta' '
 	test_path_is_file "$codex_plan_admission_workflow" &&
 	test_grep "name: Codex plan admission" \
 		"$codex_plan_admission_workflow" &&
@@ -9541,7 +9541,7 @@ test_expect_success 'explicit reorder and remove stay plan-only policy changes' 
 	)
 '
 
-test_expect_success 'topic review requires the exact approved head' '
+test_expect_success 'topic approval survives updates to its pinned head' '
 	mkdir topic-review-bin &&
 	cat >topic-review-bin/gh <<-\EOF &&
 	#!/bin/sh
@@ -9557,6 +9557,12 @@ test_expect_success 'topic review requires the exact approved head' '
 	*"pulls/42/reviews?"*)
 		printf "%s\t%s\t%s\t%s\n" reviewer APPROVED \
 			"$FAKE_REVIEW_HEAD" "${FAKE_ASSOCIATION:-MEMBER}"
+		if test -n "${FAKE_LATEST_REVIEW_STATE:-}"
+		then
+			printf "%s\t%s\t%s\t%s\n" reviewer \
+				"$FAKE_LATEST_REVIEW_STATE" "$FAKE_REVIEW_HEAD" \
+				"${FAKE_ASSOCIATION:-MEMBER}"
+		fi
 		exit 0
 		;;
 	*"pulls/42 "*)
@@ -9578,8 +9584,6 @@ test_expect_success 'topic review requires the exact approved head' '
 	source=$(git rev-parse HEAD) &&
 	test_commit review-moved &&
 	moved=$(git rev-parse HEAD) &&
-	test_commit review-old &&
-	old=$(git rev-parse HEAD) &&
 	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
 		FAKE_HEAD="$moved" FAKE_REVIEW_HEAD="$source" \
 		FAKE_DECISION=APPROVED sh "$codex_branch" \
@@ -9594,22 +9598,33 @@ test_expect_success 'topic review requires the exact approved head' '
 			--topic aa/codex/reviewed --source-tip "$source" \
 		>decision.out 2>decision.err &&
 	test_grep "is not approved" decision.err &&
-	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
-		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$old" \
+	env PATH="$PWD/topic-review-bin:$PATH" \
+		FAKE_HEAD="$moved" FAKE_REVIEW_HEAD="$source" \
 		FAKE_DECISION=APPROVED sh "$codex_branch" \
 		validate-topic-review --pull-request 42 --lane codex \
-			--topic aa/codex/reviewed --source-tip "$source" \
-		>stale.out 2>stale.err &&
-	test_grep "has no current approval for $source" stale.err &&
+			--topic aa/codex/reviewed --source-tip "$moved" \
+		>updated.out &&
+	test_grep "validated reviewed topic" updated.out &&
 	env PATH="$PWD/topic-review-bin:$PATH" \
-		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$source" \
+		FAKE_HEAD="$moved" FAKE_REVIEW_HEAD="$source" \
 		FAKE_ASSOCIATION=NONE FAKE_WRITER=yes \
 		FAKE_WRITER_HEAD="$source" \
 		FAKE_DECISION=APPROVED sh "$codex_branch" \
 		validate-topic-review --pull-request 42 --lane codex \
-			--topic aa/codex/reviewed --source-tip "$source" \
+			--topic aa/codex/reviewed --source-tip "$moved" \
 		>writer.out &&
 	test_grep "validated reviewed topic" writer.out &&
+	for state in CHANGES_REQUESTED DISMISSED
+	do
+		test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
+			FAKE_HEAD="$moved" FAKE_REVIEW_HEAD="$source" \
+			FAKE_LATEST_REVIEW_STATE="$state" FAKE_WRITER=no \
+			FAKE_DECISION=APPROVED sh "$codex_branch" \
+			validate-topic-review --pull-request 42 --lane codex \
+				--topic aa/codex/reviewed --source-tip "$moved" \
+			>"$state.out" 2>"$state.err" || return 1
+		test_grep "has no qualifying approval" "$state.err" || return 1
+	done &&
 	test_expect_code 1 env PATH="$PWD/topic-review-bin:$PATH" \
 		FAKE_HEAD="$source" FAKE_REVIEW_HEAD="$source" \
 		FAKE_ASSOCIATION=NONE FAKE_WRITER=no \
@@ -9617,7 +9632,116 @@ test_expect_success 'topic review requires the exact approved head' '
 		validate-topic-review --pull-request 42 --lane codex \
 			--topic aa/codex/reviewed --source-tip "$source" \
 		>nonwriter.out 2>nonwriter.err &&
-	test_grep "has no current approval for $source" nonwriter.err
+	test_grep "has no qualifying approval" nonwriter.err
+'
+
+test_expect_success 'publication closes only its exact integrated topic review' '
+	git init --bare published-review.git &&
+	test_create_repo published-review-source &&
+	(
+		cd published-review-source &&
+		git remote add origin ../published-review.git &&
+		test_commit published-review-base &&
+		base=$(git rev-parse HEAD) &&
+		git branch codex &&
+		git switch -c aa/codex/reviewed-unstable &&
+		test_commit published-review-topic &&
+		source=$(git rev-parse HEAD) &&
+		git switch -c codex-unstable "$base" &&
+		test_commit published-review-generated &&
+		generated=$(git rev-parse HEAD) &&
+		git switch -c meta "$base" &&
+		git config --file codex.config codex-unstable.output-tip "$base" &&
+		git config --file codex.config \
+			branch.aa/codex/reviewed-unstable.source-tip "$base" &&
+		git config --file codex.config \
+			branch.aa/codex/reviewed-unstable.codex-tip "$base" &&
+		git add codex.config &&
+		git commit -m "previous published preview" &&
+		printf "%s\t%s\t%s\t%s\n" aa/codex/reviewed-unstable \
+			"$source" "$generated" codex >rows &&
+		write_pinned_plan codex-unstable codex rows \
+			codex-unstable.plan &&
+		git add codex-unstable.plan &&
+		{
+			printf "Codex plan: alter reviewed preview\n\n" &&
+			printf "Codex-Plan-Lane: codex-unstable\n" &&
+			printf "Codex-Plan-Action: alter\n" &&
+			printf "Codex-Plan-Topic: aa/codex/reviewed-unstable\n" &&
+			printf "Codex-Plan-Source-Tip: %s\n" "$source" &&
+			printf "Codex-Plan-Review: 42\n"
+		} >message &&
+		git commit -F message &&
+		write policy controller-policy &&
+		git add controller-policy &&
+		git commit -m "unrelated controller update" &&
+		controller=$(git rev-parse HEAD) &&
+		git config --file codex.config \
+			codex-unstable.output-tip "$generated" &&
+		git config --file codex.config \
+			branch.aa/codex/reviewed-unstable.source-tip "$source" &&
+		git config --file codex.config \
+			branch.aa/codex/reviewed-unstable.codex-tip "$generated" &&
+		git add codex.config &&
+		git commit -m "record published preview" &&
+		published_meta=$(git rev-parse HEAD) &&
+		git push origin meta codex codex-unstable \
+			aa/codex/reviewed-unstable &&
+		{
+			printf "refs/heads/meta\t%s\t%s\n" \
+				"$controller" "$published_meta" &&
+			printf "refs/heads/codex\t%s\t%s\n" "$base" "$base" &&
+			printf "refs/heads/codex-unstable\t%s\t%s\n" \
+				"$base" "$generated"
+		} >updates &&
+		mkdir close-bin &&
+		cat >close-bin/gh <<-\EOF &&
+		#!/bin/sh
+		if test "$1" = pr && test "$2" = close
+		then
+			printf "%s\n" "$*" >>"$FAKE_CLOSE_LOG"
+			test "${FAKE_CLOSE_MODE:-}" != failure || exit 93
+			printf "%s\n" closed >"$FAKE_CLOSE_STATE"
+			exit 0
+		fi
+		test "$1" = api && test "$2" = --hostname &&
+			test "$3" = github.com &&
+			test "$4" = repos/openai/git/pulls/42 || exit 92
+		state=$(cat "$FAKE_CLOSE_STATE" 2>/dev/null || printf open)
+		head=$FAKE_HEAD
+		test "${FAKE_CLOSE_MODE:-}" != moved || head=$FAKE_OTHER
+		printf "%s\tfalse\tcodex-unstable\topenai/git\taa/codex/reviewed-unstable\t%s\n" \
+			"$state" "$head"
+		EOF
+		chmod +x close-bin/gh &&
+		cat >close-review <<-\EOF &&
+		#!/bin/sh
+		set -- --help
+		. "$CODEX_BRANCH" >/dev/null
+		close_published_topic_reviews "$FAKE_CONTROLLER" "$FAKE_UPDATES"
+		EOF
+		close_review () {
+			env PATH="$PWD/close-bin:$PATH" CODEX_BRANCH="$codex_branch" \
+				FAKE_CONTROLLER="$controller" FAKE_UPDATES="$PWD/updates" \
+				FAKE_HEAD="$source" FAKE_OTHER="$base" \
+				FAKE_CLOSE_LOG="$PWD/closed" \
+				FAKE_CLOSE_STATE="$PWD/close-state" \
+				FAKE_CLOSE_MODE="${1:-}" sh close-review
+		} &&
+		: >closed &&
+		close_review moved &&
+		test_must_be_empty closed &&
+		close_review >close.out &&
+		test_grep "Closed reviewed topic pull request #42" close.out &&
+		test_grep "pr close 42 --repo github.com/openai/git" closed &&
+		close_review &&
+		test_line_count = 1 closed &&
+		rm -f close-state &&
+		test_expect_code 1 close_review failure &&
+		test_line_count = 2 closed &&
+		test "$source" = "$(git --git-dir=../published-review.git \
+			rev-parse refs/heads/aa/codex/reviewed-unstable)"
+	)
 '
 
 test_expect_success 'checked-in release recovery manifest is the bound incident' '
