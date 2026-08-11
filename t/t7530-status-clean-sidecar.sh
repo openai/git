@@ -296,6 +296,40 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'exact dirty status avoids a sparse full-worktree bulk scan' '
+	test_when_finished "stop_daemon external-sparse-exact" &&
+	setup_repo external-sparse-exact &&
+	for i in $(test_seq 1 31)
+	do
+		test_write_lines "$i" >external-sparse-exact/clean-$i ||
+			return 1
+	done &&
+	git -C external-sparse-exact add . &&
+	git -C external-sparse-exact commit -m clean-files &&
+	test-tool chmtime -120 external-sparse-exact/tracked \
+		external-sparse-exact/clean-* &&
+	git -C external-sparse-exact update-index --refresh &&
+	git -C external-sparse-exact config core.untrackedCache true &&
+	prime_semantic_history external-sparse-exact &&
+	test_write_lines changed >external-sparse-exact/tracked &&
+	test-tool chmtime -60 external-sparse-exact/tracked &&
+	bulk_status -C external-sparse-exact status --porcelain=2 \
+		>external-sparse-exact.primed &&
+	bulk_status -C external-sparse-exact status --porcelain=v2 \
+		-z --branch --show-stash --no-ahead-behind \
+		--untracked-files=normal --ignore-submodules=all \
+		>external-sparse-exact.daemon &&
+	test_env GIT_TRACE2_EVENT="$PWD/external-sparse-exact.trace" \
+		bulk_status -C external-sparse-exact status --porcelain=v2 \
+		>actual &&
+	test_grep "^1 \.M .* tracked$" actual &&
+	test_trace2_data index preload/bulk_sparse_skip 1 \
+		<external-sparse-exact.trace &&
+	test_grep ! "\"category\":\"index\",\"label\":\"preload/bulk\"" \
+		external-sparse-exact.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'normal status persists bootstrap stat repairs' '
 	test_when_finished "stop_daemon external-stat-bootstrap" &&
 	setup_repo external-stat-bootstrap &&
