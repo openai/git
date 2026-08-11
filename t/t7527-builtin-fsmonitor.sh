@@ -1567,6 +1567,7 @@ test_expect_success 'bound daemon also serves legacy token queries' '
 	test_create_repo legacy-client-query &&
 	(
 		cd legacy-client-query &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
 		test_commit base tracked &&
 		git config core.preloadIndex false &&
 		git config core.untrackedCache true &&
