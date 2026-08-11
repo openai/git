@@ -5,6 +5,7 @@
 #include "clean-status.h"
 #include "convert.h"
 #include "fsmonitor.h"
+#include "gettext.h"
 #include "object.h"
 #include "read-cache-ll.h"
 #include "repository.h"
@@ -80,6 +81,7 @@ int semantic_verify_prepare(struct index_state *istate,
 {
 	struct semantic_verify_proof *proof;
 	struct semantic_verify_worker *workers;
+	struct clean_status_progress *progress;
 	unsigned int nr_threads;
 	size_t updates_nr = 0;
 	int create_threads = 1;
@@ -179,6 +181,8 @@ int semantic_verify_prepare(struct index_state *istate,
 			   "threads", nr_threads);
 	trace2_data_intmax("semantic_verify", istate->repo,
 			   "result-bytes", sizeof(struct semantic_verify_result));
+	progress = clean_status_start_progress(
+		istate->repo, _("Verifying tracked files"), proof->cache_nr);
 
 	for (unsigned int i = 0; i < nr_threads; i++) {
 		struct semantic_verify_worker *worker = &workers[i];
@@ -187,6 +191,7 @@ int semantic_verify_prepare(struct index_state *istate,
 		worker->istate = istate;
 		worker->root = proof->root;
 		worker->results = proof->results;
+		worker->progress = progress;
 		worker->start = st_mult(proof->cache_nr, i) / nr_threads;
 		worker->end = st_mult(proof->cache_nr, i + 1) / nr_threads;
 		worker->validate_filter_scope = proof->filter_scope_checked;
@@ -214,6 +219,7 @@ int semantic_verify_prepare(struct index_state *istate,
 			die("could not join semantic verifier thread: %s",
 			    strerror(err));
 	}
+	clean_status_stop_progress(&progress);
 
 	for (unsigned int i = 0; i < nr_threads; i++)
 		updates_nr += workers[i].updates_nr;
