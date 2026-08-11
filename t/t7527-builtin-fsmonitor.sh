@@ -2307,7 +2307,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 			git status --porcelain=v2 -- scoped >.git/first &&
 		test_grep "^? scoped/new$" .git/first &&
-		! test_grep "tracked\|outside-new" .git/first &&
+		test_grep ! "tracked\|outside-new" .git/first &&
 		test_path_is_missing .git/index.csts &&
 		cp .git/index .git/before &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
@@ -2323,6 +2323,118 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 			git status --porcelain=v2 >.git/root &&
 		test_grep "^1 \.M .* tracked$" .git/root
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked-directory pathspec reads a closed untracked-cache subtree' '
+	test_when_finished "rm -rf pathspec-cached-subtree" &&
+	test_create_repo pathspec-cached-subtree &&
+	(
+		cd pathspec-cached-subtree &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		mkdir scoped &&
+		test_commit selected scoped/tracked &&
+		test-tool chmtime -120 tracked scoped/tracked &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test_write_lines selected >scoped/new &&
+		test_write_lines outside >outside-new &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/root &&
+		test_grep "^? scoped/new$" .git/root &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/root-repeat &&
+		cp .git/index .git/before &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/scoped.trace" \
+			git status --porcelain=v2 -- scoped >.git/scoped &&
+		test_grep "^? scoped/new$" .git/scoped &&
+		test_grep ! "outside-new" .git/scoped &&
+		test_cmp .git/before .git/index &&
+		test_trace2_data status untracked/pathspec-cache 1 \
+			<.git/scoped.trace &&
+		test_grep ! "\"label\":\"read_directory\"" \
+			.git/scoped.trace &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/nested.trace" \
+			git -C scoped status --porcelain=v2 -- . >.git/nested &&
+		test_grep "^? new$" .git/nested &&
+		test_trace2_data status untracked/pathspec-cache 1 \
+			<.git/nested.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked-directory pathspec repairs changed untracked children' '
+	test_when_finished "rm -rf pathspec-repaired-subtree" &&
+	test_create_repo pathspec-repaired-subtree &&
+	(
+		cd pathspec-repaired-subtree &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		mkdir scoped outside &&
+		test_commit selected scoped/tracked &&
+		test_commit unrelated outside/tracked &&
+		test_write_lines "*.ignored" >.gitignore &&
+		test_write_lines "ignored-dir/" >scoped/.gitignore &&
+		git add .gitignore scoped/.gitignore &&
+		git commit -qm "add tracked ignore files" &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		test_write_lines created >scoped/new &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=scoped/new \
+		GIT_TRACE2_EVENT_NESTING=5 \
+		GIT_TRACE2_EVENT="$PWD/.git/created.trace" \
+			git status --porcelain=v2 -- scoped >.git/created &&
+		test_grep "^? scoped/new$" .git/created &&
+		test_trace2_data status untracked/pathspec-refreshed 1 \
+			<.git/created.trace &&
+		test_trace2_data fsmonitor untracked/targeted-refresh 1 \
+			<.git/created.trace &&
+		test_trace2_data read_directory paths-visited 1 \
+			<.git/created.trace &&
+		test_trace2_data read_directory opendir 0 \
+			<.git/created.trace &&
+		test_grep ! "\"label\":\"read_directory\"" \
+			.git/created.trace &&
+
+		rm scoped/new &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=scoped/new \
+		GIT_TRACE2_EVENT_NESTING=5 \
+		GIT_TRACE2_EVENT="$PWD/.git/removed.trace" \
+			git status --porcelain=v2 -- scoped >.git/removed &&
+		test_must_be_empty .git/removed &&
+		test_trace2_data status untracked/pathspec-refreshed 1 \
+			<.git/removed.trace &&
+		test_trace2_data fsmonitor untracked/targeted-refresh 1 \
+			<.git/removed.trace &&
+		test_trace2_data read_directory paths-visited 1 \
+			<.git/removed.trace &&
+		test_trace2_data read_directory opendir 0 \
+			<.git/removed.trace &&
+		test_grep ! "\"label\":\"read_directory\"" \
+			.git/removed.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT_NESTING=5 \
+		GIT_TRACE2_EVENT="$PWD/.git/root-after-remove.trace" \
+			git status --porcelain=v2 >.git/root-after-remove &&
+		test_must_be_empty .git/root-after-remove &&
+		test_grep ! "\"key\":\"gitignore-invalidation\",\"value\":\"[1-9]" \
+			.git/root-after-remove.trace
 	)
 '
 
