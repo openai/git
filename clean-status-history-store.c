@@ -475,6 +475,10 @@ int clean_status_history_store_install(
 	int current_is_regular, encoded_matches = 0;
 	int checkpoint_fd = -1, ret = -1;
 
+#ifdef GIT_WINDOWS_NATIVE
+	/* Preserve the unsupported Windows path's original fail-closed behavior. */
+	goto done;
+#endif
 	if (!snapshot || snapshot->fd < 0 ||
 	    !clean_status_index_snapshot_still_matches_path(
 		    snapshot, index_path, algo))
