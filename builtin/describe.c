@@ -2,6 +2,8 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -598,11 +600,19 @@ static int option_parse_exact_match(const struct option *opt, const char *arg,
 	return 0;
 }
 
+static int describe_config(const char *key, const char *value,
+			   const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
 int cmd_describe(int argc,
 		 const char **argv,
 		 const char *prefix,
 		 struct repository *repo UNUSED )
 {
+	struct clean_status_config_digest clean_digest;
 	struct refs_for_each_ref_options for_each_ref_opts = {
 		.flags = REFS_FOR_EACH_INCLUDE_BROKEN,
 	};
@@ -647,7 +657,11 @@ int cmd_describe(int argc,
 		OPT_END(),
 	};
 
-	repo_config(the_repository, git_default_config, NULL);
+	show_usage_with_options_if_asked(argc, argv, describe_usage, options);
+
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	repo_config(the_repository, describe_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
 	argc = parse_options(argc, argv, prefix, options, describe_usage, 0);
 	if (abbrev < 0)
 		abbrev = DEFAULT_ABBREV;
@@ -761,6 +775,12 @@ int cmd_describe(int argc,
 			setup_work_tree(the_repository);
 			prepare_repo_settings(the_repository);
 			the_repository->settings.command_requires_full_index = 0;
+			/*
+			 * The in-process dirty check only refreshes stat
+			 * data before comparing the worktree with HEAD.
+			 */
+			clean_status_set_config_digest(the_repository,
+						       &clean_digest);
 			repo_read_index(the_repository);
 			refresh_index(the_repository->index, REFRESH_QUIET|REFRESH_UNMERGED,
 				      NULL, NULL, NULL);

@@ -5,6 +5,15 @@
 
 struct repository;
 
+#define FSMONITOR_IPC_QUERY_VERSION "query-v1"
+#define FSMONITOR_IPC_QUERY_PREFIX FSMONITOR_IPC_QUERY_VERSION " "
+#define FSMONITOR_IPC_CAPABILITY_COMMAND "get-capabilities"
+#define FSMONITOR_IPC_WORKTREE_ID_HEX 64
+
+/* Hash the canonical worktree root and its stable filesystem identity. */
+int fsmonitor_ipc__get_worktree_identity(struct repository *r,
+					 struct strbuf *identity);
+
 /*
  * Returns true if built-in file system monitor daemon is defined
  * for this platform.
@@ -35,7 +44,8 @@ enum ipc_active_state fsmonitor_ipc__get_state(void);
  * Returns -1 on error; 0 on success.
  */
 int fsmonitor_ipc__send_query(const char *since_token,
-			      struct strbuf *answer);
+			      struct strbuf *answer,
+			      int *legacy_worktree_authenticated);
 
 /*
  * Connect to a `git-fsmonitor--daemon` process via simple-ipc and
