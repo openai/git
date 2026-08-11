@@ -189,7 +189,6 @@ void test_clean_status_history_store__keeps_namespaces_independent(void)
 	static const unsigned char second_fsmn[] = "second-fsmn";
 	static const unsigned char second_fscf[] = "second-fscf";
 
-	require_local_apfs(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
 	fixture_init(&fixture, algo);
 	memset(first.index_hash, 1, algo->rawsz);
 	first.fsmonitor = first_fsmn;
@@ -292,7 +291,6 @@ void test_clean_status_history_store__bounds_namespaces(void)
 	struct utimbuf times;
 	char namespace[32];
 
-	require_local_apfs(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
 	fixture_init(&fixture, algo);
 	checkpoint.fsmonitor = fsmn;
 	checkpoint.fsmonitor_len = sizeof(fsmn) - 1;
