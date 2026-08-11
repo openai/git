@@ -362,7 +362,7 @@ void clean_status_capture_external_history_source(
 		goto done;
 	if (!clean_status_has_persistent_fsmonitor_semantic_history(istate))
 		goto done;
-	if (clean_status_index_snapshot_pin(&snapshot, istate))
+	if (clean_status_index_snapshot_pin_proof_epoch(&snapshot, istate))
 		goto done;
 	if (!external_history_namespace(istate, proof_namespace) &&
 	    !clean_status_history_store_load(
@@ -379,7 +379,8 @@ void clean_status_capture_external_history_source(
 			   istate, state->source_logical_hash)) {
 		goto done;
 	}
-	if (!clean_status_index_snapshot_still_matches(&snapshot, istate))
+	if (!clean_status_index_snapshot_still_matches_proof_epoch(
+		    &snapshot, istate))
 		goto done;
 	state->source_logical_hash_valid = 1;
 
@@ -397,12 +398,28 @@ clean_status_prepare_external_history(struct index_state *istate)
 		CE_ENTRY_CHANGED | FSMONITOR_CHANGED | UNTRACKED_CHANGED;
 
 	if (!clean_status_external_history_enabled(istate) ||
-	    getenv(INDEX_ENVIRONMENT) || istate != istate->repo->index ||
-	    !state || !state->source_logical_hash_valid ||
-	    !current_proof_is_writable(istate) ||
-	    (istate->cache_changed & ~acceleration_changes) ||
-	    has_racy_timestamp(istate))
+	    getenv(INDEX_ENVIRONMENT) || istate != istate->repo->index)
 		return NULL;
+	if (!state || !state->source_logical_hash_valid) {
+		trace2_data_string("fsmonitor", istate->repo,
+				   "history/external-save-reject", "missing-source");
+		return NULL;
+	}
+	if (!current_proof_is_writable(istate)) {
+		trace2_data_string("fsmonitor", istate->repo,
+				   "history/external-save-reject", "unwritable-proof");
+		return NULL;
+	}
+	if (istate->cache_changed & ~acceleration_changes) {
+		trace2_data_string("fsmonitor", istate->repo,
+				   "history/external-save-reject", "logical-flags");
+		return NULL;
+	}
+	if (has_racy_timestamp(istate)) {
+		trace2_data_string("fsmonitor", istate->repo,
+				   "history/external-save-reject", "racy-index");
+		return NULL;
+	}
 	CALLOC_ARRAY(checkpoint, 1);
 	checkpoint->fsmonitor = (struct strbuf)STRBUF_INIT;
 	checkpoint->untracked_cache = (struct strbuf)STRBUF_INIT;
@@ -482,7 +499,8 @@ static int clean_status_install_external_history(
 	struct clean_status_index_snapshot snapshot = { .fd = -1 };
 	int installed = 0;
 
-	if (!checkpoint || clean_status_index_snapshot_pin(&snapshot, istate) ||
+	if (!checkpoint ||
+	    clean_status_index_snapshot_pin_proof_epoch(&snapshot, istate) ||
 	    clean_status_history_store_install(
 		    istate->repo->index_file, checkpoint->proof_namespace,
 		    &checkpoint->checkpoint, &snapshot,
@@ -572,7 +590,7 @@ int clean_status_restore_external_history(struct index_state *istate)
 	    !state->current_attr_valid || getenv(INDEX_ENVIRONMENT) ||
 	    istate != istate->repo->index ||
 	    on_index_history_is_coherent(istate) ||
-	    clean_status_index_snapshot_pin(&snapshot, istate))
+	    clean_status_index_snapshot_pin_proof_epoch(&snapshot, istate))
 		goto done;
 	if (external_history_namespace(istate, proof_namespace))
 		goto done;
@@ -652,7 +670,8 @@ have_index_hash:
 				   "history/external-token-unreplayable", 1);
 		goto done;
 	}
-	if (!clean_status_index_snapshot_still_matches(&snapshot, istate))
+	if (!clean_status_index_snapshot_still_matches_proof_epoch(
+		    &snapshot, istate))
 		goto done;
 	clean_status_invalidate_current_proof(istate);
 	clean_status_copy_fsmonitor_history(istate, &parsed);
