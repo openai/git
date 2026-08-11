@@ -1150,6 +1150,148 @@ static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
 			   index_invalidated);
 }
 
+static struct untracked_cache_dir *wt_status_find_cached_directory(
+	struct untracked_cache_dir *root,
+	const char *path,
+	size_t len)
+{
+	struct untracked_cache_dir *dir = root;
+	const char *end = path + len;
+
+	while (path < end) {
+		const char *slash = memchr(path, '/', end - path);
+		size_t component_len = slash ? slash - path : end - path;
+		struct untracked_cache_dir *child = NULL;
+
+		if (!component_len) {
+			path++;
+			continue;
+		}
+		for (size_t i = 0; i < dir->dirs_nr; i++) {
+			struct untracked_cache_dir *candidate = dir->dirs[i];
+
+			if (strlen(candidate->name) == component_len &&
+			    !strncmp(candidate->name, path, component_len)) {
+				child = candidate;
+				break;
+			}
+		}
+		if (!child || !child->valid || !child->valid_recursive ||
+		    !child->recurse || child->check_only)
+			return NULL;
+		dir = child;
+		path += component_len;
+		if (path < end)
+			path++;
+	}
+	return dir;
+}
+
+static void wt_status_collect_cached_directory(
+	const struct untracked_cache_dir *dir,
+	struct strbuf *path,
+	struct index_state *istate,
+	const struct pathspec *pathspec,
+	struct string_list *untracked)
+{
+	size_t base_len = path->len;
+
+	if (!dir->has_untracked)
+		return;
+	for (size_t i = 0; i < dir->untracked_nr; i++) {
+		const char *name = dir->untracked[i];
+
+		strbuf_setlen(path, base_len);
+		strbuf_addstr(path, name);
+		if (index_name_is_other(istate, path->buf, path->len) &&
+		    match_pathspec(istate, pathspec,
+				   path->buf, path->len, 0, NULL,
+				   path->len && path->buf[path->len - 1] == '/'))
+			string_list_append(untracked, path->buf);
+	}
+	for (size_t i = 0; i < dir->dirs_nr; i++) {
+		const struct untracked_cache_dir *child = dir->dirs[i];
+
+		if (!child->recurse || child->check_only ||
+		    !child->has_untracked)
+			continue;
+		strbuf_setlen(path, base_len);
+		strbuf_addstr(path, child->name);
+		strbuf_addch(path, '/');
+		wt_status_collect_cached_directory(
+			child, path, istate, pathspec, untracked);
+	}
+	strbuf_setlen(path, base_len);
+}
+
+static int wt_status_collect_cached_pathspec(
+	struct wt_status *s,
+	struct dir_struct *dir,
+	struct string_list *untracked)
+{
+	struct index_state *istate = s->repo->index;
+	struct untracked_cache *uc = istate->untracked;
+	const struct pathspec_item *item;
+	const struct cache_entry *ce;
+	struct untracked_cache_dir *selected;
+	struct strbuf path = STRBUF_INIT;
+	size_t len;
+	int pos;
+
+	if (s->pathspec.nr != 1 || s->pathspec.has_wildcard ||
+	    (s->pathspec.magic & ~(PATHSPEC_FROMTOP | PATHSPEC_LITERAL)) ||
+	    s->show_ignored_mode ||
+	    s->show_untracked_files != SHOW_NORMAL_UNTRACKED_FILES ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    !istate->fsmonitor_untracked_valid ||
+	    fsmonitor_has_pending_token(istate) ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC ||
+	    !uc || !uc->root || !uc->use_fsmonitor ||
+	    !uc->root->valid || !uc->root->valid_recursive ||
+	    dir->untracked != uc || dir->flags != uc->dir_flags ||
+	    dir->internal.unmanaged_exclude_files ||
+	    dir->internal.exclude_list_group[EXC_CMDL].nr ||
+	    !oideq(&dir->internal.ss_info_exclude.oid,
+		   &uc->ss_info_exclude.oid) ||
+	    !oideq(&dir->internal.ss_excludes_file.oid,
+		   &uc->ss_excludes_file.oid))
+		return 0;
+
+	item = &s->pathspec.items[0];
+	if (item->nowildcard_len != item->len)
+		return 0;
+	len = item->len;
+	if (len && item->match[len - 1] == '/')
+		len--;
+	if (!len)
+		return 0;
+
+	pos = index_name_pos(istate, item->match, len);
+	if (pos >= 0)
+		return 0;
+	pos = -pos - 1;
+	if (pos >= istate->cache_nr)
+		return 0;
+	ce = istate->cache[pos];
+	if (ce_namelen(ce) <= len || ce->name[len] != '/' ||
+	    strncmp(ce->name, item->match, len))
+		return 0;
+
+	selected = wt_status_find_cached_directory(
+		uc->root, item->match, len);
+	if (!selected)
+		return 0;
+
+	strbuf_add(&path, item->match, len);
+	strbuf_addch(&path, '/');
+	wt_status_collect_cached_directory(
+		selected, &path, istate, &s->pathspec, untracked);
+	strbuf_release(&path);
+	trace2_data_intmax("status", s->repo,
+			   "untracked/pathspec-cache", 1);
+	return 1;
+}
+
 static int wt_status_collect_untracked_1(
 	struct wt_status *s,
 	struct string_list *untracked,
@@ -1182,16 +1324,20 @@ static int wt_status_collect_untracked_1(
 	dir.internal.untracked_cache_preloaded =
 		s->untracked_cache_preloaded;
 
-	fill_directory(&dir, istate, &s->pathspec);
-	if (s->certify_clean_status && dir.internal.traversal_failed)
-		s->certify_untracked_scan_failed = 1;
-	used_untracked_cache = dir.untracked &&
-		dir.untracked == istate->untracked;
+	if (wt_status_collect_cached_pathspec(s, &dir, untracked)) {
+		used_untracked_cache = 1;
+	} else {
+		fill_directory(&dir, istate, &s->pathspec);
+		if (s->certify_clean_status && dir.internal.traversal_failed)
+			s->certify_untracked_scan_failed = 1;
+		used_untracked_cache = dir.untracked &&
+			dir.untracked == istate->untracked;
 
-	for (i = 0; i < dir.nr; i++) {
-		struct dir_entry *ent = dir.entries[i];
-		if (index_name_is_other(istate, ent->name, ent->len))
-			string_list_append(untracked, ent->name);
+		for (i = 0; i < dir.nr; i++) {
+			struct dir_entry *ent = dir.entries[i];
+			if (index_name_is_other(istate, ent->name, ent->len))
+				string_list_append(untracked, ent->name);
+		}
 	}
 	string_list_sort_u(untracked, 0);
 
