@@ -3,17 +3,26 @@
 #include "clean-status.h"
 #include "clean-status-internal.h"
 #include "fsmonitor-clean-proof.h"
+#include "progress.h"
 #include "read-cache-ll.h"
 #include "repository.h"
+#include "thread-utils.h"
 #include "trace2.h"
 
 static struct repository *configured_repo;
 static unsigned char configured_hash[GIT_MAX_RAWSZ];
 static unsigned char configured_semantic_hash[GIT_MAX_RAWSZ];
 static struct repository *external_history_repo;
+static struct repository *progress_repo;
 static int configured_hash_valid;
 static int configured_filter_configured;
 static int configured_semantic_explicit;
+
+struct clean_status_progress {
+	struct progress *display;
+	pthread_mutex_t mutex;
+	uint64_t completed;
+};
 
 void clean_status_enable_external_history(struct repository *repo)
 {
@@ -23,6 +32,45 @@ void clean_status_enable_external_history(struct repository *repo)
 int clean_status_external_history_enabled(const struct index_state *istate)
 {
 	return istate && istate->repo == external_history_repo;
+}
+
+void clean_status_enable_progress(struct repository *repo)
+{
+	progress_repo = repo;
+}
+
+struct clean_status_progress *clean_status_start_progress(
+	struct repository *repo, const char *title, uint64_t total)
+{
+	struct clean_status_progress *progress;
+
+	if (repo != progress_repo)
+		return NULL;
+	CALLOC_ARRAY(progress, 1);
+	if (pthread_mutex_init(&progress->mutex, NULL))
+		BUG("could not initialize clean status progress mutex");
+	progress->display = start_delayed_progress(repo, title, total);
+	return progress;
+}
+
+void clean_status_update_progress(struct clean_status_progress *progress,
+				  uint64_t completed)
+{
+	if (!progress || !completed)
+		return;
+	pthread_mutex_lock(&progress->mutex);
+	progress->completed += completed;
+	display_progress(progress->display, progress->completed);
+	pthread_mutex_unlock(&progress->mutex);
+}
+
+void clean_status_stop_progress(struct clean_status_progress **progress)
+{
+	if (!progress || !*progress)
+		return;
+	stop_progress(&(*progress)->display);
+	pthread_mutex_destroy(&(*progress)->mutex);
+	FREE_AND_NULL(*progress);
 }
 
 struct clean_status_state *clean_status_get_state(struct index_state *istate)
