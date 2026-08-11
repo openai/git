@@ -742,7 +742,8 @@ static void wt_status_collect_changes_worktree(struct wt_status *s)
 	rev.diffopt.rename_limit = s->rename_limit >= 0 ? s->rename_limit : rev.diffopt.rename_limit;
 	rev.diffopt.rename_score = s->rename_score >= 0 ? s->rename_score : rev.diffopt.rename_score;
 	copy_pathspec(&rev.prune_data, &s->pathspec);
-	run_diff_files(&rev, 0);
+	run_diff_files(&rev, s->bulk_update_index_stat ?
+		       DIFF_UPDATE_INDEX_STAT : 0);
 	wt_status_release_preload_changes(direct, direct_nr);
 	release_revisions(&rev);
 }
