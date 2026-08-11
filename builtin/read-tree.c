@@ -5,6 +5,8 @@
  */
 #define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -46,10 +48,11 @@ static const char * const read_tree_usage[] = {
 	NULL
 };
 
-static int index_output_cb(const struct option *opt UNUSED, const char *arg,
+static int index_output_cb(const struct option *opt, const char *arg,
 				 int unset)
 {
 	BUG_ON_OPT_NEG(unset);
+	*(int *)opt->value = 1;
 	set_alternate_index_output(arg);
 	return 0;
 }
@@ -100,12 +103,14 @@ static int debug_merge(const struct cache_entry * const *stages,
 }
 
 static int git_read_tree_config(const char *var, const char *value,
-				const struct config_context *ctx, void *cb)
+				const struct config_context *ctx, void *data)
 {
-	if (!strcmp(var, "submodule.recurse"))
-		return git_default_submodule_config(var, value, cb);
+	clean_status_config_add(data, var, value, ctx);
 
-	return git_default_config(var, value, ctx, cb);
+	if (!strcmp(var, "submodule.recurse"))
+		return git_default_submodule_config(var, value, NULL);
+
+	return git_default_config(var, value, ctx, NULL);
 }
 
 int cmd_read_tree(int argc,
@@ -113,7 +118,10 @@ int cmd_read_tree(int argc,
 		  const char *cmd_prefix,
 		  struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	int i, stage = 0;
+	int index_output = 0;
+	int preserve_history = 0;
 	struct object_id oid;
 	struct tree_desc t[MAX_UNPACK_TREES];
 	struct unpack_trees_options opts;
@@ -121,7 +129,7 @@ int cmd_read_tree(int argc,
 	struct lock_file lock_file = LOCK_INIT;
 	const struct option read_tree_options[] = {
 		OPT__SUPER_PREFIX(&opts.super_prefix),
-		OPT_CALLBACK_F(0, "index-output", NULL, N_("file"),
+		OPT_CALLBACK_F(0, "index-output", &index_output, N_("file"),
 		  N_("write resulting index to <file>"),
 		  PARSE_OPT_NONEG, index_output_cb),
 		OPT_BOOL(0, "empty", &read_empty,
@@ -169,7 +177,12 @@ int cmd_read_tree(int argc,
 	opts.src_index = the_repository->index;
 	opts.dst_index = the_repository->index;
 
-	repo_config(the_repository, git_read_tree_config, NULL);
+	show_usage_with_options_if_asked(argc, argv,
+					 read_tree_usage, read_tree_options);
+
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	repo_config(the_repository, git_read_tree_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
 
 	argc = parse_options(argc, argv, cmd_prefix, read_tree_options,
 			     read_tree_usage, 0);
@@ -191,6 +204,23 @@ int cmd_read_tree(int argc,
 	repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
 
 	/*
+	 * A one-tree merge or reset can rewrite only stat and fsmonitor
+	 * state when its tree matches the existing index. Attach history
+	 * before reading that index; unpack_trees() will transfer it only
+	 * after proving that the result has the same logical entries.
+	 */
+	if (argc == 1 && !read_empty && !opts.prefix &&
+	    (opts.reset || opts.merge) &&
+	    !opts.dry_run &&
+	    !opts.skip_sparse_checkout && !opts.internal.debug_unpack &&
+	    !opts.trivial_merges_only && !opts.aggressive &&
+	    !opts.super_prefix && !index_output &&
+	    !should_update_submodules()) {
+		preserve_history = 1;
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	}
+
+	/*
 	 * NEEDSWORK
 	 *
 	 * The old index should be read anyway even if we're going to
@@ -200,10 +230,17 @@ int cmd_read_tree(int argc,
 	 */
 
 	if (opts.reset || opts.merge || opts.prefix) {
-		if (repo_read_index_unmerged(the_repository) && (opts.prefix || opts.merge))
+		int unmerged = repo_read_index_unmerged(the_repository);
+
+		if (preserve_history && unmerged)
+			clean_status_invalidate_current_proof(
+				the_repository->index);
+		if (unmerged && (opts.prefix || opts.merge))
 			die(_("You need to resolve your current index first"));
 		stage = opts.merge = 1;
 	}
+	if (preserve_history && the_repository->index->resolve_undo)
+		clean_status_invalidate_current_proof(the_repository->index);
 	resolve_undo_clear_index(the_repository->index);
 
 	for (i = 0; i < argc; i++) {

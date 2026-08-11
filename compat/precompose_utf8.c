@@ -72,19 +72,32 @@ void probe_utf8_pathname_composition(void)
 	strbuf_release(&path);
 }
 
-const char *precompose_string_if_needed(const char *in)
+void repo_precompose_utf8_prepare(struct repository *repo)
+{
+	struct repo_config_values *cfg = repo_config_values(repo);
+
+	if (cfg->precomposed_unicode < 0 &&
+	    repo_config_get_bool(repo, "core.precomposeunicode",
+				 &cfg->precomposed_unicode))
+		cfg->precomposed_unicode = 0;
+}
+
+const char *repo_precompose_string_if_needed(struct repository *repo,
+					     const char *in)
 {
 	size_t inlen;
 	size_t outlen;
-	struct repo_config_values *cfg = repo_config_values(the_repository);
+	struct repo_config_values *cfg = repo_config_values(repo);
 
 	if (!in)
 		return NULL;
 	if (has_non_ascii(in, (size_t)-1, &inlen)) {
 		iconv_t ic_prec;
 		char *out;
+
 		if (cfg->precomposed_unicode < 0)
-			repo_config_get_bool(the_repository, "core.precomposeunicode", &cfg->precomposed_unicode);
+			repo_config_get_bool(repo, "core.precomposeunicode",
+					     &cfg->precomposed_unicode);
 		if (cfg->precomposed_unicode != 1)
 			return in;
 		ic_prec = iconv_open(repo_encoding, path_encoding);
@@ -102,6 +115,11 @@ const char *precompose_string_if_needed(const char *in)
 
 	}
 	return in;
+}
+
+const char *precompose_string_if_needed(const char *in)
+{
+	return repo_precompose_string_if_needed(the_repository, in);
 }
 
 const char *precompose_argv_prefix(int argc, const char **argv, const char *prefix)
