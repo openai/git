@@ -2242,7 +2242,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 			git status --porcelain=v2 -- scoped >.git/first &&
 		test_grep "^? scoped/new$" .git/first &&
-		! test_grep "tracked\|outside-new" .git/first &&
+		test_grep ! "tracked\|outside-new" .git/first &&
 		test_path_is_missing .git/index.csts &&
 		cp .git/index .git/before &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
@@ -2258,6 +2258,49 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 			git status --porcelain=v2 >.git/root &&
 		test_grep "^1 \.M .* tracked$" .git/root
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked-directory pathspec reads a closed untracked-cache subtree' '
+	test_when_finished "rm -rf pathspec-cached-subtree" &&
+	test_create_repo pathspec-cached-subtree &&
+	(
+		cd pathspec-cached-subtree &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		mkdir scoped &&
+		test_commit selected scoped/tracked &&
+		test-tool chmtime -120 tracked scoped/tracked &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test_write_lines selected >scoped/new &&
+		test_write_lines outside >outside-new &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/root &&
+		test_grep "^? scoped/new$" .git/root &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/root-repeat &&
+		cp .git/index .git/before &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/scoped.trace" \
+			git status --porcelain=v2 -- scoped >.git/scoped &&
+		test_grep "^? scoped/new$" .git/scoped &&
+		test_grep ! "outside-new" .git/scoped &&
+		test_cmp .git/before .git/index &&
+		test_trace2_data status untracked/pathspec-cache 1 \
+			<.git/scoped.trace &&
+		test_grep ! "\"label\":\"read_directory\"" \
+			.git/scoped.trace &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/nested.trace" \
+			git -C scoped status --porcelain=v2 -- . >.git/nested &&
+		test_grep "^? new$" .git/nested &&
+		test_trace2_data status untracked/pathspec-cache 1 \
+			<.git/nested.trace
 	)
 '
 
