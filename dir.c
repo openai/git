@@ -4043,6 +4043,19 @@ static int ident_in_untracked(const struct untracked_cache *uc)
 	return !strcmp(uc->ident.buf, get_ident_string());
 }
 
+static int legacy_ident_in_untracked(const struct untracked_cache *uc)
+{
+	static const char suffix[] = ", cache version 2";
+	const char *current = get_ident_string();
+	size_t current_len = strlen(current);
+	size_t suffix_len = sizeof(suffix) - 1;
+
+	return current_len > suffix_len &&
+		!strcmp(current + current_len - suffix_len, suffix) &&
+		strlen(uc->ident.buf) == current_len - suffix_len &&
+		!memcmp(uc->ident.buf, current, current_len - suffix_len);
+}
+
 static void set_untracked_ident(struct untracked_cache *uc)
 {
 	strbuf_reset(&uc->ident);
@@ -4093,10 +4106,47 @@ void add_untracked_cache(struct index_state *istate)
 		new_untracked_cache(istate, -1);
 	} else {
 		if (!ident_in_untracked(istate->untracked)) {
+			if (istate->fsmonitor_token_valid &&
+			    istate->fsmonitor_last_update &&
+			    starts_with(istate->fsmonitor_last_update,
+					"builtin:") &&
+			    !istate->fsmonitor_untracked_extension_seen &&
+			    !istate->fsmonitor_untracked_extension_invalid &&
+			    !istate->split_index &&
+			    fsm_settings__get_mode(istate->repo) ==
+				FSMONITOR_MODE_IPC &&
+			    legacy_ident_in_untracked(istate->untracked)) {
+				trace2_data_intmax("fsmonitor", istate->repo,
+						   "untracked/legacy-preserved", 1);
+				return;
+			}
 			free_untracked_cache(istate->untracked);
 			new_untracked_cache(istate, -1);
 		}
 	}
+}
+
+int untracked_cache_adopt_legacy(struct index_state *istate)
+{
+	if (!istate->untracked ||
+	    !legacy_ident_in_untracked(istate->untracked))
+		return 0;
+	set_untracked_ident(istate->untracked);
+	untracked_cache_recompute_fsmonitor_valid_recursive(
+		istate->untracked);
+	istate->cache_changed |= UNTRACKED_CHANGED;
+	return 1;
+}
+
+void untracked_cache_discard_legacy(struct index_state *istate)
+{
+	if (!istate->untracked ||
+	    !legacy_ident_in_untracked(istate->untracked))
+		return;
+	free_untracked_cache(istate->untracked);
+	new_untracked_cache(istate, -1);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "untracked/legacy-discarded", 1);
 }
 
 void remove_untracked_cache(struct index_state *istate)
@@ -4162,7 +4212,9 @@ static struct untracked_cache_dir *validate_untracked_cache(struct dir_struct *d
 	if (dir->internal.exclude_list_group[EXC_CMDL].nr)
 		return NULL;
 
-	if (!ident_in_untracked(dir->untracked)) {
+	if (!ident_in_untracked(dir->untracked) &&
+	    !(istate->fsmonitor_legacy_untracked_fallback &&
+	      legacy_ident_in_untracked(dir->untracked))) {
 		warning(_("untracked cache is disabled on this system or location"));
 		return NULL;
 	}

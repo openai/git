@@ -1562,6 +1562,123 @@ test_expect_success 'bound query replaces a legacy daemon' '
 	)
 '
 
+test_expect_success 'bound daemon also serves legacy token queries' '
+	test_when_finished "stop_daemon_delete_repo legacy-client-query" &&
+	test_create_repo legacy-client-query &&
+	(
+		cd legacy-client-query &&
+		test_commit base tracked &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TRACE2_EVENT="$PWD/.git/daemon.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		token=$(sed -n "s/^fsmonitor last update //p" \
+			.git/fsmonitor) &&
+		test -n "$token" &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc send --name="$ipc_path" \
+			--token="$token" >.git/legacy-response &&
+		test_grep "^builtin:" .git/legacy-response &&
+		! test_trace2_data fsmonitor query/worktree-mismatch 1 \
+			<.git/daemon.trace &&
+		GIT_TRACE2_EVENT="$PWD/.git/legacy-client.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/legacy-client.trace
+	)
+'
+
+test_expect_success MACOS 'daemon token reset closes a skipHash index' '
+	test_when_finished \
+		"stop_daemon_delete_repo daemon-token-reset" &&
+	test_create_repo daemon-token-reset &&
+	(
+		cd daemon-token-reset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit remove removed &&
+		test_commit keep clean &&
+		git config core.preloadIndexBulk true &&
+		git config core.untrackedCache true &&
+		git config index.skipHash true &&
+		test-tool chmtime =-60 tracked removed clean &&
+		git update-index --refresh &&
+		git config core.fsmonitor true &&
+		start_daemon &&
+
+		git update-index --force-write-index &&
+		git status --porcelain=v2 >.git/prime.out &&
+		test_must_be_empty .git/prime.out &&
+		test_grep FSMN .git/index &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		test_trailing_hash .git/index >.git/index.hash &&
+		test_oid zero >.git/zero &&
+		test_cmp .git/zero .git/index.hash &&
+		test-tool dump-fsmonitor >.git/token.before &&
+		token_before=$(sed -n \
+			"s/^fsmonitor last update //p" .git/token.before) &&
+
+		git fsmonitor--daemon stop &&
+		start_daemon &&
+		GIT_TRACE2_EVENT="$PWD/.git/reset.trace" \
+			git status --porcelain=v2 --untracked-files=normal >.git/reset.out &&
+		test_must_be_empty .git/reset.out &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/reset.trace &&
+		test_trace2_data index preload/bulk_provider_applied \
+			"[1-9][0-9]*" \
+			<.git/reset.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/reset.trace &&
+		test-tool dump-fsmonitor >.git/token.after &&
+		token_after=$(sed -n \
+			"s/^fsmonitor last update //p" .git/token.after) &&
+		test -n "$token_before" &&
+		test -n "$token_after" &&
+		test "$token_before" != "$token_after" &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
+			git status --porcelain=v2 >.git/warm.out &&
+		test_must_be_empty .git/warm.out &&
+		! test_trace2_data index refresh/sum_lstat \
+			"[1-9][0-9]*" <.git/warm.trace &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/warm.trace &&
+
+		git fsmonitor--daemon stop &&
+		echo changed >>tracked &&
+		rm removed &&
+		start_daemon &&
+		GIT_TRACE2_EVENT="$PWD/.git/dirty-reset.trace" \
+			git status --porcelain=v2 >.git/dirty-reset.out &&
+		test_line_count = 2 .git/dirty-reset.out &&
+		test_grep "^1 \.M .* tracked$" .git/dirty-reset.out &&
+		test_grep "^1 \.D .* removed$" .git/dirty-reset.out &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/dirty-reset.trace &&
+		test_trace2_data index preload/bulk_provider_applied 1 \
+			<.git/dirty-reset.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/dirty-reset.trace &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/dirty-warm.trace" \
+			git status --porcelain=v2 >.git/dirty-warm.out &&
+		test_cmp .git/dirty-reset.out .git/dirty-warm.out &&
+		test_trace2_data index preload/bulk_provider_applied 1 \
+			<.git/dirty-warm.trace &&
+		test_trace2_data index refresh/sum_lstat 0 \
+			<.git/dirty-warm.trace &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/dirty-warm.trace
+	)
+'
+
 test_expect_success 'bound query accepts a capability superset' '
 	test_when_finished \
 		"stop_daemon_delete_repo capability-superset" &&
