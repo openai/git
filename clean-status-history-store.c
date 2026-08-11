@@ -475,17 +475,20 @@ int clean_status_history_store_install(
 	int current_is_regular, encoded_matches = 0;
 	int checkpoint_fd = -1, ret = -1;
 
-	if (!clean_status_identity_is_durable() || !snapshot ||
-	    snapshot->fd < 0 || local_apfs_id(snapshot->fd, &fsid) ||
+	if (!snapshot || snapshot->fd < 0 ||
 	    !clean_status_index_snapshot_still_matches_path(
 		    snapshot, index_path, algo))
 		goto done;
 	aliased = *checkpoint;
-	aliased.source_alias_valid = 1;
-	aliased.source_identity = snapshot->identity;
-	aliased.source_version = snapshot->version;
-	aliased.source_cache_nr = snapshot->cache_nr;
-	oidcpy(&aliased.source_checksum, &snapshot->checksum);
+	aliased.source_alias_valid =
+		clean_status_identity_is_durable() &&
+		!local_apfs_id(snapshot->fd, &fsid);
+	if (aliased.source_alias_valid) {
+		aliased.source_identity = snapshot->identity;
+		aliased.source_version = snapshot->version;
+		aliased.source_cache_nr = snapshot->cache_nr;
+		oidcpy(&aliased.source_checksum, &snapshot->checksum);
+	}
 	if (clean_status_history_checkpoint_write(
 		    &encoded, proof_namespace, &aliased, algo))
 		goto done;
