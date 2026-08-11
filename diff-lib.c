@@ -132,6 +132,8 @@ void run_diff_files(struct rev_info *revs, unsigned int option)
 		unsigned int oldmode, newmode;
 		int fsmonitor_valid = 0;
 		struct cache_entry *ce = istate->cache[i];
+		struct stat st;
+		int has_stat = 0;
 		int changed;
 		unsigned dirty_submodule = 0;
 		const struct object_id *old_oid, *new_oid;
@@ -253,8 +255,6 @@ void run_diff_files(struct rev_info *revs, unsigned int option)
 			fsmonitor_valid =
 				!!(ce->ce_flags & CE_FSMONITOR_VALID);
 		} else {
-			struct stat st;
-
 			changed = check_removed(ce, &st);
 			if (changed) {
 				if (changed < 0) {
@@ -276,11 +276,17 @@ void run_diff_files(struct rev_info *revs, unsigned int option)
 
 			changed = match_stat_with_submodule(&revs->diffopt, ce, &st,
 							    ce_option, &dirty_submodule);
+			has_stat = 1;
 			newmode = ce_mode_from_stat(revs->repo, ce, st.st_mode);
 			fsmonitor_valid = fsmonitor_stat_can_be_valid(&st);
 		}
 
 		if (!changed && !dirty_submodule) {
+			if ((option & DIFF_UPDATE_INDEX_STAT) && has_stat &&
+			    (ce->ce_flags & CE_CONTENT_CHECK_REQUIRED)) {
+				refresh_index_entry_stat(istate, i, &st);
+				ce = istate->cache[i];
+			}
 			ce_mark_uptodate(ce);
 			if (fsmonitor_valid)
 				mark_fsmonitor_valid(istate, ce);
