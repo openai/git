@@ -965,6 +965,51 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'a plain clean status repairs a stale proof with an invalid cache tree' '
+	test_when_finished "stop_daemon sidecar-invalid-tree" &&
+	setup_repo sidecar-invalid-tree &&
+	git -C sidecar-invalid-tree config core.untrackedCache true &&
+	issue_sidecar sidecar-invalid-tree &&
+	cp sidecar-invalid-tree/.git/index.csts stale-proof &&
+	cp sidecar-invalid-tree/tracked tracked.original &&
+	test_write_lines changed >sidecar-invalid-tree/tracked &&
+	git -C sidecar-invalid-tree add tracked &&
+	cp tracked.original sidecar-invalid-tree/tracked &&
+	test-tool chmtime -120 sidecar-invalid-tree/tracked &&
+	git -C sidecar-invalid-tree add tracked &&
+	test-tool -C sidecar-invalid-tree dump-cache-tree >tree.dump &&
+	test_grep "^invalid " tree.dump &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -C sidecar-invalid-tree status --porcelain=v2 >before &&
+	test_must_be_empty before &&
+	cp stale-proof sidecar-invalid-tree/.git/index.csts &&
+	rm -f sidecar-invalid-tree/.git/index.csh1.* &&
+	cp sidecar-invalid-tree/.git/index invalid-tree.index &&
+	test_env GIT_TRACE2_EVENT="$PWD/invalid-tree-reissue.trace" \
+		git -C sidecar-invalid-tree status >actual &&
+	test_grep "working tree clean" actual &&
+	test_cmp invalid-tree.index sidecar-invalid-tree/.git/index &&
+	test_trace2_data status index/full-tree-match 1 \
+		<invalid-tree-reissue.trace &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<invalid-tree-reissue.trace &&
+	! test_trace2_data fsmonitor history/external-restored 1 \
+		<invalid-tree-reissue.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<invalid-tree-reissue.trace &&
+	test_grep ! "\"label\":\"do_write_index\"" \
+		invalid-tree-reissue.trace &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/invalid-tree-hit.trace" \
+		git -C sidecar-invalid-tree status >actual.hit &&
+	test_cmp actual actual.hit &&
+	test_trace2_data status clean-proof/hit 1 \
+		<invalid-tree-hit.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" \
+		invalid-tree-hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'only an exact empty output installs a sidecar' '
 	test_when_finished "stop_daemon sidecar-shape" &&
 	setup_repo sidecar-shape &&

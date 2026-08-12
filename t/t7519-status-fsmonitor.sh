@@ -621,9 +621,9 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TRACE2_EVENT="$PWD/.git/exact.trace" \
 			git status --porcelain=v2 >.git/exact &&
 		test_must_be_empty .git/exact &&
-		! test_trace2_data status fsmonitor/tracked-clean 1 \
+		test_trace2_data status fsmonitor/tracked-clean 1 \
 			<.git/exact.trace &&
-		test_grep \
+		test_grep ! \
 			"\"category\":\"index\",\"label\":\"refresh\"" \
 			.git/exact.trace &&
 
@@ -1603,6 +1603,412 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/status.trace &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success MACOS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'plumbing diffs restore clean history lost by a foreign index writer' '
+	test_when_finished "rm -rf plumbing-diff-history" &&
+	test_create_repo plumbing-diff-history &&
+	(
+		cd plumbing-diff-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime -120 tracked &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		for prime in first second third
+		do
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+				git status --porcelain=v2 >.git/prime || return 1
+		done &&
+		test_must_be_empty .git/prime &&
+		test_path_is_file .git/index.csts &&
+		find .git -maxdepth 1 -type f -name "index.csh1.*" \
+			>.git/checkpoints &&
+		test_line_count = 1 .git/checkpoints &&
+
+		rm .git/index &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			read-tree HEAD &&
+		test_grep ! FSMN .git/index &&
+		cp .git/index .git/index.before &&
+
+		for diff_case in files index cached describe
+		do
+			case "$diff_case" in
+			files) set -- diff-files ;;
+			index) set -- diff-index HEAD -- ;;
+			cached) set -- diff-index --cached HEAD -- ;;
+			describe) set -- describe --dirty --tags ;;
+			esac &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$diff_case.trace" \
+				git "$@" >".git/$diff_case.actual" &&
+			if test "$diff_case" = describe
+			then
+				test_grep "^base$" ".git/$diff_case.actual" &&
+				test_trace2_data index refresh/sum_lstat 0 \
+					<".git/$diff_case.trace"
+			else
+				test_must_be_empty ".git/$diff_case.actual"
+			fi &&
+			test_cmp_bin .git/index.before .git/index &&
+			test_trace2_data fsmonitor history/external-restored 1 \
+				<".git/$diff_case.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count \
+				<".git/$diff_case.trace" &&
+			test_grep ! "\"label\":\"do_write_index\"" \
+				".git/$diff_case.trace" || return 1
+		done &&
+
+		test_write_lines changed >tracked &&
+		for diff_case in files index describe
+		do
+			case "$diff_case" in
+			files) set -- diff-files -p ;;
+			index) set -- diff-index -p HEAD -- ;;
+			describe) set -- describe --dirty --tags ;;
+			esac &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			GIT_TRACE2_EVENT="$PWD/.git/$diff_case-dirty.trace" \
+				git "$@" >".git/$diff_case-dirty.actual" &&
+			if test "$diff_case" = describe
+			then
+				test_grep "^base-dirty$" \
+					".git/$diff_case-dirty.actual"
+			else
+				test_grep "^+changed$" \
+					".git/$diff_case-dirty.actual"
+			fi &&
+			test_trace2_data fsmonitor history/external-restored 1 \
+				<".git/$diff_case-dirty.trace" &&
+			test_cmp_bin .git/index.before .git/index || return 1
+		done
+	)
+'
+
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'foreign index writers preserve unchanged worktree semantics' '
+	test_when_finished "rm -rf foreign-semantic-history" &&
+	test_when_finished \
+		"git -C foreign-semantic-history fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo foreign-semantic-history &&
+	(
+		cd foreign-semantic-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir existing &&
+		test_commit base existing/tracked &&
+		test_commit retained existing/retained &&
+		test-tool chmtime -120 existing/tracked existing/retained &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git fsmonitor--daemon start --start-timeout=10 &&
+		git update-index --fsmonitor &&
+		for prime in first second third
+		do
+			git status --porcelain=v2 >.git/prime || return 1
+		done &&
+		find .git -maxdepth 1 -type f -name "index.cswi.*" \
+			>.git/witnesses &&
+		test_line_count = 1 .git/witnesses &&
+		cat >.git/foreign-writer.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $name = $ARGV[0];
+		my $rawsz = $name eq "sha256" ? 32 : 20;
+		for my $extension ("FSUC", "FSCF") {
+			my $offset = index($index, $extension);
+			next if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			substr($index, $offset, 8 + $size, "");
+		}
+		my $payload = substr($index, 0, -$rawsz);
+		print $payload,
+			$name eq "sha256" ? sha256($payload) : sha1($payload);
+		EOF
+
+		test_write_lines changed >existing/tracked &&
+		git update-index --no-fsmonitor-valid existing/retained &&
+		git update-index --add existing/tracked &&
+		perl .git/foreign-writer.pl "$(test_oid algo)" \
+			<.git/index >.git/index.foreign &&
+		mv .git/index.foreign .git/index &&
+		test_grep ! FSCF .git/index &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			status --porcelain=v2 >.git/existing.expect &&
+		test_grep "^1 M\. .* existing/tracked$" .git/existing.expect &&
+		GIT_TRACE2_EVENT="$PWD/.git/existing.trace" \
+			git status --porcelain=v2 >.git/existing &&
+		test_grep "^1 M\. .* existing/tracked$" .git/existing &&
+		test_trace2_data fsmonitor \
+			history/external-semantic-restored 1 <.git/existing.trace &&
+		test_trace2_data fsmonitor \
+			history/external-untracked-restored 1 <.git/existing.trace &&
+		test_trace2_data fsmonitor \
+			history/external-tracked-restored 1 <.git/existing.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			<.git/existing.trace &&
+		! test_trace2_data index preload/bulk_useful \
+			<.git/existing.trace &&
+
+		mkdir newdir &&
+		test_write_lines new >newdir/tracked &&
+		git update-index --add newdir/tracked &&
+		perl .git/foreign-writer.pl "$(test_oid algo)" \
+			<.git/index >.git/index.foreign &&
+		mv .git/index.foreign .git/index &&
+		test_grep ! FSCF .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/newdir.trace" \
+			git status --porcelain=v2 >.git/newdir &&
+		test_grep "^1 A\. .* newdir/tracked$" .git/newdir &&
+		test_trace2_data fsmonitor \
+			history/external-semantic-restored 1 <.git/newdir.trace &&
+		test_trace2_data fsmonitor \
+			history/external-untracked-restored 1 <.git/newdir.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			<.git/newdir.trace &&
+		! test_trace2_data index preload/bulk_useful \
+			<.git/newdir.trace &&
+
+		mkdir existing/retired-directory &&
+		test_write_lines transient >existing/retired-directory/file &&
+		rm existing/retired-directory/file &&
+		rmdir existing/retired-directory &&
+		test_write_lines changed-again >existing/tracked &&
+		git update-index --add existing/tracked &&
+		perl .git/foreign-writer.pl "$(test_oid algo)" \
+			<.git/index >.git/index.foreign &&
+		mv .git/index.foreign .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/retired.trace" \
+			git status --porcelain=v2 >.git/retired &&
+		test_grep "^1 M\. .* existing/tracked$" .git/retired &&
+		test_trace2_data fsmonitor \
+			history/external-semantic-restored 1 <.git/retired.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			<.git/retired.trace &&
+		! test_trace2_data index preload/bulk_useful \
+			<.git/retired.trace &&
+
+		test_write_lines "* text" >existing/.gitattributes &&
+		git update-index --add existing/.gitattributes &&
+		perl .git/foreign-writer.pl "$(test_oid algo)" \
+			<.git/index >.git/index.foreign &&
+		mv .git/index.foreign .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes &&
+		test_grep "^1 A\. .* existing/.gitattributes$" \
+			.git/attributes &&
+		! test_trace2_data fsmonitor \
+			history/external-semantic-restored <.git/attributes.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/attributes.trace &&
+
+		mkdir guarded &&
+		test_write_lines "* text" >guarded/.gitattributes &&
+		test_write_lines guarded >guarded/tracked &&
+		git update-index --add guarded/tracked &&
+		perl .git/foreign-writer.pl "$(test_oid algo)" \
+			<.git/index >.git/index.foreign &&
+		mv .git/index.foreign .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/guarded.trace" \
+			git status --porcelain=v2 >.git/guarded &&
+		test_grep "^1 A\. .* guarded/tracked$" .git/guarded &&
+		! test_trace2_data fsmonitor \
+			history/external-semantic-restored <.git/guarded.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/guarded.trace
+	)
+'
+
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'branch switches preserve existing authenticated index proofs' '
+	test_when_finished "rm -rf switch-authenticated-history" &&
+	test_when_finished \
+		"git -C switch-authenticated-history fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo switch-authenticated-history &&
+	(
+		cd switch-authenticated-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p api/existing &&
+		test_write_lines "*.txt text" >api/.gitattributes &&
+		test_write_lines base >api/existing/tracked &&
+		for sibling in $(test_seq 1 24)
+		do
+			mkdir "api/sibling-$sibling" &&
+			test_write_lines retained \
+				>"api/sibling-$sibling/tracked" || return 1
+		done &&
+		git add api &&
+		git commit -m base &&
+		initial_branch=$(git symbolic-ref --short HEAD) &&
+		git switch -c replace-only &&
+		test_write_lines replacement >api/existing/tracked &&
+		git add api/existing/tracked &&
+		git commit -m replacement &&
+		git switch "$initial_branch" &&
+		git switch -c alternate &&
+		mkdir api/new-directory &&
+		mkdir api/new-directory/__pycache__ &&
+		test_write_lines existing >api/existing/added.txt &&
+		test_write_lines new >api/new-directory/added.txt &&
+		test_write_lines ignored \
+			>api/new-directory/__pycache__/hidden.pyc &&
+		git config core.excludesFile "$PWD/.git/test-excludes" &&
+		test_write_lines "__pycache__/" >.git/test-excludes &&
+		git add api/existing/added.txt api/new-directory/added.txt &&
+		git commit -m alternate &&
+		git switch "$initial_branch" &&
+		test-tool chmtime -120 api/.gitattributes api/existing/tracked \
+			api/sibling-*/tracked &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config index.recordEndOfIndexEntries false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git fsmonitor--daemon start --start-timeout=10 &&
+		git update-index --fsmonitor &&
+		for prime in first second third
+		do
+			git status --porcelain=v2 >.git/prime || return 1
+		done &&
+		test_must_be_empty .git/prime &&
+		find .git -maxdepth 1 -type f -name "index.cswi.*" \
+			>.git/witnesses &&
+		test_line_count = 1 .git/witnesses &&
+		for branch in replace-only "$initial_branch" \
+			alternate "$initial_branch"
+		do
+			GIT_TRACE2_EVENT="$PWD/.git/switch-$branch.trace" \
+			GIT_TRACE2_EVENT_NESTING=10 \
+				git switch "$branch" &&
+			test_trace2_data fsmonitor history/semantic-transferred 1 \
+				<".git/switch-$branch.trace" &&
+			if test "$branch" = alternate
+			then
+				test_trace2_data fsmonitor \
+					history/untracked-paired-new-directory-deferred 1 \
+					<".git/switch-$branch.trace" &&
+				test_grep ! FSUC .git/index
+			else
+				test_trace2_data fsmonitor \
+					history/untracked-paired-transfer 1 \
+					<".git/switch-$branch.trace" &&
+				test_grep FSUC .git/index
+			fi &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				status --porcelain=v2 >.git/expect &&
+			GIT_TRACE2_EVENT="$PWD/.git/status-$branch.trace" \
+			GIT_TRACE2_EVENT_NESTING=10 \
+			GIT_TRACE2_PERF="$PWD/.git/status-$branch.perf" \
+				git status --porcelain=v2 >.git/actual &&
+			test_cmp .git/expect .git/actual &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<".git/status-$branch.trace" &&
+			! test_trace2_data fsmonitor config/invalid-extension 1 \
+				<".git/status-$branch.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count \
+				<".git/status-$branch.trace" &&
+			! test_trace2_data index preload/bulk_useful \
+				<".git/status-$branch.trace" &&
+			if test "$branch" = replace-only
+			then
+				test_trace2_data fsmonitor \
+					checkout/untracked-replacement-targeted 1 \
+					<".git/switch-$branch.trace" &&
+				visited_dirs=$(sed -n \
+					"s/.*directories-visited:\\([0-9][0-9]*\\).*/\\1/p" \
+					".git/status-$branch.perf") &&
+				test "$visited_dirs" -lt 12
+			elif test "$branch" = alternate
+			then
+				test_trace2_data fsmonitor \
+					history/external-untracked-restored 1 \
+					<".git/status-$branch.trace" &&
+				visited_dirs=$(sed -n \
+					"s/.*directories-visited:\\([0-9][0-9]*\\).*/\\1/p" \
+					".git/status-$branch.perf") &&
+				test "$visited_dirs" -lt 12
+			fi || return 1
+		done &&
+
+		cat >.git/duplicate-fscf.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $name = $ARGV[0];
+		my $rawsz = $name eq "sha256" ? 32 : 20;
+		my $payload = substr($index, 0, -$rawsz);
+		my $offset = index($payload, "FSCF");
+		die "index has no FSCF extension\n" if $offset < 0;
+		my $size = unpack("N", substr($payload, $offset + 4, 4));
+		$payload .= substr($payload, $offset, 8 + $size);
+		print $payload,
+			$name eq "sha256" ? sha256($payload) : sha1($payload);
+		EOF
+		perl .git/duplicate-fscf.pl "$(test_oid algo)" \
+			<.git/index >.git/index.duplicate &&
+		mv .git/index.duplicate .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/duplicate.trace" \
+			git status --porcelain=v2 >.git/duplicate &&
+		test_cmp .git/expect .git/duplicate &&
+		test_trace2_data fsmonitor config/invalid-extension 1 \
+			<.git/duplicate.trace &&
+		! test_trace2_data fsmonitor history/external-restored 1 \
+			<.git/duplicate.trace &&
+		! test_trace2_data fsmonitor history/external-semantic-restored 1 \
+			<.git/duplicate.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'branch switches preserve unchanged worktree semantics' '
+	test_when_finished "rm -rf switch-semantic-history" &&
+	test_create_repo switch-semantic-history &&
+	(
+		cd switch-semantic-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines changed >tracked &&
+		git add tracked &&
+		git commit -m changed &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/switch.trace" \
+			git switch --detach HEAD^ &&
+		test_trace2_data fsmonitor history/semantic-transferred 1 \
+			<.git/switch.trace &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/status.trace
 	)
 '
 

@@ -15,6 +15,7 @@
 #include "cache-tree.h"
 #include "clean-status.h"
 #include "clean-status-index.h"
+#include "clean-status-sidecar.h"
 #include "color.h"
 #include "dir.h"
 #include "editor.h"
@@ -1636,6 +1637,23 @@ static int print_clean_sidecar(struct wt_status *s, const char *prefix)
 	return 1;
 }
 
+static int clean_status_sidecar_has_stale_index(struct repository *repo)
+{
+	struct clean_status_sidecar_record record =
+		CLEAN_STATUS_SIDECAR_RECORD_INIT;
+	struct clean_status_index_snapshot index = { .fd = -1 };
+	int stale = 0;
+
+	if (!clean_status_sidecar_load(
+		    repo->index_file, repo->hash_algo, &record))
+		stale = !!clean_status_sidecar_pin_source(
+			repo->index_file, &record.sidecar,
+			repo->hash_algo, &index);
+	clean_status_index_snapshot_release(&index);
+	clean_status_sidecar_record_release(&record);
+	return stale;
+}
+
 int cmd_status(int argc,
 const char **argv,
 const char *prefix,
@@ -1654,6 +1672,7 @@ struct repository *repo UNUSED)
 	int normal_clean_query;
 	int reusable_clean_query;
 	int normal_has_head;
+	int stale_clean_sidecar = 0;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1774,6 +1793,9 @@ struct repository *repo UNUSED)
 			return 0;
 		}
 	}
+	if (normal_clean_query && use_optional_locks())
+		stale_clean_sidecar =
+			clean_status_sidecar_has_stale_index(the_repository);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
@@ -1786,8 +1808,9 @@ struct repository *repo UNUSED)
 		clean_status_capture_external_history_source(
 			the_repository->index);
 	if (normal_clean_query && use_optional_locks() &&
-	    clean_status_external_history_was_restored(
-		    the_repository->index))
+	    (stale_clean_sidecar ||
+	     clean_status_external_history_was_restored(
+		     the_repository->index)))
 		s.certify_clean_status = 1;
 	wt_status_start_untracked_cache_preload(&s);
 	wt_status_refresh_index(
@@ -1828,9 +1851,9 @@ struct repository *repo UNUSED)
 				the_repository->index);
 		int external_saved = 0;
 		int preserve_entry_changes =
-			!external_restored &&
-			(the_repository->index->cache_changed &
-			 CE_ENTRY_CHANGED);
+			(!external_restored &&
+			 (the_repository->index->cache_changed & CE_ENTRY_CHANGED)) ||
+			the_repository->index->fsmonitor_untracked_must_persist;
 
 		/*
 		 * Publish resumable history before the physical clean proof.
@@ -1861,7 +1884,9 @@ struct repository *repo UNUSED)
 				fd = -1;
 			}
 		} else if (!preserve_entry_changes &&
-			   normal_clean_query && external_restored &&
+			   normal_clean_query &&
+			   (external_restored ||
+			    (stale_clean_sidecar && external_saved)) &&
 			   clean_status_issue_sidecar(
 				   &s, &clean_digest, &index_lock, 1)) {
 			fd = -1;

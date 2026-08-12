@@ -139,8 +139,9 @@ int clean_status_issue_sidecar(
 		goto done;
 	}
 	if (repo_get_oid_tree(repo, "HEAD^{tree}", &head_tree) ||
-	    !istate->cache_tree || istate->cache_tree->entry_count < 0 ||
-	    !oideq(&head_tree, &istate->cache_tree->oid)) {
+	    ((!istate->cache_tree || istate->cache_tree->entry_count < 0) ?
+	     !status->index_tree_verified :
+	     !oideq(&head_tree, &istate->cache_tree->oid))) {
 		trace_miss(repo, "issue-head-cache-tree");
 		goto done;
 	}
