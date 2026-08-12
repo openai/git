@@ -12,6 +12,7 @@
 #include "hash-framing.h"
 #include "lockfile.h"
 #include "path.h"
+#include "read-cache-ll.h"
 #include "repository.h"
 #include "replace-object.h"
 #include "strbuf.h"
@@ -19,7 +20,7 @@
 #include "wrapper.h"
 
 #define CLEAN_STATUS_SIDECAR_MAGIC "CSTS"
-#define CLEAN_STATUS_SIDECAR_MAX_SIZE 8192
+#define CLEAN_STATUS_HARDLINK_PATH_MAX 4096
 #define CLEAN_STATUS_FILESYSTEM_ID_SIZE 16
 
 struct clean_status_filesystem_id {
@@ -62,6 +63,108 @@ static int proof_valid(const struct clean_status_proof *proof,
 		proof->exclude_source_digest.algo == hash_algo_by_ptr(algo);
 }
 
+static int hardlink_path_valid(const unsigned char *path, size_t len,
+			       const struct path_stat_identity *identity)
+{
+	char *name;
+	int valid;
+
+	if (!path || !len || len > CLEAN_STATUS_HARDLINK_PATH_MAX ||
+	    memchr(path, '\0', len) ||
+	    identity->fields[2] > UINT32_MAX ||
+	    !S_ISREG((mode_t)identity->fields[2]) ||
+	    identity->fields[3] <= 1)
+		return 0;
+	name = xmemdupz(path, len);
+	valid = verify_path(name, (unsigned)identity->fields[2]);
+	free(name);
+	return valid;
+}
+
+int clean_status_sidecar_append_hardlink(
+	struct strbuf *out, const char *path,
+	const struct path_stat_identity *identity)
+{
+	uint32_t path_len;
+	uint64_t field;
+	size_t len;
+
+	if (!out || !path || !identity)
+		return -1;
+	len = strlen(path);
+	if (!hardlink_path_valid((const unsigned char *)path, len, identity) ||
+	    out->len > CLEAN_STATUS_SIDECAR_MAX_SIZE -
+		(sizeof(path_len) + len + CLEAN_STATUS_IDENTITY_SIZE))
+		return -1;
+	put_be32(&path_len, (uint32_t)len);
+	strbuf_add(out, &path_len, sizeof(path_len));
+	strbuf_add(out, path, len);
+	for (size_t i = 0; i < PATH_STAT_IDENTITY_FIELDS; i++) {
+		put_be64(&field, identity->fields[i]);
+		strbuf_add(out, &field, sizeof(field));
+	}
+	return 0;
+}
+
+int clean_status_sidecar_next_hardlink(
+	const unsigned char **cursor, const unsigned char *end,
+	const unsigned char **path, size_t *path_len,
+	struct path_stat_identity *identity)
+{
+	const unsigned char *p;
+	size_t len;
+
+	if (!cursor || !*cursor || !end || !path || !path_len || !identity ||
+	    *cursor > end || (size_t)(end - *cursor) < sizeof(uint32_t))
+		return -1;
+	p = *cursor;
+	len = get_be32(p);
+	p += sizeof(uint32_t);
+	if (len > (size_t)(end - p) ||
+	    (size_t)(end - p) - len < CLEAN_STATUS_IDENTITY_SIZE)
+		return -1;
+	*path = p;
+	*path_len = len;
+	p += len;
+	for (size_t i = 0; i < PATH_STAT_IDENTITY_FIELDS; i++) {
+		identity->fields[i] = get_be64(p);
+		p += sizeof(uint64_t);
+	}
+	if (!hardlink_path_valid(*path, *path_len, identity))
+		return -1;
+	*cursor = p;
+	return 0;
+}
+
+static int hardlink_block_valid(const unsigned char *block, size_t len,
+				uint32_t nr)
+{
+	struct path_stat_identity identity;
+	const unsigned char *cursor = block, *previous = NULL;
+	const unsigned char *path;
+	size_t path_len, previous_len = 0;
+
+	if (!nr || nr > CLEAN_STATUS_HARDLINK_WITNESS_MAX || !block ||
+	    len > CLEAN_STATUS_SIDECAR_MAX_SIZE)
+		return 0;
+	for (uint32_t i = 0; i < nr; i++) {
+		if (clean_status_sidecar_next_hardlink(
+			    &cursor, block + len, &path, &path_len, &identity))
+			return 0;
+		if (previous) {
+			size_t common = previous_len < path_len ?
+				previous_len : path_len;
+			int order = memcmp(previous, path, common);
+
+			if (order > 0 || (!order && previous_len >= path_len))
+				return 0;
+		}
+		previous = path;
+		previous_len = path_len;
+	}
+	return cursor == block + len;
+}
+
 int clean_status_sidecar_parse(struct clean_status_sidecar *sidecar,
 			       const void *data, size_t len,
 			       const struct git_hash_algo *algo)
@@ -71,15 +174,18 @@ int clean_status_sidecar_parse(struct clean_status_sidecar *sidecar,
 	size_t minimum = 4 + 2 * sizeof(uint32_t) +
 		CLEAN_STATUS_IDENTITY_SIZE + 3 * sizeof(uint32_t) +
 		6 * algo->rawsz + 1;
-	uint32_t flags, token_len;
+	uint32_t flags, token_len, version;
 
 	memset(sidecar, 0, sizeof(*sidecar));
-	if (len < minimum || memcmp(p, CLEAN_STATUS_SIDECAR_MAGIC, 4) ||
+	if (len < minimum || len > CLEAN_STATUS_SIDECAR_MAX_SIZE ||
+	    memcmp(p, CLEAN_STATUS_SIDECAR_MAGIC, 4) ||
 	    !checksum_valid(data, len, algo))
 		return -1;
 	end = p + len - algo->rawsz;
 	p += 4;
-	if (get_be32(p) != CLEAN_STATUS_SIDECAR_VERSION)
+	version = get_be32(p);
+	if (version != CLEAN_STATUS_SIDECAR_VERSION &&
+	    version != CLEAN_STATUS_SIDECAR_HARDLINK_VERSION)
 		return -1;
 	p += sizeof(uint32_t);
 	flags = get_be32(p);
@@ -105,11 +211,24 @@ int clean_status_sidecar_parse(struct clean_status_sidecar *sidecar,
 	token_len = get_be32(p);
 	p += sizeof(uint32_t);
 	if (!proof_valid(&sidecar->proof, algo) ||
-	    (size_t)(end - p) != token_len ||
+	    (size_t)(end - p) < token_len ||
 	    !token_valid(p, token_len))
 		return -1;
 	sidecar->token = p;
 	sidecar->token_len = token_len;
+	p += token_len;
+	if (version == CLEAN_STATUS_SIDECAR_VERSION)
+		return p == end ? 0 : -1;
+	if ((size_t)(end - p) < sizeof(uint32_t))
+		return -1;
+	sidecar->hardlink_nr = get_be32(p);
+	p += sizeof(uint32_t);
+	sidecar->hardlinks = p;
+	sidecar->hardlinks_len = end - p;
+	if (!hardlink_block_valid(sidecar->hardlinks,
+				  sidecar->hardlinks_len,
+				  sidecar->hardlink_nr))
+		return -1;
 	return 0;
 }
 
@@ -122,11 +241,18 @@ int clean_status_sidecar_write(struct strbuf *out,
 	strbuf_reset(out);
 	if (!proof_valid(&sidecar->proof, algo) ||
 	    sidecar->token_len > UINT32_MAX ||
-	    !token_valid(sidecar->token, sidecar->token_len))
+	    !token_valid(sidecar->token, sidecar->token_len) ||
+	    (sidecar->hardlink_nr ?
+		!hardlink_block_valid(sidecar->hardlinks,
+				      sidecar->hardlinks_len,
+				      sidecar->hardlink_nr) :
+		(sidecar->hardlinks || sidecar->hardlinks_len)))
 		return -1;
 
 	strbuf_add(out, CLEAN_STATUS_SIDECAR_MAGIC, 4);
-	put_be32(&value, CLEAN_STATUS_SIDECAR_VERSION);
+	put_be32(&value, sidecar->hardlink_nr ?
+		 CLEAN_STATUS_SIDECAR_HARDLINK_VERSION :
+		 CLEAN_STATUS_SIDECAR_VERSION);
 	strbuf_add(out, &value, sizeof(value));
 	put_be32(&value, 0);
 	strbuf_add(out, &value, sizeof(value));
@@ -144,6 +270,15 @@ int clean_status_sidecar_write(struct strbuf *out,
 	put_be32(&value, sidecar->token_len);
 	strbuf_add(out, &value, sizeof(value));
 	strbuf_add(out, sidecar->token, sidecar->token_len);
+	if (sidecar->hardlink_nr) {
+		put_be32(&value, sidecar->hardlink_nr);
+		strbuf_add(out, &value, sizeof(value));
+		strbuf_add(out, sidecar->hardlinks, sidecar->hardlinks_len);
+	}
+	if (out->len > CLEAN_STATUS_SIDECAR_MAX_SIZE - algo->rawsz) {
+		strbuf_reset(out);
+		return -1;
+	}
 	hash_append_checksum(out, algo);
 	return 0;
 }
@@ -277,7 +412,7 @@ int clean_status_sidecar_install(
 		    index_path, sidecar, snapshot, algo) ||
 	    clean_status_sidecar_write(&encoded, sidecar, algo))
 		goto done;
-	sidecar_fd = hold_lock_file_for_update(&lock, path, 0);
+	sidecar_fd = hold_lock_file_for_update(&lock, path, LOCK_NO_DEREF);
 	if (sidecar_fd < 0 ||
 	    (size_t)write_in_full(sidecar_fd, encoded.buf, encoded.len) !=
 		    encoded.len ||

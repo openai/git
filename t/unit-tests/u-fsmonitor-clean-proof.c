@@ -9,6 +9,7 @@ struct proof_fixture {
 	unsigned char config_hash[GIT_MAX_RAWSZ];
 	unsigned char semantic_hash[GIT_MAX_RAWSZ];
 	unsigned char attr_hash[GIT_MAX_RAWSZ];
+	unsigned char tracked_policy_hash[GIT_MAX_RAWSZ];
 	struct fsmonitor_clean_proof proof;
 };
 
@@ -26,6 +27,7 @@ static void fixture_init(struct proof_fixture *fixture,
 	memset(fixture->config_hash, 2, algo->rawsz);
 	memset(fixture->semantic_hash, 3, algo->rawsz);
 	memset(fixture->attr_hash, 4, algo->rawsz);
+	memset(fixture->tracked_policy_hash, 5, algo->rawsz);
 	attr_manifest_writer_init(&writer, &fixture->manifest, algo);
 	cl_assert_equal_i(attr_manifest_writer_add(
 		&writer, ".gitattributes", ATTR_MANIFEST_INDEX, hash), 0);
@@ -56,6 +58,9 @@ static void assert_round_trip(const struct git_hash_algo *algo)
 		&fixture.encoded, &fixture.proof, algo), 0);
 	cl_assert_equal_i(fsmonitor_clean_proof_parse(
 		&parsed, fixture.encoded.buf, fixture.encoded.len, algo), 0);
+	cl_assert_equal_i(parsed.version,
+		FSMONITOR_CLEAN_PROOF_VERSION_LEGACY);
+	cl_assert_equal_p(parsed.tracked_policy_hash, NULL);
 	cl_assert_equal_i(parsed.flags, fixture.proof.flags);
 	cl_assert_equal_i(parsed.token_len, fixture.proof.token_len);
 	cl_assert(!memcmp(parsed.token, fixture.proof.token, parsed.token_len));
@@ -78,6 +83,7 @@ static void assert_rejected(struct fsmonitor_clean_proof *parsed,
 	cl_assert_equal_p(parsed->config_hash, NULL);
 	cl_assert_equal_p(parsed->semantic_hash, NULL);
 	cl_assert_equal_p(parsed->attr_hash, NULL);
+	cl_assert_equal_p(parsed->tracked_policy_hash, NULL);
 	cl_assert_equal_p(parsed->attr_manifest, NULL);
 	cl_assert_equal_i(parsed->attr_manifest_len, 0);
 }
@@ -86,6 +92,52 @@ void test_fsmonitor_clean_proof__round_trips_both_object_formats(void)
 {
 	assert_round_trip(&hash_algos[GIT_HASH_SHA1]);
 	assert_round_trip(&hash_algos[GIT_HASH_SHA256]);
+}
+
+static void assert_tracked_policy_round_trip(
+	const struct git_hash_algo *algo)
+{
+	struct proof_fixture fixture;
+	struct fsmonitor_clean_proof parsed;
+	struct strbuf unbound = STRBUF_INIT;
+	size_t policy_offset;
+	unsigned char saved;
+
+	fixture_init(&fixture, algo);
+	fixture.proof.tracked_policy_hash = fixture.tracked_policy_hash;
+	cl_assert_equal_i(fsmonitor_clean_proof_write(
+		&fixture.encoded, &fixture.proof, algo), 0);
+	cl_assert_equal_i(fsmonitor_clean_proof_parse(
+		&parsed, fixture.encoded.buf, fixture.encoded.len, algo), 0);
+	cl_assert_equal_i(parsed.version, FSMONITOR_CLEAN_PROOF_VERSION);
+	cl_assert(!memcmp(parsed.tracked_policy_hash,
+		fixture.tracked_policy_hash, algo->rawsz));
+	cl_assert_equal_i(fsmonitor_clean_proof_copy_without_bindings(
+		&unbound, fixture.encoded.buf, fixture.encoded.len, algo), 0);
+	cl_assert_equal_i(fsmonitor_clean_proof_parse(
+		&parsed, unbound.buf, unbound.len, algo), 0);
+	cl_assert_equal_i(parsed.version, FSMONITOR_CLEAN_PROOF_VERSION);
+	cl_assert(!memcmp(parsed.tracked_policy_hash,
+		fixture.tracked_policy_hash, algo->rawsz));
+	cl_assert_equal_i(parsed.flags,
+		FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX);
+	policy_offset = 5 * sizeof(uint32_t) + fixture.proof.token_len +
+		3 * algo->rawsz;
+	saved = fixture.encoded.buf[policy_offset];
+	fixture.encoded.buf[policy_offset] ^= 1;
+	assert_rejected(&parsed, &fixture.encoded, algo);
+	fixture.encoded.buf[policy_offset] = saved;
+	fixture.encoded.len--;
+	assert_rejected(&parsed, &fixture.encoded, algo);
+	strbuf_release(&unbound);
+	fixture_release(&fixture);
+}
+
+void test_fsmonitor_clean_proof__binds_tracked_policy_in_both_formats(void)
+{
+	assert_tracked_policy_round_trip(&hash_algos[GIT_HASH_SHA1]);
+	assert_tracked_policy_round_trip(&hash_algos[GIT_HASH_SHA256]);
 }
 
 void test_fsmonitor_clean_proof__rejects_corrupt_records(void)

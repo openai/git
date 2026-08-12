@@ -1710,9 +1710,11 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	 * If changes are found, invalidate it before stash machinery
 	 * mutates the index or worktree.
 	 */
-	if (preserve_clean_history)
+	if (preserve_clean_history) {
+		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository,
 					       &stash_clean_digest);
+	}
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
@@ -1746,13 +1748,17 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			printf_ln(_("No local changes to save"));
 		goto done;
 	}
+	if (preserve_clean_history) {
+		clean_status_invalidate_current_proof(the_repository->index);
+		if (clean_status_should_write_fsmonitor_config(
+			    the_repository->index))
+			the_repository->index->cache_changed |= FSMONITOR_CHANGED;
+	}
 	if (write_locked_index(the_repository->index, &index_lock,
 			       COMMIT_LOCK | SKIP_IF_UNCHANGED)) {
 		ret = error(_("could not write index"));
 		goto done;
 	}
-	if (preserve_clean_history)
-		clean_status_invalidate_current_proof(the_repository->index);
 
 	if (!refs_reflog_exists(get_main_ref_store(the_repository), ref_stash) && do_clear_stash()) {
 		ret = -1;

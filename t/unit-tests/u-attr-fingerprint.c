@@ -1,6 +1,7 @@
 #include "unit-test.h"
 #include "attr-fingerprint.h"
 #include "dir.h"
+#include "path.h"
 #include "strbuf.h"
 #include "wrapper.h"
 
@@ -59,10 +60,14 @@ void test_attr_fingerprint__separates_contents_from_namespace(void)
 			  algo->rawsz));
 	cl_assert(memcmp(initial.namespace_hash, metadata.namespace_hash,
 			 algo->rawsz));
+	cl_assert(memcmp(initial.portable_namespace_hash,
+			 metadata.portable_namespace_hash, algo->rawsz));
 	write_file(path.buf, "*.txt -text\n");
 	fingerprint(path.buf, 1, algo, &changed);
 	cl_assert(memcmp(metadata.content_hash, changed.content_hash,
 			 algo->rawsz));
+	cl_assert(memcmp(metadata.portable_namespace_hash,
+			 changed.portable_namespace_hash, algo->rawsz));
 
 	strbuf_release(&path);
 	remove_directory(directory);
@@ -100,6 +105,8 @@ void test_attr_fingerprint__records_missing_parent_namespaces(void)
 	cl_assert(!memcmp(before.content_hash, after.content_hash, algo->rawsz));
 	cl_assert(memcmp(before.namespace_hash, after.namespace_hash,
 			 algo->rawsz));
+	cl_assert(!memcmp(before.portable_namespace_hash,
+			  after.portable_namespace_hash, algo->rawsz));
 
 	strbuf_release(&path);
 	remove_directory(directory);
@@ -121,7 +128,118 @@ void test_attr_fingerprint__does_not_observe_disabled_sources(void)
 	cl_assert(!memcmp(before.content_hash, after.content_hash, algo->rawsz));
 	cl_assert(!memcmp(before.namespace_hash, after.namespace_hash,
 			  algo->rawsz));
+	cl_assert(!memcmp(before.portable_namespace_hash,
+			  after.portable_namespace_hash, algo->rawsz));
 
 	strbuf_release(&path);
 	remove_directory(directory);
+}
+
+void test_attr_fingerprint__equates_distinct_absent_source_paths(void)
+{
+#ifndef O_NONBLOCK
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA256];
+	char *directory;
+	struct strbuf absent_a = STRBUF_INIT;
+	struct strbuf absent_b = STRBUF_INIT;
+	struct strbuf present = STRBUF_INIT;
+	struct attr_fingerprint_source first[2], second[2];
+	struct attr_fingerprint before, after, changed;
+
+	if (!fstat_is_reliable())
+		cl_skip();
+	directory = create_directory();
+	strbuf_addf(&absent_a, "%s/system-a/attributes", directory);
+	strbuf_addf(&absent_b, "%s/system-b/attributes", directory);
+	strbuf_addf(&present, "%s/global-attributes", directory);
+	write_file(present.buf, "*.txt text\n");
+
+	first[0] = (struct attr_fingerprint_source) {
+		.path = absent_a.buf,
+		.enabled = 1,
+	};
+	first[1] = (struct attr_fingerprint_source) {
+		.path = present.buf,
+		.enabled = 1,
+	};
+	second[0] = first[0];
+	second[0].path = absent_b.buf;
+	second[1] = first[1];
+
+	cl_assert_equal_i(attr_fingerprint_sources(
+		first, ARRAY_SIZE(first), algo, &before), 0);
+	cl_assert_equal_i(attr_fingerprint_sources(
+		second, ARRAY_SIZE(second), algo, &after), 0);
+	cl_assert(before.sources_present);
+	cl_assert(after.sources_present);
+	cl_assert(!memcmp(before.content_hash, after.content_hash,
+			  algo->rawsz));
+	cl_assert(!memcmp(before.portable_namespace_hash,
+			  after.portable_namespace_hash, algo->rawsz));
+	cl_assert(memcmp(before.namespace_hash, after.namespace_hash,
+			 algo->rawsz));
+
+	second[0].enabled = 0;
+	cl_assert_equal_i(attr_fingerprint_sources(
+		second, ARRAY_SIZE(second), algo, &changed), 0);
+	cl_assert(memcmp(before.content_hash, changed.content_hash,
+			 algo->rawsz));
+	cl_assert(memcmp(before.portable_namespace_hash,
+			 changed.portable_namespace_hash, algo->rawsz));
+
+	first[0].enabled = 0;
+	cl_assert_equal_i(attr_fingerprint_sources(
+		first, ARRAY_SIZE(first), algo, &before), 0);
+	cl_assert(!memcmp(before.content_hash, changed.content_hash,
+			  algo->rawsz));
+	cl_assert(!memcmp(before.portable_namespace_hash,
+			  changed.portable_namespace_hash, algo->rawsz));
+	cl_assert(memcmp(before.namespace_hash, changed.namespace_hash,
+			 algo->rawsz));
+
+	first[0].enabled = 1;
+	first[0].path = present.buf;
+	first[1].path = absent_a.buf;
+	second[0].enabled = 1;
+	cl_assert_equal_i(attr_fingerprint_sources(
+		first, ARRAY_SIZE(first), algo, &before), 0);
+	cl_assert_equal_i(attr_fingerprint_sources(
+		second, ARRAY_SIZE(second), algo, &after), 0);
+	cl_assert(memcmp(before.content_hash, after.content_hash,
+			 algo->rawsz));
+	cl_assert(memcmp(before.portable_namespace_hash,
+			 after.portable_namespace_hash, algo->rawsz));
+
+	write_file(present.buf, "*.txt -text\n");
+	cl_assert_equal_i(attr_fingerprint_sources(
+		second, ARRAY_SIZE(second), algo, &changed), 0);
+	cl_assert(memcmp(after.content_hash, changed.content_hash,
+			 algo->rawsz));
+	cl_assert(memcmp(after.portable_namespace_hash,
+			 changed.portable_namespace_hash, algo->rawsz));
+
+	cl_assert_equal_i(
+		safe_create_leading_directories_no_share(absent_b.buf), 0);
+	write_file(absent_b.buf, "*.system text\n");
+	cl_assert_equal_i(attr_fingerprint_sources(
+		second, ARRAY_SIZE(second), algo, &before), 0);
+	cl_assert(memcmp(changed.content_hash, before.content_hash,
+			 algo->rawsz));
+	cl_assert(memcmp(changed.portable_namespace_hash,
+			 before.portable_namespace_hash, algo->rawsz));
+	write_file(absent_b.buf, "*.system -text\n");
+	cl_assert_equal_i(attr_fingerprint_sources(
+		second, ARRAY_SIZE(second), algo, &after), 0);
+	cl_assert(memcmp(before.content_hash, after.content_hash,
+			 algo->rawsz));
+	cl_assert(memcmp(before.portable_namespace_hash,
+			 after.portable_namespace_hash, algo->rawsz));
+
+	strbuf_release(&present);
+	strbuf_release(&absent_b);
+	strbuf_release(&absent_a);
+	remove_directory(directory);
+#endif
 }

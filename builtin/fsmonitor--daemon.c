@@ -415,6 +415,10 @@ static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
 		struct tm tm;
 		time_t secs;
 
+#ifdef __APPLE__
+		strbuf_addstr(&token->token_id,
+			      FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX);
+#endif
 		gettimeofday(&tv, NULL);
 		secs = tv.tv_sec;
 		gmtime_r(&secs, &tm);
@@ -742,7 +746,11 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 
 	if (!strcmp(command, FSMONITOR_IPC_CAPABILITY_COMMAND)) {
 		static const char capabilities[] =
-			FSMONITOR_IPC_QUERY_VERSION "\n";
+			FSMONITOR_IPC_QUERY_VERSION "\n"
+#ifdef __APPLE__
+			FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+#endif
+			;
 
 		return reply(reply_data, capabilities,
 			     sizeof(capabilities) - 1);

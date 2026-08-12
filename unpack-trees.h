@@ -70,7 +70,8 @@ struct unpack_trees_options {
 		     quiet,
 		     exiting_early,
 		     dry_run,
-		     skip_cache_tree_update;
+		     skip_cache_tree_update,
+		     preserve_semantic_history;
 	enum unpack_trees_reset_type reset;
 	const char *prefix;
 	const char *super_prefix;
