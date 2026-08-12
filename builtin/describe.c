@@ -790,6 +790,7 @@ int cmd_describe(int argc,
 			 */
 			clean_status_set_config_digest(the_repository,
 						       &clean_digest);
+			prepare_diff_external_history(the_repository);
 			repo_read_index(the_repository);
 			refresh_index(the_repository->index, REFRESH_QUIET|REFRESH_UNMERGED,
 				      NULL, NULL, NULL);
