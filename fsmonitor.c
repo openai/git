@@ -647,7 +647,8 @@ static size_t handle_path_with_trailing_slash(
 		nr_in_cone++;
 	}
 
-	if (nr_in_cone) {
+	if (nr_in_cone &&
+	    !clean_status_directory_event_is_semantically_safe(istate, name)) {
 		/*
 		 * A matched directory event may stand in for a nested
 		 * attribute-file change.
@@ -665,6 +666,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 	int len = strlen(name);
 	int pos;
 	int attributes_may_have_changed;
+	int directory_is_semantically_safe;
 	size_t nr_in_cone;
 
 	trace_printf_key(&trace_fsmonitor,
@@ -687,12 +689,14 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 	pos = index_name_pos(istate, name, len);
 	attributes_may_have_changed =
 		fsmonitor_invalidate_attributes_path(istate, name);
+	directory_is_semantically_safe = name[len - 1] == '/' &&
+		clean_status_directory_event_is_semantically_safe(istate, name);
 
 	if (name[len - 1] == '/')
 		nr_in_cone = handle_path_with_trailing_slash(istate, name, pos);
 	else
 		nr_in_cone = handle_path_without_trailing_slash(istate, name, pos);
-	if (pos < 0 && nr_in_cone)
+	if (pos < 0 && nr_in_cone && !directory_is_semantically_safe)
 		attributes_may_have_changed = 1;
 
 	/*

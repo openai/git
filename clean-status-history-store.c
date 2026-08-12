@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 
 #ifdef __APPLE__
+#include <sys/clonefile.h>
 #include <sys/mount.h>
 #endif
 
@@ -64,6 +65,18 @@ static char *history_store_path(const char *index_path,
 	proof_namespace_hash(proof_namespace, algo, hash);
 	hash_to_hex_algop_r(hex, hash, algo);
 	return xstrfmt("%s.csh1.%s", index_path, hex);
+}
+
+char *clean_status_history_store_witness_path(
+	const char *index_path, const char *proof_namespace,
+	const struct git_hash_algo *algo)
+{
+	unsigned char hash[GIT_MAX_RAWSZ];
+	char hex[GIT_MAX_HEXSZ + 1];
+
+	proof_namespace_hash(proof_namespace, algo, hash);
+	hash_to_hex_algop_r(hex, hash, algo);
+	return xstrfmt("%s.cswi.%s", index_path, hex);
 }
 
 struct history_store_file {
@@ -157,6 +170,21 @@ static int prune_history_store(const char *index_path,
 		if (lstat(files[i].path, &st) || !S_ISREG(st.st_mode) ||
 		    unlink(files[i].path))
 			goto done;
+		{
+			char *witness = xstrdup(files[i].path);
+			size_t pathlen = strlen(witness);
+			char *marker = pathlen >= algo->hexsz + 6 ?
+				witness + pathlen - algo->hexsz - 6 : NULL;
+
+			if (marker && !memcmp(marker, ".csh1.", 6))
+				memcpy(marker, ".cswi.", 6);
+			else
+				marker = NULL;
+			if (marker && !lstat(witness, &st) &&
+			    S_ISREG(st.st_mode))
+				unlink(witness);
+			free(witness);
+		}
 		remove_nr--;
 	}
 	ret = remove_nr ? -1 : 0;
@@ -437,6 +465,49 @@ static int local_apfs_id(int fd MAYBE_UNUSED,
 #endif
 }
 
+static void install_history_witness(
+	const char *index_path, const char *proof_namespace,
+	const struct clean_status_index_snapshot *snapshot,
+	const struct git_hash_algo *algo, int encoded_matches)
+{
+#ifdef __APPLE__
+	struct clean_status_filesystem_id fsid;
+	struct clean_status_index_snapshot existing = { .fd = -1 };
+	char *witness = NULL, *temporary = NULL;
+
+	if (!snapshot || snapshot->fd < 0 ||
+	    local_apfs_id(snapshot->fd, &fsid))
+		return;
+	witness = clean_status_history_store_witness_path(
+		index_path, proof_namespace, algo);
+	if (encoded_matches &&
+	    !clean_status_index_snapshot_open(&existing, witness, algo) &&
+	    existing.version == snapshot->version &&
+	    existing.cache_nr == snapshot->cache_nr &&
+	    oideq(&existing.checksum, &snapshot->checksum)) {
+		clean_status_index_snapshot_release(&existing);
+		free(witness);
+		return;
+	}
+	clean_status_index_snapshot_release(&existing);
+	temporary = xstrfmt("%s.tmp.%"PRIuMAX, witness,
+			   (uintmax_t)getpid());
+	if (!fclonefileat(snapshot->fd, AT_FDCWD, temporary, 0) &&
+	    clean_status_index_snapshot_still_matches_path(
+		    snapshot, index_path, algo))
+		rename(temporary, witness);
+	unlink(temporary);
+	free(temporary);
+	free(witness);
+#else
+	(void)index_path;
+	(void)proof_namespace;
+	(void)snapshot;
+	(void)algo;
+	(void)encoded_matches;
+#endif
+}
+
 int clean_status_history_checkpoint_source_matches(
 	const char *index_path,
 	const struct clean_status_history_checkpoint *checkpoint,
@@ -515,6 +586,9 @@ int clean_status_history_store_install(
 	    !clean_status_index_snapshot_still_matches_path(
 		    snapshot, index_path, algo))
 		goto done;
+	if (aliased.source_alias_valid)
+		install_history_witness(index_path, proof_namespace,
+					snapshot, algo, encoded_matches);
 	if (encoded_matches) {
 		ret = 0;
 		goto done;

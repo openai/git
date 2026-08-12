@@ -1877,6 +1877,43 @@ static void update_sparsity_for_prefix(const char *prefix,
 static int verify_absent(const struct cache_entry *,
 			 enum unpack_trees_error_types,
 			 struct unpack_trees_options *);
+
+static int checkout_introduces_new_indexed_directory(
+	struct index_state *source, const struct index_state *result)
+{
+	unsigned int source_pos = 0;
+
+	for (unsigned int result_pos = 0;
+	     result_pos < result->cache_nr; result_pos++) {
+		const struct cache_entry *entry = result->cache[result_pos];
+		const char *slash;
+
+		while (source_pos < source->cache_nr &&
+		       strcmp(source->cache[source_pos]->name, entry->name) < 0)
+			source_pos++;
+		if (source_pos < source->cache_nr &&
+		    !strcmp(source->cache[source_pos]->name, entry->name))
+			continue;
+
+		for (slash = strchr(entry->name, '/'); slash;
+		     slash = strchr(slash + 1, '/')) {
+			size_t len = slash - entry->name;
+			int position = index_name_pos(source, entry->name, len);
+
+			if (position >= 0)
+				return 1;
+			position = -position - 1;
+			if (position >= source->cache_nr ||
+			    ce_namelen(source->cache[position]) <= len ||
+			    source->cache[position]->name[len] != '/' ||
+			    memcmp(source->cache[position]->name,
+				   entry->name, len))
+				return 1;
+		}
+	}
+	return 0;
+}
+
 /*
  * N-way merge "len" trees.  Returns 0 on success, -1 on failure to manipulate the
  * resulting index, -2 on failure to reflect the changes to the work tree.
@@ -2077,10 +2114,56 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 
 	ret = check_updates(o, &o->internal.result) ? (-2) : 0;
 	if (o->dst_index) {
-		if (!ret)
-			clean_status_transfer_current_proof_if_same_index(
-				&o->internal.result, o->src_index);
+		int history_transferred = 0;
+		int new_indexed_directory = 0;
+
+		if (!ret) {
+			history_transferred =
+				clean_status_transfer_current_proof_if_same_index(
+					&o->internal.result, o->src_index);
+			if (!history_transferred && o->preserve_semantic_history)
+				history_transferred =
+					clean_status_transfer_current_proof_if_semantically_same_index(
+						&o->internal.result, o->src_index);
+			if (history_transferred && o->preserve_semantic_history)
+				new_indexed_directory =
+					checkout_introduces_new_indexed_directory(
+						o->src_index, &o->internal.result);
+		}
 		move_index_extensions(&o->internal.result, o->src_index);
+		if (!ret && o->preserve_semantic_history && history_transferred &&
+		    !new_indexed_directory &&
+		    !o->src_index->sparse_index &&
+		    !o->internal.result.sparse_index &&
+		    !o->src_index->split_index &&
+		    !o->internal.result.split_index &&
+		    o->internal.result.untracked &&
+		    o->src_index->fsmonitor_token_valid &&
+		    o->internal.result.fsmonitor_token_valid &&
+		    o->src_index->fsmonitor_untracked_valid &&
+		    o->src_index->fsmonitor_untracked_extension_seen &&
+		    !o->src_index->fsmonitor_untracked_extension_invalid &&
+		    !o->src_index->fsmonitor_legacy_untracked_fallback &&
+		    o->src_index->fsmonitor_untracked_token &&
+		    o->src_index->fsmonitor_last_update &&
+		    o->internal.result.fsmonitor_last_update &&
+		    !strcmp(o->src_index->fsmonitor_untracked_token,
+			    o->src_index->fsmonitor_last_update) &&
+		    !strcmp(o->src_index->fsmonitor_untracked_token,
+			    o->internal.result.fsmonitor_last_update)) {
+			o->internal.result.fsmonitor_untracked_token =
+				xstrdup(o->src_index->fsmonitor_untracked_token);
+			o->internal.result.fsmonitor_untracked_extension_seen = 1;
+			o->internal.result.fsmonitor_untracked_extension_invalid = 0;
+			o->internal.result.fsmonitor_untracked_valid = 1;
+			o->internal.result.untracked->use_fsmonitor = 1;
+			trace2_data_intmax("fsmonitor", repo,
+					   "history/untracked-paired-transfer", 1);
+		} else if (new_indexed_directory) {
+			trace2_data_intmax(
+				"fsmonitor", repo,
+				"history/untracked-paired-new-directory-deferred", 1);
+		}
 		if (!ret) {
 			if (git_env_bool("GIT_TEST_CHECK_CACHE_TREE", 0) &&
 			    cache_tree_verify(the_repository,
@@ -2307,6 +2390,45 @@ static void invalidate_ce_path(const struct cache_entry *ce,
 		return;
 	cache_tree_invalidate_path(o->src_index, ce->name);
 	untracked_cache_invalidate_path(o->src_index, ce->name, 1);
+}
+
+static void invalidate_replaced_ce_path(const struct cache_entry *old,
+					const struct cache_entry *new,
+					struct unpack_trees_options *o)
+{
+	const unsigned int unsafe_flags = CE_SKIP_WORKTREE |
+		CE_NEW_SKIP_WORKTREE | CE_INTENT_TO_ADD | CE_CONFLICTED;
+	const char *basename;
+
+	if (!o->preserve_semantic_history ||
+	    o->src_index->sparse_index || o->src_index->split_index ||
+	    !o->src_index->fsmonitor_untracked_valid ||
+	    !o->src_index->untracked ||
+	    !o->src_index->untracked->use_fsmonitor ||
+	    ce_stage(old) ||
+	    strcmp(old->name, new->name) ||
+	    ((old->ce_flags | new->ce_flags) & unsafe_flags) ||
+	    (!S_ISREG(old->ce_mode) && !S_ISLNK(old->ce_mode)) ||
+	    ((old->ce_mode & S_IFMT) != (new->ce_mode & S_IFMT)))
+		goto rooted;
+
+	basename = find_last_dir_sep(old->name);
+	basename = basename ? basename + 1 : old->name;
+	if (!fspathcmp(basename, ".gitattributes") ||
+	    !fspathcmp(basename, ".gitignore"))
+		goto rooted;
+
+	cache_tree_invalidate_path(o->src_index, old->name);
+	untracked_cache_invalidate_path(o->src_index, old->name, 0);
+	trace2_data_intmax("fsmonitor", o->src_index->repo,
+			   "checkout/untracked-replacement-targeted", 1);
+	return;
+
+rooted:
+	invalidate_ce_path(old, o);
+	if (o->preserve_semantic_history)
+		trace2_data_intmax("fsmonitor", o->src_index->repo,
+				   "checkout/untracked-replacement-rooted", 1);
 }
 
 /*
@@ -2621,7 +2743,7 @@ static int merged_entry(const struct cache_entry *ce,
 			}
 			/* Migrate old flags over */
 			update |= old->ce_flags & (CE_SKIP_WORKTREE | CE_NEW_SKIP_WORKTREE);
-			invalidate_ce_path(old, o);
+			invalidate_replaced_ce_path(old, merge, o);
 		}
 
 		if (submodule_from_ce(ce) && file_exists(ce->name)) {

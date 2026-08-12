@@ -34,6 +34,7 @@ static int open_attr_source(const char *path)
 
 static int hash_source(struct git_hash_ctx *content_ctx,
 		       struct git_hash_ctx *namespace_ctx,
+		       struct git_hash_ctx *portable_namespace_ctx,
 		       const struct attr_fingerprint_source *source,
 		       int *present,
 		       struct attr_source_snapshot_entry *snapshot)
@@ -49,14 +50,20 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 	int fd = -1, ret = -1;
 	char extra;
 
-	hash_optional_cstring(content_ctx, source->path);
 	hash_optional_cstring(namespace_ctx, source->path);
 	put_be32(&state, source->enabled);
-	hash_length_delimited(content_ctx, &state, sizeof(state));
 	hash_length_delimited(namespace_ctx, &state, sizeof(state));
+	hash_length_delimited(portable_namespace_ctx, &state, sizeof(state));
 	*present = 0;
-	if (!source->enabled || !source->path)
+	if (!source->enabled || !source->path) {
+		hash_optional_cstring(content_ctx, NULL);
+		hash_length_delimited(content_ctx, &state, sizeof(state));
+		state = 0;
+		hash_length_delimited(content_ctx, &state, sizeof(state));
+		hash_length_delimited(portable_namespace_ctx, &state,
+				      sizeof(state));
 		return 0;
+	}
 
 	absolute = absolute_pathdup(source->path);
 	strbuf_addstr(&normalized, absolute);
@@ -64,12 +71,18 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 	    path_namespace_capture(normalized.buf, &before))
 		goto done;
 	*present = path_namespace_target_present(before);
+	hash_optional_cstring(content_ctx,
+			      *present ? source->path : NULL);
+	put_be32(&state, source->enabled);
+	hash_length_delimited(content_ctx, &state, sizeof(state));
 	if (!*present) {
 		if (path_namespace_capture(normalized.buf, &after) ||
 		    !path_namespace_equal(before, after))
 			goto done;
 		state = 0;
 		hash_length_delimited(content_ctx, &state, sizeof(state));
+		hash_length_delimited(portable_namespace_ctx, &state,
+				      sizeof(state));
 		path_namespace_hash(namespace_ctx, before);
 		ret = 0;
 		goto done;
@@ -93,9 +106,15 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 		goto done;
 	state = 1;
 	hash_length_delimited(content_ctx, &state, sizeof(state));
+	hash_length_delimited(portable_namespace_ctx, &state,
+			      sizeof(state));
+	hash_optional_cstring(portable_namespace_ctx, source->path);
 	path_namespace_hash(namespace_ctx, before);
+	path_namespace_hash(portable_namespace_ctx, before);
 	path_namespace_hash_stat(namespace_ctx, &opened_after);
+	path_namespace_hash_stat(portable_namespace_ctx, &opened_after);
 	hash_length_delimited(content_ctx, buf, size);
+	hash_length_delimited(portable_namespace_ctx, buf, size);
 	if (snapshot) {
 		snapshot->path = xstrdup(source->path);
 		snapshot->buf = buf;
@@ -119,7 +138,7 @@ static int fingerprint_sources(
 	const struct git_hash_algo *algo, struct attr_fingerprint *result,
 	struct attr_source_snapshot *snapshot)
 {
-	struct git_hash_ctx content_ctx, namespace_ctx;
+	struct git_hash_ctx content_ctx, namespace_ctx, portable_namespace_ctx;
 	uint32_t count;
 
 	if (snapshot && nr != ARRAY_SIZE(snapshot->sources))
@@ -127,26 +146,33 @@ static int fingerprint_sources(
 	memset(result, 0, sizeof(*result));
 	git_hash_init(&content_ctx, algo);
 	git_hash_init(&namespace_ctx, algo);
+	git_hash_init(&portable_namespace_ctx, algo);
 	hash_optional_cstring(&content_ctx, "attribute-source-content-v1");
 	hash_optional_cstring(&namespace_ctx,
 			      "attribute-source-namespace-v1");
+	hash_optional_cstring(&portable_namespace_ctx,
+			      "attribute-source-portable-namespace-v1");
 	if (nr > UINT32_MAX)
 		return -1;
 	put_be32(&count, nr);
 	hash_length_delimited(&content_ctx, &count, sizeof(count));
 	hash_length_delimited(&namespace_ctx, &count, sizeof(count));
+	hash_length_delimited(&portable_namespace_ctx, &count, sizeof(count));
 	for (size_t i = 0; i < nr; i++) {
 		int present;
 		struct attr_source_snapshot_entry *entry =
 			snapshot ? &snapshot->sources[i] : NULL;
 
-		if (hash_source(&content_ctx, &namespace_ctx, &sources[i],
-				&present, entry))
+		if (hash_source(&content_ctx, &namespace_ctx,
+				&portable_namespace_ctx, &sources[i], &present,
+				entry))
 			return -1;
 		result->sources_present |= present;
 	}
 	git_hash_final(result->content_hash, &content_ctx);
 	git_hash_final(result->namespace_hash, &namespace_ctx);
+	git_hash_final(result->portable_namespace_hash,
+		       &portable_namespace_ctx);
 	return 0;
 }
 

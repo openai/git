@@ -161,9 +161,17 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 		int pos;
 		struct diff_filespec *one = q->queue[i]->one;
 		int is_in_reset_tree = one->mode && !is_null_oid(&one->oid);
+		struct cache_entry *old;
 		struct cache_entry *ce;
 
+		pos = index_name_pos(the_repository->index, one->path,
+				     strlen(one->path));
+		old = pos >= 0 ? the_repository->index->cache[pos] : NULL;
 		if (!is_in_reset_tree && !intent_to_add) {
+			if (!clean_status_index_entry_is_semantically_safe(
+				    the_repository->index, old, NULL))
+				clean_status_invalidate_current_proof(
+					the_repository->index);
 			remove_file_from_index(the_repository->index, one->path);
 			continue;
 		}
@@ -179,7 +187,6 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 		 * if this entry is outside the sparse cone - this is necessary
 		 * to properly construct the reset sparse directory.
 		 */
-		pos = index_name_pos(the_repository->index, one->path, strlen(one->path));
 		if ((pos >= 0 && ce_skip_worktree(the_repository->index->cache[pos])) ||
 		    (pos < 0 && !path_in_sparse_checkout(one->path, the_repository->index)))
 			ce->ce_flags |= CE_SKIP_WORKTREE;
@@ -191,6 +198,10 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 			ce->ce_flags |= CE_INTENT_TO_ADD;
 			set_object_name_for_intent_to_add_entry(ce);
 		}
+		if (!clean_status_index_entry_is_semantically_safe(
+			    the_repository->index, old, ce))
+			clean_status_invalidate_current_proof(
+				the_repository->index);
 		add_index_entry(the_repository->index, ce,
 				ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE);
 	}
@@ -498,6 +509,9 @@ int cmd_reset(int argc,
 	    !pathspec.nr && !intent_to_add &&
 	    !unborn) {
 		preserve_mixed_history = reset_type == MIXED;
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	} else if (reset_type == MIXED && pathspec.nr &&
+		   !intent_to_add && !unborn) {
 		clean_status_set_config_digest(the_repository, &clean_digest);
 	}
 

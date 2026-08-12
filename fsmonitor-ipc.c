@@ -261,6 +261,38 @@ static int server_supports_bound_queries(void)
 	return ret;
 }
 
+static int server_supports_required_capabilities(void)
+{
+#ifdef __APPLE__
+	struct strbuf answer = STRBUF_INIT;
+	int ret;
+
+	ret = !try_send_command(FSMONITOR_IPC_CAPABILITY_COMMAND,
+				&answer, NULL) &&
+		has_capability(&answer, FSMONITOR_IPC_QUERY_VERSION) &&
+		has_capability(&answer,
+			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY);
+	strbuf_release(&answer);
+	return ret;
+#else
+	return server_supports_bound_queries();
+#endif
+}
+
+#ifdef __APPLE__
+static int query_identifies_filtered_daemon(const char *token,
+					   const struct strbuf *answer)
+{
+	static const char prefix[] =
+		"builtin:" FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX;
+	const char *end = memchr(answer->buf, '\0', answer->len);
+
+	return starts_with(token, prefix) && end &&
+		(size_t)(end - answer->buf) >= sizeof(prefix) - 1 &&
+		!memcmp(answer->buf, prefix, sizeof(prefix) - 1);
+}
+#endif
+
 #if defined(__APPLE__) || defined(__linux__)
 static int legacy_peer_credentials(
 	struct ipc_client_connection *connection, pid_t *pid)
@@ -581,7 +613,7 @@ static int restart_incompatible_daemon(void)
 	if (hold_lock_file_for_update_timeout(&restart_lock, lock_path.buf,
 					      LOCK_NO_DEREF,
 					      lock_timeout_ms) < 0) {
-		if (server_supports_bound_queries())
+		if (server_supports_required_capabilities())
 			ret = 0;
 		goto done;
 	}
@@ -595,7 +627,7 @@ static int restart_incompatible_daemon(void)
 		int wait_result;
 
 		/* Another client may have replaced the daemon while we waited. */
-		if (server_supports_bound_queries())
+		if (server_supports_required_capabilities())
 			goto success;
 		if (!lstat(fsmonitor_ipc__get_path(the_repository),
 			   &socket_stat))
@@ -606,7 +638,7 @@ static int restart_incompatible_daemon(void)
 			 * Re-read its state before abandoning the upgrade.
 			 */
 			if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
-				if (server_supports_bound_queries())
+				if (server_supports_required_capabilities())
 					ret = 0;
 				goto done;
 			}
@@ -639,6 +671,39 @@ done:
 	strbuf_release(&answer);
 	return ret;
 }
+
+#ifdef __APPLE__
+static int spawn_daemon_serialized(void)
+{
+	struct strbuf lock_path = STRBUF_INIT;
+	struct lock_file restart_lock = LOCK_INIT;
+	uintmax_t timeout_ms = (uintmax_t)get_start_timeout() * 1000;
+	long lock_timeout_ms = timeout_ms > LONG_MAX ?
+		LONG_MAX : (long)timeout_ms;
+	int have_lock = 0;
+	int ret = -1;
+
+	strbuf_addf(&lock_path, "%s.restart",
+		    fsmonitor_ipc__get_path(the_repository));
+	if (hold_lock_file_for_update_timeout(&restart_lock, lock_path.buf,
+					      LOCK_NO_DEREF,
+					      lock_timeout_ms) < 0) {
+		if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
+			ret = 0;
+		goto done;
+	}
+	have_lock = 1;
+	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING ||
+	    !spawn_daemon())
+		ret = 0;
+
+done:
+	if (have_lock)
+		rollback_lock_file(&restart_lock);
+	strbuf_release(&lock_path);
+	return ret;
+}
+#endif
 
 int fsmonitor_ipc__send_query(const char *since_token,
 			      struct strbuf *answer,
@@ -686,6 +751,18 @@ try_again:
 
 		trace2_data_intmax("fsm_client", NULL,
 				   "query/response-length", answer->len);
+#ifdef __APPLE__
+		if (!ret && !query_identifies_filtered_daemon(tok, answer) &&
+		    !server_supports_required_capabilities()) {
+			strbuf_reset(answer);
+			ret = -1;
+			if (lifecycle_attempts++ >= FSMONITOR_RESTART_ATTEMPTS ||
+			    restart_incompatible_daemon())
+				goto done;
+			options.wait_if_not_found = 1;
+			goto try_again;
+		}
+#endif
 		if (!ret && is_trivial_response(answer) &&
 		    !server_supports_bound_queries()) {
 			if (!try_send_attested_legacy_query(
@@ -716,7 +793,11 @@ try_again:
 		if (lifecycle_attempts++ >= FSMONITOR_RESTART_ATTEMPTS)
 			goto done;
 
+#ifdef __APPLE__
+		if (spawn_daemon_serialized())
+#else
 		if (spawn_daemon())
+#endif
 			goto done;
 
 		/*

@@ -239,7 +239,10 @@ static int update_some(const struct object_id *oid, struct strbuf *base,
 		}
 	}
 
-	if (checkout_context && checkout_context->index_changed)
+	if (checkout_context && checkout_context->index_changed &&
+	    !clean_status_index_entry_is_semantically_safe(
+		    the_repository->index,
+		    pos >= 0 ? the_repository->index->cache[pos] : NULL, ce))
 		*checkout_context->index_changed = 1;
 	add_index_entry(the_repository->index, ce,
 			ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE);
@@ -452,7 +455,9 @@ static void mark_ce_for_checkout_no_overlay(struct cache_entry *ce,
 			 * tree-ish, which means we should remove it
 			 * from the index and the working tree.
 			 */
-			if (index_changed)
+			if (index_changed &&
+			    !clean_status_index_entry_is_semantically_safe(
+				    the_repository->index, ce, NULL))
 				*index_changed = 1;
 			ce->ce_flags |= CE_REMOVE | CE_WT_REMOVE;
 		}
@@ -904,7 +909,8 @@ static int merge_working_tree(const struct checkout_opts *opts,
 	 * target tree matches the index. Let unpack_trees() transfer the
 	 * proof only after it proves that the rebuilt index is identical.
 	 */
-	if (opts->discard_changes)
+	if (opts->discard_changes ||
+	    (!opts->merge && !opts->new_orphan_branch))
 		clean_status_set_config_digest(the_repository,
 					       &opts->clean_digest);
 	if (repo_read_index_preload(the_repository, NULL, 0) < 0) {
@@ -952,6 +958,7 @@ static int merge_working_tree(const struct checkout_opts *opts,
 		/* 2-way merge to the new branch */
 		init_topts(&topts, opts->show_progress,
 			   opts->overwrite_ignore, quiet);
+		topts.preserve_semantic_history = 1;
 		init_checkout_metadata(&topts.meta, new_branch_info->refname,
 				       new_branch_info->commit ?
 				       &new_branch_info->commit->object.oid :
