@@ -4,6 +4,7 @@
 #include "git-compat-util.h"
 #include "attr.h"
 #include "clean-status.h"
+#include "clean-status-manifest.h"
 #include "config.h"
 #include "dir.h"
 #include "environment.h"
@@ -647,7 +648,8 @@ static size_t handle_path_with_trailing_slash(
 		nr_in_cone++;
 	}
 
-	if (nr_in_cone) {
+	if (nr_in_cone &&
+	    !clean_status_directory_event_is_semantically_safe(istate, name)) {
 		/*
 		 * A matched directory event may stand in for a nested
 		 * attribute-file change.
@@ -665,6 +667,7 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 	int len = strlen(name);
 	int pos;
 	int attributes_may_have_changed;
+	int directory_is_semantically_safe;
 	size_t nr_in_cone;
 
 	trace_printf_key(&trace_fsmonitor,
@@ -685,14 +688,30 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 		return;
 	}
 	pos = index_name_pos(istate, name, len);
-	attributes_may_have_changed =
-		fsmonitor_invalidate_attributes_path(istate, name);
+	if (pos >= 0 &&
+	    clean_status_manifest_reconcile_deleted_attribute(istate, name)) {
+		attributes_may_have_changed = 0;
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "semantic/attribute-source-reused", 1);
+	} else if (pos >= 0 &&
+		   clean_status_manifest_accept_current_display_only_attribute(
+			   istate, name)) {
+		git_attr_invalidate_all();
+		attributes_may_have_changed = 0;
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "semantic/nonconversion-attribute-replayed", 1);
+	} else {
+		attributes_may_have_changed =
+			fsmonitor_invalidate_attributes_path(istate, name);
+	}
+	directory_is_semantically_safe = name[len - 1] == '/' &&
+		clean_status_directory_event_is_semantically_safe(istate, name);
 
 	if (name[len - 1] == '/')
 		nr_in_cone = handle_path_with_trailing_slash(istate, name, pos);
 	else
 		nr_in_cone = handle_path_without_trailing_slash(istate, name, pos);
-	if (pos < 0 && nr_in_cone)
+	if (pos < 0 && nr_in_cone && !directory_is_semantically_safe)
 		attributes_may_have_changed = 1;
 
 	/*
@@ -1029,7 +1048,7 @@ void fsmonitor_invalidate_semantics(struct index_state *istate)
 static void invalidate_fsmonitor_for_bootstrap(
 	struct index_state *istate, enum fsmonitor_mode mode,
 	int semantic_adoption_needed, int semantic_baseline_needed,
-	int physical_history_unavailable)
+	int physical_history_unavailable, int provider_query_success)
 {
 	int manifest_refresh_failed;
 
@@ -1046,13 +1065,29 @@ static void invalidate_fsmonitor_for_bootstrap(
 					   "semantic/legacy-stat-fallback", 1);
 			return;
 		}
-		clean_status_refresh_worktree_manifest(istate);
-		fsmonitor_invalidate_semantics(istate);
+		manifest_refresh_failed =
+			!clean_status_has_authenticated_bootstrap_manifest(istate) &&
+			clean_status_refresh_worktree_manifest(istate) < 0;
+		if (provider_query_success && !manifest_refresh_failed &&
+		    !clean_status_manifest_global_fallback(istate) &&
+		    !clean_status_fsmonitor_strong_mismatch(istate) &&
+		    !clean_status_filter_scope_needs_validation(istate) &&
+		    istate->repo->config_values_private_.trust_ctime &&
+		    istate->repo->config_values_private_.check_stat) {
+			/* Strong stat identity survives a lost provider boundary. */
+			clean_status_begin_fsmonitor_semantic_baseline(istate);
+			invalidate_all_fsmonitor_for_baseline(istate);
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "semantic/token-reset-stat-baseline", 1);
+		} else {
+			fsmonitor_invalidate_semantics(istate);
+		}
 		untracked_cache_invalidate_all(istate);
 		return;
 	}
 
 	manifest_refresh_failed =
+		!clean_status_has_authenticated_worktree_manifest(istate) &&
 		clean_status_refresh_worktree_manifest(istate) < 0;
 	if (manifest_refresh_failed ||
 	    clean_status_manifest_global_fallback(istate) ||
@@ -1276,8 +1311,15 @@ apply_results:
 		 */
 		if (fstat_is_reliable() && !istate->split_index &&
 		    fsm_mode == FSMONITOR_MODE_IPC &&
-		    clean_status_fsmonitor_config_mismatch(istate))
-			tracked_requires_bootstrap = 1;
+		    clean_status_fsmonitor_config_mismatch(istate)) {
+			if (clean_status_try_preserve_tracked_config_epoch(istate)) {
+				tracked_requires_bootstrap = 0;
+				trace2_data_intmax("fsmonitor", istate->repo,
+						   "config/tracked-epoch-preserved", 1);
+			} else {
+				tracked_requires_bootstrap = 1;
+			}
+		}
 
 		if (tracked_requires_bootstrap) {
 			/*
@@ -1298,7 +1340,7 @@ apply_results:
 			invalidate_fsmonitor_for_bootstrap(
 				istate, fsm_mode, semantic_adoption_needed,
 				semantic_baseline_needed,
-				!istate->fsmonitor_token_valid);
+				!istate->fsmonitor_token_valid, query_success);
 		}
 
 		/* Now mark the untracked cache for fsmonitor usage */
@@ -1324,7 +1366,7 @@ apply_results:
 		 */
 		invalidate_fsmonitor_for_bootstrap(
 			istate, fsm_mode, semantic_adoption_needed,
-			semantic_baseline_needed, 1);
+			semantic_baseline_needed, 1, query_success);
 	}
 	trace2_region_leave("fsmonitor", "apply_results", istate->repo);
 

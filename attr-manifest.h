@@ -55,5 +55,8 @@ int attr_manifest_for_each_changed(const void *old_data, size_t old_len,
 				   const void *new_data, size_t new_len,
 				   const struct git_hash_algo *algo,
 				   attr_manifest_change_fn fn, void *data);
+int attr_manifest_only_linguist_generated_changed(
+	const char *old_data, size_t old_len,
+	const char *new_data, size_t new_len);
 
 #endif /* ATTR_MANIFEST_H */

@@ -8,11 +8,18 @@ struct repository;
 #define FSMONITOR_IPC_QUERY_VERSION "query-v1"
 #define FSMONITOR_IPC_QUERY_PREFIX FSMONITOR_IPC_QUERY_VERSION " "
 #define FSMONITOR_IPC_CAPABILITY_COMMAND "get-capabilities"
+#define FSMONITOR_IPC_DIR_METADATA_CAPABILITY "dir-metadata-filter-v1"
+#define FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX "dirmeta-v1."
 #define FSMONITOR_IPC_WORKTREE_ID_HEX 64
 
 /* Hash the canonical worktree root and its stable filesystem identity. */
 int fsmonitor_ipc__get_worktree_identity(struct repository *r,
 					 struct strbuf *identity);
+
+/* Remember a bounded, worktree-specific inotify watch-limit failure. */
+void fsmonitor_ipc__record_watch_limit_failure(const char *worktree_identity);
+void fsmonitor_ipc__clear_watch_limit_failure(void);
+int fsmonitor_ipc__watch_limit_backoff(struct repository *r);
 
 /*
  * Returns true if built-in file system monitor daemon is defined

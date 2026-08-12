@@ -10,7 +10,9 @@
 #include "fsmonitor.h"
 #include "fsmonitor-settings.h"
 #include "object-name.h"
+#include "path-namespace.h"
 #include "repository.h"
+#include "semantic-verify-internal.h"
 #include "trace2.h"
 #include "worktree.h"
 #include "wrapper.h"
@@ -79,6 +81,84 @@ static int attr_snapshot_still_matches(
 			repo->hash_algo->rawsz) &&
 		!memcmp(current.namespace_hash, expected->namespace_hash,
 			repo->hash_algo->rawsz);
+}
+
+static int hardlink_witnesses_still_match(
+	struct repository *repo, const struct clean_status_sidecar *sidecar)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN && !defined(NO_NSEC)
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	const unsigned char *cursor, *end;
+	unsigned int namespace_unstable = 0;
+	int ret = 0;
+
+	if (!sidecar->hardlink_nr)
+		return 1;
+	cursor = sidecar->hardlinks;
+	end = cursor + sidecar->hardlinks_len;
+	if (!repo->config_values_private_.trust_ctime ||
+	    !repo->config_values_private_.check_stat ||
+	    semantic_verify_root_init(repo, &root))
+		goto done;
+	path = semantic_verify_path_new(root);
+	if (!path)
+		goto done;
+	for (uint32_t i = 0; i < sidecar->hardlink_nr; i++) {
+		struct path_stat_identity expected, observed;
+		const unsigned char *raw_path;
+		const char *basename;
+		struct stat held, named;
+		size_t path_len;
+		char *name;
+		int parent_fd, fd;
+
+		if (clean_status_sidecar_next_hardlink(
+			    &cursor, end, &raw_path, &path_len, &expected) ||
+		    !path_len || memchr(raw_path, '\0', path_len))
+			goto done;
+		name = xmemdupz(raw_path, path_len);
+		if (semantic_verify_resolve_parent(
+			    path, name, i, &parent_fd, &basename)) {
+			free(name);
+			goto done;
+		}
+		fd = semantic_verify_openat(
+			parent_fd, basename,
+			O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+		if (fd < 0) {
+			free(name);
+			goto done;
+		}
+		if (fstat(fd, &held) || !S_ISREG(held.st_mode) ||
+		    held.st_nlink <= 1 || held.st_dev != root->stat.st_dev ||
+		    fstatat(parent_fd, basename, &named,
+			    AT_SYMLINK_NOFOLLOW) ||
+		    !path_namespace_stat_equal(&held, &named)) {
+			close(fd);
+			free(name);
+			goto done;
+		}
+		path_stat_identity_init(&observed, &held);
+		close(fd);
+		free(name);
+		if (!path_stat_identity_equal(&expected, &observed))
+			goto done;
+	}
+	if (cursor != end || !semantic_verify_root_stable(root))
+		goto done;
+	ret = 1;
+
+done:
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	if (namespace_unstable || (root && !semantic_verify_root_stable(root)))
+		ret = 0;
+	semantic_verify_root_clear(root);
+	return ret;
+#else
+	(void)repo;
+	return !sidecar->hardlink_nr;
+#endif
 }
 
 static int fast_path_test_barrier(void)
@@ -187,6 +267,10 @@ int clean_status_try_sidecar(
 		trace_miss(repo, "fast-head-changed");
 		goto done;
 	}
+	if (!hardlink_witnesses_still_match(repo, &record.sidecar)) {
+		trace_miss(repo, "fast-hardlink-changed");
+		goto done;
+	}
 
 	query_token = xmemdupz(
 		record.sidecar.token, record.sidecar.token_len);
@@ -233,7 +317,15 @@ int clean_status_try_sidecar(
 		trace_miss(repo, "fast-index-raced");
 		goto done;
 	}
+	if (!hardlink_witnesses_still_match(repo, &record.sidecar)) {
+		trace_miss(repo, "fast-hardlink-raced");
+		goto done;
+	}
 
+	if (record.sidecar.hardlink_nr)
+		trace2_data_intmax("status", repo,
+				   "clean-proof/hardlink-validated",
+				   record.sidecar.hardlink_nr);
 	trace2_data_intmax("status", repo, "clean-proof/hit", 1);
 	ret = 1;
 
