@@ -482,6 +482,48 @@ test_expect_success 'resetting an unmodified path is a no-op' '
 	git diff-index --cached --exit-code HEAD
 '
 
+test_expect_success 'mixed resets do not rewrite an unchanged index' '
+	test_when_finished "rm -rf reset-unchanged-index" &&
+	git init reset-unchanged-index &&
+	(
+		cd reset-unchanged-index &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		git config core.fsmonitor false &&
+		test_commit base tracked &&
+		git commit --allow-empty -m same-tree &&
+		git update-index --no-fsmonitor &&
+		test_set_magic_mtime .git/index &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/head.trace" \
+			git reset --mixed HEAD &&
+		test_is_magic_mtime .git/index &&
+		test_grep ! "\"label\":\"do_write_index\"" .git/head.trace &&
+
+		GIT_TRACE2_EVENT="$PWD/.git/path.trace" \
+			git reset HEAD -- tracked &&
+		test_is_magic_mtime .git/index &&
+		test_grep ! "\"label\":\"do_write_index\"" .git/path.trace &&
+
+		old_head=$(git rev-parse HEAD) &&
+		GIT_TRACE2_EVENT="$PWD/.git/same-tree.trace" \
+			git reset --mixed HEAD^ &&
+		test_is_magic_mtime .git/index &&
+		test_grep ! "\"label\":\"do_write_index\"" \
+			.git/same-tree.trace &&
+		test "$(git rev-parse ORIG_HEAD)" = "$old_head" &&
+		test "$(git rev-parse HEAD)" = "$(git rev-parse base)" &&
+
+		test_hook --setup post-index-change <<-\EOF &&
+		echo "$1 $2" >.git/hook-args
+		EOF
+		GIT_TRACE2_EVENT="$PWD/.git/hook.trace" \
+			git reset --mixed HEAD &&
+		test_grep "\"label\":\"do_write_index\"" .git/hook.trace &&
+		test_grep "^0 1$" .git/hook-args &&
+		! test_is_magic_mtime .git/index
+	)
+'
+
 test_reset_refreshes_index () {
 
 	# To test whether the index is refreshed in `git reset --mixed` with
