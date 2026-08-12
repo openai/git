@@ -50,7 +50,8 @@ static int output_is_certifiable(const struct wt_status *status,
 		(normal_clean_query &&
 		 status->status_format == STATUS_FORMAT_NONE)) &&
 		!status->pathspec.nr && !status->show_branch &&
-		!status->show_stash && !status->show_ignored_mode &&
+		(!status->show_stash || normal_clean_query) &&
+		!status->show_ignored_mode &&
 		!status->null_termination && !status->verbose &&
 		status->show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!status->change.nr && !status->untracked.nr &&
