@@ -8,6 +8,8 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-sidecar.h"
 #include "config.h"
 #include "ewah/ewok.h"
 #include "lockfile.h"
@@ -15,6 +17,7 @@
 #include "commit.h"
 #include "environment.h"
 #include "gettext.h"
+#include "fsmonitor-settings.h"
 #include "tag.h"
 #include "diff.h"
 #include "diff-merges.h"
@@ -26,6 +29,7 @@
 #include "setup.h"
 #include "oid-array.h"
 #include "tree.h"
+#include "worktree.h"
 
 #define DIFF_NO_INDEX_EXPLICIT 1
 #define DIFF_NO_INDEX_IMPLICIT 2
@@ -400,6 +404,28 @@ static void symdiff_release(struct symdiff *sdiff)
 	bitmap_free(sdiff->skip);
 }
 
+void prepare_diff_external_history(struct repository *repo)
+{
+	struct clean_status_config_digest digest;
+	struct worktree *worktree = NULL;
+
+	if (!fstat_is_reliable() || getenv(INDEX_ENVIRONMENT) ||
+	    is_bare_repository(repo) || !repo_get_work_tree(repo) ||
+	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
+	    repo_config_values(repo)->apply_sparse_checkout)
+		goto done;
+	worktree = get_current_worktree(repo);
+	if (!worktree || !is_main_worktree(worktree) ||
+	    clean_status_config_read_repository(repo, &digest) ||
+	    digest.filter_configured)
+		goto done;
+	clean_status_set_config_digest(repo, &digest);
+	clean_status_enable_external_history(repo);
+
+done:
+	free_worktree(worktree);
+}
+
 int cmd_diff(int argc,
 	     const char **argv,
 	     const char *prefix,
@@ -537,6 +563,7 @@ int cmd_diff(int argc,
 
 	if (nongit)
 		die(_("Not a git repository"));
+	prepare_diff_external_history(the_repository);
 	argc = setup_revisions(argc, argv, &rev, NULL);
 	if (!rev.diffopt.output_format) {
 		rev.diffopt.output_format = DIFF_FORMAT_PATCH;
