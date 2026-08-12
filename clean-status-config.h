@@ -4,13 +4,16 @@
 #include "hash.h"
 
 struct config_context;
+struct index_state;
 struct repository;
 
 struct clean_status_config_digest {
 	struct git_hash_ctx ctx;
 	struct git_hash_ctx semantic_ctx;
+	struct git_hash_ctx tracked_policy_ctx;
 	unsigned char hash[GIT_MAX_RAWSZ];
 	unsigned char semantic_hash[GIT_MAX_RAWSZ];
+	unsigned char tracked_policy_hash[GIT_MAX_RAWSZ];
 	unsigned initialized : 1;
 	unsigned finalized : 1;
 	unsigned filter_configured : 1;
@@ -26,5 +29,7 @@ void clean_status_config_final(struct clean_status_config_digest *digest);
 int clean_status_config_read_repository(
 	struct repository *repo,
 	struct clean_status_config_digest *digest);
+int clean_status_config_tracked_sources_predate_index(
+	struct index_state *istate);
 
 #endif /* CLEAN_STATUS_CONFIG_H */

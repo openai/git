@@ -13,6 +13,7 @@ struct attr_fingerprint_source {
 struct attr_fingerprint {
 	unsigned char content_hash[GIT_MAX_RAWSZ];
 	unsigned char namespace_hash[GIT_MAX_RAWSZ];
+	unsigned char portable_namespace_hash[GIT_MAX_RAWSZ];
 	unsigned int sources_present : 1;
 };
 
@@ -30,6 +31,8 @@ int attr_fingerprint_sources(
 	const struct git_hash_algo *algo, struct attr_fingerprint *result);
 int attr_fingerprint_repository(struct repository *repo,
 				struct attr_fingerprint *result);
+int attr_fingerprint_matches_legacy_absent_sources(
+	struct repository *repo, const unsigned char *expected);
 int attr_source_snapshot_repository(struct repository *repo,
 				    struct attr_source_snapshot **result);
 int attr_source_snapshot_matches_repository(

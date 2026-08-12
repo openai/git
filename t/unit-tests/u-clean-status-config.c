@@ -67,6 +67,85 @@ void test_clean_status_config__origin_only_affects_full_hash(void)
 	cl_assert(hashes_equal(global.semantic_hash, local.semantic_hash));
 }
 
+void test_clean_status_config__command_transport_config_does_not_change_proof(void)
+{
+	static const char *const ignored_keys[] = {
+		"credential.helper",
+		"credential.https://Example/Team.helper",
+		"url.https://Proxy.Example/Team/.insteadof",
+		"url.https://Proxy.Example/Team/.pushinsteadof",
+	};
+	static const enum config_scope persistent_scopes[] = {
+		CONFIG_SCOPE_GLOBAL,
+		CONFIG_SCOPE_LOCAL,
+		CONFIG_SCOPE_WORKTREE,
+		CONFIG_SCOPE_UNKNOWN,
+	};
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+	struct clean_status_config_digest baseline, digest;
+
+	clean_status_config_init(&baseline, &hash_algos[GIT_HASH_SHA1]);
+	clean_status_config_final(&baseline);
+	kvi.scope = CONFIG_SCOPE_COMMAND;
+	kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+
+	for (size_t i = 0; i < ARRAY_SIZE(ignored_keys); i++) {
+		digest_one(&digest, ignored_keys[i], "transport", &ctx);
+		cl_assert(hashes_equal(digest.hash, baseline.hash));
+		cl_assert(hashes_equal(digest.semantic_hash,
+				       baseline.semantic_hash));
+		cl_assert(!digest.filter_configured);
+		cl_assert(!digest.semantic_config_explicit);
+
+		for (size_t j = 0; j < ARRAY_SIZE(persistent_scopes); j++) {
+			kvi.scope = persistent_scopes[j];
+			digest_one(&digest, ignored_keys[i], "transport", &ctx);
+			cl_assert(!hashes_equal(digest.hash, baseline.hash));
+		}
+		kvi.scope = CONFIG_SCOPE_COMMAND;
+		digest_one(&digest, ignored_keys[i], "transport", NULL);
+		cl_assert(!hashes_equal(digest.hash, baseline.hash));
+	}
+}
+
+void test_clean_status_config__command_worktree_config_still_changes_proof(void)
+{
+	static const char *const retained_keys[] = {
+		"url.insteadof",
+		"url.https://Proxy.Example/Team/.other",
+		"core.excludesfile",
+		"status.showuntrackedfiles",
+	};
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+	struct clean_status_config_digest baseline, digest;
+
+	clean_status_config_init(&baseline, &hash_algos[GIT_HASH_SHA1]);
+	clean_status_config_final(&baseline);
+	kvi.scope = CONFIG_SCOPE_COMMAND;
+	kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+
+	for (size_t i = 0; i < ARRAY_SIZE(retained_keys); i++) {
+		digest_one(&digest, retained_keys[i], "value", &ctx);
+		cl_assert(!hashes_equal(digest.hash, baseline.hash));
+		cl_assert(hashes_equal(digest.semantic_hash,
+				       baseline.semantic_hash));
+	}
+
+	digest_one(&digest, "core.autocrlf", "true", &ctx);
+	cl_assert(!hashes_equal(digest.hash, baseline.hash));
+	cl_assert(!hashes_equal(digest.semantic_hash, baseline.semantic_hash));
+	cl_assert(digest.semantic_config_explicit);
+	cl_assert(!digest.filter_configured);
+
+	digest_one(&digest, "filter.demo.clean", "cat", &ctx);
+	cl_assert(!hashes_equal(digest.hash, baseline.hash));
+	cl_assert(!hashes_equal(digest.semantic_hash, baseline.semantic_hash));
+	cl_assert(digest.semantic_config_explicit);
+	cl_assert(digest.filter_configured);
+}
+
 static void digest_without_final_domain(
 	const struct clean_status_config_digest *digest,
 	unsigned char *full_hash, unsigned char *semantic_hash)
@@ -207,6 +286,8 @@ void test_clean_status_config__attaches_only_to_the_staged_repository(void)
 			  algo->rawsz));
 	cl_assert(!memcmp(state->current_attr_namespace_hash,
 			  attrs.namespace_hash, algo->rawsz));
+	cl_assert(!memcmp(state->current_attr_portable_namespace_hash,
+			  attrs.portable_namespace_hash, algo->rawsz));
 
 	clean_status_set_config_digest(&repo_a, &replacement);
 	clean_status_attach_config(&istate_a);
