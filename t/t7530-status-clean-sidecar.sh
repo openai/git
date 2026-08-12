@@ -1562,4 +1562,44 @@ test_expect_success DURABLE_FSMONITOR \
 		external-token.trace
 '
 
+test_expect_success DURABLE_FSMONITOR \
+	'no-op checkout-index -u preserves a clean status proof' '
+	update_repo=sidecar-noop-checkout-index &&
+	test_when_finished "stop_daemon $update_repo" &&
+	setup_repo "$update_repo" &&
+	git -C "$update_repo" config core.untrackedCache true &&
+	issue_sidecar "$update_repo" &&
+
+	for update_case in path force all stdin
+	do
+		case "$update_case" in
+		path) set -- -u tracked ;;
+		force) set -- -u -f tracked ;;
+		all) set -- -u -a ;;
+		stdin) set -- -u --stdin ;;
+		esac &&
+		if test "$update_case" = stdin
+		then
+			echo tracked >checkout-update.stdin
+		else
+			: >checkout-update.stdin
+		fi &&
+		cp "$update_repo/.git/index" \
+			"checkout-update-$update_case.index" &&
+		cp "$update_repo/.git/index.csts" \
+			"checkout-update-$update_case.sidecar" &&
+		GIT_TRACE2_EVENT="$PWD/checkout-update-$update_case.trace" \
+			git -C "$update_repo" checkout-index "$@" \
+			<checkout-update.stdin &&
+		test_cmp_bin "checkout-update-$update_case.index" \
+			"$update_repo/.git/index" &&
+		test_cmp_bin "checkout-update-$update_case.sidecar" \
+			"$update_repo/.git/index.csts" &&
+		test_grep ! "\"label\":\"do_write_index\"" \
+			"checkout-update-$update_case.trace" &&
+		assert_clean_sidecar_hit "$update_repo" "$update_repo" \
+			"checkout-update-$update_case.hit" || return 1
+	done
+'
+
 test_done
