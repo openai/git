@@ -741,14 +741,23 @@ int cmd_describe(int argc,
 		if (broken) {
 			struct child_process cp = CHILD_PROCESS_INIT;
 
-			strvec_pushv(&cp.args, update_index_args);
-			cp.git_cmd = 1;
-			cp.no_stdin = 1;
-			cp.no_stdout = 1;
-			run_command(&cp);
+			if (use_optional_locks()) {
+				strvec_pushv(&cp.args, update_index_args);
+				cp.git_cmd = 1;
+				cp.no_stdin = 1;
+				cp.no_stdout = 1;
+				run_command(&cp);
 
-			child_process_init(&cp);
-			strvec_pushv(&cp.args, diff_index_args);
+				child_process_init(&cp);
+				strvec_pushv(&cp.args, diff_index_args);
+			} else {
+				strvec_pushl(&cp.args, "-c",
+					     "diff.autoRefreshIndex=true",
+					     "diff", "--quiet",
+					     "--no-ext-diff", "--no-textconv",
+					     "--ignore-submodules=untracked",
+					     "HEAD", "--", NULL);
+			}
 			cp.git_cmd = 1;
 			cp.no_stdin = 1;
 			cp.no_stdout = 1;
@@ -784,10 +793,13 @@ int cmd_describe(int argc,
 			repo_read_index(the_repository);
 			refresh_index(the_repository->index, REFRESH_QUIET|REFRESH_UNMERGED,
 				      NULL, NULL, NULL);
-			fd = repo_hold_locked_index(the_repository,
-						    &index_lock, 0);
-			if (0 <= fd)
-				repo_update_index_if_able(the_repository, &index_lock);
+			if (use_optional_locks()) {
+				fd = repo_hold_locked_index(the_repository,
+							    &index_lock, 0);
+				if (0 <= fd)
+					repo_update_index_if_able(the_repository,
+								  &index_lock);
+			}
 
 			repo_init_revisions(the_repository, &revs, prefix);
 
