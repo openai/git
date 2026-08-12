@@ -13,6 +13,7 @@
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
+#include "hook.h"
 #include "lockfile.h"
 #include "quote.h"
 #include "cache-tree.h"
@@ -360,8 +361,14 @@ int cmd_checkout_index(int argc,
 	if (err)
 		return 1;
 
-	if (is_lock_file_locked(&lock_file) &&
-	    write_locked_index(repo->index, &lock_file, COMMIT_LOCK))
-		die("Unable to write new index file");
+	if (is_lock_file_locked(&lock_file)) {
+		unsigned int flags = COMMIT_LOCK;
+
+		if (!repo->index->cache_changed &&
+		    !hook_exists(repo, "post-index-change"))
+			flags |= SKIP_IF_UNCHANGED;
+		if (write_locked_index(repo->index, &lock_file, flags))
+			die("Unable to write new index file");
+	}
 	return 0;
 }
