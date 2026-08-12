@@ -12,11 +12,14 @@
 
 #include "builtin.h"
 #include "advice.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
+#include "hook.h"
 #include "lockfile.h"
 #include "object.h"
 #include "pretty.h"
@@ -159,9 +162,17 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 		int pos;
 		struct diff_filespec *one = q->queue[i]->one;
 		int is_in_reset_tree = one->mode && !is_null_oid(&one->oid);
+		struct cache_entry *old;
 		struct cache_entry *ce;
 
+		pos = index_name_pos(the_repository->index, one->path,
+				     strlen(one->path));
+		old = pos >= 0 ? the_repository->index->cache[pos] : NULL;
 		if (!is_in_reset_tree && !intent_to_add) {
+			if (!clean_status_index_entry_is_semantically_safe(
+				    the_repository->index, old, NULL))
+				clean_status_invalidate_current_proof(
+					the_repository->index);
 			remove_file_from_index(the_repository->index, one->path);
 			continue;
 		}
@@ -177,7 +188,6 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 		 * if this entry is outside the sparse cone - this is necessary
 		 * to properly construct the reset sparse directory.
 		 */
-		pos = index_name_pos(the_repository->index, one->path, strlen(one->path));
 		if ((pos >= 0 && ce_skip_worktree(the_repository->index->cache[pos])) ||
 		    (pos < 0 && !path_in_sparse_checkout(one->path, the_repository->index)))
 			ce->ce_flags |= CE_SKIP_WORKTREE;
@@ -189,6 +199,10 @@ static void update_index_from_diff(struct diff_queue_struct *q,
 			ce->ce_flags |= CE_INTENT_TO_ADD;
 			set_object_name_for_intent_to_add_entry(ce);
 		}
+		if (!clean_status_index_entry_is_semantically_safe(
+			    the_repository->index, old, ce))
+			clean_status_invalidate_current_proof(
+				the_repository->index);
 		add_index_entry(the_repository->index, ce,
 				ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE);
 	}
@@ -325,12 +339,14 @@ static int reset_refs(const char *rev, const struct object_id *oid)
 }
 
 static int git_reset_config(const char *var, const char *value,
-			    const struct config_context *ctx, void *cb)
+			    const struct config_context *ctx, void *data)
 {
-	if (!strcmp(var, "submodule.recurse"))
-		return git_default_submodule_config(var, value, cb);
+	clean_status_config_add(data, var, value, ctx);
 
-	return git_default_config(var, value, ctx, cb);
+	if (!strcmp(var, "submodule.recurse"))
+		return git_default_submodule_config(var, value, NULL);
+
+	return git_default_config(var, value, ctx, NULL);
 }
 
 int cmd_reset(int argc,
@@ -338,9 +354,11 @@ int cmd_reset(int argc,
 	      const char *prefix,
 	      struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	int reset_type = NONE, update_ref_status = 0, quiet = 0;
 	int no_refresh = 0;
 	int patch_mode = 0, pathspec_file_nul = 0, unborn;
+	int preserve_mixed_history = 0;
 	const char *rev;
 	char *pathspec_from_file = NULL;
 	struct object_id oid;
@@ -382,7 +400,11 @@ int cmd_reset(int argc,
 		OPT_END()
 	};
 
-	repo_config(the_repository, git_reset_config, NULL);
+	show_usage_with_options_if_asked(argc, argv, git_reset_usage, options);
+
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	repo_config(the_repository, git_reset_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
 
 	argc = parse_options(argc, argv, prefix, options, git_reset_usage,
 						PARSE_OPT_KEEP_DASHDASH);
@@ -477,6 +499,23 @@ int cmd_reset(int argc,
 	if (intent_to_add && reset_type != MIXED)
 		die(_("the option '%s' requires '%s'"), "-N", "--mixed");
 
+	/*
+	 * A no-path mixed or hard reset is a candidate for a stat-only
+	 * rewrite even when its target commit differs from HEAD. Attach
+	 * history early enough for the initial index read. Mixed reset
+	 * checks its in-place result below; hard reset lets unpack_trees()
+	 * transfer only an equal logical index.
+	 */
+	if ((reset_type == MIXED || reset_type == HARD) &&
+	    !pathspec.nr && !intent_to_add &&
+	    !unborn) {
+		preserve_mixed_history = reset_type == MIXED;
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	} else if (reset_type == MIXED && pathspec.nr &&
+		   !intent_to_add && !unborn) {
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	}
+
 	if (repo_read_index(the_repository) < 0)
 		die(_("index file corrupt"));
 
@@ -488,6 +527,8 @@ int cmd_reset(int argc,
 
 	if (reset_type != SOFT) {
 		struct lock_file lock = LOCK_INIT;
+		unsigned int write_flags = COMMIT_LOCK;
+
 		repo_hold_locked_index(the_repository, &lock,
 				       LOCK_DIE_ON_ERROR);
 		if (reset_type == MIXED) {
@@ -496,6 +537,14 @@ int cmd_reset(int argc,
 				update_ref_status = 1;
 				goto cleanup;
 			}
+			if (preserve_mixed_history &&
+			    (the_repository->index->split_index ||
+			     the_repository->index->sparse_index ||
+			     (the_repository->index->cache_changed &
+			      (CE_ENTRY_CHANGED | CE_ENTRY_REMOVED |
+			       CE_ENTRY_ADDED | RESOLVE_UNDO_CHANGED))))
+				clean_status_invalidate_current_proof(
+					the_repository->index);
 			the_repository->index->updated_skipworktree = 1;
 			if (!no_refresh && repo_get_work_tree(the_repository)) {
 				uint64_t t_begin, t_delta_in_ms;
@@ -527,7 +576,11 @@ int cmd_reset(int argc,
 			free(ref);
 		}
 
-		if (write_locked_index(the_repository->index, &lock, COMMIT_LOCK))
+		if (reset_type == MIXED &&
+		    !the_repository->index->cache_changed &&
+		    !hook_exists(the_repository, "post-index-change"))
+			write_flags |= SKIP_IF_UNCHANGED;
+		if (write_locked_index(the_repository->index, &lock, write_flags))
 			die(_("Could not write new index file."));
 	}
 

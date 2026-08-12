@@ -107,4 +107,35 @@ test_expect_success 'checkout-index --temp correctly reports error for submodule
 	test_grep "cannot create temporary submodule sub" stderr
 '
 
+test_expect_success 'checkout-index -u preserves an unchanged index' '
+	test_when_finished "rm -rf checkout-index-unchanged" &&
+	test_create_repo checkout-index-unchanged &&
+	test_commit -C checkout-index-unchanged base tracked &&
+	test-tool -C checkout-index-unchanged chmtime -120 tracked &&
+	git -C checkout-index-unchanged update-index --refresh &&
+	cp checkout-index-unchanged/.git/index checkout-index.before &&
+	GIT_TRACE2_EVENT="$PWD/checkout-index.trace" \
+		git -C checkout-index-unchanged checkout-index -u tracked &&
+	test_cmp_bin checkout-index.before checkout-index-unchanged/.git/index &&
+	test_grep ! "\"label\":\"do_write_index\"" checkout-index.trace
+'
+
+test_expect_success 'checkout-index -u retains post-index-change hooks' '
+	test_when_finished "rm -rf checkout-index-hook" &&
+	test_create_repo checkout-index-hook &&
+	test_commit -C checkout-index-hook base tracked &&
+	test-tool -C checkout-index-hook chmtime -120 tracked &&
+	git -C checkout-index-hook update-index --refresh &&
+	mkdir checkout-index-hook/hooks &&
+	git -C checkout-index-hook config core.hooksPath hooks &&
+	write_script checkout-index-hook/hooks/post-index-change <<-\EOF &&
+	printf "%s %s\n" "$1" "$2" >hook-actual
+	EOF
+	GIT_TRACE2_EVENT="$PWD/checkout-index-hook.trace" \
+		git -C checkout-index-hook checkout-index -u tracked &&
+	test_write_lines "0 0" >checkout-index-hook.expect &&
+	test_cmp checkout-index-hook.expect checkout-index-hook/hook-actual &&
+	test_grep "\"label\":\"do_write_index\"" checkout-index-hook.trace
+'
+
 test_done

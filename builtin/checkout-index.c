@@ -8,9 +8,12 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
+#include "hook.h"
 #include "lockfile.h"
 #include "quote.h"
 #include "cache-tree.h"
@@ -29,6 +32,13 @@ static int to_tempfile = -1;
 static char topath[4][TEMPORARY_FILENAME_LENGTH + 1];
 
 static struct checkout state = CHECKOUT_INIT;
+
+static int checkout_index_config(const char *key, const char *value,
+				 const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
 
 static void write_tempfile_record(const char *name, const char *prefix)
 {
@@ -215,6 +225,7 @@ int cmd_checkout_index(int argc,
 		       const char *prefix,
 		       struct repository *repo)
 {
+	struct clean_status_config_digest clean_digest;
 	int i;
 	struct lock_file lock_file = LOCK_INIT;
 	int all = 0;
@@ -253,7 +264,14 @@ int cmd_checkout_index(int argc,
 	show_usage_with_options_if_asked(argc, argv,
 					 builtin_checkout_index_usage,
 					 builtin_checkout_index_options);
-	repo_config(repo, git_default_config, NULL);
+	clean_status_config_init(&clean_digest, repo->hash_algo);
+	repo_config(repo, checkout_index_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
+	/*
+	 * checkout-index never changes index contents. Keep closed semantic
+	 * history attached when -u writes fresh stat data.
+	 */
+	clean_status_set_config_digest(repo, &clean_digest);
 	prefix_length = prefix ? strlen(prefix) : 0;
 
 	prepare_repo_settings(repo);
@@ -343,8 +361,14 @@ int cmd_checkout_index(int argc,
 	if (err)
 		return 1;
 
-	if (is_lock_file_locked(&lock_file) &&
-	    write_locked_index(repo->index, &lock_file, COMMIT_LOCK))
-		die("Unable to write new index file");
+	if (is_lock_file_locked(&lock_file)) {
+		unsigned int flags = COMMIT_LOCK;
+
+		if (!repo->index->cache_changed &&
+		    !hook_exists(repo, "post-index-change"))
+			flags |= SKIP_IF_UNCHANGED;
+		if (write_locked_index(repo->index, &lock_file, flags))
+			die("Unable to write new index file");
+	}
 	return 0;
 }
