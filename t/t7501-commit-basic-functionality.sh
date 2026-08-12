@@ -79,6 +79,37 @@ test_expect_success '--dry-run fails with nothing to commit' '
 	test_must_fail git commit -m initial --dry-run
 '
 
+test_expect_success '--no-optional-locks prevents dry-run index updates' '
+	test_when_finished "rm -rf optional-locks-dry-run" &&
+	test_create_repo optional-locks-dry-run &&
+	(
+		cd optional-locks-dry-run &&
+		git config core.fsmonitor false &&
+		test_commit base tracked &&
+		test_set_magic_mtime tracked &&
+		test_set_magic_mtime .git/index +1 &&
+		test_must_fail git --no-optional-locks commit --dry-run >../actual &&
+		test_grep "working tree clean" ../actual &&
+		test_is_magic_mtime .git/index +1 &&
+		echo modified >>tracked &&
+		test_must_fail git --no-optional-locks commit --dry-run >../actual &&
+		test_grep "modified:.*tracked" ../actual &&
+		test_is_magic_mtime .git/index +1 &&
+		git add tracked &&
+		test_set_magic_mtime tracked &&
+		test_set_magic_mtime .git/index +1 &&
+		>.git/index.lock &&
+		git --no-optional-locks commit --dry-run >../actual &&
+		test_grep "modified:.*tracked" ../actual &&
+		test_is_magic_mtime .git/index +1 &&
+		test_must_fail git commit --dry-run >../actual 2>../err &&
+		test_grep "index.lock" ../err &&
+		rm .git/index.lock &&
+		git commit --dry-run >../actual &&
+		! test_is_magic_mtime .git/index +1
+	)
+'
+
 test_expect_success '--short fails with nothing to commit' '
 	test_must_fail git commit -m initial --short
 '
