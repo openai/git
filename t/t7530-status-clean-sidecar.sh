@@ -1135,6 +1135,49 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'configured stash output does not prevent clean sidecar issuance' '
+	stash_repo=sidecar-configured-stash &&
+	test_when_finished "stop_daemon $stash_repo" &&
+	setup_repo "$stash_repo" &&
+	git -C "$stash_repo" config core.autocrlf false &&
+	git -C "$stash_repo" config core.untrackedCache true &&
+	test_write_lines stashed >"$stash_repo/tracked" &&
+	git -C "$stash_repo" stash push -qm configured-stash &&
+	test-tool chmtime -120 "$stash_repo/tracked" &&
+	git -C "$stash_repo" update-index --refresh &&
+	prime_semantic_history "$stash_repo" &&
+	git -C "$stash_repo" config status.showStash true &&
+	test_path_is_missing "$stash_repo/.git/index.csts" &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/configured-stash.exact.trace" \
+		bulk_status -C "$stash_repo" status --porcelain=v2 \
+		>configured-stash.exact &&
+	test_grep "^# stash 1$" configured-stash.exact &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<configured-stash.exact.trace &&
+	test_path_is_missing "$stash_repo/.git/index.csts" &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/configured-stash.issue.trace" \
+		bulk_status -C "$stash_repo" status >configured-stash.issue &&
+	test_grep "nothing to commit, working tree clean" \
+		configured-stash.issue &&
+	test_grep "Your stash currently has 1 entry" configured-stash.issue &&
+	test_trace2_data fsmonitor history/external-restored 1 \
+		<configured-stash.issue.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<configured-stash.issue.trace &&
+	test_path_is_file "$stash_repo/.git/index.csts" &&
+
+	assert_clean_sidecar_hit "$stash_repo" "$stash_repo" \
+		configured-stash-hit &&
+	test_grep "Your stash currently has 1 entry" \
+		configured-stash-hit.actual &&
+	assert_clean_sidecar_hit "$stash_repo" "$stash_repo" \
+		configured-stash-v2-hit --porcelain=v2 &&
+	test_grep "^# stash 1$" configured-stash-v2-hit.actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'a clean sidecar never answers unsupported or dirty status shapes' '
 	test_when_finished "stop_daemon sidecar-unsafe-shapes" &&
 	setup_repo sidecar-unsafe-shapes &&
