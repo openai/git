@@ -84,6 +84,7 @@ int cmd_diff_files(int argc,
 	    (rev.diffopt.output_format & DIFF_FORMAT_PATCH))
 		diff_merges_set_dense_combined_if_unset(&rev);
 
+	prepare_diff_external_history(the_repository);
 	if (repo_read_index_preload(the_repository, &rev.diffopt.pathspec, 0) < 0)
 		die_errno("repo_read_index_preload");
 	run_diff_files(&rev, options);
