@@ -1754,7 +1754,7 @@ struct repository *repo UNUSED)
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES;
 	normal_clean_query = default_status_command &&
 		status_format == STATUS_FORMAT_NONE && normal_has_head &&
-		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
+		!s.pathspec.nr && !s.show_branch &&
 		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
