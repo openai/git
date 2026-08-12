@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "dir.h"
+#include "fsmonitor-ipc.h"
 #include "fsmonitor-ll.h"
 #include "fsm-listen.h"
 #include "fsmonitor--daemon.h"
@@ -42,6 +43,7 @@ struct rename_entry {
 
 struct fsm_listen_data {
 	int fd_inotify;
+	const char *worktree_identity;
 	enum shutdown_reason shutdown;
 	struct hashmap watches;
 	struct hashmap renames;
@@ -102,9 +104,12 @@ static int add_watch(const char *path, struct fsm_listen_data *data)
 			return 0; /* directory was deleted or is not a directory */
 		if (errno == EEXIST)
 			return 0; /* watch already exists, no action needed */
-		if (errno == ENOSPC)
+		if (errno == ENOSPC) {
+			fsmonitor_ipc__record_watch_limit_failure(
+				data->worktree_identity);
 			return error(_("inotify watch limit reached; "
 				       "increase fs.inotify.max_user_watches"));
+		}
 		return error_errno(_("inotify_add_watch('%s') failed"), interned);
 	}
 
@@ -409,6 +414,7 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 	state->listen_data = data;
 	state->listen_error_code = -1;
 	data->fd_inotify = -1;
+	data->worktree_identity = state->worktree_identity.buf;
 	data->shutdown = SHUTDOWN_ERROR;
 
 	fd = inotify_init1(O_NONBLOCK);
@@ -435,6 +441,7 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 	}
 
 	if (!ret) {
+		fsmonitor_ipc__clear_watch_limit_failure();
 		state->listen_error_code = 0;
 		data->shutdown = SHUTDOWN_CONTINUE;
 	}
@@ -445,11 +452,6 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 void fsm_listen__dtor(struct fsmonitor_daemon_state *state)
 {
 	struct fsm_listen_data *data;
-	struct hashmap_iter iter;
-	struct watch_entry *w;
-	struct watch_entry **to_remove;
-	size_t nr_to_remove = 0, alloc_to_remove = 0;
-	size_t i;
 	int fd;
 
 	if (!state || !state->listen_data)
@@ -459,31 +461,17 @@ void fsm_listen__dtor(struct fsmonitor_daemon_state *state)
 	fd = data->fd_inotify;
 
 	/*
-	 * Collect all entries first, then remove them.
-	 * We can't modify the hashmap while iterating over it.
+	 * Closing the inotify instance releases every kernel watch at once.
+	 * The forward and reverse maps own separate watch_entry allocations.
 	 */
-	to_remove = NULL;
-	hashmap_for_each_entry(&data->watches, &iter, w, ent) {
-		ALLOC_GROW(to_remove, nr_to_remove + 1, alloc_to_remove);
-		to_remove[nr_to_remove++] = w;
-	}
-
-	for (i = 0; i < nr_to_remove; i++) {
-		to_remove[i]->cookie = 0; /* ignore any pending renames */
-		remove_watch(to_remove[i], data);
-	}
-	free(to_remove);
-
-	hashmap_clear(&data->watches);
-
-	hashmap_clear(&data->revwatches); /* remove_watch freed the entries */
-
+	data->fd_inotify = -1;
+	if (fd >= 0 && close(fd) < 0)
+		error_errno(_("closing inotify file descriptor failed"));
+	hashmap_clear_and_free(&data->watches, struct watch_entry, ent);
+	hashmap_clear_and_free(&data->revwatches, struct watch_entry, ent);
 	hashmap_clear_and_free(&data->renames, struct rename_entry, ent);
 
 	FREE_AND_NULL(state->listen_data);
-
-	if (fd >= 0 && (close(fd) < 0))
-		error_errno(_("closing inotify file descriptor failed"));
 }
 
 void fsm_listen__stop_async(struct fsmonitor_daemon_state *state)

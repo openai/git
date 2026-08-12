@@ -187,7 +187,7 @@ void test_clean_status_store__rejects_oversized_sidecars(void)
 
 	fixture_init(&fixture, algo);
 	path = sidecar_path(&fixture);
-	strbuf_addchars(&oversized, 'x', 8193);
+	strbuf_addchars(&oversized, 'x', CLEAN_STATUS_SIDECAR_MAX_SIZE + 1);
 	write_file_buf(path.buf, oversized.buf, oversized.len);
 	cl_assert_equal_i(clean_status_sidecar_load(
 		fixture.index_path.buf, algo, &record), -1);

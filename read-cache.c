@@ -701,8 +701,13 @@ int remove_file_from_index_with_flags(struct index_state *istate,
 		printf(_("remove '%s'\n"), path);
 	if (pretend)
 		return 0;
-	if (flags & ADD_CACHE_TRACK_CLEAN_HISTORY)
-		clean_status_invalidate_current_proof(istate);
+	if (flags & ADD_CACHE_TRACK_CLEAN_HISTORY) {
+		int pos = index_name_pos(istate, path, strlen(path));
+
+		if (!clean_status_index_entry_is_semantically_safe(
+			    istate, pos >= 0 ? istate->cache[pos] : NULL, NULL))
+			clean_status_invalidate_current_proof(istate);
+	}
 	return remove_file_from_index(istate, path);
 }
 
@@ -793,7 +798,7 @@ void set_object_name_for_intent_to_add_entry(struct cache_entry *ce)
 
 int add_to_index(struct index_state *istate, const char *path, struct stat *st, int flags)
 {
-	int namelen, was_same, logical_same;
+	int namelen, was_same, logical_same, semantic_same;
 	int cache_nr = istate->cache_nr;
 	mode_t st_mode = st->st_mode;
 	struct cache_entry *ce, *alias = NULL;
@@ -880,9 +885,11 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 		    oideq(&alias->oid, &ce->oid) &&
 		    ce->ce_mode == alias->ce_mode);
 	logical_same = same_persistent_add_entry(alias, ce);
+	semantic_same = clean_status_index_entry_is_semantically_safe(
+		istate, alias, ce);
 
 	if (!pretend && (flags & ADD_CACHE_TRACK_CLEAN_HISTORY) &&
-	    !logical_same)
+	    !logical_same && !semantic_same)
 		clean_status_invalidate_current_proof(istate);
 
 	if (pretend)
@@ -893,7 +900,7 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 			return error(_("unable to add '%s' to index"), path);
 		}
 		if ((flags & ADD_CACHE_TRACK_CLEAN_HISTORY) &&
-		    cache_nr != istate->cache_nr)
+		    cache_nr != istate->cache_nr && !semantic_same)
 			clean_status_invalidate_current_proof(istate);
 	}
 	if (verbose && !was_same)
@@ -1487,6 +1494,10 @@ static struct cache_entry *refresh_cache_ent(struct index_state *istate,
 			*err = errno;
 		return NULL;
 	}
+	if (clean_status_fsmonitor_semantic_baseline_pending(istate) &&
+	    !fsmonitor_stat_can_be_valid(&st) &&
+	    !(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED))
+		fsmonitor_invalidate_cache_entry(ce);
 
 	changed = ie_match_stat(istate, ce, &st, options);
 	if (changed_ret)

@@ -1,4 +1,5 @@
 #include "git-compat-util.h"
+#include "attr.h"
 #include "attr-manifest.h"
 #include "environment.h"
 #include "read-cache-ll.h"
@@ -43,6 +44,86 @@ static int attr_manifest_entry_equal(const struct attr_manifest_entry *a,
 {
 	return !attr_manifest_entry_cmp(a, b) && a->source == b->source &&
 		!memcmp(a->hash, b->hash, algo->rawsz);
+}
+
+static void release_parsed_attr(struct match_attr *match)
+{
+	for (size_t i = 0; i < match->num_attr; i++) {
+		const char *value = match->state[i].setto;
+
+		if (!ATTR_TRUE(value) && !ATTR_FALSE(value) &&
+		    !ATTR_UNSET(value))
+			free((char *)value);
+	}
+	free(match);
+}
+
+static int normalize_conversion_attributes(
+	const char *data, size_t len, struct strbuf *normalized)
+{
+	struct strbuf line = STRBUF_INIT;
+	size_t offset = 0;
+	int lineno = 0, ret = -1;
+
+	if ((!data && len) || memchr(data, '\0', len))
+		goto done;
+	while (offset < len) {
+		const char *start = data + offset;
+		const char *newline = memchr(start, '\n', len - offset);
+		const char *trimmed;
+		struct match_attr *match;
+		size_t line_len = newline ?
+			(size_t)(newline - start) + 1 : len - offset;
+		int display_only;
+
+		strbuf_reset(&line);
+		strbuf_add(&line, start, line_len);
+		trimmed = line.buf + strspn(line.buf, " \t\r\n");
+		lineno++;
+		if (!*trimmed || *trimmed == '#') {
+			strbuf_add(normalized, start, line_len);
+			offset += line_len;
+			continue;
+		}
+		if (starts_with(trimmed, ATTRIBUTE_MACRO_PREFIX))
+			goto done;
+		match = parse_attr_line(line.buf, GITATTRIBUTES_FILE, lineno, 0);
+		if (!match || match->is_macro || !match->num_attr) {
+			if (match)
+				release_parsed_attr(match);
+			goto done;
+		}
+		display_only = 1;
+		for (size_t i = 0; i < match->num_attr; i++)
+			if (strcmp(git_attr_name(match->state[i].attr),
+				   "linguist-generated"))
+				display_only = 0;
+		release_parsed_attr(match);
+		if (!display_only)
+			strbuf_add(normalized, start, line_len);
+		offset += line_len;
+	}
+	ret = 0;
+
+done:
+	strbuf_release(&line);
+	return ret;
+}
+
+int attr_manifest_only_linguist_generated_changed(
+	const char *old_data, size_t old_len,
+	const char *new_data, size_t new_len)
+{
+	struct strbuf old = STRBUF_INIT, new = STRBUF_INIT;
+	int equal = 0;
+
+	if (!normalize_conversion_attributes(old_data, old_len, &old) &&
+	    !normalize_conversion_attributes(new_data, new_len, &new))
+		equal = old.len == new.len &&
+			!memcmp(old.buf, new.buf, old.len);
+	strbuf_release(&old);
+	strbuf_release(&new);
+	return equal;
 }
 
 void attr_manifest_writer_init(struct attr_manifest_writer *writer,

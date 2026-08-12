@@ -7,6 +7,7 @@
 #include "git-compat-util.h"
 #include "pathspec.h"
 #include "dir.h"
+#include "clean-status.h"
 #include "environment.h"
 #include "fsmonitor.h"
 #include "gettext.h"
@@ -113,6 +114,12 @@ static void *preload_thread(void *_data)
 		p->t2_nr_lstat++;
 		if (lstat(ce->name, &st))
 			continue;
+		if (clean_status_fsmonitor_semantic_baseline_pending(index) &&
+		    !fsmonitor_stat_can_be_valid(&st)) {
+			/* An unwatched hard-link alias can evade coarse stat identity. */
+			fsmonitor_invalidate_cache_entry(ce);
+			continue;
+		}
 		if (ie_match_stat(index, ce, &st, CE_MATCH_RACY_IS_DIRTY|CE_MATCH_IGNORE_FSMONITOR))
 			continue;
 		ce_mark_uptodate(ce);
