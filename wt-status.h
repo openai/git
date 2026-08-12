@@ -145,6 +145,7 @@ struct wt_status {
 	int workdir_dirty;
 	unsigned allow_clean_status_shortcuts : 1;
 	unsigned certify_clean_status : 1;
+	unsigned index_tree_verified : 1;
 	unsigned tracked_from_fsmonitor : 1;
 	unsigned untracked_from_token_closure : 1;
 	unsigned untracked_from_preload : 1;

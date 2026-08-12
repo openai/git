@@ -639,7 +639,8 @@ void untracked_cache_add_to_index(struct index_state *, const char *);
 struct untracked_cache_preload;
 struct untracked_cache_preload *
 untracked_cache_preload_start_fsmonitor_excludes(
-	struct index_state *, unsigned int dir_flags);
+	struct index_state *, unsigned int dir_flags,
+	const struct pathspec *pathspec);
 struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
 	struct index_state *, unsigned int dir_flags);
 int untracked_cache_preload_finish(struct untracked_cache_preload *,

@@ -4,6 +4,7 @@
 #include "clean-status-config.h"
 
 struct index_state;
+struct cache_entry;
 struct attr_source_snapshot;
 struct clean_status_progress;
 struct clean_status_proof_epoch;
@@ -104,6 +105,17 @@ int clean_status_read_fsmonitor_config(struct index_state *istate,
 void clean_status_prepare_fsmonitor_config(struct index_state *istate);
 int clean_status_probe_fsmonitor_config(struct index_state *istate);
 void clean_status_invalidate_current_proof(struct index_state *istate);
+int clean_status_index_entry_is_semantically_safe(
+	const struct index_state *istate,
+	const struct cache_entry *old,
+	const struct cache_entry *new_entry);
+void clean_status_set_authenticated_new_directories(
+	struct index_state *istate, const struct index_state *old_index,
+	const struct strbuf *paths);
+void clean_status_clear_authenticated_new_directories(
+	struct index_state *istate);
+int clean_status_directory_event_is_semantically_safe(
+	const struct index_state *istate, const char *name);
 void clean_status_advance_fsmonitor_config_token(
 	struct index_state *istate, const char *next_token);
 int clean_status_should_write_fsmonitor_config(
@@ -119,6 +131,8 @@ int clean_status_save_external_history(struct index_state *istate);
 void clean_status_copy_fsmonitor_history(struct index_state *dst,
 					 const struct index_state *src);
 int clean_status_transfer_current_proof_if_same_index(
+	struct index_state *dst, const struct index_state *src);
+int clean_status_transfer_current_proof_if_semantically_same_index(
 	struct index_state *dst, const struct index_state *src);
 
 void clean_status_release(struct index_state *istate);

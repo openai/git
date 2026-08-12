@@ -144,6 +144,20 @@ static int ef_is_hardlink(const FSEventStreamEventFlags ef)
 		     kFSEventStreamEventFlagItemIsLastHardlink);
 }
 
+static int ef_ignore_dir_metadata(const FSEventStreamEventFlags ef)
+{
+	static const FSEventStreamEventFlags required =
+		kFSEventStreamEventFlagItemIsDir |
+		kFSEventStreamEventFlagItemInodeMetaMod;
+	static const FSEventStreamEventFlags allowed =
+		kFSEventStreamEventFlagItemIsDir |
+		kFSEventStreamEventFlagItemInodeMetaMod |
+		kFSEventStreamEventFlagItemCreated |
+		kFSEventStreamEventFlagItemXattrMod;
+
+	return (ef & required) == required && !(ef & ~allowed);
+}
+
 /*
  * If an `xattr` change is the only reason we received this event,
  * then silently ignore it.  Git doesn't care about xattr's.  We
@@ -353,6 +367,12 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 
 			if (trace_pass_fl(&trace_fsmonitor))
 				log_flags_set(path_k, event_flags[k]);
+			if (ef_ignore_dir_metadata(event_flags[k])) {
+				trace_printf_key(&trace_fsmonitor,
+						 "ignore-dir-metadata: '%s', flags=0x%x",
+						 path_k, event_flags[k]);
+				break;
+			}
 
 			/*
 			 * Because of the implicit "binning" (the

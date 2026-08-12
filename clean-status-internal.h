@@ -11,8 +11,10 @@ struct clean_status_state {
 	struct clean_status_identity source_index_identity;
 	struct clean_status_manifest_state manifest;
 	struct strbuf disk_config_raw;
+	struct strbuf authenticated_new_directories;
 	char *disk_config_token;
 	char *config_revalidated_token;
+	char *authenticated_new_directories_token;
 	int source_index_fd;
 	unsigned char current_config_hash[GIT_MAX_RAWSZ];
 	unsigned char disk_config_hash[GIT_MAX_RAWSZ];
@@ -20,6 +22,7 @@ struct clean_status_state {
 	unsigned char disk_semantic_hash[GIT_MAX_RAWSZ];
 	unsigned char current_attr_hash[GIT_MAX_RAWSZ];
 	unsigned char current_attr_namespace_hash[GIT_MAX_RAWSZ];
+	unsigned char current_attr_portable_namespace_hash[GIT_MAX_RAWSZ];
 	unsigned char disk_attr_hash[GIT_MAX_RAWSZ];
 	unsigned char source_logical_hash[GIT_MAX_RAWSZ];
 	unsigned current_config_valid : 1;
