@@ -32,6 +32,13 @@ const struct object_id *do_lookup_replace_object(struct repository *r,
 int replace_refs_enabled(struct repository *r);
 
 /*
+ * Return whether the repository currently has any replacement objects that
+ * would be honored by lookup_replace_object().  Do not consult the cached
+ * replacement map.
+ */
+int repo_has_replace_refs_uncached(struct repository *r);
+
+/*
  * If object sha1 should be replaced, return the replacement object's
  * name (replaced recursively, if necessary).  The return value is
  * either sha1 or a pointer to a permanently-allocated value.  When

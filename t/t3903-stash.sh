@@ -1290,6 +1290,33 @@ test_expect_success 'push <pathspec>: show no changes when there are none' '
 	test_cmp expect actual
 '
 
+test_expect_success 'clean stash push does not rewrite an unchanged index' '
+	test_when_finished "rm -rf clean-stash-index" &&
+	test_create_repo clean-stash-index &&
+	(
+		cd clean-stash-index &&
+		test_commit base tracked &&
+		test_set_magic_mtime .git/index +1 &&
+		git stash push >actual &&
+		test_grep "No local changes to save" actual &&
+		test_is_magic_mtime .git/index +1 &&
+		git --no-optional-locks stash push >actual &&
+		test_grep "No local changes to save" actual &&
+		test_is_magic_mtime .git/index +1 &&
+		test_set_magic_mtime tracked &&
+		git --no-optional-locks stash push >actual &&
+		test_grep "No local changes to save" actual &&
+		test_is_magic_mtime .git/index +1 &&
+		git stash push >actual &&
+		test_grep "No local changes to save" actual &&
+		test_is_magic_mtime .git/index +1 &&
+		test_write_lines changed >tracked &&
+		git stash push >actual &&
+		test_grep "Saved working directory" actual &&
+		! test_is_magic_mtime .git/index +1
+	)
+'
+
 test_expect_success 'push: <pathspec> not in the repository errors out' '
 	>untracked &&
 	test_must_fail git stash push untracked &&
@@ -1694,6 +1721,28 @@ test_expect_success 'stash push reports a locked index' '
 		test_must_fail git stash push 2>err &&
 		test_grep "error: could not write index" err &&
 		test_grep "error: Unable to create '.*index.lock'" err
+	)
+'
+
+test_expect_success 'stash push rolls back its lock for an unmerged index' '
+	test_when_finished "rm -rf stash-unmerged-lock" &&
+	test_create_repo stash-unmerged-lock &&
+	(
+		cd stash-unmerged-lock &&
+		test_commit base tracked &&
+		git checkout -b side &&
+		test_write_lines side >tracked &&
+		git commit -am side &&
+		git checkout - &&
+		test_write_lines main >tracked &&
+		git commit -am main &&
+		test_must_fail git merge side &&
+		test_must_fail git stash push >actual 2>err &&
+		test_grep "needs merge" actual &&
+		test_grep "could not write index" err &&
+		test_path_is_missing .git/index.lock &&
+		git ls-files --unmerged >stages &&
+		test_line_count = 3 stages
 	)
 '
 

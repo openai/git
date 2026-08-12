@@ -63,6 +63,12 @@ ifeq ($(uname_S),Linux)
 	PROCFS_EXECUTABLE_PATH = /proc/self/exe
 	HAVE_PLATFORM_PROCINFO = YesPlease
 	COMPAT_OBJS += compat/linux/procinfo.o
+	PRELOAD_INDEX_BULK_BACKEND = linux
+	PRELOAD_INDEX_BULK_PLATFORM_OBJS += compat/preload-index/bulk-linux-entry.o
+	PRELOAD_INDEX_BULK_PLATFORM_OBJS += compat/preload-index/bulk-linux-open.o
+	PRELOAD_INDEX_BULK_PLATFORM_OBJS += compat/preload-index/bulk-linux-scan.o
+	PRELOAD_INDEX_BULK_PLATFORM_OBJS += compat/preload-index/bulk-linux-stat.o
+	PRELOAD_INDEX_BULK_PLATFORM_OBJS += compat/preload-index/bulk-linux-topology.o
 	EXTLIBS += -ldl
 	# centos7/rhel7 provides gcc 4.8.5 and zlib 1.2.7.
         ifneq ($(findstring .el7.,$(uname_R)),)
@@ -162,6 +168,8 @@ ifeq ($(uname_S),Darwin)
 	USE_ENHANCED_BASIC_REGULAR_EXPRESSIONS = YesPlease
 	HAVE_PLATFORM_PROCINFO = YesPlease
 	COMPAT_OBJS += compat/darwin/procinfo.o
+	PRELOAD_INDEX_BULK_BACKEND = darwin
+	PRELOAD_INDEX_BULK_PLATFORM_OBJS += compat/preload-index/bulk-darwin-root.o
 
         ifeq ($(uname_M),arm64)
 		HOMEBREW_PREFIX = /opt/homebrew
