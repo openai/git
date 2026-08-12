@@ -233,8 +233,12 @@ stop_after_fast_fallback () {
 		if grep -q "\"value\":\"fast-excludes-raced\"" \
 			"$race_trace"
 		then
-			kill "$status_pid" 2>/dev/null || return 1
-			wait "$status_pid" 2>/dev/null || :
+			if kill "$status_pid" 2>/dev/null
+			then
+				wait "$status_pid" 2>/dev/null || :
+			else
+				wait "$status_pid" 2>/dev/null || return 1
+			fi
 			status_pid=
 			return 0
 		fi
