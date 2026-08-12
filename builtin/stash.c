@@ -1677,6 +1677,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 {
 	int ret = 0;
 	int preserve_clean_history = !ps->nr && !include_untracked;
+	struct lock_file index_lock = LOCK_INIT;
 	struct stash_info info = STASH_INFO_INIT;
 	struct strbuf patch = STRBUF_INIT;
 	struct strbuf stash_msg_buf = STRBUF_INIT;
@@ -1705,11 +1706,9 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	}
 
 	/*
-	 * A clean stash push returns after its initial stat refresh. Keep
-	 * that rewrite bound only for whole-worktree forms; paths and
-	 * untracked discovery can change the index or its status inputs.
-	 * If changes are found below, invalidate before the real stash
-	 * machinery mutates the index or worktree.
+	 * Keep whole-worktree history bound while inspecting the worktree.
+	 * If changes are found, invalidate it before stash machinery
+	 * mutates the index or worktree.
 	 */
 	if (preserve_clean_history)
 		clean_status_set_config_digest(the_repository,
@@ -1733,15 +1732,23 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		free(ps_matched);
 	}
 
-	if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET, 0, 0,
-					 NULL, NULL, NULL)) {
+	if (repo_hold_locked_index(the_repository, &index_lock,
+				   LOCK_REPORT_ON_ERROR) < 0 ||
+	    refresh_index(the_repository->index, REFRESH_QUIET,
+			  NULL, NULL, NULL)) {
 		ret = error(_("could not write index"));
 		goto done;
 	}
 
 	if (!check_changes(ps, include_untracked, &untracked_files)) {
+		rollback_lock_file(&index_lock);
 		if (!quiet)
 			printf_ln(_("No local changes to save"));
+		goto done;
+	}
+	if (write_locked_index(the_repository->index, &index_lock,
+			       COMMIT_LOCK | SKIP_IF_UNCHANGED)) {
+		ret = error(_("could not write index"));
 		goto done;
 	}
 	if (preserve_clean_history)
@@ -1910,6 +1917,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	}
 
 done:
+	rollback_lock_file(&index_lock);
 	strbuf_release(&patch);
 	strbuf_release(&out);
 	free_stash_info(&info);
