@@ -191,6 +191,7 @@ struct index_state {
 		 fsmonitor_token_valid : 1,
 		 fsmonitor_extension_seen : 1,
 		 fsmonitor_untracked_valid : 1,
+		 fsmonitor_untracked_must_persist : 1,
 		 fsmonitor_untracked_extension_seen : 1,
 		 fsmonitor_untracked_extension_invalid : 1,
 		 fsmonitor_legacy_untracked_adopted : 1,

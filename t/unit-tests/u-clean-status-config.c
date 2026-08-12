@@ -207,6 +207,8 @@ void test_clean_status_config__attaches_only_to_the_staged_repository(void)
 			  algo->rawsz));
 	cl_assert(!memcmp(state->current_attr_namespace_hash,
 			  attrs.namespace_hash, algo->rawsz));
+	cl_assert(!memcmp(state->current_attr_portable_namespace_hash,
+			  attrs.portable_namespace_hash, algo->rawsz));
 
 	clean_status_set_config_digest(&repo_a, &replacement);
 	clean_status_attach_config(&istate_a);

@@ -1828,9 +1828,9 @@ struct repository *repo UNUSED)
 				the_repository->index);
 		int external_saved = 0;
 		int preserve_entry_changes =
-			!external_restored &&
-			(the_repository->index->cache_changed &
-			 CE_ENTRY_CHANGED);
+			(!external_restored &&
+			 (the_repository->index->cache_changed & CE_ENTRY_CHANGED)) ||
+			the_repository->index->fsmonitor_untracked_must_persist;
 
 		/*
 		 * Publish resumable history before the physical clean proof.

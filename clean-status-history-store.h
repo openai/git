@@ -52,6 +52,9 @@ int clean_status_history_store_install(
 	const struct clean_status_history_checkpoint *checkpoint,
 	const struct clean_status_index_snapshot *snapshot,
 	const struct git_hash_algo *algo);
+char *clean_status_history_store_witness_path(
+	const char *index_path, const char *proof_namespace,
+	const struct git_hash_algo *algo);
 int clean_status_history_checkpoint_source_matches(
 	const char *index_path,
 	const struct clean_status_history_checkpoint *checkpoint,
