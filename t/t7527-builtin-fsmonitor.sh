@@ -2132,9 +2132,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_must_be_empty .git/prime &&
 		test_grep FSCF .git/index &&
 
+		cp .git/index .git/index.before &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/stash.trace" \
 			git stash push >.git/stash &&
 		test_grep "No local changes to save" .git/stash &&
+		test_cmp .git/index.before .git/index &&
+		test_grep ! "\"label\":\"do_write_index\"" .git/stash.trace &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
