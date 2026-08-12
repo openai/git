@@ -1356,6 +1356,45 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'no-op checkout, restore, and mixed reset preserve a clean sidecar' '
+	checkout_repo=sidecar-noop-checkout &&
+	test_when_finished "stop_daemon $checkout_repo" &&
+	setup_repo "$checkout_repo" &&
+	git -C "$checkout_repo" config core.untrackedCache true &&
+	issue_sidecar "$checkout_repo" &&
+
+	for checkout_case in checkout-index checkout-head \
+		restore-worktree restore-staged reset-path reset-head \
+		reset-mixed-head reset-mixed-no-refresh
+	do
+		case "$checkout_case" in
+		checkout-index) set -- checkout -- tracked ;;
+		checkout-head) set -- checkout HEAD -- tracked ;;
+		restore-worktree) set -- restore --worktree tracked ;;
+		restore-staged) set -- restore --staged tracked ;;
+		reset-path) set -- reset -- tracked ;;
+		reset-head) set -- reset HEAD -- tracked ;;
+		reset-mixed-head) set -- reset --mixed HEAD ;;
+		reset-mixed-no-refresh)
+			set -- reset --mixed --no-refresh HEAD ;;
+		esac &&
+		cp "$checkout_repo/.git/index" "$checkout_case.before" &&
+		cp "$checkout_repo/.git/index.csts" \
+			"$checkout_case.sidecar" &&
+		GIT_TRACE2_EVENT="$PWD/$checkout_case.command.trace" \
+			git -C "$checkout_repo" "$@" &&
+		test_cmp_bin "$checkout_case.before" \
+			"$checkout_repo/.git/index" &&
+		test_cmp_bin "$checkout_case.sidecar" \
+			"$checkout_repo/.git/index.csts" &&
+		test_grep ! "\"label\":\"do_write_index\"" \
+			"$checkout_case.command.trace" &&
+		assert_clean_sidecar_hit "$checkout_repo" "$checkout_repo" \
+			"$checkout_case.hit" || return 1
+	done
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'clean pathspec status reuses an existing root-wide clean proof' '
 	test_when_finished "stop_daemon clean-pathspec-status" &&
 	setup_repo clean-pathspec-status &&
