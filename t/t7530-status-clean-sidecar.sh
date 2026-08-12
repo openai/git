@@ -1518,6 +1518,59 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'diff restores clean history lost by a foreign index writer' '
+	diff_repo=sidecar-foreign-diff &&
+	test_when_finished "stop_daemon $diff_repo" &&
+	setup_repo "$diff_repo" &&
+	git -C "$diff_repo" config core.untrackedCache true &&
+	issue_sidecar "$diff_repo" &&
+	test_grep FSMN "$diff_repo/.git/index" &&
+	test_grep FSCF "$diff_repo/.git/index" &&
+	find "$diff_repo/.git" -maxdepth 1 -type f \
+		-name "index.csh1.*" >diff-history.checkpoints &&
+	test_line_count = 1 diff-history.checkpoints &&
+	git -C "$diff_repo" ls-files --stage >diff-history.stage &&
+
+	rm "$diff_repo/.git/index" &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-C "$diff_repo" read-tree HEAD &&
+	test_grep ! FSMN "$diff_repo/.git/index" &&
+	test_grep ! FSCF "$diff_repo/.git/index" &&
+	git -c core.fsmonitor=false -C "$diff_repo" \
+		ls-files --stage >diff-history.rewritten.stage &&
+	test_cmp diff-history.stage diff-history.rewritten.stage &&
+	cp "$diff_repo/.git/index" diff-history.index &&
+	cp "$diff_repo/.git/index.csts" diff-history.sidecar &&
+
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/diff-history.clean.trace" \
+		git -C "$diff_repo" diff --no-ext-diff \
+		>diff-history.clean &&
+	test_must_be_empty diff-history.clean &&
+	test_cmp_bin diff-history.index "$diff_repo/.git/index" &&
+	test_cmp_bin diff-history.sidecar "$diff_repo/.git/index.csts" &&
+	test_trace2_data fsmonitor history/external-restored 1 \
+		<diff-history.clean.trace &&
+	! test_trace2_data fsmonitor semantic/manifest-scan-count \
+		<diff-history.clean.trace &&
+	test_grep ! \
+		"\"key\":\"preload/sum_lstat\",\"value\":\"[1-9]" \
+		diff-history.clean.trace &&
+	test_grep ! "\"label\":\"do_write_index\"" \
+		diff-history.clean.trace &&
+
+	test_write_lines changed >"$diff_repo/tracked" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/diff-history.dirty.trace" \
+		git -C "$diff_repo" diff --no-ext-diff \
+		>diff-history.dirty &&
+	test_grep "^+changed$" diff-history.dirty &&
+	test_trace2_data fsmonitor history/external-restored 1 \
+		<diff-history.dirty.trace &&
+	test_cmp_bin diff-history.index "$diff_repo/.git/index"
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'no-op checkout-index -u preserves a clean status proof' '
 	update_repo=sidecar-noop-checkout-index &&
 	test_when_finished "stop_daemon $update_repo" &&
