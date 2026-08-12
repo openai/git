@@ -512,8 +512,11 @@ static const char *prepare_index(const char **argv, const char *prefix,
 	 * We still need to refresh the index here.
 	 */
 	if (!only && !pathspec.nr) {
-		repo_hold_locked_index(the_repository, &index_lock,
-				       LOCK_DIE_ON_ERROR);
+		int update_index = !is_status || use_optional_locks();
+
+		if (update_index)
+			repo_hold_locked_index(the_repository, &index_lock,
+					       LOCK_DIE_ON_ERROR);
 		if (!fstat_is_reliable() ||
 		    the_repository->index->split_index ||
 		    fsm_settings__get_mode(the_repository) !=
@@ -525,7 +528,8 @@ static const char *prepare_index(const char **argv, const char *prefix,
 		if (the_repository->index->cache_changed
 		    || !cache_tree_fully_valid(the_repository->index->cache_tree))
 			cache_tree_update(the_repository->index, WRITE_TREE_SILENT);
-		if (write_locked_index(the_repository->index, &index_lock,
+		if (update_index &&
+		    write_locked_index(the_repository->index, &index_lock,
 				       COMMIT_LOCK | SKIP_IF_UNCHANGED))
 			die(_("unable to write new index file"));
 		commit_style = COMMIT_AS_IS;
