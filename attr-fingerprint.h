@@ -13,6 +13,7 @@ struct attr_fingerprint_source {
 struct attr_fingerprint {
 	unsigned char content_hash[GIT_MAX_RAWSZ];
 	unsigned char namespace_hash[GIT_MAX_RAWSZ];
+	unsigned char portable_namespace_hash[GIT_MAX_RAWSZ];
 	unsigned int sources_present : 1;
 };
 

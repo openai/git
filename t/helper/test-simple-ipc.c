@@ -161,6 +161,7 @@ static int app__sendbytes_command(const char *received, size_t received_len,
 static int my_app_data = 42;
 static int fsmonitor_legacy;
 static int fsmonitor_capability_superset;
+static int fsmonitor_pre_dir_metadata;
 
 static ipc_server_application_cb test_app_cb;
 
@@ -170,7 +171,12 @@ static int app__fsmonitor_capability_superset(
 	struct ipc_server_reply_data *reply_data)
 {
 	static const char capability_command[] = "get-capabilities";
-	static const char capabilities[] = "query-v1\nquery-v2\n";
+	static const char capabilities[] = "query-v1\nquery-v2\n"
+#ifdef __APPLE__
+		"dir-metadata-filter-v1\n"
+#endif
+		;
+	static const char pre_dir_metadata_capabilities[] = "query-v1\n";
 	static const char query_prefix[] = "query-v1 ";
 	static const char token[] = "builtin:test-capable:0";
 	const char *query;
@@ -178,9 +184,14 @@ static int app__fsmonitor_capability_superset(
 	int ret;
 
 	if (command_len == sizeof(capability_command) - 1 &&
-	    !memcmp(command, capability_command, command_len))
+	    !memcmp(command, capability_command, command_len)) {
+		if (fsmonitor_pre_dir_metadata)
+			return reply_cb(reply_data,
+					pre_dir_metadata_capabilities,
+					sizeof(pre_dir_metadata_capabilities) - 1);
 		return reply_cb(reply_data, capabilities,
 				sizeof(capabilities) - 1);
+	}
 
 	query = memchr(command, '\n', command_len);
 	query_len = query ? command_len - (query + 1 - command) : 0;
@@ -232,7 +243,7 @@ static int test_app_cb(void *application_data,
 		return SIMPLE_IPC_QUIT;
 	}
 
-	if (fsmonitor_capability_superset)
+	if (fsmonitor_capability_superset || fsmonitor_pre_dir_metadata)
 		return app__fsmonitor_capability_superset(
 			command, command_len, reply_cb, reply_data);
 
@@ -359,6 +370,8 @@ static int daemon__start_server(void)
 		strvec_push(&cp.args, "--fsmonitor-legacy");
 	if (fsmonitor_capability_superset)
 		strvec_push(&cp.args, "--fsmonitor-capability-superset");
+	if (fsmonitor_pre_dir_metadata)
+		strvec_push(&cp.args, "--fsmonitor-pre-dir-metadata");
 
 	cp.no_stdin = 1;
 	cp.no_stdout = 1;
@@ -656,6 +669,9 @@ int cmd__simple_ipc(int argc, const char **argv)
 		OPT_BOOL(0, "fsmonitor-capability-superset",
 			 &fsmonitor_capability_superset,
 			 N_("advertise multiple fsmonitor query versions")),
+		OPT_BOOL(0, "fsmonitor-pre-dir-metadata",
+			 &fsmonitor_pre_dir_metadata,
+			 N_("emulate a daemon without directory metadata filtering")),
 
 		/*
 		 * The "byte" string here is not marked for translation and
