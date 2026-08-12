@@ -7,6 +7,7 @@
 #include "statinfo.h"
 #include "strbuf.h"
 
+struct exclude_source_proof;
 struct repository;
 
 /**
@@ -182,7 +183,18 @@ struct untracked_cache_dir {
 	/* all data except 'dirs' in this struct are good */
 	unsigned int valid : 1;
 	unsigned int recurse : 1;
-	/* null object ID means this directory does not have .gitignore */
+	/* this subtree contains at least one cached untracked entry */
+	unsigned int has_untracked : 1;
+	/* transient results from directory-stat preloading */
+	unsigned int stat_checked : 1;
+	unsigned int stat_matches : 1;
+	unsigned int exclude_matches : 1;
+	unsigned int valid_recursive : 1;
+	unsigned int fsmonitor_dirty : 1;
+	/*
+	 * A null object ID means this directory does not have .gitignore.
+	 * The empty-tree ID records a present source that could not be read.
+	 */
 	struct object_id exclude_oid;
 	char name[FLEX_ARRAY];
 };
@@ -204,6 +216,7 @@ struct untracked_cache {
 	int gitignore_invalidated;
 	int dir_invalidated;
 	int dir_opened;
+	struct strbuf fsmonitor_dirty_paths;
 	/* fsmonitor invalidation data */
 	unsigned int use_fsmonitor : 1;
 };
@@ -353,6 +366,14 @@ struct dir_struct {
 		/* Stats about the traversal */
 		unsigned visited_paths;
 		unsigned visited_directories;
+		unsigned untracked_cache_preloaded : 1;
+		unsigned traversal_failed : 1;
+
+		/*
+		 * Optional borrowed proof that covers every exclusion source
+		 * consulted by this traversal.
+		 */
+		struct exclude_source_proof *exclude_source_proof;
 	} internal;
 };
 
@@ -401,6 +422,11 @@ int fill_directory(struct dir_struct *dir,
 int read_directory(struct dir_struct *, struct index_state *istate,
 		   const char *path, int len,
 		   const struct pathspec *pathspec);
+int read_directory_cached_subtree(struct dir_struct *,
+				  struct index_state *istate,
+				  struct untracked_cache_dir *untracked,
+				  const char *path, int len,
+				  const struct pathspec *pathspec);
 
 enum pattern_match_result {
 	UNDECIDED = -1,
@@ -597,6 +623,7 @@ int cmp_dir_entry(const void *p1, const void *p2);
 int check_dir_entry_contains(const struct dir_entry *out, const struct dir_entry *in);
 
 void untracked_cache_invalidate_path(struct index_state *, const char *, int safe_path);
+void untracked_cache_invalidate_all(struct index_state *);
 /*
  * Invalidate the untracked-cache for this path, but first strip
  * off a trailing slash, if present.
@@ -604,14 +631,30 @@ void untracked_cache_invalidate_path(struct index_state *, const char *, int saf
 void untracked_cache_invalidate_trimmed_path(struct index_state *,
 					     const char *path,
 					     int safe_path);
+void untracked_cache_recompute_fsmonitor_valid_recursive(
+	struct untracked_cache *);
 void untracked_cache_remove_from_index(struct index_state *, const char *);
 void untracked_cache_add_to_index(struct index_state *, const char *);
+
+struct untracked_cache_preload;
+struct untracked_cache_preload *
+untracked_cache_preload_start_fsmonitor_excludes(
+	struct index_state *, unsigned int dir_flags,
+	const struct pathspec *pathspec);
+struct untracked_cache_preload *untracked_cache_preload_start_ordinary(
+	struct index_state *, unsigned int dir_flags);
+int untracked_cache_preload_finish(struct untracked_cache_preload *,
+					   struct index_state *, unsigned int dir_flags,
+					   size_t *index_invalidated);
+void untracked_cache_preload_release(struct untracked_cache_preload *);
 
 void free_untracked_cache(struct untracked_cache *);
 struct untracked_cache *read_untracked_extension(const void *data, unsigned long sz);
 void write_untracked_extension(struct strbuf *out, struct untracked_cache *untracked);
 void add_untracked_cache(struct index_state *istate);
 void remove_untracked_cache(struct index_state *istate);
+int untracked_cache_adopt_legacy(struct index_state *istate);
+void untracked_cache_discard_legacy(struct index_state *istate);
 
 /*
  * Connect a worktree to a git directory by creating (or overwriting) a

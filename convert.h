@@ -8,6 +8,7 @@
 #include "string-list.h"
 
 struct index_state;
+struct attr_check;
 struct strbuf;
 
 #define CONV_EOL_RNDTRP_DIE   (1<<0) /* Die if CRLF to LF to CRLF is different */
@@ -90,6 +91,34 @@ struct conv_attrs {
 
 void convert_attrs(struct index_state *istate,
 		   struct conv_attrs *ca, const char *path);
+
+/*
+ * Prepare conversion configuration and the default attribute source on the
+ * main thread before using per-thread attribute checks below.
+ */
+void convert_attrs_prepare(struct index_state *istate);
+
+/* Allocate the exact six-attribute check used by convert_attrs(). */
+struct attr_check *convert_attrs_check_alloc(void);
+
+/*
+ * Thread-friendly variant.  Each concurrent caller must supply a distinct
+ * check allocated by convert_attrs_check_alloc(), and conversion/attribute
+ * global state must remain immutable until all callers have finished.
+ */
+void convert_attrs_with_check(struct index_state *istate,
+			      struct conv_attrs *ca, const char *path,
+			      struct attr_check *check);
+
+/* True when the selected driver can affect conversion into the index. */
+int convert_attrs_has_clean_filter(const struct conv_attrs *ca);
+
+/* True only when hashing the worktree bytes verbatim is exact. */
+int convert_attrs_are_raw_safe(const struct conv_attrs *ca);
+
+/* True only when hashing the worktree bytes verbatim is exact. */
+int convert_attrs_is_raw_safe(struct index_state *istate, const char *path,
+			      struct attr_check *check);
 
 extern enum eol core_eol;
 extern char *check_roundtrip_encoding;
