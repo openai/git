@@ -159,8 +159,50 @@ static int app__sendbytes_command(const char *received, size_t received_len,
  * data is handled properly.
  */
 static int my_app_data = 42;
+static int fsmonitor_legacy;
+static int fsmonitor_capability_superset;
+static int fsmonitor_pre_dir_metadata;
 
 static ipc_server_application_cb test_app_cb;
+
+static int app__fsmonitor_capability_superset(
+	const char *command, size_t command_len,
+	ipc_server_reply_cb *reply_cb,
+	struct ipc_server_reply_data *reply_data)
+{
+	static const char capability_command[] = "get-capabilities";
+	static const char capabilities[] = "query-v1\nquery-v2\n"
+#ifdef __APPLE__
+		"dir-metadata-filter-v1\n"
+#endif
+		;
+	static const char pre_dir_metadata_capabilities[] = "query-v1\n";
+	static const char query_prefix[] = "query-v1 ";
+	static const char token[] = "builtin:test-capable:0";
+	const char *query;
+	size_t query_len;
+	int ret;
+
+	if (command_len == sizeof(capability_command) - 1 &&
+	    !memcmp(command, capability_command, command_len)) {
+		if (fsmonitor_pre_dir_metadata)
+			return reply_cb(reply_data,
+					pre_dir_metadata_capabilities,
+					sizeof(pre_dir_metadata_capabilities) - 1);
+		return reply_cb(reply_data, capabilities,
+				sizeof(capabilities) - 1);
+	}
+
+	query = memchr(command, '\n', command_len);
+	query_len = query ? command_len - (query + 1 - command) : 0;
+	ret = reply_cb(reply_data, token, sizeof(token));
+	if (!ret &&
+	    (!starts_with(command, query_prefix) ||
+	     query_len != sizeof(token) - 1 ||
+	     memcmp(query + 1, token, query_len)))
+		ret = reply_cb(reply_data, "/", 2);
+	return ret;
+}
 
 /*
  * This is the "application callback" that sits on top of the
@@ -199,6 +241,20 @@ static int test_app_cb(void *application_data,
 		 * This DOES NOT force an immediate sync shutdown.
 		 */
 		return SIMPLE_IPC_QUIT;
+	}
+
+	if (fsmonitor_capability_superset || fsmonitor_pre_dir_metadata)
+		return app__fsmonitor_capability_superset(
+			command, command_len, reply_cb, reply_data);
+
+	if (fsmonitor_legacy) {
+		static const char token[] = "builtin:test-legacy:0";
+		int ret;
+
+		ret = reply_cb(reply_data, token, sizeof(token));
+		if (!ret && !starts_with(command, "builtin:"))
+			ret = reply_cb(reply_data, "/", 2);
+		return ret;
 	}
 
 	if (command_len == 4 && !strncmp(command, "ping", 4)) {
@@ -310,6 +366,12 @@ static int daemon__start_server(void)
 	strvec_push(&cp.args, "run-daemon");
 	strvec_pushf(&cp.args, "--name=%s", cl_args.path);
 	strvec_pushf(&cp.args, "--threads=%d", cl_args.nr_threads);
+	if (fsmonitor_legacy)
+		strvec_push(&cp.args, "--fsmonitor-legacy");
+	if (fsmonitor_capability_superset)
+		strvec_push(&cp.args, "--fsmonitor-capability-superset");
+	if (fsmonitor_pre_dir_metadata)
+		strvec_push(&cp.args, "--fsmonitor-pre-dir-metadata");
 
 	cp.no_stdin = 1;
 	cp.no_stdout = 1;
@@ -602,6 +664,14 @@ int cmd__simple_ipc(int argc, const char **argv)
 
 		OPT_INTEGER(0, "bytecount", &cl_args.bytecount, N_("number of bytes")),
 		OPT_INTEGER(0, "batchsize", &cl_args.batchsize, N_("number of requests per thread")),
+		OPT_BOOL(0, "fsmonitor-legacy", &fsmonitor_legacy,
+			 N_("emulate the legacy fsmonitor query protocol")),
+		OPT_BOOL(0, "fsmonitor-capability-superset",
+			 &fsmonitor_capability_superset,
+			 N_("advertise multiple fsmonitor query versions")),
+		OPT_BOOL(0, "fsmonitor-pre-dir-metadata",
+			 &fsmonitor_pre_dir_metadata,
+			 N_("emulate a daemon without directory metadata filtering")),
 
 		/*
 		 * The "byte" string here is not marked for translation and
