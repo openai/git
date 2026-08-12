@@ -70,6 +70,63 @@ issue_sidecar () {
 	test_path_is_file "$repo/.git/index.csts"
 }
 
+assert_clean_sidecar_result () {
+	sidecar_result=$1 &&
+	sidecar_repo=$2 &&
+	sidecar_cwd=$3 &&
+	sidecar_label=$4 &&
+	shift 4 &&
+	cp "$sidecar_repo/.git/index" "$sidecar_label.index" &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false -C "$sidecar_cwd" \
+		status "$@" >"$sidecar_label.expect" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/$sidecar_label.trace" \
+		git -C "$sidecar_cwd" status "$@" \
+		>"$sidecar_label.actual" &&
+	test_cmp_bin "$sidecar_label.expect" "$sidecar_label.actual" &&
+	test_cmp_bin "$sidecar_label.index" "$sidecar_repo/.git/index" ||
+		return 1
+
+	if test "$sidecar_result" = hit
+	then
+		test_trace2_data status clean-proof/hit 1 \
+			<"$sidecar_label.trace" &&
+		test_grep ! "\"label\":\"do_read_index\"" \
+			"$sidecar_label.trace" &&
+		test_grep ! "\"category\":\"index\",\"label\":\"refresh\"" \
+			"$sidecar_label.trace" &&
+		test_grep ! "\"category\":\"index\",\"label\":\"preload" \
+			"$sidecar_label.trace" &&
+		test_grep ! "\"label\":\"read_directory\"" \
+			"$sidecar_label.trace"
+	else
+		test_grep ! "\"key\":\"clean-proof/hit\"" \
+			"$sidecar_label.trace"
+	fi
+}
+
+assert_clean_sidecar_hit () {
+	assert_clean_sidecar_result hit "$@"
+}
+
+assert_clean_sidecar_fallback () {
+	assert_clean_sidecar_result fallback "$@"
+}
+
+assert_tracked_clean_fallback () {
+	tracked_trace=$3.trace &&
+	assert_clean_sidecar_fallback "$@" &&
+	test_trace2_data status fsmonitor/tracked-clean 1 \
+		<"$tracked_trace" &&
+	test_trace2_data status index/cache-tree-match 1 \
+		<"$tracked_trace" &&
+	test_grep ! "\"category\":\"index\",\"label\":\"refresh\"" \
+		"$tracked_trace" &&
+	test_grep ! "\"category\":\"index\",\"label\":\"preload" \
+		"$tracked_trace"
+}
+
 assert_fallback_matches_oracle () {
 	repo=$1 &&
 	sidecar_trace=$2 &&
@@ -226,6 +283,252 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_grep "\"key\":\"clean-proof/hit\"" hit.trace &&
 	test_grep ! "\"label\":\"do_read_index\"" hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a clean sidecar serves every index-independent status shape' '
+	shapes=sidecar-query-shapes &&
+	test_when_finished "stop_daemon $shapes" &&
+	setup_repo "$shapes" &&
+	mkdir "$shapes/scoped" &&
+	test_commit -C "$shapes" scoped scoped/tracked &&
+	test_write_lines "*.ignored" >"$shapes/.gitignore" &&
+	git -C "$shapes" add .gitignore &&
+	git -C "$shapes" commit -qm ignores &&
+	git -C "$shapes" branch sidecar-upstream &&
+	git -C "$shapes" branch --set-upstream-to=sidecar-upstream &&
+	git -C "$shapes" commit --allow-empty -qm ahead &&
+	test_write_lines stashed >"$shapes/tracked" &&
+	git -C "$shapes" stash push -qm sidecar-stash &&
+	test-tool -C "$shapes" chmtime -120 \
+		tracked scoped/tracked .gitignore &&
+	git -C "$shapes" update-index --refresh &&
+	test_write_lines ignored >"$shapes/root.ignored" &&
+	test_write_lines ignored >"$shapes/scoped/nested.ignored" &&
+	git -C "$shapes" config core.untrackedCache true &&
+	issue_sidecar "$shapes" &&
+
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-default &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-long --long &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose --verbose &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-twice -vv &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-long --verbose --long &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-short --verbose --short &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-v2 --verbose --porcelain=v2 &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-null --verbose -z &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-branch --verbose --branch &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-stash --verbose --show-stash &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-verbose-scoped --verbose -- scoped &&
+	assert_clean_sidecar_hit "$shapes" "$shapes/scoped" \
+		sidecar-verbose-nested --verbose &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-short --short &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-porcelain --porcelain &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-porcelain-v1 --porcelain=v1 &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-porcelain-v2 --porcelain=v2 &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-null -z &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-short-branch --short --branch &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-v1-branch-null \
+		--porcelain=v1 --branch -z &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-v2-branch \
+		--porcelain=v2 --branch &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-stash --show-stash &&
+	test_grep "Your stash currently has 1 entry" sidecar-stash.actual &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-v2-stash \
+		--porcelain=v2 --show-stash &&
+	test_grep "^# stash 1$" sidecar-v2-stash.actual &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-daemon \
+		--porcelain=v2 -z --branch --show-stash \
+		--no-ahead-behind --untracked-files=normal \
+		--ignore-submodules=all &&
+	for ignore_mode in all dirty untracked none
+	do
+		assert_clean_sidecar_hit "$shapes" "$shapes" \
+			"sidecar-ignore-$ignore_mode" \
+			"--ignore-submodules=$ignore_mode" || return 1
+	done &&
+	test_must_fail git -C "$shapes" status \
+		--ignore-submodules=bogus >sidecar-invalid-ignore.out \
+		2>sidecar-invalid-ignore.err &&
+	test_must_be_empty sidecar-invalid-ignore.out &&
+	test_grep "bad --ignore-submodules argument: bogus" \
+		sidecar-invalid-ignore.err &&
+	test_must_fail git -C "$shapes" status \
+		--ignore-submodules=bogus -- ":(bogus)tracked" \
+		>sidecar-invalid-order.out 2>sidecar-invalid-order.err &&
+	test_must_be_empty sidecar-invalid-order.out &&
+	test_grep "Invalid pathspec magic.*bogus" \
+		sidecar-invalid-order.err &&
+	test_grep ! "bad --ignore-submodules argument" \
+		sidecar-invalid-order.err &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-untracked-no -uno &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-untracked-all -uall &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-no-renames --no-renames &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-find-renames --find-renames=50% &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-scoped -- scoped &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-scoped-slash -- scoped/ &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-scoped-file -- scoped/tracked &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-multiple -- tracked scoped &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-scoped-v2 \
+		--porcelain=v2 -- scoped &&
+	assert_clean_sidecar_hit "$shapes" "$shapes/scoped" sidecar-nested &&
+	assert_clean_sidecar_hit "$shapes" "$shapes/scoped" sidecar-nested-v2 \
+		--porcelain=v2 -- tracked &&
+	assert_clean_sidecar_hit "$shapes" "$shapes/scoped" sidecar-nested-root \
+		--porcelain=v1 -- ":(top)tracked" &&
+
+	stash_oid=$(git -C "$shapes" rev-parse refs/stash) &&
+	git -C "$shapes" stash drop -q &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-stash-dropped --show-stash &&
+	test_grep ! "Your stash currently has" \
+		sidecar-stash-dropped.actual &&
+	git -C "$shapes" stash store -m restored "$stash_oid" &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-stash-restored \
+		--porcelain=v2 --show-stash &&
+	test_grep "^# stash 1$" sidecar-stash-restored.actual &&
+
+	current_ref=$(git -C "$shapes" symbolic-ref HEAD) &&
+	git -C "$shapes" branch sidecar-live HEAD &&
+	git -C "$shapes" symbolic-ref HEAD refs/heads/sidecar-live &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-branch-moved \
+		--porcelain=v2 --branch &&
+	test_grep "^# branch.head sidecar-live$" \
+		sidecar-branch-moved.actual &&
+	git -C "$shapes" symbolic-ref HEAD "$current_ref" &&
+
+	git -C "$shapes" rev-parse HEAD >"$shapes/.git/MERGE_HEAD" &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-merge --long &&
+	test_grep "All conflicts fixed but you are still merging" \
+		sidecar-merge.actual &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-merge-verbose --verbose &&
+	assert_clean_sidecar_fallback "$shapes" "$shapes" \
+		sidecar-merge-verbose-twice -vv &&
+	test_grep "Changes to be committed:" \
+		sidecar-merge-verbose-twice.actual &&
+	rm "$shapes/.git/MERGE_HEAD" &&
+	mkdir "$shapes/.git/rebase-merge" &&
+	git -C "$shapes" symbolic-ref HEAD \
+		>"$shapes/.git/rebase-merge/head-name" &&
+	git -C "$shapes" rev-parse HEAD \
+		>"$shapes/.git/rebase-merge/onto" &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" sidecar-rebase --long &&
+	test_grep "You are currently rebasing" sidecar-rebase.actual &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-rebase-verbose --verbose &&
+	assert_clean_sidecar_hit "$shapes" "$shapes" \
+		sidecar-rebase-verbose-twice -vv &&
+	rm -rf "$shapes/.git/rebase-merge"
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a clean sidecar respects configured short and branch output' '
+	test_when_finished "stop_daemon sidecar-configured-shapes" &&
+	setup_repo sidecar-configured-shapes &&
+	git -C sidecar-configured-shapes config status.short true &&
+	git -C sidecar-configured-shapes config status.branch true &&
+	issue_sidecar sidecar-configured-shapes &&
+	assert_clean_sidecar_hit sidecar-configured-shapes \
+		sidecar-configured-shapes sidecar-configured-short &&
+	test_grep "^## " sidecar-configured-short.actual &&
+	assert_clean_sidecar_hit sidecar-configured-shapes \
+		sidecar-configured-shapes sidecar-configured-long \
+		--no-short --no-branch &&
+	assert_clean_sidecar_hit sidecar-configured-shapes \
+		sidecar-configured-shapes sidecar-configured-v2 \
+		--porcelain=v2 --branch
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a clean sidecar never answers unsupported or dirty status shapes' '
+	test_when_finished "stop_daemon sidecar-unsafe-shapes" &&
+	setup_repo sidecar-unsafe-shapes &&
+	mkdir sidecar-unsafe-shapes/scoped &&
+	test_commit -C sidecar-unsafe-shapes scoped scoped/tracked &&
+	test_write_lines "*.ignored" >sidecar-unsafe-shapes/.gitignore &&
+	git -C sidecar-unsafe-shapes add .gitignore &&
+	git -C sidecar-unsafe-shapes commit -qm ignores &&
+	test-tool -C sidecar-unsafe-shapes chmtime -120 \
+		tracked scoped/tracked .gitignore &&
+	git -C sidecar-unsafe-shapes update-index --refresh &&
+	test_write_lines ignored >sidecar-unsafe-shapes/root.ignored &&
+	test_write_lines ignored \
+		>sidecar-unsafe-shapes/scoped/nested.ignored &&
+	git -C sidecar-unsafe-shapes config core.untrackedCache true &&
+	issue_sidecar sidecar-unsafe-shapes &&
+
+	assert_tracked_clean_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-ignored --ignored &&
+	test_grep "root.ignored" sidecar-ignored.actual &&
+	test_grep "\"label\":\"read_directory\"" sidecar-ignored.trace &&
+	assert_tracked_clean_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-ignored-matching \
+		--ignored=matching &&
+	assert_tracked_clean_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-ignored-scoped \
+		--ignored -- scoped &&
+	test_grep "scoped/nested.ignored" sidecar-ignored-scoped.actual &&
+	assert_clean_sidecar_hit sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-verbose-clean --verbose &&
+
+	git -C sidecar-unsafe-shapes config core.sparseCheckout true &&
+	assert_clean_sidecar_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-sparse --long &&
+	git -C sidecar-unsafe-shapes config --unset core.sparseCheckout &&
+	current_ref=$(git -C sidecar-unsafe-shapes symbolic-ref HEAD) &&
+	git -C sidecar-unsafe-shapes symbolic-ref \
+		HEAD refs/heads/sidecar-unborn &&
+	assert_clean_sidecar_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-unborn \
+		--porcelain=v2 --branch &&
+	test_grep "^# branch.oid (initial)$" sidecar-unborn.actual &&
+	git -C sidecar-unsafe-shapes symbolic-ref HEAD "$current_ref" &&
+
+	test_write_lines changed >sidecar-unsafe-shapes/tracked &&
+	assert_clean_sidecar_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-dirty-verbose --verbose &&
+	test_grep "tracked" sidecar-dirty-verbose.actual &&
+	test_grep "\"category\":\"diff\"" \
+		sidecar-dirty-verbose.trace &&
+	assert_clean_sidecar_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-dirty --porcelain=v2 &&
+	test_grep "^1 \.M .* tracked$" sidecar-dirty.actual &&
+	assert_clean_sidecar_fallback sidecar-unsafe-shapes \
+		sidecar-unsafe-shapes sidecar-dirty-outside \
+		--porcelain=v2 -- scoped &&
+	test_must_be_empty sidecar-dirty-outside.actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'submodule summaries reject an otherwise valid clean sidecar' '
+	test_when_finished "stop_daemon sidecar-submodule-summary" &&
+	setup_repo sidecar-submodule-summary &&
+	git -C sidecar-submodule-summary \
+		config status.submoduleSummary true &&
+	issue_sidecar sidecar-submodule-summary &&
+	assert_clean_sidecar_fallback sidecar-submodule-summary \
+		sidecar-submodule-summary sidecar-summary --long
 '
 
 test_expect_success DURABLE_FSMONITOR \
@@ -671,8 +974,12 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_path_is_missing sidecar-shape/.git/index.csts &&
 
-	bulk_status -C sidecar-shape status --porcelain=v2 --branch >actual &&
+	test_env GIT_TRACE2_EVENT="$PWD/shape-branch.trace" \
+		bulk_status -C sidecar-shape \
+			status --porcelain=v2 --branch >actual &&
 	test_grep "^# branch.oid " actual &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" \
+		shape-branch.trace &&
 	test_path_is_missing sidecar-shape/.git/index.csts &&
 
 	echo changed >sidecar-shape/tracked &&
