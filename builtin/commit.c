@@ -36,6 +36,7 @@
 #include "refs.h"
 #include "repository.h"
 #include "string-list.h"
+#include "submodule.h"
 #include "rerere.h"
 #include "unpack-trees.h"
 #include "column.h"
@@ -1606,12 +1607,11 @@ static int git_status_config(const char *k, const char *v,
 
 /*
  * A clean-proof hit certifies the tracked and untracked lists, but it
- * deliberately does not cache human-readable status output.  Refresh the
- * cheap state which the long printer derives from refs and administrative
- * files before printing those empty lists.
+ * deliberately does not cache status output. Refresh the cheap state which
+ * the selected printer derives from refs and administrative files before
+ * printing those empty lists.
  */
-static int print_normal_clean_sidecar(struct wt_status *s,
-				      const char *prefix)
+static int print_clean_sidecar(struct wt_status *s, const char *prefix)
 {
 	struct object_id oid;
 
@@ -1621,7 +1621,8 @@ static int print_normal_clean_sidecar(struct wt_status *s,
 	oidcpy(&s->oid_commit, &oid);
 	s->ignore_submodule_arg = ignore_submodule_arg;
 	s->status_format = status_format;
-	s->verbose = verbose;
+	/* A globally clean proof guarantees that both verbose diffs are empty. */
+	s->verbose = 0;
 	FREE_AND_NULL(s->branch);
 	s->branch = refs_resolve_refdup(get_main_ref_store(s->repo),
 					"HEAD", 0, NULL, NULL);
@@ -1651,7 +1652,7 @@ struct repository *repo UNUSED)
 		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
 	int exact_clean_query;
 	int normal_clean_query;
-	int scoped_clean_query;
+	int reusable_clean_query;
 	int normal_has_head;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
@@ -1727,6 +1728,7 @@ struct repository *repo UNUSED)
 
 	handle_untracked_files_arg(&s);
 	handle_ignored_arg(&s);
+	s.ignore_submodule_arg = ignore_submodule_arg;
 
 	if (s.show_ignored_mode == SHOW_MATCHING_IGNORED &&
 	    s.show_untracked_files == SHOW_NO_UNTRACKED_FILES)
@@ -1735,10 +1737,12 @@ struct repository *repo UNUSED)
 	parse_pathspec(&s.pathspec, 0,
 		       PATHSPEC_PREFER_FULL,
 		       prefix, argv);
-	s.allow_clean_status_shortcuts =
-		default_status_command && !s.pathspec.nr;
-	normal_has_head = default_status_command &&
-		!repo_get_oid(the_repository, s.reference, &oid);
+	if (s.ignore_submodule_arg) {
+		struct diff_options diffopt = { 0 };
+
+		handle_ignore_submodules_arg(&diffopt, s.ignore_submodule_arg);
+	}
+	normal_has_head = !repo_get_oid(the_repository, s.reference, &oid);
 	exact_clean_query = exact_clean_command &&
 		status_format == STATUS_FORMAT_PORCELAIN_V2 &&
 		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
@@ -1751,19 +1755,21 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
-	scoped_clean_query = s.pathspec.nr &&
-		status_format == STATUS_FORMAT_NONE &&
-		!s.show_branch && !s.show_stash && !s.show_ignored_mode &&
-		!s.null_termination && !s.verbose && !s.submodule_summary &&
-		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
-		!repo_config_values(the_repository)->apply_sparse_checkout &&
-		!repo_get_oid(the_repository, s.reference, &oid);
+	reusable_clean_query = normal_has_head &&
+		!s.show_ignored_mode && !s.submodule_summary &&
+		/* A clean merge still prints a staged-changes header with -vv. */
+		!(verbose > 1 &&
+		  file_exists(git_path_merge_head(the_repository))) &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
+	s.allow_clean_status_shortcuts = normal_has_head &&
+		!s.submodule_summary &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
 	clean_status_enable_external_history(the_repository);
 	s.certify_clean_status = exact_clean_query;
-	if ((exact_clean_query || normal_clean_query || scoped_clean_query) &&
+	if (reusable_clean_query &&
 	    clean_status_try_sidecar(the_repository, &clean_digest)) {
 		if (exact_clean_query ||
-		    print_normal_clean_sidecar(&s, prefix)) {
+		    print_clean_sidecar(&s, prefix)) {
 			wt_status_collect_free_buffers(&s);
 			return 0;
 		}
@@ -1803,7 +1809,6 @@ struct repository *repo UNUSED)
 	if (!s.is_initial)
 		oidcpy(&s.oid_commit, &oid);
 
-	s.ignore_submodule_arg = ignore_submodule_arg;
 	s.status_format = status_format;
 	s.verbose = verbose;
 	if (no_renames != -1)
