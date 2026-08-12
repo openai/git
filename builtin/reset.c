@@ -19,6 +19,7 @@
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
+#include "hook.h"
 #include "lockfile.h"
 #include "object.h"
 #include "pretty.h"
@@ -527,6 +528,8 @@ int cmd_reset(int argc,
 
 	if (reset_type != SOFT) {
 		struct lock_file lock = LOCK_INIT;
+		unsigned int write_flags = COMMIT_LOCK;
+
 		repo_hold_locked_index(the_repository, &lock,
 				       LOCK_DIE_ON_ERROR);
 		if (reset_type == MIXED) {
@@ -574,7 +577,11 @@ int cmd_reset(int argc,
 			free(ref);
 		}
 
-		if (write_locked_index(the_repository->index, &lock, COMMIT_LOCK))
+		if (reset_type == MIXED &&
+		    !the_repository->index->cache_changed &&
+		    !hook_exists(the_repository, "post-index-change"))
+			write_flags |= SKIP_IF_UNCHANGED;
+		if (write_locked_index(the_repository->index, &lock, write_flags))
 			die(_("Could not write new index file."));
 	}
 
