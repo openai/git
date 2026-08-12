@@ -34,6 +34,7 @@ static int open_attr_source(const char *path)
 
 static int hash_source(struct git_hash_ctx *content_ctx,
 		       struct git_hash_ctx *namespace_ctx,
+		       struct git_hash_ctx *portable_namespace_ctx,
 		       const struct attr_fingerprint_source *source,
 		       int *present,
 		       struct attr_source_snapshot_entry *snapshot)
@@ -49,14 +50,20 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 	int fd = -1, ret = -1;
 	char extra;
 
-	hash_optional_cstring(content_ctx, source->path);
 	hash_optional_cstring(namespace_ctx, source->path);
 	put_be32(&state, source->enabled);
-	hash_length_delimited(content_ctx, &state, sizeof(state));
 	hash_length_delimited(namespace_ctx, &state, sizeof(state));
+	hash_length_delimited(portable_namespace_ctx, &state, sizeof(state));
 	*present = 0;
-	if (!source->enabled || !source->path)
+	if (!source->enabled || !source->path) {
+		hash_optional_cstring(content_ctx, NULL);
+		hash_length_delimited(content_ctx, &state, sizeof(state));
+		state = 0;
+		hash_length_delimited(content_ctx, &state, sizeof(state));
+		hash_length_delimited(portable_namespace_ctx, &state,
+				      sizeof(state));
 		return 0;
+	}
 
 	absolute = absolute_pathdup(source->path);
 	strbuf_addstr(&normalized, absolute);
@@ -64,12 +71,18 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 	    path_namespace_capture(normalized.buf, &before))
 		goto done;
 	*present = path_namespace_target_present(before);
+	hash_optional_cstring(content_ctx,
+			      *present ? source->path : NULL);
+	put_be32(&state, source->enabled);
+	hash_length_delimited(content_ctx, &state, sizeof(state));
 	if (!*present) {
 		if (path_namespace_capture(normalized.buf, &after) ||
 		    !path_namespace_equal(before, after))
 			goto done;
 		state = 0;
 		hash_length_delimited(content_ctx, &state, sizeof(state));
+		hash_length_delimited(portable_namespace_ctx, &state,
+				      sizeof(state));
 		path_namespace_hash(namespace_ctx, before);
 		ret = 0;
 		goto done;
@@ -93,9 +106,15 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 		goto done;
 	state = 1;
 	hash_length_delimited(content_ctx, &state, sizeof(state));
+	hash_length_delimited(portable_namespace_ctx, &state,
+			      sizeof(state));
+	hash_optional_cstring(portable_namespace_ctx, source->path);
 	path_namespace_hash(namespace_ctx, before);
+	path_namespace_hash(portable_namespace_ctx, before);
 	path_namespace_hash_stat(namespace_ctx, &opened_after);
+	path_namespace_hash_stat(portable_namespace_ctx, &opened_after);
 	hash_length_delimited(content_ctx, buf, size);
+	hash_length_delimited(portable_namespace_ctx, buf, size);
 	if (snapshot) {
 		snapshot->path = xstrdup(source->path);
 		snapshot->buf = buf;
@@ -119,7 +138,7 @@ static int fingerprint_sources(
 	const struct git_hash_algo *algo, struct attr_fingerprint *result,
 	struct attr_source_snapshot *snapshot)
 {
-	struct git_hash_ctx content_ctx, namespace_ctx;
+	struct git_hash_ctx content_ctx, namespace_ctx, portable_namespace_ctx;
 	uint32_t count;
 
 	if (snapshot && nr != ARRAY_SIZE(snapshot->sources))
@@ -127,26 +146,33 @@ static int fingerprint_sources(
 	memset(result, 0, sizeof(*result));
 	git_hash_init(&content_ctx, algo);
 	git_hash_init(&namespace_ctx, algo);
+	git_hash_init(&portable_namespace_ctx, algo);
 	hash_optional_cstring(&content_ctx, "attribute-source-content-v1");
 	hash_optional_cstring(&namespace_ctx,
 			      "attribute-source-namespace-v1");
+	hash_optional_cstring(&portable_namespace_ctx,
+			      "attribute-source-portable-namespace-v1");
 	if (nr > UINT32_MAX)
 		return -1;
 	put_be32(&count, nr);
 	hash_length_delimited(&content_ctx, &count, sizeof(count));
 	hash_length_delimited(&namespace_ctx, &count, sizeof(count));
+	hash_length_delimited(&portable_namespace_ctx, &count, sizeof(count));
 	for (size_t i = 0; i < nr; i++) {
 		int present;
 		struct attr_source_snapshot_entry *entry =
 			snapshot ? &snapshot->sources[i] : NULL;
 
-		if (hash_source(&content_ctx, &namespace_ctx, &sources[i],
-				&present, entry))
+		if (hash_source(&content_ctx, &namespace_ctx,
+				&portable_namespace_ctx, &sources[i], &present,
+				entry))
 			return -1;
 		result->sources_present |= present;
 	}
 	git_hash_final(result->content_hash, &content_ctx);
 	git_hash_final(result->namespace_hash, &namespace_ctx);
+	git_hash_final(result->portable_namespace_hash,
+		       &portable_namespace_ctx);
 	return 0;
 }
 
@@ -187,6 +213,97 @@ int attr_fingerprint_repository(struct repository *repo,
 				       repo->hash_algo, result);
 	free(info_attributes);
 	return ret;
+}
+
+static int legacy_absent_path_is_stable(const char *path)
+{
+	struct path_namespace_snapshot *before = NULL, *after = NULL;
+	struct strbuf normalized = STRBUF_INIT;
+	char *absolute = NULL;
+	int stable = 0;
+
+	if (!path)
+		return 0;
+	absolute = absolute_pathdup(path);
+	strbuf_addstr(&normalized, absolute);
+	if (!strbuf_normalize_path(&normalized) &&
+	    !path_namespace_capture(normalized.buf, &before) &&
+	    !path_namespace_target_present(before) &&
+	    !path_namespace_capture(normalized.buf, &after) &&
+	    !path_namespace_target_present(after) &&
+	    path_namespace_equal(before, after))
+		stable = 1;
+	free(absolute);
+	path_namespace_clear(before);
+	path_namespace_clear(after);
+	strbuf_release(&normalized);
+	return stable;
+}
+
+static void legacy_absent_source_hash(
+	const struct attr_fingerprint_source *sources,
+	const char *system_path, const struct git_hash_algo *algo,
+	unsigned char *hash)
+{
+	struct git_hash_ctx ctx;
+	uint32_t value;
+
+	git_hash_init(&ctx, algo);
+	hash_optional_cstring(&ctx, "attribute-source-content-v1");
+	put_be32(&value, ATTR_SOURCE_SNAPSHOT_NR);
+	hash_length_delimited(&ctx, &value, sizeof(value));
+	for (size_t i = 0; i < ATTR_SOURCE_SNAPSHOT_NR; i++) {
+		const char *path = i == ATTR_SOURCE_SNAPSHOT_SYSTEM ?
+			system_path : sources[i].path;
+
+		hash_optional_cstring(&ctx, path);
+		put_be32(&value, sources[i].enabled);
+		hash_length_delimited(&ctx, &value, sizeof(value));
+		if (!sources[i].enabled || !path)
+			continue;
+		put_be32(&value, 0);
+		hash_length_delimited(&ctx, &value, sizeof(value));
+	}
+	git_hash_final(hash, &ctx);
+}
+
+int attr_fingerprint_matches_legacy_absent_sources(
+	struct repository *repo, const unsigned char *expected)
+{
+	static const char shipped_system_path[] = "//etc/gitattributes";
+	struct attr_fingerprint_source sources[ATTR_SOURCE_SNAPSHOT_NR];
+	struct attr_fingerprint before, after;
+	unsigned char legacy[GIT_MAX_RAWSZ];
+	char *info_attributes = NULL;
+	int matches = 0;
+
+	if (!expected || !fstat_is_reliable() ||
+	    repository_sources(repo, sources, &info_attributes) ||
+	    !sources[ATTR_SOURCE_SNAPSHOT_SYSTEM].enabled ||
+	    attr_fingerprint_repository(repo, &before) ||
+	    before.sources_present)
+		goto done;
+	legacy_absent_source_hash(
+		sources, sources[ATTR_SOURCE_SNAPSHOT_SYSTEM].path,
+		repo->hash_algo, legacy);
+	if (!memcmp(legacy, expected, repo->hash_algo->rawsz)) {
+		matches = 1;
+	} else if (legacy_absent_path_is_stable(shipped_system_path)) {
+		legacy_absent_source_hash(
+			sources, shipped_system_path, repo->hash_algo, legacy);
+		matches = !memcmp(legacy, expected, repo->hash_algo->rawsz);
+	}
+	if (!matches || attr_fingerprint_repository(repo, &after) ||
+	    after.sources_present ||
+	    memcmp(before.content_hash, after.content_hash,
+		   repo->hash_algo->rawsz) ||
+	    memcmp(before.namespace_hash, after.namespace_hash,
+		   repo->hash_algo->rawsz))
+		matches = 0;
+
+done:
+	free(info_attributes);
+	return matches;
 }
 
 int attr_source_snapshot_repository(struct repository *repo,

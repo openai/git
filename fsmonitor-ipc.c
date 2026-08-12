@@ -9,6 +9,7 @@
 #include "hash.h"
 #include "lockfile.h"
 #include "parse.h"
+#include "path.h"
 #include "simple-ipc.h"
 #include "fsmonitor-ipc.h"
 #include "repository.h"
@@ -77,6 +78,20 @@ int fsmonitor_ipc__is_supported(void)
 	return 0;
 }
 
+void fsmonitor_ipc__record_watch_limit_failure(
+	const char *worktree_identity UNUSED)
+{
+}
+
+void fsmonitor_ipc__clear_watch_limit_failure(void)
+{
+}
+
+int fsmonitor_ipc__watch_limit_backoff(struct repository *r UNUSED)
+{
+	return 0;
+}
+
 const char *fsmonitor_ipc__get_path(struct repository *r UNUSED)
 {
 	return NULL;
@@ -126,6 +141,161 @@ enum ipc_active_state fsmonitor_ipc__get_state(void)
 #define FSMONITOR_START_TIMEOUT_KEY "fsmonitor.starttimeout"
 #define FSMONITOR_START_TIMEOUT_DEFAULT 60
 #define FSMONITOR_RESTART_ATTEMPTS 3
+
+#if defined(__linux__) || defined(__APPLE__)
+#define FSMONITOR_WATCH_LIMIT_MARKER "fsmonitor--daemon.inotify-limit"
+#define FSMONITOR_WATCH_LIMIT_MAGIC "inotify-limit-v1\n"
+#define FSMONITOR_WATCH_LIMIT_BACKOFF_SECONDS 60
+
+static int watch_limit_backoff_enabled(void)
+{
+#ifdef __linux__
+	return 1;
+#else
+	return git_env_bool("GIT_TEST_FSMONITOR_INOTIFY_BACKOFF", 0);
+#endif
+}
+
+static int read_inotify_watch_limit(unsigned long *limit)
+{
+#ifdef __linux__
+	struct strbuf value = STRBUF_INIT;
+	int ret = -1;
+
+	if (strbuf_read_file(&value,
+			     "/proc/sys/fs/inotify/max_user_watches", 64) < 0)
+		goto done;
+	strbuf_trim(&value);
+	if (git_parse_ulong(value.buf, limit))
+		ret = 0;
+done:
+	strbuf_release(&value);
+	return ret;
+#else
+	*limit = 0;
+	return 0;
+#endif
+}
+
+void fsmonitor_ipc__record_watch_limit_failure(const char *worktree_identity)
+{
+	struct lock_file lock = LOCK_INIT;
+	struct strbuf contents = STRBUF_INIT;
+	unsigned long limit;
+	char *path;
+	int fd;
+
+	if (!watch_limit_backoff_enabled() || !worktree_identity ||
+	    strlen(worktree_identity) != FSMONITOR_IPC_WORKTREE_ID_HEX ||
+	    read_inotify_watch_limit(&limit))
+		return;
+	path = repo_git_path(the_repository, FSMONITOR_WATCH_LIMIT_MARKER);
+	fd = hold_lock_file_for_update(&lock, path, LOCK_NO_DEREF);
+	if (fd < 0)
+		goto done;
+	strbuf_addf(&contents, "%s%s\n%lu\n",
+		    FSMONITOR_WATCH_LIMIT_MAGIC, worktree_identity, limit);
+	if (fchmod(fd, 0600) ||
+	    write_in_full(fd, contents.buf, contents.len) !=
+		(ssize_t)contents.len ||
+	    commit_lock_file(&lock))
+		rollback_lock_file(&lock);
+done:
+	strbuf_release(&contents);
+	free(path);
+}
+
+void fsmonitor_ipc__clear_watch_limit_failure(void)
+{
+	char *path;
+
+	if (!watch_limit_backoff_enabled())
+		return;
+	path = repo_git_path(the_repository, FSMONITOR_WATCH_LIMIT_MARKER);
+	unlink(path);
+	free(path);
+}
+
+int fsmonitor_ipc__watch_limit_backoff(struct repository *r)
+{
+	struct strbuf contents = STRBUF_INIT;
+	struct strbuf identity = STRBUF_INIT;
+	struct stat st;
+	const char *recorded_identity, *recorded_limit;
+	unsigned long limit, current_limit;
+	time_t now;
+	char *path, *identity_end, *limit_end;
+	int fd, ret = 0;
+
+	if (!watch_limit_backoff_enabled())
+		return 0;
+	path = repo_git_path(r, FSMONITOR_WATCH_LIMIT_MARKER);
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		goto done;
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_uid != geteuid() || st.st_nlink != 1 ||
+	    (st.st_mode & 077) || st.st_size < 0 || st.st_size > 256)
+		goto close_fd;
+	now = time(NULL);
+	if (now < st.st_mtime ||
+	    now - st.st_mtime > FSMONITOR_WATCH_LIMIT_BACKOFF_SECONDS)
+		goto clear_marker;
+	if (strbuf_read(&contents, fd, st.st_size) != st.st_size ||
+	    !skip_prefix(contents.buf, FSMONITOR_WATCH_LIMIT_MAGIC,
+			 &recorded_identity) ||
+	    !(identity_end = strchr(contents.buf +
+				    strlen(FSMONITOR_WATCH_LIMIT_MAGIC), '\n')))
+		goto close_fd;
+	*identity_end = '\0';
+	recorded_limit = identity_end + 1;
+	if (!(limit_end = strchr(identity_end + 1, '\n')) || limit_end[1])
+		goto close_fd;
+	*limit_end = '\0';
+	if (!git_parse_ulong(recorded_limit, &limit) ||
+	    read_inotify_watch_limit(&current_limit))
+		goto close_fd;
+	if (limit != current_limit)
+		goto clear_marker;
+	if (fsmonitor_ipc__get_worktree_identity(r, &identity))
+		goto close_fd;
+	if (strcmp(recorded_identity, identity.buf)) {
+#ifndef __linux__
+		if (!git_env_bool("GIT_TEST_FSMONITOR_INOTIFY_BACKOFF", 0) ||
+		    strcmp(recorded_identity, "test-worktree"))
+#endif
+			goto close_fd;
+	}
+	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
+		goto clear_marker;
+	ret = 1;
+	goto close_fd;
+
+clear_marker:
+	unlink(path);
+close_fd:
+	close(fd);
+done:
+	strbuf_release(&identity);
+	strbuf_release(&contents);
+	free(path);
+	return ret;
+}
+#else
+void fsmonitor_ipc__record_watch_limit_failure(
+	const char *worktree_identity UNUSED)
+{
+}
+
+void fsmonitor_ipc__clear_watch_limit_failure(void)
+{
+}
+
+int fsmonitor_ipc__watch_limit_backoff(struct repository *r UNUSED)
+{
+	return 0;
+}
+#endif
 
 static unsigned int get_start_timeout(void)
 {
@@ -194,7 +364,7 @@ done:
 }
 
 static int try_send_command(const char *command, struct strbuf *answer,
-			    enum ipc_active_state *state_out)
+			    enum ipc_active_state *state_out, int quietly)
 {
 	struct ipc_client_connection *connection = NULL;
 	struct ipc_client_connect_options options
@@ -209,8 +379,12 @@ static int try_send_command(const char *command, struct strbuf *answer,
 	state = ipc_client_try_connect(fsmonitor_ipc__get_path(the_repository),
 				       &options, &connection);
 	if (state == IPC_STATE__LISTENING) {
-		ret = ipc_client_send_command_to_connection(
-			connection, command, strlen(command), answer);
+		if (quietly)
+			ret = ipc_client_send_command_to_connection_gently(
+				connection, command, strlen(command), answer);
+		else
+			ret = ipc_client_send_command_to_connection(
+				connection, command, strlen(command), answer);
 		ipc_client_close_connection(connection);
 	}
 
@@ -255,11 +429,43 @@ static int server_supports_bound_queries(void)
 	int ret;
 
 	ret = !try_send_command(FSMONITOR_IPC_CAPABILITY_COMMAND,
-				&answer, NULL) &&
+				&answer, NULL, 1) &&
 		has_capability(&answer, FSMONITOR_IPC_QUERY_VERSION);
 	strbuf_release(&answer);
 	return ret;
 }
+
+static int server_supports_required_capabilities(void)
+{
+#ifdef __APPLE__
+	struct strbuf answer = STRBUF_INIT;
+	int ret;
+
+	ret = !try_send_command(FSMONITOR_IPC_CAPABILITY_COMMAND,
+				&answer, NULL, 1) &&
+		has_capability(&answer, FSMONITOR_IPC_QUERY_VERSION) &&
+		has_capability(&answer,
+			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY);
+	strbuf_release(&answer);
+	return ret;
+#else
+	return server_supports_bound_queries();
+#endif
+}
+
+#ifdef __APPLE__
+static int query_identifies_filtered_daemon(const char *token,
+					   const struct strbuf *answer)
+{
+	static const char prefix[] =
+		"builtin:" FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX;
+	const char *end = memchr(answer->buf, '\0', answer->len);
+
+	return starts_with(token, prefix) && end &&
+		(size_t)(end - answer->buf) >= sizeof(prefix) - 1 &&
+		!memcmp(answer->buf, prefix, sizeof(prefix) - 1);
+}
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 static int legacy_peer_credentials(
@@ -518,7 +724,7 @@ static int try_send_attested_legacy_query(
 	trace2_data_intmax("fsm_client", NULL,
 			   cached ? "query/legacy-peer-cached" :
 				    "query/legacy-peer-authenticated", 1);
-	ret = ipc_client_send_command_to_connection(
+	ret = ipc_client_send_command_to_connection_gently(
 		connection, token, strlen(token), answer);
 done:
 	ipc_client_close_connection(connection);
@@ -581,7 +787,7 @@ static int restart_incompatible_daemon(void)
 	if (hold_lock_file_for_update_timeout(&restart_lock, lock_path.buf,
 					      LOCK_NO_DEREF,
 					      lock_timeout_ms) < 0) {
-		if (server_supports_bound_queries())
+		if (server_supports_required_capabilities())
 			ret = 0;
 		goto done;
 	}
@@ -595,18 +801,18 @@ static int restart_incompatible_daemon(void)
 		int wait_result;
 
 		/* Another client may have replaced the daemon while we waited. */
-		if (server_supports_bound_queries())
+		if (server_supports_required_capabilities())
 			goto success;
 		if (!lstat(fsmonitor_ipc__get_path(the_repository),
 			   &socket_stat))
 			original_socket = &socket_stat;
-		if (try_send_command("quit", &answer, NULL)) {
+		if (try_send_command("quit", &answer, NULL, 1)) {
 			/*
 			 * The failed connection may already have been replaced.
 			 * Re-read its state before abandoning the upgrade.
 			 */
 			if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING) {
-				if (server_supports_bound_queries())
+				if (server_supports_required_capabilities())
 					ret = 0;
 				goto done;
 			}
@@ -639,6 +845,39 @@ done:
 	strbuf_release(&answer);
 	return ret;
 }
+
+#ifdef __APPLE__
+static int spawn_daemon_serialized(void)
+{
+	struct strbuf lock_path = STRBUF_INIT;
+	struct lock_file restart_lock = LOCK_INIT;
+	uintmax_t timeout_ms = (uintmax_t)get_start_timeout() * 1000;
+	long lock_timeout_ms = timeout_ms > LONG_MAX ?
+		LONG_MAX : (long)timeout_ms;
+	int have_lock = 0;
+	int ret = -1;
+
+	strbuf_addf(&lock_path, "%s.restart",
+		    fsmonitor_ipc__get_path(the_repository));
+	if (hold_lock_file_for_update_timeout(&restart_lock, lock_path.buf,
+					      LOCK_NO_DEREF,
+					      lock_timeout_ms) < 0) {
+		if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING)
+			ret = 0;
+		goto done;
+	}
+	have_lock = 1;
+	if (fsmonitor_ipc__get_state() == IPC_STATE__LISTENING ||
+	    !spawn_daemon())
+		ret = 0;
+
+done:
+	if (have_lock)
+		rollback_lock_file(&restart_lock);
+	strbuf_release(&lock_path);
+	return ret;
+}
+#endif
 
 int fsmonitor_ipc__send_query(const char *since_token,
 			      struct strbuf *answer,
@@ -679,13 +918,32 @@ try_again:
 
 	switch (state) {
 	case IPC_STATE__LISTENING:
-		ret = ipc_client_send_command_to_connection(
+		ret = ipc_client_send_command_to_connection_gently(
 			connection, command.buf, command.len, answer);
 		ipc_client_close_connection(connection);
 		connection = NULL;
+		if (ret && lifecycle_attempts++ < FSMONITOR_RESTART_ATTEMPTS) {
+			trace2_data_intmax("fsm_client", NULL,
+					   "query/reconnect-after-failed-send", 1);
+			/* Let a missing daemon enter normal startup without polling. */
+			options.wait_if_not_found = 0;
+			goto try_again;
+		}
 
 		trace2_data_intmax("fsm_client", NULL,
 				   "query/response-length", answer->len);
+#ifdef __APPLE__
+		if (!ret && !query_identifies_filtered_daemon(tok, answer) &&
+		    !server_supports_required_capabilities()) {
+			strbuf_reset(answer);
+			ret = -1;
+			if (lifecycle_attempts++ >= FSMONITOR_RESTART_ATTEMPTS ||
+			    restart_incompatible_daemon())
+				goto done;
+			options.wait_if_not_found = 1;
+			goto try_again;
+		}
+#endif
 		if (!ret && is_trivial_response(answer) &&
 		    !server_supports_bound_queries()) {
 			if (!try_send_attested_legacy_query(
@@ -716,7 +974,11 @@ try_again:
 		if (lifecycle_attempts++ >= FSMONITOR_RESTART_ATTEMPTS)
 			goto done;
 
+#ifdef __APPLE__
+		if (spawn_daemon_serialized())
+#else
 		if (spawn_daemon())
+#endif
 			goto done;
 
 		/*
@@ -756,7 +1018,7 @@ int fsmonitor_ipc__send_command(const char *command,
 {
 	enum ipc_active_state state;
 	const char *c = command ? command : "";
-	int ret = try_send_command(c, answer, &state);
+	int ret = try_send_command(c, answer, &state, 0);
 
 	if (state != IPC_STATE__LISTENING) {
 		die(_("fsmonitor--daemon is not running"));

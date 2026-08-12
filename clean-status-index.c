@@ -2,6 +2,7 @@
 #include "clean-status.h"
 #include "clean-status-index.h"
 #include "clean-status-internal.h"
+#include "clean-status-sidecar.h"
 #include "hash-framing.h"
 #include "object.h"
 #include "read-cache-ll.h"
@@ -251,6 +252,44 @@ int clean_status_index_is_certifiable(const struct index_state *istate)
 
 	return checksum_is_bound &&
 		clean_status_index_entries_are_certifiable(istate);
+}
+
+int clean_status_index_is_certifiable_with_hardlinks(
+	const struct index_state *istate, uint32_t *hardlink_nr)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	uint32_t nr = 0;
+	int checksum_is_bound =
+		!is_null_oid(&istate->oid) ||
+		(clean_status_identity_is_durable() && state &&
+		 state->source_identity_valid);
+
+	if (!hardlink_nr || !checksum_is_bound)
+		return 0;
+	*hardlink_nr = 0;
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *ce = istate->cache[i];
+
+		if (S_ISGITLINK(ce->ce_mode) || ce_stage(ce) ||
+		    ce_intent_to_add(ce) || ce_skip_worktree(ce) ||
+		    (ce->ce_flags & CE_VALID) ||
+		    (ce->ce_flags & ~(CE_UPTODATE | CE_HASHED |
+				      CE_FSMONITOR_VALID |
+				      CE_UPDATE_IN_BASE)))
+			return 0;
+		if (ce->ce_flags & CE_FSMONITOR_VALID)
+			continue;
+		if (!S_ISREG(ce->ce_mode) ||
+		    !(ce->ce_flags & CE_UPTODATE) ||
+		    nr == CLEAN_STATUS_HARDLINK_WITNESS_MAX)
+			return 0;
+		nr++;
+	}
+	if (nr && (!istate->repo->config_values_private_.trust_ctime ||
+		   !istate->repo->config_values_private_.check_stat))
+		return 0;
+	*hardlink_nr = nr;
+	return 1;
 }
 
 static int index_entry_logical_state_is_supported(
