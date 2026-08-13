@@ -1059,6 +1059,10 @@ static void invalidate_fsmonitor_for_bootstrap(
 	}
 
 	if (physical_history_unavailable) {
+		int authenticated_manifest =
+			clean_status_has_authenticated_worktree_manifest(istate);
+		int preserve_untracked = 0;
+
 		if (istate->fsmonitor_legacy_untracked_fallback) {
 			invalidate_all_fsmonitor_for_baseline(istate);
 			trace2_data_intmax("fsmonitor", istate->repo,
@@ -1075,6 +1079,10 @@ static void invalidate_fsmonitor_for_bootstrap(
 		    istate->repo->config_values_private_.trust_ctime &&
 		    istate->repo->config_values_private_.check_stat) {
 			/* Strong stat identity survives a lost provider boundary. */
+			if (authenticated_manifest &&
+			    !clean_status_fsmonitor_config_mismatch(istate))
+				preserve_untracked =
+					untracked_cache_preserve_for_revalidation(istate);
 			clean_status_begin_fsmonitor_semantic_baseline(istate);
 			invalidate_all_fsmonitor_for_baseline(istate);
 			trace2_data_intmax("fsmonitor", istate->repo,
@@ -1082,7 +1090,8 @@ static void invalidate_fsmonitor_for_bootstrap(
 		} else {
 			fsmonitor_invalidate_semantics(istate);
 		}
-		untracked_cache_invalidate_all(istate);
+		if (!preserve_untracked)
+			untracked_cache_invalidate_all(istate);
 		return;
 	}
 
@@ -1518,8 +1527,14 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 	istate->fsmonitor_pending_token_from_provider = 0;
 	istate->fsmonitor_token_valid = 1;
 	istate->fsmonitor_untracked_valid = !!untracked_cache_valid;
-	if (istate->untracked)
+	if (istate->untracked) {
+		if (istate->untracked->fsmonitor_revalidation &&
+		    untracked_cache_valid)
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "untracked/provider-reset-revalidated", 1);
+		istate->untracked->fsmonitor_revalidation = 0;
 		istate->untracked->use_fsmonitor = !!untracked_cache_valid;
+	}
 	istate->cache_changed |= FSMONITOR_CHANGED;
 	FREE_AND_NULL(istate->fsmonitor_untracked_token);
 	if (untracked_cache_valid)
@@ -1543,6 +1558,8 @@ void fsmonitor_reject_pending_token(struct index_state *istate)
 {
 	FREE_AND_NULL(istate->fsmonitor_last_update_pending);
 	istate->fsmonitor_pending_token_from_provider = 0;
+	if (istate->untracked)
+		istate->untracked->fsmonitor_revalidation = 0;
 	if (!istate->fsmonitor_token_valid)
 		FREE_AND_NULL(istate->fsmonitor_last_update);
 	invalidate_all_fsmonitor_strong(istate);

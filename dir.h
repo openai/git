@@ -219,6 +219,8 @@ struct untracked_cache {
 	struct strbuf fsmonitor_dirty_paths;
 	/* fsmonitor invalidation data */
 	unsigned int use_fsmonitor : 1;
+	/* A lost provider boundary requires ordinary directory validation. */
+	unsigned int fsmonitor_revalidation : 1;
 };
 
 /**
@@ -624,6 +626,7 @@ int check_dir_entry_contains(const struct dir_entry *out, const struct dir_entry
 
 void untracked_cache_invalidate_path(struct index_state *, const char *, int safe_path);
 void untracked_cache_invalidate_all(struct index_state *);
+int untracked_cache_preserve_for_revalidation(struct index_state *);
 /*
  * Invalidate the untracked-cache for this path, but first strip
  * off a trailing slash, if present.
