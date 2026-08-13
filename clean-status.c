@@ -3,6 +3,7 @@
 #include "attr-manifest.h"
 #include "clean-status.h"
 #include "clean-status-internal.h"
+#include "convert.h"
 #include "dir.h"
 #include "fsmonitor-clean-proof.h"
 #include "progress.h"
@@ -313,11 +314,13 @@ int clean_status_index_entry_is_semantically_safe(
 {
 	const struct clean_status_state *state = istate->clean_status;
 	const struct cache_entry *entry = old ? old : new_entry;
+	struct conv_attrs attrs;
 	const char *base;
 
 	if (!state || !state->config_revalidated ||
 	    !clean_status_revalidated_token_matches(istate) ||
-	    state->filter_configured || istate->split_index ||
+	    (state->filter_configured && !state->filter_scope_valid) ||
+	    istate->split_index ||
 	    istate->sparse_index || !entry)
 		return 0;
 	if ((old && (!S_ISREG(old->ce_mode) && !S_ISLNK(old->ce_mode))) ||
@@ -336,6 +339,11 @@ int clean_status_index_entry_is_semantically_safe(
 	if (!fspathcmp(base, ".gitattributes") ||
 	    !fspathcmp(base, ".gitignore"))
 		return 0;
+	if (state->filter_configured) {
+		convert_attrs((struct index_state *)istate, &attrs, entry->name);
+		if (convert_attrs_has_clean_filter(&attrs))
+			return 0;
+	}
 	if (!old || !new_entry)
 		return path_has_no_new_attribute_sources(istate, entry->name,
 							 old && !new_entry);
