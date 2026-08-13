@@ -83,6 +83,18 @@ static int config_is_command_acceleration(const char *key,
 		 !strcmp(key, "core.preloadindexbulk"));
 }
 
+static int config_is_command_empty_attributes(const char *key,
+					      const char *value,
+					      const struct config_context *ctx,
+					      const struct clean_status_config_digest *digest)
+{
+	return ctx && ctx->kvi && ctx->kvi->scope == CONFIG_SCOPE_COMMAND &&
+		value && !*value &&
+		(!strcmp(key, "core.attributesfile") ||
+		 (!strcmp(key, "attr.tree") &&
+		  !digest->attribute_tree_configured));
+}
+
 static int config_is_tracked_policy(const char *key)
 {
 	return !strcmp(key, "core.filemode") ||
@@ -109,9 +121,12 @@ void clean_status_config_add(struct clean_status_config_digest *digest,
 
 	if (!digest->initialized || digest->finalized)
 		BUG("invalid clean-status config digest state");
-	/* Process-local transport and traversal settings cannot change a proof. */
+	if (!strcmp(key, "attr.tree") && value && *value)
+		digest->attribute_tree_configured = 1;
+	/* Independent attribute fingerprints guard empty source overrides. */
 	if (config_is_command_transport(key, ctx) ||
-	    config_is_command_acceleration(key, ctx))
+	    config_is_command_acceleration(key, ctx) ||
+	    config_is_command_empty_attributes(key, value, ctx, digest))
 		return;
 	hash_config_entry(&digest->ctx, key, value, ctx);
 	if (config_is_tracked_policy(key))
