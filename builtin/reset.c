@@ -510,9 +510,11 @@ int cmd_reset(int argc,
 	    !pathspec.nr && !intent_to_add &&
 	    !unborn) {
 		preserve_mixed_history = reset_type == MIXED;
+		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository, &clean_digest);
 	} else if (reset_type == MIXED && pathspec.nr &&
 		   !intent_to_add && !unborn) {
+		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository, &clean_digest);
 	}
 

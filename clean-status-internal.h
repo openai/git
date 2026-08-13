@@ -20,6 +20,8 @@ struct clean_status_state {
 	unsigned char disk_config_hash[GIT_MAX_RAWSZ];
 	unsigned char current_semantic_hash[GIT_MAX_RAWSZ];
 	unsigned char disk_semantic_hash[GIT_MAX_RAWSZ];
+	unsigned char current_tracked_policy_hash[GIT_MAX_RAWSZ];
+	unsigned char disk_tracked_policy_hash[GIT_MAX_RAWSZ];
 	unsigned char current_attr_hash[GIT_MAX_RAWSZ];
 	unsigned char current_attr_namespace_hash[GIT_MAX_RAWSZ];
 	unsigned char current_attr_portable_namespace_hash[GIT_MAX_RAWSZ];
@@ -27,6 +29,7 @@ struct clean_status_state {
 	unsigned char source_logical_hash[GIT_MAX_RAWSZ];
 	unsigned current_config_valid : 1;
 	unsigned current_semantic_valid : 1;
+	unsigned current_tracked_policy_valid : 1;
 	unsigned current_attr_valid : 1;
 	unsigned current_semantic_explicit : 1;
 	unsigned current_attr_sources_present : 1;
@@ -41,8 +44,13 @@ struct clean_status_state {
 	unsigned source_index_identity_valid : 1;
 	unsigned source_logical_hash_valid : 1;
 	unsigned external_history_restored : 1;
+	unsigned external_history_owned_index : 1;
+	unsigned external_history_preserve_witness : 1;
+	unsigned recovered_tracked_stat : 1;
+	unsigned authenticated_bootstrap_manifest : 1;
 	unsigned disk_config_valid : 1;
 	unsigned disk_semantic_valid : 1;
+	unsigned disk_tracked_policy_valid : 1;
 	unsigned disk_attr_valid : 1;
 	unsigned disk_config_seen : 1;
 	unsigned disk_config_invalid : 1;

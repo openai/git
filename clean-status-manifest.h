@@ -31,6 +31,12 @@ void clean_status_manifest_adopt_disk(
 	struct clean_status_manifest_state *state);
 int clean_status_manifest_refresh(struct index_state *istate,
 				  struct clean_status_manifest_state *state);
+int clean_status_manifest_reconcile_deleted_attribute(
+	struct index_state *istate, const char *path);
+int clean_status_manifest_reconcile_display_only_attribute(
+	struct index_state *istate, const char *path);
+int clean_status_manifest_accept_current_display_only_attribute(
+	struct index_state *istate, const char *path);
 void clean_status_manifest_invalidate(
 	struct clean_status_manifest_state *state);
 

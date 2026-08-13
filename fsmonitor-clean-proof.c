@@ -22,8 +22,12 @@ int fsmonitor_clean_proof_parse(struct fsmonitor_clean_proof *proof,
 	if (len < FSMONITOR_CLEAN_PROOF_HEADER_WORDS * sizeof(uint32_t) +
 		  hashes_len + 1)
 		return -1;
-	if (get_be32(p) != FSMONITOR_CLEAN_PROOF_VERSION)
+	parsed.version = get_be32(p);
+	if (parsed.version != FSMONITOR_CLEAN_PROOF_VERSION_LEGACY &&
+	    parsed.version != FSMONITOR_CLEAN_PROOF_VERSION)
 		return -1;
+	if (parsed.version == FSMONITOR_CLEAN_PROOF_VERSION)
+		hashes_len += algo->rawsz;
 	p += sizeof(uint32_t);
 	if (get_be32(p) != FSMONITOR_CLEAN_PROOF_MAGIC)
 		return -1;
@@ -51,6 +55,10 @@ int fsmonitor_clean_proof_parse(struct fsmonitor_clean_proof *proof,
 	p += algo->rawsz;
 	parsed.attr_hash = p;
 	p += algo->rawsz;
+	if (parsed.version == FSMONITOR_CLEAN_PROOF_VERSION) {
+		parsed.tracked_policy_hash = p;
+		p += algo->rawsz;
+	}
 	parsed.attr_manifest = p;
 	parsed.attr_manifest_len = manifest_len;
 	p += manifest_len;
@@ -82,7 +90,9 @@ int fsmonitor_clean_proof_write(struct strbuf *out,
 				 proof->attr_manifest_len, algo))
 		return -1;
 
-	put_be32(&value, FSMONITOR_CLEAN_PROOF_VERSION);
+	put_be32(&value, proof->tracked_policy_hash ?
+		FSMONITOR_CLEAN_PROOF_VERSION :
+		FSMONITOR_CLEAN_PROOF_VERSION_LEGACY);
 	strbuf_add(out, &value, sizeof(value));
 	put_be32(&value, FSMONITOR_CLEAN_PROOF_MAGIC);
 	strbuf_add(out, &value, sizeof(value));
@@ -96,6 +106,8 @@ int fsmonitor_clean_proof_write(struct strbuf *out,
 	strbuf_add(out, proof->config_hash, algo->rawsz);
 	strbuf_add(out, proof->semantic_hash, algo->rawsz);
 	strbuf_add(out, proof->attr_hash, algo->rawsz);
+	if (proof->tracked_policy_hash)
+		strbuf_add(out, proof->tracked_policy_hash, algo->rawsz);
 	strbuf_add(out, proof->attr_manifest, proof->attr_manifest_len);
 	hash_append_checksum(out, algo);
 	return 0;
