@@ -31,6 +31,9 @@ struct cache_entry {
 	char name[FLEX_ARRAY]; /* more */
 };
 
+struct clean_status_proof_epoch;
+struct preload_bulk_stat_update;
+
 #define CE_STAGEMASK (0x3000)
 #define CE_EXTENDED  (0x4000)
 #define CE_VALID     (0x8000)
@@ -69,14 +72,18 @@ struct cache_entry {
  */
 #define CE_INTENT_TO_ADD     (1 << 29)
 #define CE_SKIP_WORKTREE     (1 << 30)
-/* CE_EXTENDED2 is for future extension */
-#define CE_EXTENDED2         (1U << 31)
+/*
+ * In-memory only. The cached stat data cannot be trusted, and callers which
+ * normally trust stat differences must verify content. This occupies the
+ * former never-persisted extension slot.
+ */
+#define CE_CONTENT_CHECK_REQUIRED (1U << 31)
 
 #define CE_EXTENDED_FLAGS (CE_INTENT_TO_ADD | CE_SKIP_WORKTREE)
 
 /*
  * Safeguard to avoid saving wrong flags:
- *  - CE_EXTENDED2 won't get saved until its semantic is known
+ *  - CE_CONTENT_CHECK_REQUIRED is transient and must not be saved
  *  - Bits in 0x0000FFFF have been saved in ce_flags already
  *  - Bits in 0x003F0000 are currently in-memory flags
  */
@@ -120,7 +127,9 @@ static inline unsigned create_ce_flags(unsigned stage)
 #define ce_stage(ce) ((CE_STAGEMASK & (ce)->ce_flags) >> CE_STAGESHIFT)
 #define ce_uptodate(ce) ((ce)->ce_flags & CE_UPTODATE)
 #define ce_skip_worktree(ce) ((ce)->ce_flags & CE_SKIP_WORKTREE)
-#define ce_mark_uptodate(ce) ((ce)->ce_flags |= CE_UPTODATE)
+#define ce_mark_uptodate(ce) \
+	((ce)->ce_flags = ((ce)->ce_flags | CE_UPTODATE) & \
+			  ~CE_CONTENT_CHECK_REQUIRED)
 #define ce_intent_to_add(ce) ((ce)->ce_flags & CE_INTENT_TO_ADD)
 
 #define cache_entry_size(len) (offsetof(struct cache_entry,name) + (len) + 1)
@@ -136,7 +145,9 @@ static inline unsigned create_ce_flags(unsigned stage)
 #define FSMONITOR_CHANGED	(1 << 8)
 
 struct split_index;
+struct clean_status_state;
 struct untracked_cache;
+struct string_list;
 struct progress;
 struct pattern_list;
 
@@ -176,18 +187,44 @@ struct index_state {
 		 drop_cache_tree : 1,
 		 updated_workdir : 1,
 		 updated_skipworktree : 1,
-		 fsmonitor_has_run_once : 1;
+		 fsmonitor_has_run_once : 1,
+		 fsmonitor_token_valid : 1,
+		 fsmonitor_extension_seen : 1,
+		 fsmonitor_untracked_valid : 1,
+		 fsmonitor_untracked_must_persist : 1,
+		 fsmonitor_untracked_extension_seen : 1,
+		 fsmonitor_untracked_extension_invalid : 1,
+		 fsmonitor_legacy_untracked_adopted : 1,
+		 fsmonitor_legacy_untracked_fallback : 1,
+		 fsmonitor_pending_token_from_provider : 1,
+		 preload_untracked_complete : 1,
+		 preload_bulk_provider_pending : 1,
+		 preload_bulk_excludes_digest_pending : 1,
+		 preload_bulk_excludes_digest_valid : 1;
 	enum sparse_index_mode sparse_index;
 	struct hashmap name_hash;
 	struct hashmap dir_hash;
 	struct object_id oid;
 	struct untracked_cache *untracked;
+	unsigned char *preload_bulk_tracked_state;
+	size_t preload_bulk_tracked_nr;
+	struct preload_bulk_stat_update *preload_bulk_stat_updates;
+	size_t preload_bulk_stat_updates_nr;
+	struct object_id preload_bulk_standard_excludes_digest;
+	struct stat preload_bulk_scanned_worktree;
+	/* Borrowed only while refresh_index() performs a provider scan. */
+	struct clean_status_proof_epoch *preload_bulk_proof_epoch;
+	/* Borrowed for the duration of preload_index(). */
+	struct string_list *preload_untracked;
 	char *fsmonitor_last_update;
+	char *fsmonitor_last_update_pending;
+	char *fsmonitor_untracked_token;
 	struct ewah_bitmap *fsmonitor_dirty;
 	struct mem_pool *ce_mem_pool;
 	struct progress *progress;
 	struct repository *repo;
 	struct pattern_list *sparse_checkout_patterns;
+	struct clean_status_state *clean_status;
 };
 
 /**
@@ -396,6 +433,7 @@ int remove_file_from_index(struct index_state *, const char *path);
 #define ADD_CACHE_IGNORE_ERRORS	4
 #define ADD_CACHE_IGNORE_REMOVAL 8
 #define ADD_CACHE_INTENT 16
+#define ADD_CACHE_TRACK_CLEAN_HISTORY 32
 /*
  * These two are used to add the contents of the file at path
  * to the index, marking the working tree up-to-date by storing
@@ -431,6 +469,13 @@ int is_racy_timestamp(const struct index_state *istate,
 int has_racy_timestamp(struct index_state *istate);
 int ie_match_stat(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
 int ie_modified(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
+/*
+ * Unlike ie_match_stat(), verify content for marked non-gitlinks. Ordinary
+ * entries, including unmarked zero-stat entries, retain stat-only matching.
+ */
+int ie_match_stat_with_content_check(struct index_state *,
+				     const struct cache_entry *,
+				     struct stat *, unsigned int);
 
 int match_stat_data_racy(const struct index_state *istate,
 			 const struct stat_data *sd, struct stat *st);
@@ -453,6 +498,8 @@ int fake_lstat(const struct cache_entry *ce, struct stat *st);
 #define REFRESH_IN_PORCELAIN             (1 << 5) /* user friendly output, not "needs update" */
 #define REFRESH_PROGRESS                 (1 << 6) /* show progress bar if stderr is tty */
 #define REFRESH_IGNORE_SKIP_WORKTREE     (1 << 7) /* ignore skip_worktree entries */
+#define REFRESH_DEFER_BULK_DIRTY         (1 << 8) /* leave bulk results to diff */
+#define REFRESH_IN_PROOF_EPOCH           (1 << 9) /* refresh is bounded by a proof epoch */
 int refresh_index(struct index_state *, unsigned int flags, const struct pathspec *pathspec, char *seen, const char *header_msg);
 /*
  * Refresh the index and write it to disk.
@@ -472,6 +519,9 @@ int refresh_index(struct index_state *, unsigned int flags, const struct pathspe
 int repo_refresh_and_write_index(struct repository*, unsigned int refresh_flags, unsigned int write_flags, int gentle, const struct pathspec *, char *seen, const char *header_msg);
 
 struct cache_entry *refresh_cache_entry(struct index_state *, struct cache_entry *, unsigned int);
+
+/* The caller must first verify the entry's content and mode against st. */
+void refresh_index_entry_stat(struct index_state *, int, struct stat *);
 
 void set_alternate_index_output(const char *);
 

@@ -6,6 +6,8 @@
 #include "branch.h"
 #include "cache-tree.h"
 #include "checkout.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "commit.h"
 #include "config.h"
 #include "diff.h"
@@ -46,6 +48,7 @@
 #include "add-interactive.h"
 
 struct checkout_opts {
+	struct clean_status_config_digest clean_digest;
 	int patch_mode;
 	int patch_context;
 	int patch_interhunk_context;
@@ -142,6 +145,11 @@ static int post_checkout_hook(struct commit *old_commit, struct commit *new_comm
 	return run_hooks_opt(the_repository, "post-checkout", &opt);
 }
 
+struct tree_checkout_context {
+	int overlay_mode;
+	int *index_changed;
+};
+
 /*
  * Handle a tree object and determine if we need to recurse into the
  * tree (READ_TREE_RECURSIVE) or skip it (0).
@@ -149,11 +157,12 @@ static int post_checkout_hook(struct commit *old_commit, struct commit *new_comm
 static int try_update_sparse_directory(const struct object_id *oid,
 				       struct strbuf *base,
 				       const char *pathname,
-				       int overlay_mode)
+				       struct tree_checkout_context *context)
 {
 	struct strbuf dirpath = STRBUF_INIT;
 	struct cache_entry *old;
 	int pos, result = READ_TREE_RECURSIVE;
+	int overlay_mode = context ? context->overlay_mode : 1;
 
 	if (!the_repository->index->sparse_index)
 		return result;
@@ -180,8 +189,11 @@ static int try_update_sparse_directory(const struct object_id *oid,
 		 * sparse directory OID directly since files not present in
 		 * the source tree should be removed anyway.
 		 */
+		if (context && context->index_changed)
+			*context->index_changed = 1;
 		oidcpy(&old->oid, oid);
 		old->ce_flags |= CE_UPDATE;
+		the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
 		result = 0;
 	}
 
@@ -196,11 +208,11 @@ static int update_some(const struct object_id *oid, struct strbuf *base,
 	int len;
 	struct cache_entry *ce;
 	int pos;
-	int overlay_mode = context ? *((int *)context) : 1;
+	struct tree_checkout_context *checkout_context = context;
 
 	if (S_ISDIR(mode))
 		return try_update_sparse_directory(oid, base, pathname,
-						   overlay_mode);
+						   checkout_context);
 
 	len = base->len + strlen(pathname);
 	ce = make_empty_cache_entry(the_repository->index, len);
@@ -228,16 +240,26 @@ static int update_some(const struct object_id *oid, struct strbuf *base,
 		}
 	}
 
+	if (checkout_context && checkout_context->index_changed &&
+	    !clean_status_index_entry_is_semantically_safe(
+		    the_repository->index,
+		    pos >= 0 ? the_repository->index->cache[pos] : NULL, ce))
+		*checkout_context->index_changed = 1;
 	add_index_entry(the_repository->index, ce,
 			ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE);
 	return 0;
 }
 
 static int read_tree_some(struct tree *tree, const struct pathspec *pathspec,
-			  int overlay_mode)
+			  int overlay_mode, int *index_changed)
 {
+	struct tree_checkout_context context = {
+		.overlay_mode = overlay_mode,
+		.index_changed = index_changed,
+	};
+
 	read_tree(the_repository, tree,
-		  pathspec, update_some, &overlay_mode);
+		  pathspec, update_some, &context);
 
 	/* update the index with the given tree's info
 	 * for all args, expanding wildcards, and exit
@@ -420,20 +442,26 @@ static void mark_ce_for_checkout_overlay(struct cache_entry *ce,
 
 static void mark_ce_for_checkout_no_overlay(struct cache_entry *ce,
 					    char *ps_matched,
-					    const struct checkout_opts *opts)
+					    const struct checkout_opts *opts,
+					    int *index_changed)
 {
 	ce->ce_flags &= ~CE_MATCHED;
 	if (!opts->ignore_skipworktree && ce_skip_worktree(ce))
 		return;
 	if (ce_path_match(the_repository->index, ce, &opts->pathspec, ps_matched)) {
 		ce->ce_flags |= CE_MATCHED;
-		if (opts->source_tree && !(ce->ce_flags & CE_UPDATE))
+		if (opts->source_tree && !(ce->ce_flags & CE_UPDATE)) {
 			/*
-			 * In overlay mode, but the path is not in
+			 * In no-overlay mode, but the path is not in
 			 * tree-ish, which means we should remove it
 			 * from the index and the working tree.
 			 */
+			if (index_changed &&
+			    !clean_status_index_entry_is_semantically_safe(
+				    the_repository->index, ce, NULL))
+				*index_changed = 1;
 			ce->ce_flags |= CE_REMOVE | CE_WT_REMOVE;
+		}
 	}
 }
 
@@ -524,6 +552,8 @@ static int checkout_paths(const struct checkout_opts *opts,
 	int errs = 0;
 	struct lock_file lock_file = LOCK_INIT;
 	int checkout_index;
+	int preserve_source_tree_history = 0;
+	int source_tree_index_changed = 0;
 
 	trace2_cmd_mode(opts->patch_mode ? "patch" : "path");
 
@@ -628,12 +658,36 @@ static int checkout_paths(const struct checkout_opts *opts,
 	}
 
 	repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
+	/*
+	 * A plain worktree checkout from the index only rewrites stat data.
+	 * A source-tree checkout may do the same when every selected entry
+	 * already matches the index; if not, invalidate its proof below.
+	 * Keep written paths fsmonitor-invalid in either case. Do not do
+	 * this for --merge, which may recreate unmerged index entries from
+	 * resolve undo data.
+	 */
+	preserve_source_tree_history =
+		opts->source_tree && opts->checkout_index &&
+		!opts->merge && !opts->writeout_stage;
+	if ((opts->checkout_worktree && !opts->source_tree &&
+	     !opts->merge && !opts->writeout_stage) ||
+	    preserve_source_tree_history) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository,
+					       &opts->clean_digest);
+	}
 	if (repo_read_index_preload(the_repository, &opts->pathspec, 0) < 0)
 		return error(_("index file corrupt"));
 
+	if (preserve_source_tree_history &&
+	    (the_repository->index->split_index ||
+	     the_repository->index->sparse_index))
+		source_tree_index_changed = 1;
 	if (opts->source_tree)
 		read_tree_some(opts->source_tree, &opts->pathspec,
-			       opts->overlay_mode);
+			       opts->overlay_mode,
+			       preserve_source_tree_history ?
+			       &source_tree_index_changed : NULL);
 	if (opts->merge)
 		unmerge_index(the_repository->index, &opts->pathspec, CE_MATCHED);
 
@@ -651,7 +705,10 @@ static int checkout_paths(const struct checkout_opts *opts,
 		else
 			mark_ce_for_checkout_no_overlay(the_repository->index->cache[pos],
 							ps_matched,
-							opts);
+							opts,
+							preserve_source_tree_history ?
+							&source_tree_index_changed :
+							NULL);
 
 	if (report_path_error(ps_matched, &opts->pathspec)) {
 		free(ps_matched);
@@ -698,7 +755,16 @@ static int checkout_paths(const struct checkout_opts *opts,
 		checkout_index = opts->checkout_index;
 
 	if (checkout_index) {
-		if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))
+		unsigned int flags = COMMIT_LOCK;
+
+		if (preserve_source_tree_history &&
+		    (source_tree_index_changed || errs))
+			clean_status_invalidate_current_proof(
+				the_repository->index);
+		if (!the_repository->index->cache_changed &&
+		    !hook_exists(the_repository, "post-index-change"))
+			flags |= SKIP_IF_UNCHANGED;
+		if (write_locked_index(the_repository->index, &lock_file, flags))
 			die(_("unable to write new index file"));
 	} else {
 		/*
@@ -846,6 +912,17 @@ static int merge_working_tree(const struct checkout_opts *opts,
 	struct tree *new_tree;
 
 	repo_hold_locked_index(the_repository, &lock_file, LOCK_DIE_ON_ERROR);
+	/*
+	 * A discarding switch may rewrite only worktree/stat state when the
+	 * target tree matches the index. Let unpack_trees() transfer the
+	 * proof only after it proves that the rebuilt index is identical.
+	 */
+	if (opts->discard_changes ||
+	    (!opts->merge && !opts->new_orphan_branch)) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository,
+					       &opts->clean_digest);
+	}
 	if (repo_read_index_preload(the_repository, NULL, 0) < 0) {
 		rollback_lock_file(&lock_file);
 		return error(_("index file corrupt"));
@@ -891,6 +968,7 @@ static int merge_working_tree(const struct checkout_opts *opts,
 		/* 2-way merge to the new branch */
 		init_topts(&topts, opts->show_progress,
 			   opts->overwrite_ignore, quiet);
+		topts.preserve_semantic_history = 1;
 		init_checkout_metadata(&topts.meta, new_branch_info->refname,
 				       new_branch_info->commit ?
 				       &new_branch_info->commit->object.oid :
@@ -1281,6 +1359,8 @@ static int git_checkout_config(const char *var, const char *value,
 			       const struct config_context *ctx, void *cb)
 {
 	struct checkout_opts *opts = cb;
+
+	clean_status_config_add(&opts->clean_digest, var, value, ctx);
 
 	if (!strcmp(var, "diff.ignoresubmodules")) {
 		if (!value)
@@ -1879,7 +1959,11 @@ static int checkout_main(int argc, const char **argv, const char *prefix,
 	opts->prefix = prefix;
 	opts->show_progress = -1;
 
+	show_usage_with_options_if_asked(argc, argv, usagestr, options);
+
+	clean_status_config_init(&opts->clean_digest, the_repository->hash_algo);
 	repo_config(the_repository, git_checkout_config, opts);
+	clean_status_config_final(&opts->clean_digest);
 	if (the_repository->gitdir) {
 		prepare_repo_settings(the_repository);
 		the_repository->settings.command_requires_full_index = 0;

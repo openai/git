@@ -13,12 +13,16 @@
 #include "config.h"
 #include "lockfile.h"
 #include "cache-tree.h"
+#include "clean-status.h"
+#include "clean-status-index.h"
+#include "clean-status-sidecar.h"
 #include "color.h"
 #include "dir.h"
 #include "editor.h"
 #include "environment.h"
 #include "diff.h"
 #include "commit.h"
+#include "fsmonitor-settings.h"
 #include "add-interactive.h"
 #include "gettext.h"
 #include "revision.h"
@@ -30,8 +34,10 @@
 #include "path.h"
 #include "preload-index.h"
 #include "read-cache.h"
+#include "refs.h"
 #include "repository.h"
 #include "string-list.h"
+#include "submodule.h"
 #include "rerere.h"
 #include "unpack-trees.h"
 #include "column.h"
@@ -39,9 +45,11 @@
 #include "sparse-index.h"
 #include "mailmap.h"
 #include "help.h"
+#include "hook.h"
 #include "commit-reach.h"
 #include "commit-graph.h"
 #include "pretty.h"
+#include "trace2.h"
 #include "trailer.h"
 
 static const char * const builtin_commit_usage[] = {
@@ -205,11 +213,34 @@ static void determine_whence(struct wt_status *s)
 		s->whence = whence;
 }
 
-static void status_init_config(struct wt_status *s, config_fn_t fn)
+struct status_config_callback_data {
+	struct wt_status *status;
+	config_fn_t fn;
+	struct clean_status_config_digest *clean_digest;
+};
+
+static int status_config_callback(const char *key, const char *value,
+				  const struct config_context *ctx, void *cb)
 {
+	struct status_config_callback_data *data = cb;
+
+	clean_status_config_add(data->clean_digest, key, value, ctx);
+	return data->fn(key, value, ctx, data->status);
+}
+
+static void status_init_config_with_clean_digest(
+	struct wt_status *s, config_fn_t fn,
+	struct clean_status_config_digest *clean_digest)
+{
+	struct status_config_callback_data data = {
+		.status = s,
+		.fn = fn,
+		.clean_digest = clean_digest,
+	};
+
 	wt_status_prepare(the_repository, s);
 	init_diff_ui_defaults();
-	repo_config(the_repository, fn, s);
+	repo_config(the_repository, status_config_callback, &data);
 	determine_whence(s);
 	s->hints = advice_enabled(ADVICE_STATUS_HINTS); /* must come after repo_config() */
 }
@@ -349,7 +380,8 @@ static void refresh_cache_or_die(int refresh_flags)
 }
 
 static const char *prepare_index(const char **argv, const char *prefix,
-				 const struct commit *current_head, int is_status)
+				 const struct commit *current_head, int is_status,
+				 struct wt_status *s)
 {
 	struct string_list partial = STRING_LIST_INIT_DUP;
 	struct pathspec pathspec;
@@ -480,13 +512,24 @@ static const char *prepare_index(const char **argv, const char *prefix,
 	 * We still need to refresh the index here.
 	 */
 	if (!only && !pathspec.nr) {
-		repo_hold_locked_index(the_repository, &index_lock,
-				       LOCK_DIE_ON_ERROR);
-		refresh_cache_or_die(refresh_flags);
+		int update_index = !is_status || use_optional_locks();
+
+		if (update_index)
+			repo_hold_locked_index(the_repository, &index_lock,
+					       LOCK_DIE_ON_ERROR);
+		if (!fstat_is_reliable() ||
+		    the_repository->index->split_index ||
+		    fsm_settings__get_mode(the_repository) !=
+			    FSMONITOR_MODE_IPC)
+			refresh_cache_or_die(refresh_flags);
+		else if (wt_status_refresh_index(
+				 s, refresh_flags | REFRESH_IN_PORCELAIN, 0))
+			die_resolve_conflict("commit");
 		if (the_repository->index->cache_changed
 		    || !cache_tree_fully_valid(the_repository->index->cache_tree))
 			cache_tree_update(the_repository->index, WRITE_TREE_SILENT);
-		if (write_locked_index(the_repository->index, &index_lock,
+		if (update_index &&
+		    write_locked_index(the_repository->index, &index_lock,
 				       COMMIT_LOCK | SKIP_IF_UNCHANGED))
 			die(_("unable to write new index file"));
 		commit_style = COMMIT_AS_IS;
@@ -773,13 +816,29 @@ static int prepare_to_commit(const char *index_file, const char *prefix,
 	int clean_message_contents = (cleanup_mode != COMMIT_MSG_CLEANUP_NONE);
 	int old_display_comment_prefix;
 	int invoked_hook;
+	int hook_index_matches = 0;
+	struct clean_status_index_snapshot hook_index = { .fd = -1 };
 
 	/* This checks and barfs if author is badly specified */
 	determine_author_info(author_ident);
 
-	if (!no_verify && run_commit_hook(use_editor, index_file, &invoked_hook,
-					  "pre-commit", NULL))
-		return 0;
+	if (!no_verify) {
+		int hook_failed = run_commit_hook(
+			use_editor, index_file, &invoked_hook,
+			"pre-commit", NULL);
+
+		if (invoked_hook && fstat_is_reliable())
+			wt_status_invalidate_refresh(s);
+		if (invoked_hook && fstat_is_reliable() &&
+		    commit_style == COMMIT_AS_IS)
+			hook_index_matches =
+				!clean_status_index_snapshot_pin(
+					&hook_index, the_repository->index);
+		if (hook_failed) {
+			clean_status_index_snapshot_release(&hook_index);
+			return 0;
+		}
+	}
 
 	if (squash_message) {
 		/*
@@ -1095,10 +1154,29 @@ static int prepare_to_commit(const char *index_file, const char *prefix,
 			else
 				fputs(_(empty_rebase_pick_advice), stderr);
 		}
+		clean_status_index_snapshot_release(&hook_index);
 		return 0;
 	}
 
 	if (!no_verify && invoked_hook) {
+		struct lock_file refresh_lock = LOCK_INIT;
+
+		/*
+		 * Preserve any strong invalidation recorded while status
+		 * closed the post-hook token. The pinned source prevents this
+		 * write from replacing an index updated by the hook.
+		 */
+		if (hook_index_matches &&
+		    repo_hold_locked_index(the_repository, &refresh_lock, 0) >= 0) {
+			if (clean_status_index_snapshot_still_matches(
+				    &hook_index, the_repository->index))
+				repo_update_index_if_able(
+					the_repository, &refresh_lock);
+			else
+				rollback_lock_file(&refresh_lock);
+		}
+		clean_status_index_snapshot_release(&hook_index);
+
 		/*
 		 * Re-read the index as the pre-commit-commit hook was invoked
 		 * and could have updated it. We must do this before we invoke
@@ -1431,7 +1509,7 @@ static int dry_run_commit(const char **argv, const char *prefix,
 	int committable;
 	const char *index_file;
 
-	index_file = prepare_index(argv, prefix, current_head, 1);
+	index_file = prepare_index(argv, prefix, current_head, 1, s);
 	committable = run_status(stdout, index_file, prefix, 0, s);
 	rollback_index_files();
 
@@ -1534,6 +1612,68 @@ static int git_status_config(const char *k, const char *v,
 	return git_diff_ui_config(k, v, ctx, NULL);
 }
 
+/*
+ * A clean-proof hit certifies the tracked and untracked lists, but it
+ * deliberately does not cache status output. Refresh the cheap state which
+ * the selected printer derives from refs and administrative files before
+ * printing those empty lists.
+ */
+static int print_clean_sidecar(struct wt_status *s, const char *prefix)
+{
+	struct object_id oid;
+
+	if (repo_get_oid(s->repo, s->reference, &oid))
+		return 0;
+	s->is_initial = 0;
+	oidcpy(&s->oid_commit, &oid);
+	s->ignore_submodule_arg = ignore_submodule_arg;
+	s->status_format = status_format;
+	/* A globally clean proof guarantees that both verbose diffs are empty. */
+	s->verbose = 0;
+	FREE_AND_NULL(s->branch);
+	s->branch = refs_resolve_refdup(get_main_ref_store(s->repo),
+					"HEAD", 0, NULL, NULL);
+	wt_status_get_state(s->repo, &s->state,
+			    s->branch && !strcmp(s->branch, "HEAD"));
+	if (s->state.merge_in_progress)
+		s->committable = 1;
+	if (s->relative_paths)
+		s->prefix = prefix;
+	wt_status_print(s);
+	return 1;
+}
+
+static int clean_status_sidecar_needs_reissue(struct repository *repo)
+{
+	struct clean_status_sidecar_record record =
+		CLEAN_STATUS_SIDECAR_RECORD_INIT;
+	struct clean_status_index_snapshot index = { .fd = -1 };
+	char *path = xstrfmt("%s.csts", repo->index_file);
+	struct stat st;
+	int safe_existing = !lstat(path, &st) &&
+		S_ISREG(st.st_mode) && st.st_nlink == 1 &&
+		is_path_owned_by_current_user(path, NULL);
+	int reissue = 0;
+
+	if (!clean_status_sidecar_load(
+		    repo->index_file, repo->hash_algo, &record))
+		reissue = safe_existing &&
+			(!!clean_status_sidecar_pin_source(
+				 repo->index_file, &record.sidecar,
+				 repo->hash_algo, &index) ||
+			 record.sidecar.hardlink_nr > 0);
+	else {
+		if (lstat(path, &st) < 0)
+			reissue = errno == ENOENT;
+		else
+			reissue = safe_existing;
+	}
+	free(path);
+	clean_status_index_snapshot_release(&index);
+	clean_status_sidecar_record_release(&record);
+	return reissue;
+}
+
 int cmd_status(int argc,
 const char **argv,
 const char *prefix,
@@ -1542,8 +1682,19 @@ struct repository *repo UNUSED)
 	static int no_renames = -1;
 	static const char *rename_score_arg = (const char *)-1;
 	static struct wt_status s;
+	struct clean_status_config_digest clean_digest;
 	unsigned int progress_flag = 0;
 	int fd;
+	int default_status_command = argc == 1 && (!prefix || !*prefix);
+	int exact_clean_command = argc == 2 &&
+		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
+	int exact_clean_query;
+	int normal_clean_query;
+	int reusable_clean_query;
+	int normal_has_head;
+	int reissue_clean_sidecar = 0;
+	int reissue_after_write = 0;
+	int save_history_after_write = 0;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1605,7 +1756,11 @@ struct repository *repo UNUSED)
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
 
-	status_init_config(&s, git_status_config);
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	status_init_config_with_clean_digest(
+		&s, git_status_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
+	clean_status_set_config_digest(the_repository, &clean_digest);
 	argc = parse_options(argc, argv, prefix,
 			     builtin_status_options,
 			     builtin_status_usage, 0);
@@ -1614,6 +1769,7 @@ struct repository *repo UNUSED)
 
 	handle_untracked_files_arg(&s);
 	handle_ignored_arg(&s);
+	s.ignore_submodule_arg = ignore_submodule_arg;
 
 	if (s.show_ignored_mode == SHOW_MATCHING_IGNORED &&
 	    s.show_untracked_files == SHOW_NO_UNTRACKED_FILES)
@@ -1622,25 +1778,84 @@ struct repository *repo UNUSED)
 	parse_pathspec(&s.pathspec, 0,
 		       PATHSPEC_PREFER_FULL,
 		       prefix, argv);
+	if (s.ignore_submodule_arg) {
+		struct diff_options diffopt = { 0 };
+
+		handle_ignore_submodules_arg(&diffopt, s.ignore_submodule_arg);
+	}
+	normal_has_head = !repo_get_oid(the_repository, s.reference, &oid);
+	exact_clean_query = exact_clean_command &&
+		status_format == STATUS_FORMAT_PORCELAIN_V2 &&
+		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
+		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
+		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES;
+	normal_clean_query = default_status_command &&
+		status_format == STATUS_FORMAT_NONE && normal_has_head &&
+		!s.pathspec.nr && !s.show_branch &&
+		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
+		!s.submodule_summary &&
+		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
+	reusable_clean_query = normal_has_head &&
+		!s.show_ignored_mode && !s.submodule_summary &&
+		/* A clean merge still prints a staged-changes header with -vv. */
+		!(verbose > 1 &&
+		  file_exists(git_path_merge_head(the_repository))) &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
+	s.allow_clean_status_shortcuts = normal_has_head &&
+		!s.submodule_summary &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
+	clean_status_enable_external_history(the_repository);
+	s.certify_clean_status = exact_clean_query;
+	if (reusable_clean_query &&
+	    clean_status_try_sidecar(the_repository, &clean_digest)) {
+		if (exact_clean_query ||
+		    print_clean_sidecar(&s, prefix)) {
+			wt_status_collect_free_buffers(&s);
+			return 0;
+		}
+	}
+	if (normal_clean_query && use_optional_locks() &&
+	    clean_status_identity_is_durable())
+		reissue_clean_sidecar =
+			clean_status_sidecar_needs_reissue(the_repository);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
-	    status_format != STATUS_FORMAT_PORCELAIN_V2)
+	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
 		progress_flag = REFRESH_PROGRESS;
+		if (isatty(2))
+			clean_status_enable_progress(the_repository);
+	}
 	repo_read_index(the_repository);
-	refresh_index(the_repository->index,
-		      REFRESH_QUIET|REFRESH_UNMERGED|progress_flag,
-		      &s.pathspec, NULL, NULL);
+	if (use_optional_locks())
+		clean_status_capture_external_history_source(
+			the_repository->index);
+	if (normal_clean_query && use_optional_locks() &&
+	    clean_status_identity_is_durable() &&
+	    (reissue_clean_sidecar ||
+	     clean_status_external_history_was_restored(
+		     the_repository->index)))
+		s.certify_clean_status = 1;
+	wt_status_start_untracked_cache_preload(&s);
+	wt_status_refresh_index(
+		&s, REFRESH_QUIET | REFRESH_UNMERGED | progress_flag |
+		REFRESH_DEFER_BULK_DIRTY,
+		s.show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
+		!s.show_ignored_mode);
 
 	if (use_optional_locks())
 		fd = repo_hold_locked_index(the_repository, &index_lock, 0);
 	else
 		fd = -1;
+	s.bulk_update_index_stat =
+		0 <= fd &&
+		the_repository->index->preload_bulk_tracked_nr ==
+			the_repository->index->cache_nr;
 
 	s.is_initial = repo_get_oid(the_repository, s.reference, &oid) ? 1 : 0;
 	if (!s.is_initial)
 		oidcpy(&s.oid_commit, &oid);
 
-	s.ignore_submodule_arg = ignore_submodule_arg;
 	s.status_format = status_format;
 	s.verbose = verbose;
 	if (no_renames != -1)
@@ -1654,8 +1869,104 @@ struct repository *repo UNUSED)
 
 	wt_status_collect(&s);
 
-	if (0 <= fd)
+	if (0 <= fd) {
+		int external_restored =
+			clean_status_external_history_was_restored(
+				the_repository->index);
+		int external_saved = 0;
+		int persist_restored_boundary = 0;
+		int preserve_entry_changes =
+			(!external_restored &&
+			 (the_repository->index->cache_changed & CE_ENTRY_CHANGED)) ||
+			the_repository->index->fsmonitor_untracked_must_persist;
+		int deferred_history = preserve_entry_changes &&
+			!external_restored &&
+			clean_status_has_recovered_tracked_stat(
+				the_repository->index);
+		int preserve_history_witness = external_restored &&
+			clean_status_external_history_needs_witness_preservation(
+				the_repository->index);
+
+		/*
+		 * Publish resumable history before the physical clean proof.
+		 * A later foreign index rewrite can only recover the proof if
+		 * both files name the same provider boundary.
+		 *
+		 * CSH1 carries acceleration state, not refreshed stat data.
+		 * A fresh checkpoint names the pre-repair physical index; do
+		 * not let publishing it roll back the write which makes an
+		 * entry repair durable.  Restored checkpoints stay no-spill
+		 * for foreign index writers.
+		 */
+		if (!deferred_history && !preserve_history_witness)
+			external_saved = clean_status_save_external_history(
+				the_repository->index);
+		else if (deferred_history &&
+			 !hook_exists(the_repository, "post-index-change"))
+			save_history_after_write = 1;
+		if (external_restored && !external_saved &&
+		    clean_status_external_history_owns_index(
+			    the_repository->index) &&
+		    has_racy_timestamp(the_repository->index)) {
+			persist_restored_boundary = 1;
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "history/external-racy-index-persisted", 1);
+		}
+		reissue_after_write = normal_clean_query &&
+			reissue_clean_sidecar && preserve_entry_changes &&
+			!external_restored && !persist_restored_boundary &&
+			!hook_exists(the_repository, "post-index-change");
+
+		if (the_repository->index->fsmonitor_legacy_untracked_fallback &&
+		    !preserve_entry_changes && !external_saved) {
+			rollback_lock_file(&index_lock);
+			fd = -1;
+		} else if (exact_clean_query) {
+			if (!preserve_entry_changes && external_saved &&
+			    clean_status_issue_sidecar(
+				    &s, &clean_digest, &index_lock, 0))
+				fd = -1;
+			else if (!preserve_entry_changes &&
+				 !persist_restored_boundary &&
+				 (external_restored || external_saved)) {
+				rollback_lock_file(&index_lock);
+				fd = -1;
+			}
+		} else if (!preserve_entry_changes &&
+			   !persist_restored_boundary &&
+			   normal_clean_query &&
+			   (external_restored || reissue_clean_sidecar) &&
+			   clean_status_issue_sidecar(
+				   &s, &clean_digest, &index_lock, 1)) {
+			fd = -1;
+		} else if (!preserve_entry_changes &&
+			   !persist_restored_boundary &&
+			   (external_restored || external_saved)) {
+			rollback_lock_file(&index_lock);
+			fd = -1;
+		}
+	}
+	if (0 <= fd) {
 		repo_update_index_if_able(the_repository, &index_lock);
+		if (save_history_after_write &&
+		    !hook_exists(the_repository, "post-index-change") &&
+		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
+			if (clean_status_save_external_history(
+				    the_repository->index))
+				trace2_data_intmax("fsmonitor", the_repository,
+						   "history/external-postwrite-stored", 1);
+			rollback_lock_file(&index_lock);
+		}
+		if (reissue_after_write &&
+		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
+			if (clean_status_issue_sidecar(
+				    &s, &clean_digest, &index_lock, 1))
+				trace2_data_intmax("status", the_repository,
+						   "clean-proof/postwrite-reissued", 1);
+			else
+				rollback_lock_file(&index_lock);
+		}
+	}
 
 	if (s.relative_paths)
 		s.prefix = prefix;
@@ -1701,6 +2012,7 @@ int cmd_commit(int argc,
 	       struct repository *repo UNUSED)
 {
 	static struct wt_status s;
+	struct clean_status_config_digest clean_digest;
 	static const char *cleanup_arg = NULL;
 	static struct option builtin_commit_options[] = {
 		OPT__QUIET(&quiet, N_("suppress summary after successful commit")),
@@ -1805,7 +2117,11 @@ int cmd_commit(int argc,
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
 
-	status_init_config(&s, git_commit_config);
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	status_init_config_with_clean_digest(
+		&s, git_commit_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
+	clean_status_set_config_digest(the_repository, &clean_digest);
 	s.commit_template = 1;
 	status_format = STATUS_FORMAT_NONE; /* Ignore status.short */
 	s.colopts = 0;
@@ -1835,7 +2151,7 @@ int cmd_commit(int argc,
 
 	if (dry_run)
 		return dry_run_commit(argv, prefix, current_head, &s);
-	index_file = prepare_index(argv, prefix, current_head, 0);
+	index_file = prepare_index(argv, prefix, current_head, 0, &s);
 
 	/* Set up everything for writing the commit object.  This includes
 	   running hooks, writing the trees, and interacting with the user.  */
@@ -1845,6 +2161,7 @@ int cmd_commit(int argc,
 		rollback_index_files();
 		goto cleanup;
 	}
+	wt_status_collect_free_buffers(&s);
 
 	/* Determine parents */
 	reflog_msg = getenv("GIT_REFLOG_ACTION");
@@ -1983,6 +2300,7 @@ int cmd_commit(int argc,
 			    NULL, NULL, NULL, NULL);
 
 cleanup:
+	wt_status_collect_free_buffers(&s);
 	free_commit_extra_headers(extra);
 	commit_list_free(parents);
 	strbuf_release(&author_ident);
