@@ -516,12 +516,210 @@ static void many_sources_fixture_release(struct many_sources_fixture *fixture)
 	remove_worktree(fixture->worktree);
 }
 
+static void verify_unusual_manifest_paths(const struct git_hash_algo *algo)
+{
+	static const char *const directories[] = {
+		"!before", ".hidden", "a", "a/!nested", "a/nested", "z",
+	};
+	static const char *const tracked[] = {
+		"!before/file",
+		".hidden/.gitattributes",
+		".hidden/file",
+		"a/!nested/file",
+		"a/file",
+		"a/nested/file",
+		"a/nested/other",
+		"a/other",
+		"z/file",
+	};
+	static const char *const expected_paths[] = {
+		"!before/.gitattributes",
+		".gitattributes",
+		".hidden/.gitattributes",
+		"a/!nested/.gitattributes",
+	};
+	char indexed_source[] = "*.hidden text\n";
+	char *worktree = create_worktree();
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct cache_entry *indexed;
+	struct strbuf path = STRBUF_INIT, manifest = STRBUF_INIT;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int have_repository, ret;
+	size_t i;
+
+	init_object_store(&repo, worktree);
+	for (i = 0; i < ARRAY_SIZE(directories); i++) {
+		strbuf_reset(&path);
+		strbuf_addf(&path, "%s/%s", worktree, directories[i]);
+		cl_must_pass(mkdir(path.buf, 0777));
+	}
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/.gitattributes", worktree);
+	write_file(path.buf, "*.root text\n");
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/!before/.gitattributes", worktree);
+	write_file(path.buf, "*.before -text\n");
+	strbuf_reset(&path);
+	strbuf_addf(&path, "%s/a/!nested/.gitattributes", worktree);
+	write_file(path.buf, "*.nested text\n");
+
+	CALLOC_ARRAY(istate.cache, ARRAY_SIZE(tracked));
+	istate.cache_alloc = istate.cache_nr = ARRAY_SIZE(tracked);
+	for (i = 0; i < ARRAY_SIZE(tracked); i++)
+		add_index_path(&istate, i, tracked[i], 0);
+	indexed = istate.cache[1];
+	cl_must_pass(odb_pretend_object(
+		repo.objects, indexed_source, strlen(indexed_source),
+		OBJ_BLOB, &indexed->oid));
+
+	have_repository = startup_info->have_repository;
+	startup_info->have_repository = 1;
+	ret = worktree_attr_manifest_build(&istate, &manifest, hash, &stats);
+	startup_info->have_repository = have_repository;
+	cl_assert_equal_i(ret, 0);
+	cl_assert_equal_i(stats.candidates, ARRAY_SIZE(directories) + 1);
+	cl_assert_equal_i(stats.worktree_sources, 3);
+	cl_assert_equal_i(stats.index_sources, 1);
+	cl_must_pass(attr_manifest_cursor_init(
+		&cursor, manifest.buf, manifest.len, algo));
+	for (i = 0; i < ARRAY_SIZE(expected_paths); i++) {
+		cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+		cl_assert_equal_i(entry.path_len, strlen(expected_paths[i]));
+		cl_assert(!memcmp(entry.path, expected_paths[i], entry.path_len));
+		cl_assert_equal_i(entry.source,
+			i == 2 ? ATTR_MANIFEST_INDEX : ATTR_MANIFEST_WORKTREE);
+		if (i == 2)
+			cl_assert(!memcmp(entry.hash, indexed->oid.hash, algo->rawsz));
+	}
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 0);
+
+	strbuf_release(&manifest);
+	strbuf_release(&path);
+	release_index(&istate);
+	odb_free(repo.objects);
+	remove_worktree(worktree);
+}
+
 static void clear_attr_manifest_thread_env(void *unused UNUSED)
 {
 	unsetenv(ATTR_MANIFEST_TEST_THREADS);
 	unsetenv(ATTR_MANIFEST_TEST_THREAD_FAIL_AT);
 }
 #endif
+
+void test_attr_manifest__preserves_unusual_paths_for_both_hash_algorithms(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	verify_unusual_manifest_paths(&hash_algos[GIT_HASH_SHA1]);
+	verify_unusual_manifest_paths(&hash_algos[GIT_HASH_SHA256]);
+#endif
+}
+
+void test_attr_manifest__rechecks_previously_absent_nested_source(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA256];
+	char *worktree = create_worktree();
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats absent_stats, present_stats;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct strbuf path = STRBUF_INIT, manifest = STRBUF_INIT;
+	unsigned char absent_hash[GIT_MAX_RAWSZ];
+	unsigned char present_hash[GIT_MAX_RAWSZ];
+	const char *name = "parent/nested/.gitattributes";
+
+	strbuf_addf(&path, "%s/parent", worktree);
+	cl_must_pass(mkdir(path.buf, 0777));
+	strbuf_addstr(&path, "/nested");
+	cl_must_pass(mkdir(path.buf, 0777));
+
+	CALLOC_ARRAY(istate.cache, 2);
+	istate.cache_alloc = istate.cache_nr = 2;
+	add_index_path(&istate, 0, "parent/nested/first", 0);
+	add_index_path(&istate, 1, "parent/nested/second", 0);
+	cl_must_pass(worktree_attr_manifest_build(
+		&istate, &manifest, absent_hash, &absent_stats));
+	cl_assert_equal_i(absent_stats.candidates, 3);
+	cl_assert_equal_i(absent_stats.worktree_sources, 0);
+
+	strbuf_addstr(&path, "/.gitattributes");
+	write_file(path.buf, "*.dat text\n");
+	cl_must_pass(worktree_attr_manifest_build(
+		&istate, &manifest, present_hash, &present_stats));
+	cl_assert_equal_i(present_stats.candidates, 3);
+	cl_assert_equal_i(present_stats.worktree_sources, 1);
+	cl_assert(memcmp(absent_hash, present_hash, algo->rawsz) != 0);
+	cl_must_pass(attr_manifest_cursor_init(
+		&cursor, manifest.buf, manifest.len, algo));
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+	cl_assert_equal_i(entry.path_len, strlen(name));
+	cl_assert(!memcmp(entry.path, name, entry.path_len));
+	cl_assert_equal_i(entry.source, ATTR_MANIFEST_WORKTREE);
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 0);
+
+	strbuf_release(&manifest);
+	strbuf_release(&path);
+	release_index(&istate);
+	remove_worktree(worktree);
+#endif
+}
+
+void test_attr_manifest__detects_symlink_replaced_parent(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	char *worktree = create_worktree();
+	struct repository repo = {
+		.worktree = worktree,
+		.hash_algo = &hash_algos[GIT_HASH_SHA1],
+	};
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path;
+	struct strbuf parent = STRBUF_INIT;
+	struct strbuf original = STRBUF_INIT;
+	struct strbuf replacement = STRBUF_INIT;
+	const char *basename;
+	size_t namespace_unstable_from;
+	unsigned int namespace_unstable;
+	int parent_fd;
+
+	strbuf_addf(&parent, "%s/parent", worktree);
+	strbuf_addf(&original, "%s/original", worktree);
+	strbuf_addf(&replacement, "%s/replacement", worktree);
+	cl_must_pass(mkdir(parent.buf, 0777));
+	cl_must_pass(mkdir(replacement.buf, 0777));
+	cl_must_pass(semantic_verify_root_init(&repo, &root));
+	path = semantic_verify_path_new(root);
+	cl_assert(path != NULL);
+	cl_must_pass(semantic_verify_resolve_parent(
+		path, "parent/.gitattributes", 23, &parent_fd, &basename));
+	cl_assert_equal_s(basename, ".gitattributes");
+	cl_assert(parent_fd >= 0);
+	cl_must_pass(rename(parent.buf, original.buf));
+	cl_must_pass(symlink("replacement", parent.buf));
+	semantic_verify_path_free(
+		path, &namespace_unstable, &namespace_unstable_from);
+	cl_assert_equal_i(namespace_unstable, 1);
+	cl_assert_equal_i(namespace_unstable_from, 23);
+
+	semantic_verify_root_clear(root);
+	strbuf_release(&replacement);
+	strbuf_release(&original);
+	strbuf_release(&parent);
+	remove_worktree(worktree);
+#endif
+}
 
 void test_attr_manifest__parallel_probes_match_serial_output(void)
 {

@@ -34,8 +34,15 @@ static void pop_anchored_dir(struct semantic_verify_path *path)
 	struct anchored_dir *dir = &path->dirs[path->dirs_nr - 1];
 	int parent_fd = path->dirs_nr == 1 ? path->root->fd :
 		path->dirs[path->dirs_nr - 2].fd;
-	int named_fd;
 	struct stat named_stat;
+
+#ifdef __APPLE__
+	if (fstatat(parent_fd, dir->component, &named_stat,
+		    AT_SYMLINK_NOFOLLOW) ||
+	    !path_namespace_stat_equal(&dir->stat, &named_stat))
+		note_namespace_unstable(path, dir->first_cache_pos);
+#else
+	int named_fd;
 
 	named_fd = semantic_verify_openat(parent_fd, dir->component,
 				      O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
@@ -44,6 +51,7 @@ static void pop_anchored_dir(struct semantic_verify_path *path)
 		note_namespace_unstable(path, dir->first_cache_pos);
 	if (named_fd >= 0)
 		close(named_fd);
+#endif
 	close(dir->fd);
 	free(dir->component);
 	path->dirs_nr--;

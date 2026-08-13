@@ -3845,6 +3845,145 @@ test_expect_success MACOS,LEGACY_PREVIEW_FSMONITOR_GIT,UNTRACKED_CACHE,SEMANTIC_
 	)
 '
 
+test_expect_success FOREIGN_FSMONITOR_GIT,HARDLINKS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'a foreign reset without fsmonitor extensions replays staged history safely' '
+	test_when_finished "rm -rf foreign-reset-no-provider" &&
+	test_when_finished "rm -f foreign-reset-no-provider.alias" &&
+	test_create_repo foreign-reset-no-provider &&
+	(
+		cd foreign-reset-no-provider &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		for sibling in $(test_seq 1 48)
+		do
+			mkdir -p "existing-$((sibling % 8))" &&
+			test_write_lines "$sibling" \
+				>"existing-$((sibling % 8))/tracked-$sibling" ||
+				return 1
+		done &&
+		git add existing-* &&
+		git commit -qm base &&
+		ln existing-0/tracked-8 \
+			../foreign-reset-no-provider.alias &&
+		test-tool chmtime -120 existing-*/* &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.trustctime true &&
+		git config core.checkStat default &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		test_write_lines staged >x &&
+		test-tool chmtime -120 x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+			git add x &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/physical-staged &&
+		test_grep "^1 A\\..* x$" .git/physical-staged &&
+		test_grep FSMN .git/index &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/checkpoint.trace" \
+			git status --porcelain=v2 >.git/checkpoint &&
+		test_cmp .git/physical-staged .git/checkpoint &&
+		test_trace2_data fsmonitor history/external-stored 1 \
+			<.git/checkpoint.trace &&
+
+		rm x &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+			git status --porcelain=v2 >.git/deleted &&
+		test_grep "^1 AD .* x$" .git/deleted &&
+		/opt/homebrew/bin/git -c core.fsmonitor=false \
+			checkout -- x &&
+		/opt/homebrew/bin/git -c core.fsmonitor=false \
+			reset >.git/foreign-reset &&
+		test_grep ! FSMN .git/index &&
+		test_grep ! FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+		test_grep UNTR .git/index &&
+		cp .git/index .git/foreign-before.index &&
+		test_write_lines "? x" >.git/expect &&
+		GIT_OPTIONAL_LOCKS=0 git \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 >.git/reference &&
+		test_cmp .git/expect .git/reference &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/recover.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_trace2_data fsmonitor history/external-semantic-restored 1 \
+			<.git/recover.trace &&
+		test_trace2_data fsmonitor history/external-fsmn-recovered 1 \
+			<.git/recover.trace &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/recover.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/recover.trace &&
+		! test_trace2_data index preload/bulk_useful \
+			"[1-9][0-9]*" <.git/recover.trace &&
+		! test_trace2_data index preload/bulk_dirs \
+			"[1-9][0-9]*" <.git/recover.trace &&
+		! test_trace2_data index refresh/sum_scan \
+			"[2-9][0-9]*" <.git/recover.trace &&
+
+		cp .git/foreign-before.index .git/index &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=// \
+		GIT_TRACE2_EVENT="$PWD/.git/global.trace" \
+			git status --porcelain=v2 >.git/global &&
+		test_cmp .git/expect .git/global &&
+		! test_trace2_data fsmonitor history/external-fsmn-recovered 1 \
+			<.git/global.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/global.trace &&
+
+		mtime=$(test-tool chmtime --get existing-0/tracked-8) &&
+		printf "9\\n" >../foreign-reset-no-provider.alias &&
+		test-tool chmtime =$mtime \
+			../foreign-reset-no-provider.alias &&
+		cp .git/foreign-before.index .git/index &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 git \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 >.git/hardlink.expect &&
+		test_grep "^1 \\.M .* existing-0/tracked-8$" \
+			.git/hardlink.expect &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/hardlink.trace" \
+			git status --porcelain=v2 >.git/hardlink.actual &&
+		test_cmp .git/hardlink.expect .git/hardlink.actual &&
+
+		test_write_lines "*.txt text" >.gitattributes &&
+		cp .git/foreign-before.index .git/index &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 git \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 >.git/attributes.expect &&
+		test_grep "^? \\.gitattributes$" .git/attributes.expect &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes.actual &&
+		test_cmp .git/attributes.expect .git/attributes.actual &&
+		! test_trace2_data fsmonitor history/external-fsmn-recovered 1 \
+			<.git/attributes.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/attributes.trace
+	)
+'
+
 test_expect_success FOREIGN_FSMONITOR_GIT,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'a foreign index writer does not strand a racy provider token' '
 	test_when_finished "stop_daemon_delete_repo foreign-racy-token" &&
@@ -5291,6 +5430,81 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/status.trace &&
 		! test_trace2_data status semantic_verify/prepared 1 \
 			<.git/status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'mixed reset preserves semantic history when unstaging a new file' '
+	test_when_finished "rm -rf reset-mixed-new-file" &&
+	test_create_repo reset-mixed-new-file &&
+	(
+		cd reset-mixed-new-file &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		for sibling in $(test_seq 1 24)
+		do
+			mkdir -p "existing-$((sibling % 6))" &&
+			test_write_lines "$sibling" \
+				>"existing-$((sibling % 6))/tracked-$sibling" ||
+				return 1
+		done &&
+		git add existing-* &&
+		git commit -qm base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSMN .git/index &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+
+		test_write_lines staged >x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+			git add x &&
+		rm x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+			git checkout -- x &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=x \
+		GIT_TRACE2_EVENT="$PWD/.git/reset.trace" \
+			git reset >.git/reset &&
+		test_grep FSMN .git/index &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_write_lines "? x" >.git/expect &&
+		test_cmp .git/expect .git/actual &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/status.trace &&
+		! test_trace2_data index preload/bulk_useful \
+			"[1-9][0-9]*" <.git/status.trace &&
+		! test_trace2_data index preload/bulk_dirs \
+			"[1-9][0-9]*" <.git/status.trace &&
+		! test_trace2_data index refresh/sum_scan \
+			"[2-9][0-9]*" <.git/status.trace &&
+
+		test_write_lines "*.txt text" >.gitattributes &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+			git add .gitattributes &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+			git reset >.git/attributes-reset &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes &&
+		test_grep "^? \\.gitattributes$" .git/attributes &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/attributes.trace
 	)
 '
 
