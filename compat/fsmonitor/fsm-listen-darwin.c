@@ -138,6 +138,26 @@ static int ef_is_dropped(const FSEventStreamEventFlags ef)
 		ef & kFSEventStreamEventFlagUserDropped);
 }
 
+static int ef_is_hardlink(const FSEventStreamEventFlags ef)
+{
+	return ef & (kFSEventStreamEventFlagItemIsHardlink |
+		     kFSEventStreamEventFlagItemIsLastHardlink);
+}
+
+static int ef_ignore_dir_metadata(const FSEventStreamEventFlags ef)
+{
+	static const FSEventStreamEventFlags required =
+		kFSEventStreamEventFlagItemIsDir |
+		kFSEventStreamEventFlagItemInodeMetaMod;
+	static const FSEventStreamEventFlags allowed =
+		kFSEventStreamEventFlagItemIsDir |
+		kFSEventStreamEventFlagItemInodeMetaMod |
+		kFSEventStreamEventFlagItemCreated |
+		kFSEventStreamEventFlagItemXattrMod;
+
+	return (ef & required) == required && !(ef & ~allowed);
+}
+
 /*
  * If an `xattr` change is the only reason we received this event,
  * then silently ignore it.  Git doesn't care about xattr's.  We
@@ -208,6 +228,7 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 	const char *slash;
 	char *resolved = NULL;
 	struct strbuf tmp = STRBUF_INIT;
+	enum fsmonitor_path_type path_type;
 
 	/*
 	 * Build a list of all filesystem changes into a private/local
@@ -290,7 +311,23 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 			continue;
 		}
 
-		switch (fsmonitor_classify_path_absolute(state, path_k)) {
+		path_type = fsmonitor_classify_path_absolute(state, path_k);
+		if (ef_is_hardlink(event_flags[k]) &&
+		    path_type == IS_WORKDIR_PATH) {
+			/*
+			 * An event for one name does not prove that all names of the
+			 * inode are in this watch cone.  Make the client content-check
+			 * the entire tracked set rather than trusting path-local stats.
+			 */
+			if (trace_pass_fl(&trace_fsmonitor))
+				log_flags_set(path_k, event_flags[k]);
+			if (!batch)
+				batch = fsmonitor_batch__new();
+			my_add_path(batch, FSMONITOR_PATH_GLOBAL_INVALIDATE);
+			continue;
+		}
+
+		switch (path_type) {
 
 		case IS_INSIDE_DOT_GIT_WITH_COOKIE_PREFIX:
 		case IS_INSIDE_GITDIR_WITH_COOKIE_PREFIX:
@@ -330,6 +367,12 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 
 			if (trace_pass_fl(&trace_fsmonitor))
 				log_flags_set(path_k, event_flags[k]);
+			if (ef_ignore_dir_metadata(event_flags[k])) {
+				trace_printf_key(&trace_fsmonitor,
+						 "ignore-dir-metadata: '%s', flags=0x%x",
+						 path_k, event_flags[k]);
+				break;
+			}
 
 			/*
 			 * Because of the implicit "binning" (the

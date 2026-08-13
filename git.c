@@ -929,6 +929,9 @@ int cmd_main(int argc, const char **argv)
 		if (slash)
 			cmd = slash + 1;
 	}
+	/* A renamed dispatcher is still safer to re-exec than a Git from PATH. */
+	if (!starts_with(cmd, "git-"))
+		git_mark_executable_as_dispatcher();
 
 	trace_command_performance(argv);
 
