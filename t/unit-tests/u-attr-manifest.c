@@ -621,6 +621,59 @@ void test_attr_manifest__preserves_unusual_paths_for_both_hash_algorithms(void)
 #endif
 }
 
+void test_attr_manifest__rechecks_previously_absent_nested_source(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA256];
+	char *worktree = create_worktree();
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats absent_stats, present_stats;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct strbuf path = STRBUF_INIT, manifest = STRBUF_INIT;
+	unsigned char absent_hash[GIT_MAX_RAWSZ];
+	unsigned char present_hash[GIT_MAX_RAWSZ];
+	const char *name = "parent/nested/.gitattributes";
+
+	strbuf_addf(&path, "%s/parent", worktree);
+	cl_must_pass(mkdir(path.buf, 0777));
+	strbuf_addstr(&path, "/nested");
+	cl_must_pass(mkdir(path.buf, 0777));
+
+	CALLOC_ARRAY(istate.cache, 2);
+	istate.cache_alloc = istate.cache_nr = 2;
+	add_index_path(&istate, 0, "parent/nested/first", 0);
+	add_index_path(&istate, 1, "parent/nested/second", 0);
+	cl_must_pass(worktree_attr_manifest_build(
+		&istate, &manifest, absent_hash, &absent_stats));
+	cl_assert_equal_i(absent_stats.candidates, 3);
+	cl_assert_equal_i(absent_stats.worktree_sources, 0);
+
+	strbuf_addstr(&path, "/.gitattributes");
+	write_file(path.buf, "*.dat text\n");
+	cl_must_pass(worktree_attr_manifest_build(
+		&istate, &manifest, present_hash, &present_stats));
+	cl_assert_equal_i(present_stats.candidates, 3);
+	cl_assert_equal_i(present_stats.worktree_sources, 1);
+	cl_assert(memcmp(absent_hash, present_hash, algo->rawsz) != 0);
+	cl_must_pass(attr_manifest_cursor_init(
+		&cursor, manifest.buf, manifest.len, algo));
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+	cl_assert_equal_i(entry.path_len, strlen(name));
+	cl_assert(!memcmp(entry.path, name, entry.path_len));
+	cl_assert_equal_i(entry.source, ATTR_MANIFEST_WORKTREE);
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 0);
+
+	strbuf_release(&manifest);
+	strbuf_release(&path);
+	release_index(&istate);
+	remove_worktree(worktree);
+#endif
+}
+
 void test_attr_manifest__detects_symlink_replaced_parent(void)
 {
 #if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
