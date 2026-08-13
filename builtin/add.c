@@ -637,8 +637,10 @@ int cmd_add(int argc,
 finish:
 	if (preserve_add_history && exit_status)
 		clean_status_invalidate_current_proof(repo->index);
-	if (write_locked_index(repo->index, &lock_file,
-			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+	if (show_only)
+		rollback_lock_file(&lock_file);
+	else if (write_locked_index(repo->index, &lock_file,
+				    COMMIT_LOCK | SKIP_IF_UNCHANGED))
 		die(_("unable to write new index file"));
 
 	free(ps_matched);
