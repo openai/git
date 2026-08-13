@@ -6370,6 +6370,110 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'empty command attributes preserve inactive filter history' '
+	test_when_finished "rm -rf configured-filter-empty-attributes" &&
+	test_create_repo configured-filter-empty-attributes &&
+	(
+		cd configured-filter-empty-attributes &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir nested &&
+		test_write_lines original >tracked &&
+		test_write_lines sibling >nested/tracked &&
+		test_write_lines "*.filtered filter=demo" \
+			"*.processed filter=protocol" >.gitattributes &&
+		git add .gitattributes tracked nested/tracked &&
+		git commit -m base &&
+		git config filter.demo.clean cat &&
+		git config filter.protocol.process \
+			"test-tool rot13-filter --log=.git/filter-process.log clean smudge" &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+
+		for label in empty tree-empty repeated
+		do
+			case "$label" in
+			empty|repeated) set -- -c core.attributesFile= ;;
+			tree-empty) set -- -c attr.tree= -c core.attributesFile= ;;
+			esac &&
+			cp .git/index .git/$label.index &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$label.trace" \
+				git "$@" status --porcelain=v1 --untracked-files=no \
+				>.git/$label &&
+			test_must_be_empty .git/$label &&
+			test_cmp .git/$label.index .git/index &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<.git/$label.trace &&
+			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+				<.git/$label.trace &&
+			! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+				<.git/$label.trace &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$label-plain.trace" \
+				git status --porcelain=v1 --untracked-files=no \
+				>.git/$label-plain &&
+			test_must_be_empty .git/$label-plain &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<.git/$label-plain.trace &&
+			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+				<.git/$label-plain.trace || return 1
+		done &&
+
+		test_write_lines "tracked filter=demo" >.git/global-attributes &&
+		git config core.attributesFile "$PWD/.git/global-attributes" &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			git status --porcelain=v2 >.git/global-prime &&
+		test_must_be_empty .git/global-prime &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false -c core.attributesFile= \
+			status --porcelain=v1 --untracked-files=no \
+			>.git/global.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/global-empty.trace" \
+			git -c core.attributesFile= status --porcelain=v1 \
+			--untracked-files=no >.git/global.actual &&
+		test_cmp .git/global.expect .git/global.actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/global-empty.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/global-empty.trace &&
+
+		git config --unset core.attributesFile &&
+		git config attr.tree HEAD &&
+		test_write_lines "tracked filter=demo" >.gitattributes &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+			git status --porcelain=v1 --untracked-files=no \
+			>.git/tree-prime &&
+		test_grep "^ M .gitattributes$" .git/tree-prime &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false -c attr.tree= \
+			status --porcelain=v1 --untracked-files=no \
+			>.git/tree.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/tree-cleared.trace" \
+			git -c attr.tree= status --porcelain=v1 \
+			--untracked-files=no >.git/tree.actual &&
+		test_cmp .git/tree.expect .git/tree.actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/tree-cleared.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/tree-cleared.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'sparse index rebuilds semantic history without expansion' '
 	test_when_finished "rm -rf sparse-semantic" &&
