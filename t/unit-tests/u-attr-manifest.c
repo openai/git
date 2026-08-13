@@ -181,6 +181,32 @@ void test_attr_manifest__does_not_report_identical_entries(void)
 	strbuf_release(&old);
 }
 
+void test_attr_manifest__distinguishes_display_only_attribute_edits(void)
+{
+	static const char original[] = "*.txt text\n# keep me\n";
+	static const char display[] =
+		"*.txt text\n# keep me\n*.gen linguist-generated\n";
+	static const char removed[] =
+		"*.txt text\n*.old -linguist-generated\n# keep me\n";
+	static const char converted[] =
+		"*.txt text\n# keep me\n*.gen linguist-generated text\n";
+	static const char filtered[] =
+		"*.txt text\n# keep me\n*.gen filter=smudge\n";
+	static const char macro[] =
+		"[attr]linguist-generated text\n*.gen linguist-generated\n";
+
+	cl_assert(attr_manifest_only_linguist_generated_changed(
+		original, strlen(original), display, strlen(display)));
+	cl_assert(attr_manifest_only_linguist_generated_changed(
+		removed, strlen(removed), original, strlen(original)));
+	cl_assert(!attr_manifest_only_linguist_generated_changed(
+		original, strlen(original), converted, strlen(converted)));
+	cl_assert(!attr_manifest_only_linguist_generated_changed(
+		original, strlen(original), filtered, strlen(filtered)));
+	cl_assert(!attr_manifest_only_linguist_generated_changed(
+		original, strlen(original), macro, strlen(macro)));
+}
+
 void test_attr_manifest__rejects_malformed_tail_before_callbacks(void)
 {
 	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
@@ -240,11 +266,8 @@ static struct cache_entry *add_index_path(struct index_state *istate,
 
 static void init_object_store(struct repository *repo, const char *worktree)
 {
-	struct strbuf object_dir = STRBUF_INIT;
-
-	strbuf_addf(&object_dir, "%s/objects", worktree);
-	repo->objects = odb_new(repo, object_dir.buf, "");
-	strbuf_release(&object_dir);
+	repo->commondir = (char *)worktree;
+	repo->objects = odb_new(repo, 0);
 }
 #endif
 

@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "abspath.h"
+#include "attr-fingerprint.h"
 #include "clean-status.h"
 #include "clean-status-history-store.h"
 #include "clean-status-index.h"
@@ -13,7 +14,9 @@
 #include "hash-framing.h"
 #include "hex.h"
 #include "read-cache-ll.h"
+#include "replace-object.h"
 #include "repository.h"
+#include "semantic-verify-internal.h"
 #include "strbuf.h"
 #include "trace2.h"
 #include "ewah/ewok.h"
@@ -26,6 +29,9 @@ static void invalidate_disk_history(struct clean_status_state *state)
 	state->disk_config_invalid = 1;
 	state->disk_config_valid = 0;
 	state->disk_semantic_valid = 0;
+	state->disk_tracked_policy_valid = 0;
+	memset(state->disk_tracked_policy_hash, 0,
+	       sizeof(state->disk_tracked_policy_hash));
 	state->disk_attr_valid = 0;
 	FREE_AND_NULL(state->disk_config_token);
 	strbuf_reset(&state->disk_config_raw);
@@ -62,6 +68,16 @@ int clean_status_read_fsmonitor_config(struct index_state *istate,
 	       istate->repo->hash_algo->rawsz);
 	memcpy(state->disk_attr_hash, proof.attr_hash,
 	       istate->repo->hash_algo->rawsz);
+	if (proof.tracked_policy_hash) {
+		memcpy(state->disk_tracked_policy_hash,
+		       proof.tracked_policy_hash,
+		       istate->repo->hash_algo->rawsz);
+		state->disk_tracked_policy_valid = 1;
+	} else {
+		state->disk_tracked_policy_valid = 0;
+		memset(state->disk_tracked_policy_hash, 0,
+		       sizeof(state->disk_tracked_policy_hash));
+	}
 	strbuf_add(&state->disk_config_raw, data, size);
 	state->disk_config_valid = 1;
 	state->disk_semantic_valid = 1;
@@ -73,7 +89,10 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 {
 	struct clean_status_state *state = istate->clean_status;
 	const struct git_hash_algo *algo = istate->repo->hash_algo;
-	int token_coherent, config_coherent, semantic_changed, attr_changed;
+	int token_coherent, config_coherent, tracked_policy_coherent;
+	int semantic_changed, attr_changed;
+	int legacy_empty_attributes = 0;
+	int manifest_reusable;
 	int coherent;
 
 	if (!state || !state->current_config_valid)
@@ -82,7 +101,12 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		!state->disk_config_invalid && istate->fsmonitor_token_valid &&
 		istate->fsmonitor_last_update && state->disk_config_token &&
 		!strcmp(state->disk_config_token, istate->fsmonitor_last_update);
+	tracked_policy_coherent = !state->disk_tracked_policy_valid ||
+		(state->current_tracked_policy_valid &&
+		 !memcmp(state->disk_tracked_policy_hash,
+			 state->current_tracked_policy_hash, algo->rawsz));
 	config_coherent = state->disk_config_valid &&
+		tracked_policy_coherent &&
 		!memcmp(state->disk_config_hash, state->current_config_hash,
 			algo->rawsz);
 	semantic_changed = state->disk_semantic_valid &&
@@ -93,11 +117,38 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		(state->disk_attr_valid && state->current_attr_valid &&
 		 memcmp(state->disk_attr_hash, state->current_attr_hash,
 			algo->rawsz));
+	if (attr_changed && token_coherent && state->disk_semantic_valid &&
+	    state->current_semantic_valid && !semantic_changed &&
+	    state->disk_attr_valid && state->current_attr_valid &&
+	    !state->current_attr_sources_present && !state->filter_configured &&
+	    state->manifest.disk_valid &&
+	    (state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+		FSMONITOR_CLEAN_PROOF_ALL &&
+	    !getenv(INDEX_ENVIRONMENT) &&
+	    !getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+	    !getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+	    !getenv(ALTERNATE_DB_ENVIRONMENT) &&
+	    istate == istate->repo->index && !istate->split_index &&
+	    istate->sparse_index == INDEX_EXPANDED &&
+	    fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+	    !repo_has_replace_refs_uncached(istate->repo) &&
+	    attr_fingerprint_matches_legacy_absent_sources(
+		istate->repo, state->disk_attr_hash)) {
+		attr_changed = 0;
+		legacy_empty_attributes = 1;
+	}
 	coherent = token_coherent && config_coherent &&
 		state->disk_semantic_valid && state->current_semantic_valid &&
 		!semantic_changed && state->disk_attr_valid &&
 		state->current_attr_valid && !attr_changed &&
 		state->manifest.disk_valid &&
+		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+			FSMONITOR_CLEAN_PROOF_ALL;
+	manifest_reusable = token_coherent && !config_coherent &&
+		state->disk_semantic_valid && state->current_semantic_valid &&
+		!semantic_changed && state->disk_attr_valid &&
+		state->current_attr_valid && !attr_changed &&
+		!state->filter_configured && state->manifest.disk_valid &&
 		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
 			FSMONITOR_CLEAN_PROOF_ALL;
 	state->filter_scope_valid = coherent && state->filter_configured;
@@ -108,6 +159,11 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		state->config_revalidated_token =
 			xstrdup(istate->fsmonitor_last_update);
 		clean_status_manifest_adopt_disk(&state->manifest);
+	} else if (manifest_reusable) {
+		clean_status_manifest_adopt_disk(&state->manifest);
+		if (trace)
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "semantic/manifest-reused", 1);
 	}
 	state->config_mismatch = state->config_enforced && !coherent;
 	state->strong_mismatch = state->config_enforced &&
@@ -120,6 +176,9 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		  state->current_attr_sources_present) ||
 		 clean_status_filter_scope_needs_validation(istate));
 	if (trace) {
+		if (legacy_empty_attributes)
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "semantic/legacy-empty-attributes", 1);
 		trace2_data_intmax("fsmonitor", istate->repo,
 				   "config/coherent", coherent);
 		trace2_data_intmax("fsmonitor", istate->repo,
@@ -137,6 +196,60 @@ void clean_status_prepare_fsmonitor_config(struct index_state *istate)
 int clean_status_probe_fsmonitor_config(struct index_state *istate)
 {
 	return prepare_fsmonitor_config(istate, 0);
+}
+
+int clean_status_try_preserve_tracked_config_epoch(
+	struct index_state *istate)
+{
+	struct clean_status_state *state = istate->clean_status;
+	const struct git_hash_algo *algo;
+	int attr_matches;
+
+	if (!state || !istate->repo || istate != istate->repo->index)
+		return 0;
+	algo = istate->repo->hash_algo;
+	attr_matches = state->disk_attr_valid &&
+		state->current_attr_valid &&
+		(!memcmp(state->disk_attr_hash, state->current_attr_hash,
+			 algo->rawsz) ||
+		 attr_fingerprint_matches_legacy_absent_sources(
+			 istate->repo, state->disk_attr_hash));
+	if (!state->config_enforced || !state->config_mismatch ||
+	    state->strong_mismatch || !state->disk_config_valid ||
+	    state->disk_config_invalid || !state->disk_config_raw.len ||
+	    !state->current_config_valid || !state->disk_semantic_valid ||
+	    !state->current_semantic_valid ||
+	    memcmp(state->disk_semantic_hash, state->current_semantic_hash,
+		   algo->rawsz) || !attr_matches ||
+	    (!state->disk_tracked_policy_valid &&
+	     state->current_attr_sources_present) ||
+	    state->filter_configured ||
+	    !state->manifest.disk_valid || !state->manifest.current_valid ||
+	    !state->manifest.checked || state->manifest.current_invalidated ||
+	    state->manifest.global_fallback ||
+	    (state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) !=
+		FSMONITOR_CLEAN_PROOF_ALL ||
+	    (state->manifest.current_flags & FSMONITOR_CLEAN_PROOF_ALL) !=
+		FSMONITOR_CLEAN_PROOF_ALL ||
+	    !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_last_update || !state->disk_config_token ||
+	    strcmp(state->disk_config_token, istate->fsmonitor_last_update) ||
+	    istate->split_index || istate->sparse_index != INDEX_EXPANDED ||
+	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC ||
+	    repo_has_replace_refs_uncached(istate->repo) ||
+	    !state->current_tracked_policy_valid ||
+	    (state->disk_tracked_policy_valid ?
+		memcmp(state->disk_tracked_policy_hash,
+		       state->current_tracked_policy_hash, algo->rawsz) :
+		!clean_status_config_tracked_sources_predate_index(istate)))
+		return 0;
+	clean_status_mark_fsmonitor_config_valid(
+		istate, istate->fsmonitor_last_update);
+	if (!clean_status_revalidated_token_matches(istate))
+		return 0;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "config/tracked-epoch-valid", 1);
+	return 1;
 }
 
 int clean_status_has_persistent_fsmonitor_semantic_history(
@@ -279,6 +392,9 @@ void clean_status_write_fsmonitor_config(struct strbuf *out,
 			.config_hash = state->current_config_hash,
 			.semantic_hash = state->current_semantic_hash,
 			.attr_hash = state->current_attr_hash,
+			.tracked_policy_hash =
+				state->current_tracked_policy_valid ?
+				state->current_tracked_policy_hash : NULL,
 			.attr_manifest =
 				(const unsigned char *)state->manifest.current.buf,
 			.attr_manifest_len = state->manifest.current.len,
@@ -575,6 +691,79 @@ static int external_token_is_replayable(const char *token)
 	return replayable;
 }
 
+static int missing_fsmonitor_token_is_replayable(
+	struct index_state *istate, struct index_state *parsed)
+{
+	struct fsmonitor_query_result result =
+		FSMONITOR_QUERY_RESULT_INIT;
+	const char *token = parsed->fsmonitor_last_update;
+	const char *path, *end;
+	int replayable = 0;
+
+	if (!token || !starts_with(token, "builtin:") ||
+	    !strcmp(token, "builtin:fake") ||
+	    query_builtin_fsmonitor(token, &result) !=
+		FSMONITOR_QUERY_DELTA)
+		goto done;
+	path = result.paths.buf;
+	end = result.paths.buf + result.paths.len;
+	while (path < end) {
+		size_t len = strlen(path);
+		const char *base = find_last_dir_sep(path);
+
+		base = base ? base + 1 : path;
+		if (!strcmp(path, FSMONITOR_PATH_GLOBAL_INVALIDATE))
+			goto done;
+		if (!fspathcmp(base, ".gitattributes")) {
+			struct index_state witness = *istate;
+
+			witness.clean_status = parsed->clean_status;
+			witness.fsmonitor_last_update =
+				parsed->fsmonitor_last_update;
+			witness.fsmonitor_token_valid =
+				parsed->fsmonitor_token_valid;
+			if (!clean_status_manifest_reconcile_deleted_attribute(
+				    &witness, path)) {
+				struct clean_status_state *state =
+					parsed->clean_status;
+				struct strbuf proof = STRBUF_INIT;
+
+				if (!clean_status_manifest_reconcile_display_only_attribute(
+					    &witness, path))
+					goto done;
+				clean_status_write_fsmonitor_config(
+					&proof, parsed);
+				strbuf_reset(&state->disk_config_raw);
+				strbuf_addbuf(&state->disk_config_raw, &proof);
+				strbuf_reset(&state->manifest.disk);
+				strbuf_addbuf(&state->manifest.disk,
+					      &state->manifest.current);
+				memcpy(state->manifest.disk_hash,
+				       state->manifest.current_hash,
+				       parsed->repo->hash_algo->rawsz);
+				state->manifest.disk_flags =
+					state->manifest.current_flags;
+				strbuf_release(&proof);
+			}
+		}
+		path += len + 1;
+	}
+	replayable = path == end;
+
+done:
+	fsmonitor_query_result_release(&result);
+	return replayable;
+}
+
+static void invalidate_unwatched_recovered_entry(size_t pos, void *data)
+{
+	struct index_state *istate = data;
+
+	if (pos >= istate->cache_nr)
+		BUG("recovered fsmonitor entry is outside the index");
+	fsmonitor_invalidate_cache_entry(istate->cache[pos]);
+}
+
 #ifdef __APPLE__
 static int external_semantic_delta_is_safe(
 	const struct strbuf *paths, struct index_state *old_index,
@@ -647,6 +836,7 @@ static void restore_external_tracked_history(
 	const struct strbuf *paths, const struct fsmonitor_clean_proof *proof)
 {
 	struct index_state parsed = INDEX_STATE_INIT(istate->repo);
+	const struct stat_data empty_stat = { 0 };
 	unsigned int old_pos = 0, new_pos = 0, restored = 0, i;
 	const unsigned int unsafe_flags = CE_VALID | CE_SKIP_WORKTREE |
 		CE_INTENT_TO_ADD | CE_CONTENT_CHECK_REQUIRED | CE_STAGEMASK;
@@ -676,6 +866,7 @@ static void restore_external_tracked_history(
 		const struct cache_entry *old_entry = witness->cache[old_pos];
 		struct cache_entry *new_entry = istate->cache[new_pos];
 		int cmp = strcmp(old_entry->name, new_entry->name);
+		int recover_stat;
 
 		if (cmp < 0) {
 			old_pos++;
@@ -694,12 +885,30 @@ static void restore_external_tracked_history(
 		     !S_ISLNK(new_entry->ce_mode)) ||
 		    old_entry->ce_mode != new_entry->ce_mode ||
 		    !oideq(&old_entry->oid, &new_entry->oid) ||
-		    memcmp(&old_entry->ce_stat_data, &new_entry->ce_stat_data,
-			   sizeof(old_entry->ce_stat_data)) ||
-		    is_racy_timestamp(istate, new_entry) ||
 		    external_checkpoint_path_was_replayed(
 			new_entry->name, paths))
 			continue;
+		recover_stat = !memcmp(&new_entry->ce_stat_data, &empty_stat,
+				       sizeof(empty_stat));
+		if (memcmp(&old_entry->ce_stat_data, &new_entry->ce_stat_data,
+			   sizeof(old_entry->ce_stat_data)) &&
+		    (!recover_stat ||
+		     !memcmp(&old_entry->ce_stat_data, &empty_stat,
+			     sizeof(empty_stat)) ||
+		     is_racy_timestamp(witness, old_entry)))
+			continue;
+		if (recover_stat)
+			new_entry->ce_stat_data = old_entry->ce_stat_data;
+		if (is_racy_timestamp(istate, new_entry)) {
+			if (recover_stat)
+				new_entry->ce_stat_data = empty_stat;
+			continue;
+		}
+		if (recover_stat) {
+			new_entry->ce_flags |= CE_UPDATE_IN_BASE;
+			istate->cache_changed |= CE_ENTRY_CHANGED;
+			istate->clean_status->recovered_tracked_stat = 1;
+		}
 		new_entry->ce_flags |= CE_FSMONITOR_VALID;
 		restored++;
 	}
@@ -962,6 +1171,171 @@ done:
 #endif
 }
 
+static int restore_external_bootstrap_manifest(
+	struct index_state *istate,
+	const struct clean_status_history_checkpoint *checkpoint,
+	const char *proof_namespace,
+	const struct clean_status_index_snapshot *snapshot)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	const unsigned int semantic_flags =
+		CE_STAGEMASK | CE_VALID | CE_EXTENDED_FLAGS;
+	const unsigned int transient_flags =
+		CE_UPDATE | CE_REMOVE | CE_ADDED | CE_WT_REMOVE |
+		CE_CONFLICTED | CE_UNPACKED | CE_NEW_SKIP_WORKTREE |
+		CE_MATCHED | CE_STRIP_NAME | CE_CONTENT_CHECK_REQUIRED;
+	struct clean_status_state *state = istate->clean_status;
+	struct index_state witness = INDEX_STATE_INIT(istate->repo);
+	struct clean_status_identity before_identity, after_identity;
+	struct fsmonitor_query_result changes =
+		FSMONITOR_QUERY_RESULT_INIT;
+	struct fsmonitor_clean_proof proof;
+	struct strbuf rewritten = STRBUF_INIT;
+	struct stat before, after;
+	unsigned char witness_hash[GIT_MAX_RAWSZ];
+	char *path = NULL;
+	int fd = -1, attr_pos = -1, transferred = 0;
+
+	if (!checkpoint->source_alias_valid || !state ||
+	    state->disk_config_invalid || state->filter_configured ||
+	    state->current_attr_sources_present || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC ||
+	    fsmonitor_clean_proof_parse(&proof, checkpoint->fsmonitor_config,
+		checkpoint->fsmonitor_config_len,
+		istate->repo->hash_algo) ||
+	    (proof.flags & FSMONITOR_CLEAN_PROOF_ALL) !=
+		FSMONITOR_CLEAN_PROOF_ALL)
+		goto done;
+	path = clean_status_history_store_witness_path(
+		istate->repo->index_file, proof_namespace,
+		istate->repo->hash_algo);
+	fd = open_nofollow(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) ||
+	    before.st_nlink != 1 || before.st_uid != geteuid() ||
+	    clean_status_identity_from_stat(&before_identity, &before) ||
+	    lstat(path, &after) || before.st_dev != after.st_dev ||
+	    before.st_ino != after.st_ino)
+		goto done;
+	do_read_index(&witness, path, 1);
+	if (fstat(fd, &after) || after.st_nlink != 1 ||
+	    after.st_uid != geteuid() ||
+	    clean_status_identity_from_stat(&after_identity, &after) ||
+	    !clean_status_identity_equal(&before_identity, &after_identity) ||
+	    before.st_size != after.st_size ||
+	    lstat(path, &after) || before.st_dev != after.st_dev ||
+	    before.st_ino != after.st_ino ||
+	    witness.version != checkpoint->source_version ||
+	    witness.cache_nr != checkpoint->source_cache_nr ||
+	    witness.cache_nr != istate->cache_nr ||
+	    !oideq(&witness.oid, &checkpoint->source_checksum) ||
+	    clean_status_index_logical_digest(&witness, witness_hash) ||
+	    memcmp(witness_hash, checkpoint->index_hash,
+		   istate->repo->hash_algo->rawsz))
+		goto done;
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *old = witness.cache[i];
+		const struct cache_entry *current = istate->cache[i];
+
+		if (ce_namelen(old) != ce_namelen(current) ||
+		    memcmp(old->name, current->name, ce_namelen(old) + 1) ||
+		    old->ce_mode != current->ce_mode ||
+		    ((old->ce_flags ^ current->ce_flags) & semantic_flags) ||
+		    ((old->ce_flags | current->ce_flags) & transient_flags))
+			goto done;
+		if (oideq(&old->oid, &current->oid))
+			continue;
+		if (attr_pos >= 0 || strcmp(current->name, ".gitattributes") ||
+		    !S_ISREG(current->ce_mode))
+			goto done;
+		attr_pos = i;
+	}
+	if (attr_pos < 0 ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(
+		    snapshot, istate))
+		goto done;
+	clean_status_release(&witness);
+	clean_status_attach_config(&witness);
+	clean_status_read_fsmonitor_config(
+		&witness, checkpoint->fsmonitor_config,
+		checkpoint->fsmonitor_config_len);
+	free(witness.fsmonitor_last_update);
+	witness.fsmonitor_last_update =
+		xmemdupz(proof.token, proof.token_len);
+	witness.fsmonitor_token_valid = 1;
+	clean_status_prepare_fsmonitor_config(&witness);
+	if (!current_proof_is_writable(&witness))
+		goto done;
+	{
+		struct index_state current = *istate;
+
+		current.clean_status = witness.clean_status;
+		current.fsmonitor_last_update =
+			witness.fsmonitor_last_update;
+		current.fsmonitor_token_valid = 1;
+		if (!clean_status_manifest_reconcile_display_only_attribute(
+			    &current, ".gitattributes"))
+			goto done;
+	}
+	if (!clean_status_index_snapshot_still_matches_proof_epoch(
+		    snapshot, istate))
+		goto done;
+	if (query_builtin_fsmonitor(witness.fsmonitor_last_update,
+				      &changes) != FSMONITOR_QUERY_DELTA)
+		goto done;
+	for (const char *changed = changes.paths.buf,
+			 *end = changes.paths.buf + changes.paths.len;
+	     changed < end; changed += strlen(changed) + 1) {
+		size_t len = strlen(changed);
+		const char *base = find_last_dir_sep(changed);
+
+		base = base ? base + 1 : changed;
+		if (!len ||
+		    !strcmp(changed, FSMONITOR_PATH_GLOBAL_INVALIDATE) ||
+		    changed[len - 1] == '/' ||
+		    (!fspathcmp(base, ".gitattributes") &&
+		     strcmp(changed, ".gitattributes")))
+			goto done;
+	}
+	if (!clean_status_index_snapshot_still_matches_proof_epoch(
+		    snapshot, istate))
+		goto done;
+	clean_status_write_fsmonitor_config(&rewritten, &witness);
+	clean_status_release(istate);
+	clean_status_attach_config(istate);
+	clean_status_read_fsmonitor_config(
+		istate, rewritten.buf, rewritten.len);
+	state = istate->clean_status;
+	state->config_mismatch = 0;
+	state->strong_mismatch = 0;
+	state->initial_coherent = 0;
+	state->config_revalidated = 0;
+	clean_status_manifest_adopt_disk(&state->manifest);
+	state->manifest.checked = 1;
+	state->manifest.global_fallback = 0;
+	state->manifest.current_invalidated = 0;
+	state->authenticated_bootstrap_manifest = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/external-bootstrap-manifest", 1);
+	transferred = 1;
+
+done:
+	if (fd >= 0)
+		close(fd);
+	free(path);
+	fsmonitor_query_result_release(&changes);
+	strbuf_release(&rewritten);
+	release_index(&witness);
+	return transferred;
+#else
+	(void)istate;
+	(void)checkpoint;
+	(void)proof_namespace;
+	(void)snapshot;
+	return 0;
+#endif
+}
+
 int clean_status_restore_external_history(struct index_state *istate)
 {
 	struct clean_status_history_store_record record =
@@ -972,6 +1346,9 @@ int clean_status_restore_external_history(struct index_state *istate)
 	unsigned char index_hash[GIT_MAX_RAWSZ];
 	char proof_namespace[GIT_MAX_HEXSZ + 1];
 	int record_loaded = 0;
+	int missing_fsmonitor_recovery = 0;
+	int owned_index = 0;
+	int preserve_witness = 0;
 	int restored = 0;
 
 	if (!clean_status_external_history_enabled(istate) || !state ||
@@ -992,9 +1369,19 @@ int clean_status_restore_external_history(struct index_state *istate)
 	    !memcmp(state->disk_config_hash, state->current_config_hash,
 		    istate->repo->hash_algo->rawsz) &&
 	    !clean_status_has_persistent_fsmonitor_semantic_history(istate)) {
-		trace2_data_intmax("fsmonitor", istate->repo,
-				   "history/external-proof-invalidated", 1);
-		goto done;
+		missing_fsmonitor_recovery =
+			!istate->fsmonitor_extension_seen &&
+			!istate->fsmonitor_token_valid &&
+			!istate->fsmonitor_last_update &&
+			fsm_settings__get_mode(istate->repo) ==
+				FSMONITOR_MODE_IPC &&
+			istate->repo->config_values_private_.trust_ctime &&
+			istate->repo->config_values_private_.check_stat;
+		if (!missing_fsmonitor_recovery) {
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "history/external-proof-invalidated", 1);
+			goto done;
+		}
 	}
 	if (external_history_namespace(istate, proof_namespace))
 		goto done;
@@ -1020,10 +1407,23 @@ have_index_hash:
 	memcpy(state->source_logical_hash, index_hash,
 	       istate->repo->hash_algo->rawsz);
 	state->source_logical_hash_valid = 1;
-	if (!record_loaded)
+	if (!record_loaded) {
+		if (missing_fsmonitor_recovery)
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "history/external-proof-invalidated", 1);
 		goto done;
+	}
 	if (memcmp(index_hash, record.checkpoint.index_hash,
 		   istate->repo->hash_algo->rawsz)) {
+		if (missing_fsmonitor_recovery) {
+			if (restore_external_bootstrap_manifest(
+				    istate, &record.checkpoint, proof_namespace,
+				    &snapshot))
+				goto done;
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "history/external-proof-invalidated", 1);
+			goto done;
+		}
 		restored = restore_external_semantic_history(
 			istate, &record.checkpoint, proof_namespace, &snapshot);
 		goto done;
@@ -1058,6 +1458,13 @@ have_index_hash:
 	if (!current_proof_is_writable(&parsed) ||
 	    (!!parsed.untracked && !parsed.fsmonitor_untracked_valid))
 		goto done;
+	if (missing_fsmonitor_recovery &&
+	    (!parsed.untracked ||
+	     !missing_fsmonitor_token_is_replayable(istate, &parsed))) {
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "history/external-proof-invalidated", 1);
+		goto done;
+	}
 	/*
 	 * Provider tokens are opaque.  A logical-index match says that the
 	 * checkpoint names the same staged entries; it does not say that its
@@ -1081,6 +1488,37 @@ have_index_hash:
 	if (!clean_status_index_snapshot_still_matches_proof_epoch(
 		    &snapshot, istate))
 		goto done;
+	owned_index = !getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!istate->split_index &&
+		!state->current_attr_sources_present &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		!state->disk_config_invalid &&
+		((!state->disk_config_seen && !state->disk_config_valid &&
+		  fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		  has_usable_on_index_builtin_token(istate) &&
+		  has_usable_on_index_builtin_token(&parsed) &&
+		  !strcmp(istate->fsmonitor_last_update,
+			  parsed.fsmonitor_last_update)) ||
+		 (state->disk_config_seen && state->disk_config_valid &&
+		  state->disk_semantic_valid && state->disk_attr_valid &&
+		  state->manifest.disk_valid &&
+		  (((state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+			FSMONITOR_CLEAN_PROOF_ALL) ||
+		   (missing_fsmonitor_recovery &&
+		    clean_status_has_worktree_manifest_history(istate))) &&
+		  !memcmp(state->disk_config_hash,
+			  state->current_config_hash,
+			  istate->repo->hash_algo->rawsz) &&
+		  !memcmp(state->disk_semantic_hash,
+			  state->current_semantic_hash,
+			  istate->repo->hash_algo->rawsz) &&
+		  !memcmp(state->disk_attr_hash,
+			  state->current_attr_hash,
+			  istate->repo->hash_algo->rawsz)));
+	preserve_witness = !state->disk_config_seen &&
+		!istate->fsmonitor_untracked_valid &&
+		has_usable_on_index_builtin_token(istate);
 	clean_status_invalidate_current_proof(istate);
 	clean_status_copy_fsmonitor_history(istate, &parsed);
 	FREE_AND_NULL(istate->fsmonitor_last_update);
@@ -1092,6 +1530,9 @@ have_index_hash:
 	parsed.fsmonitor_last_update = NULL;
 	istate->fsmonitor_dirty = parsed.fsmonitor_dirty;
 	parsed.fsmonitor_dirty = NULL;
+	if (missing_fsmonitor_recovery)
+		ewah_each_bit(istate->fsmonitor_dirty,
+			      invalidate_unwatched_recovered_entry, istate);
 	istate->fsmonitor_token_valid = 1;
 	istate->fsmonitor_extension_seen = 1;
 	free_untracked_cache(istate->untracked);
@@ -1108,7 +1549,12 @@ have_index_hash:
 		parsed.fsmonitor_untracked_valid;
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "history/external-restored", 1);
+	if (missing_fsmonitor_recovery)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "history/external-fsmn-recovered", 1);
 	state->external_history_restored = 1;
+	state->external_history_owned_index = owned_index;
+	state->external_history_preserve_witness = preserve_witness;
 	restored = 1;
 
 done:
@@ -1128,6 +1574,56 @@ int clean_status_external_history_was_restored(
 	const struct clean_status_state *state = istate->clean_status;
 
 	return state && state->external_history_restored;
+}
+
+int clean_status_external_history_needs_witness_preservation(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->external_history_restored &&
+		state->external_history_preserve_witness &&
+		!state->external_history_owned_index &&
+		istate == istate->repo->index &&
+		current_proof_is_writable(istate);
+}
+
+int clean_status_has_recovered_tracked_stat(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->recovered_tracked_stat &&
+		(istate->cache_changed & CE_ENTRY_CHANGED) &&
+		istate == istate->repo->index &&
+		current_proof_is_writable(istate);
+}
+
+int clean_status_has_authenticated_bootstrap_manifest(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->authenticated_bootstrap_manifest &&
+		state->manifest.current_valid && state->manifest.checked &&
+		!state->manifest.current_invalidated &&
+		(state->manifest.current_flags &
+			(FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+			 FSMONITOR_CLEAN_PROOF_FULL_INDEX)) ==
+			(FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+			 FSMONITOR_CLEAN_PROOF_FULL_INDEX);
+}
+
+int clean_status_external_history_owns_index(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->external_history_restored &&
+		state->external_history_owned_index &&
+		istate == istate->repo->index &&
+		!getenv(INDEX_ENVIRONMENT) && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED;
 }
 
 
@@ -1151,6 +1647,9 @@ void clean_status_copy_fsmonitor_history(struct index_state *dst,
 	       dst->repo->hash_algo->rawsz);
 	memcpy(dst_state->disk_semantic_hash, src_state->disk_semantic_hash,
 	       dst->repo->hash_algo->rawsz);
+	memcpy(dst_state->disk_tracked_policy_hash,
+	       src_state->disk_tracked_policy_hash,
+	       dst->repo->hash_algo->rawsz);
 	memcpy(dst_state->disk_attr_hash, src_state->disk_attr_hash,
 	       dst->repo->hash_algo->rawsz);
 	if (clean_status_manifest_load(
@@ -1161,6 +1660,8 @@ void clean_status_copy_fsmonitor_history(struct index_state *dst,
 	dst_state->disk_config_seen = 1;
 	dst_state->disk_config_valid = 1;
 	dst_state->disk_semantic_valid = src_state->disk_semantic_valid;
+	dst_state->disk_tracked_policy_valid =
+		src_state->disk_tracked_policy_valid;
 	dst_state->disk_attr_valid = src_state->disk_attr_valid;
 	dst_state->disk_config_invalid = 0;
 }

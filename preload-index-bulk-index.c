@@ -1,4 +1,6 @@
 #include "git-compat-util.h"
+#include "clean-status.h"
+#include "fsmonitor.h"
 #include "name-hash.h"
 #include "object.h"
 #include "preload-index-bulk.h"
@@ -176,6 +178,13 @@ void preload_bulk_record_tracked(
 
 	if (!tracked_entry_is_eligible(ce))
 		return;
+	if (clean_status_fsmonitor_semantic_baseline_pending(scan->istate) &&
+	    !fsmonitor_stat_can_be_valid(st)) {
+		if (record_tracked_state(worker, pos,
+					 PRELOAD_BULK_TRACKED_CONTENT_CHECK))
+			fsmonitor_invalidate_cache_entry(ce);
+		return;
+	}
 	changed = ie_match_stat(
 		scan->istate, ce, (struct stat *)st,
 		CE_MATCH_RACY_IS_DIRTY | CE_MATCH_IGNORE_FSMONITOR);

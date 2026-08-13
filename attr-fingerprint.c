@@ -215,6 +215,97 @@ int attr_fingerprint_repository(struct repository *repo,
 	return ret;
 }
 
+static int legacy_absent_path_is_stable(const char *path)
+{
+	struct path_namespace_snapshot *before = NULL, *after = NULL;
+	struct strbuf normalized = STRBUF_INIT;
+	char *absolute = NULL;
+	int stable = 0;
+
+	if (!path)
+		return 0;
+	absolute = absolute_pathdup(path);
+	strbuf_addstr(&normalized, absolute);
+	if (!strbuf_normalize_path(&normalized) &&
+	    !path_namespace_capture(normalized.buf, &before) &&
+	    !path_namespace_target_present(before) &&
+	    !path_namespace_capture(normalized.buf, &after) &&
+	    !path_namespace_target_present(after) &&
+	    path_namespace_equal(before, after))
+		stable = 1;
+	free(absolute);
+	path_namespace_clear(before);
+	path_namespace_clear(after);
+	strbuf_release(&normalized);
+	return stable;
+}
+
+static void legacy_absent_source_hash(
+	const struct attr_fingerprint_source *sources,
+	const char *system_path, const struct git_hash_algo *algo,
+	unsigned char *hash)
+{
+	struct git_hash_ctx ctx;
+	uint32_t value;
+
+	git_hash_init(&ctx, algo);
+	hash_optional_cstring(&ctx, "attribute-source-content-v1");
+	put_be32(&value, ATTR_SOURCE_SNAPSHOT_NR);
+	hash_length_delimited(&ctx, &value, sizeof(value));
+	for (size_t i = 0; i < ATTR_SOURCE_SNAPSHOT_NR; i++) {
+		const char *path = i == ATTR_SOURCE_SNAPSHOT_SYSTEM ?
+			system_path : sources[i].path;
+
+		hash_optional_cstring(&ctx, path);
+		put_be32(&value, sources[i].enabled);
+		hash_length_delimited(&ctx, &value, sizeof(value));
+		if (!sources[i].enabled || !path)
+			continue;
+		put_be32(&value, 0);
+		hash_length_delimited(&ctx, &value, sizeof(value));
+	}
+	git_hash_final(hash, &ctx);
+}
+
+int attr_fingerprint_matches_legacy_absent_sources(
+	struct repository *repo, const unsigned char *expected)
+{
+	static const char shipped_system_path[] = "//etc/gitattributes";
+	struct attr_fingerprint_source sources[ATTR_SOURCE_SNAPSHOT_NR];
+	struct attr_fingerprint before, after;
+	unsigned char legacy[GIT_MAX_RAWSZ];
+	char *info_attributes = NULL;
+	int matches = 0;
+
+	if (!expected || !fstat_is_reliable() ||
+	    repository_sources(repo, sources, &info_attributes) ||
+	    !sources[ATTR_SOURCE_SNAPSHOT_SYSTEM].enabled ||
+	    attr_fingerprint_repository(repo, &before) ||
+	    before.sources_present)
+		goto done;
+	legacy_absent_source_hash(
+		sources, sources[ATTR_SOURCE_SNAPSHOT_SYSTEM].path,
+		repo->hash_algo, legacy);
+	if (!memcmp(legacy, expected, repo->hash_algo->rawsz)) {
+		matches = 1;
+	} else if (legacy_absent_path_is_stable(shipped_system_path)) {
+		legacy_absent_source_hash(
+			sources, shipped_system_path, repo->hash_algo, legacy);
+		matches = !memcmp(legacy, expected, repo->hash_algo->rawsz);
+	}
+	if (!matches || attr_fingerprint_repository(repo, &after) ||
+	    after.sources_present ||
+	    memcmp(before.content_hash, after.content_hash,
+		   repo->hash_algo->rawsz) ||
+	    memcmp(before.namespace_hash, after.namespace_hash,
+		   repo->hash_algo->rawsz))
+		matches = 0;
+
+done:
+	free(info_attributes);
+	return matches;
+}
+
 int attr_source_snapshot_repository(struct repository *repo,
 				    struct attr_source_snapshot **result)
 {

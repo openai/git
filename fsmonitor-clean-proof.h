@@ -5,7 +5,8 @@
 
 struct strbuf;
 
-#define FSMONITOR_CLEAN_PROOF_VERSION 1
+#define FSMONITOR_CLEAN_PROOF_VERSION_LEGACY 1
+#define FSMONITOR_CLEAN_PROOF_VERSION 2
 #define FSMONITOR_CLEAN_PROOF_TOKEN_MAX 4096
 
 #define FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE (1u << 0)
@@ -19,12 +20,14 @@ struct strbuf;
 	 FSMONITOR_CLEAN_PROOF_FULL_INDEX)
 
 struct fsmonitor_clean_proof {
+	uint32_t version;
 	uint32_t flags;
 	const unsigned char *token;
 	size_t token_len;
 	const unsigned char *config_hash;
 	const unsigned char *semantic_hash;
 	const unsigned char *attr_hash;
+	const unsigned char *tracked_policy_hash;
 	const unsigned char *attr_manifest;
 	size_t attr_manifest_len;
 };
