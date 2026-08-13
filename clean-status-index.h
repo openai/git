@@ -44,6 +44,8 @@ void clean_status_index_snapshot_release(
 int clean_status_index_entries_are_certifiable(
 	const struct index_state *istate);
 int clean_status_index_is_certifiable(const struct index_state *istate);
+int clean_status_index_is_certifiable_with_hardlinks(
+	const struct index_state *istate, uint32_t *hardlink_nr);
 int clean_status_index_logical_digest(const struct index_state *istate,
 				      unsigned char *out);
 int clean_status_index_logical_digest_after_status(

@@ -59,6 +59,8 @@ void clean_status_release_proof_epoch(
 
 int clean_status_fsmonitor_config_mismatch(const struct index_state *istate);
 int clean_status_fsmonitor_strong_mismatch(const struct index_state *istate);
+int clean_status_try_preserve_tracked_config_epoch(
+	struct index_state *istate);
 int clean_status_revalidated_token_matches(
 	const struct index_state *istate);
 
@@ -77,6 +79,10 @@ void clean_status_begin_fsmonitor_semantic_baseline(
 
 int clean_status_refresh_worktree_manifest(struct index_state *istate);
 int clean_status_manifest_global_fallback(const struct index_state *istate);
+int clean_status_has_authenticated_worktree_manifest(
+	const struct index_state *istate);
+int clean_status_has_authenticated_bootstrap_manifest(
+	const struct index_state *istate);
 int clean_status_worktree_manifest_needs_refresh(
 	const struct index_state *istate);
 void clean_status_invalidate_current_manifest(struct index_state *istate);
@@ -124,6 +130,12 @@ void clean_status_write_fsmonitor_config(struct strbuf *out,
 					 const struct index_state *istate);
 int clean_status_restore_external_history(struct index_state *istate);
 int clean_status_external_history_was_restored(
+	const struct index_state *istate);
+int clean_status_external_history_needs_witness_preservation(
+	const struct index_state *istate);
+int clean_status_has_recovered_tracked_stat(
+	const struct index_state *istate);
+int clean_status_external_history_owns_index(
 	const struct index_state *istate);
 void clean_status_capture_external_history_source(
 	struct index_state *istate);
