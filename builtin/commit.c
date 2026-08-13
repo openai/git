@@ -1643,7 +1643,8 @@ static int print_clean_sidecar(struct wt_status *s, const char *prefix)
 	return 1;
 }
 
-static int clean_status_sidecar_needs_reissue(struct repository *repo)
+static int clean_status_sidecar_needs_reissue(struct repository *repo,
+					     int repository_inputs_changed)
 {
 	struct clean_status_sidecar_record record =
 		CLEAN_STATUS_SIDECAR_RECORD_INIT;
@@ -1658,7 +1659,8 @@ static int clean_status_sidecar_needs_reissue(struct repository *repo)
 	if (!clean_status_sidecar_load(
 		    repo->index_file, repo->hash_algo, &record))
 		reissue = safe_existing &&
-			(!!clean_status_sidecar_pin_source(
+			(repository_inputs_changed ||
+			 !!clean_status_sidecar_pin_source(
 				 repo->index_file, &record.sidecar,
 				 repo->hash_algo, &index) ||
 			 record.sidecar.hardlink_nr > 0);
@@ -1693,6 +1695,7 @@ struct repository *repo UNUSED)
 	int reusable_clean_query;
 	int normal_has_head;
 	int reissue_clean_sidecar = 0;
+	int repository_inputs_changed = 0;
 	int reissue_after_write = 0;
 	int save_history_after_write = 0;
 	struct object_id oid;
@@ -1808,7 +1811,8 @@ struct repository *repo UNUSED)
 	clean_status_enable_external_history(the_repository);
 	s.certify_clean_status = exact_clean_query;
 	if (reusable_clean_query &&
-	    clean_status_try_sidecar(the_repository, &clean_digest)) {
+	    clean_status_try_sidecar(the_repository, &clean_digest,
+				     &repository_inputs_changed)) {
 		if (exact_clean_query ||
 		    print_clean_sidecar(&s, prefix)) {
 			wt_status_collect_free_buffers(&s);
@@ -1818,7 +1822,8 @@ struct repository *repo UNUSED)
 	if (normal_clean_query && use_optional_locks() &&
 	    clean_status_identity_is_durable())
 		reissue_clean_sidecar =
-			clean_status_sidecar_needs_reissue(the_repository);
+			clean_status_sidecar_needs_reissue(
+				the_repository, repository_inputs_changed);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
