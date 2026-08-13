@@ -6274,6 +6274,102 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'command-scoped preload tuning preserves configured filter history' '
+	test_when_finished "rm -rf configured-filter-preload" &&
+	test_create_repo configured-filter-preload &&
+	(
+		cd configured-filter-preload &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir nested &&
+		test_write_lines base >tracked &&
+		test_write_lines sibling >nested/tracked &&
+		test_write_lines "*.filtered filter=demo" \
+			"*.processed filter=protocol" >.gitattributes &&
+		git add .gitattributes tracked nested/tracked &&
+		git commit -m base &&
+		git config filter.demo.clean cat &&
+		git config filter.protocol.process \
+			"test-tool rot13-filter --log=.git/filter-process.log clean smudge" &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/prime.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/prime.trace &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+
+		for label in bulk preload both bulk-false preload-false
+		do
+			case "$label" in
+			bulk) set -- -c core.preloadIndexBulk ;;
+			preload) set -- -c core.preloadIndex ;;
+			both) set -- -c core.preloadIndexBulk -c core.preloadIndex ;;
+			bulk-false) set -- -c core.preloadIndexBulk=false ;;
+			preload-false) set -- -c core.preloadIndex=false ;;
+			esac &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$label.trace" \
+				git "$@" status --porcelain=v2 >.git/$label &&
+			test_must_be_empty .git/$label &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<.git/$label.trace &&
+			! test_trace2_data fsmonitor semantic/initial-mismatch 1 \
+				<.git/$label.trace &&
+			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+				<.git/$label.trace &&
+			! test_trace2_data fsmonitor semantic/strong-invalidation 1 \
+				<.git/$label.trace &&
+			! test_trace2_data index refresh/sum_lstat \
+				"[1-9][0-9]*" <.git/$label.trace &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$label-plain.trace" \
+				git status --porcelain=v2 >.git/$label-plain &&
+			test_must_be_empty .git/$label-plain &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<.git/$label-plain.trace &&
+			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+				<.git/$label-plain.trace || return 1
+		done &&
+
+		git config core.preloadIndexBulk true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/persistent.trace" \
+			git status --porcelain=v2 >.git/persistent &&
+		test_must_be_empty .git/persistent &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/persistent.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/persistent.trace &&
+
+		git config core.filemode false &&
+		chmod +x tracked &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			git status --porcelain=v2 >.git/filemode-prime &&
+		test_must_be_empty .git/filemode-prime &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false -c core.filemode=true \
+			status --porcelain=v2 >.git/filemode.expect &&
+		test_grep "^1 \\.M .* tracked$" .git/filemode.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/filemode.trace" \
+			git -c core.filemode=true status --porcelain=v2 \
+			>.git/filemode.actual &&
+		test_cmp .git/filemode.expect .git/filemode.actual &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/filemode.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/filemode.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'sparse index rebuilds semantic history without expansion' '
 	test_when_finished "rm -rf sparse-semantic" &&
