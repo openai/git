@@ -970,6 +970,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		git config core.fsmonitor true &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
 			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
 			git status --porcelain=v2 >.git/prime &&
 		test_must_be_empty .git/prime &&
