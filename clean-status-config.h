@@ -18,6 +18,7 @@ struct clean_status_config_digest {
 	unsigned finalized : 1;
 	unsigned filter_configured : 1;
 	unsigned semantic_config_explicit : 1;
+	unsigned attribute_tree_configured : 1;
 };
 
 void clean_status_config_init(struct clean_status_config_digest *digest,
