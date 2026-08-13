@@ -1724,6 +1724,55 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'a plain clean status reissues a proof after locale changes' '
+	test_when_finished "stop_daemon sidecar-locale-reissue" &&
+	setup_repo sidecar-locale-reissue &&
+	git -C sidecar-locale-reissue config core.untrackedCache true &&
+	issue_sidecar sidecar-locale-reissue &&
+	cp sidecar-locale-reissue/.git/index locale-reissue.index &&
+
+	test_env LANG=sidecar-locale-reissue \
+		GIT_TRACE2_EVENT="$PWD/locale-reissue.trace" \
+		git -C sidecar-locale-reissue status >locale-reissue.actual &&
+	test_grep "working tree clean" locale-reissue.actual &&
+	test_cmp_bin locale-reissue.index \
+		sidecar-locale-reissue/.git/index &&
+	test_trace2_data status clean-proof/miss fast-repository-input \
+		<locale-reissue.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<locale-reissue.trace &&
+	test_grep ! "\"label\":\"do_write_index\"" locale-reissue.trace &&
+
+	test_env LANG=sidecar-locale-reissue \
+		GIT_TRACE2_EVENT="$PWD/locale-reissue-hit.trace" \
+		git -C sidecar-locale-reissue status >locale-reissue-hit.actual &&
+	test_cmp locale-reissue.actual locale-reissue-hit.actual &&
+	test_trace2_data status clean-proof/hit 1 \
+		<locale-reissue-hit.trace &&
+	test_grep ! "\"label\":\"do_read_index\"" locale-reissue-hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a locale mismatch does not rewrite proof without optional locks' '
+	test_when_finished "stop_daemon sidecar-locale-readonly" &&
+	setup_repo sidecar-locale-readonly &&
+	git -C sidecar-locale-readonly config core.untrackedCache true &&
+	issue_sidecar sidecar-locale-readonly &&
+	cp sidecar-locale-readonly/.git/index.csts locale-readonly.sidecar &&
+
+	test_env LANG=sidecar-locale-readonly GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/locale-readonly.trace" \
+		git -C sidecar-locale-readonly status >locale-readonly.actual &&
+	test_grep "working tree clean" locale-readonly.actual &&
+	test_cmp_bin locale-readonly.sidecar \
+		sidecar-locale-readonly/.git/index.csts &&
+	test_trace2_data status clean-proof/miss fast-repository-input \
+		<locale-readonly.trace &&
+	! test_trace2_data status clean-proof/sidecar 1 \
+		<locale-readonly.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'a plain clean status repairs a stale proof with an invalid cache tree' '
 	test_when_finished "stop_daemon sidecar-invalid-tree" &&
 	setup_repo sidecar-invalid-tree &&
