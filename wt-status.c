@@ -1135,7 +1135,10 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 				s->pathspec.nr ? &s->pathspec : NULL);
 		return;
 	}
-	if (s->pathspec.nr ||
+	if ((s->pathspec.nr &&
+	     (!istate->untracked ||
+	      !istate->untracked->fsmonitor_revalidation ||
+	      !fsmonitor_pending_token_from_provider(istate))) ||
 	    s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
 	    s->show_ignored_mode)
 		return;
@@ -1166,9 +1169,13 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 	s->untracked_cache_preload =
 		untracked_cache_preload_start_ordinary(istate, dir_flags);
 	if (s->untracked_cache_preload &&
-	    istate->untracked->fsmonitor_revalidation)
+	    istate->untracked->fsmonitor_revalidation) {
 		trace2_data_intmax("status", s->repo,
 				   "untracked/provider-reset-preload", 1);
+		if (s->pathspec.nr)
+			trace2_data_intmax("status", s->repo,
+					   "untracked/provider-reset-scoped-preload", 1);
+	}
 }
 
 static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
