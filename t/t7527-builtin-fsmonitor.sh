@@ -6156,6 +6156,124 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'unused configured filters preserve staged and dry-run history' '
+	test_when_finished "rm -rf configured-filter-staged" &&
+	test_create_repo configured-filter-staged &&
+	(
+		cd configured-filter-staged &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir nested &&
+		test_write_lines base >tracked &&
+		test_write_lines sibling >nested/tracked &&
+		test_write_lines "*.filtered filter=demo" \
+			"*.processed filter=protocol" >.gitattributes &&
+		git add .gitattributes tracked nested/tracked &&
+		git commit -m base &&
+		git config filter.demo.clean cat &&
+		git config filter.protocol.process \
+			"test-tool rot13-filter --log=.git/filter-process.log clean smudge" &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/prime.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/prime.trace &&
+		test_grep FSCF .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/tracked-staged.trace" \
+			git status --porcelain=v2 >.git/tracked-staged &&
+		test_grep "^1 M\\..* tracked$" .git/tracked-staged &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/tracked-staged.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/tracked-staged.trace &&
+		! test_trace2_data status semantic_verify/prepared 1 \
+			<.git/tracked-staged.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git restore --staged tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/tracked-unstaged.trace" \
+			git status --porcelain=v2 >.git/tracked-unstaged &&
+		test_grep "^1 \\.M.* tracked$" .git/tracked-unstaged &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/tracked-unstaged.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/tracked-unstaged.trace &&
+
+		cp .git/index .git/before-dry-run.index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/dry-run.trace" \
+			git add --dry-run tracked >.git/dry-run &&
+		test_grep "^add .*tracked" .git/dry-run &&
+		test_cmp .git/before-dry-run.index .git/index &&
+		test_grep ! "\"label\":\"do_write_index\"" .git/dry-run.trace &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/after-dry-run.trace" \
+			git status --porcelain=v2 >.git/after-dry-run &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/after-dry-run.trace &&
+		! test_trace2_data fsmonitor history/external-proof-invalidated 1 \
+			<.git/after-dry-run.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/after-dry-run.trace &&
+
+		for path in new-root nested/new
+		do
+			test_write_lines added >"$path" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+			GIT_TEST_FSMONITOR_QUERY_PATH="$path" \
+				git add "$path" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/new-staged.trace" \
+				git status --porcelain=v2 >.git/new-staged &&
+			test_grep "^1 A\\..* $path$" .git/new-staged &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<.git/new-staged.trace &&
+			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+				<.git/new-staged.trace &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git restore --staged "$path" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/new-unstaged.trace" \
+				git status --porcelain=v2 >.git/new-unstaged &&
+			test_grep "^? $path$" .git/new-unstaged &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<.git/new-unstaged.trace &&
+			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+				<.git/new-unstaged.trace &&
+			rm "$path" || return 1
+		done &&
+
+		test_write_lines sensitive >active.filtered &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=active.filtered \
+			git add active.filtered &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/active-staged.trace" \
+			git status --porcelain=v2 >.git/active-staged &&
+		test_grep "^1 A\\..* active.filtered$" .git/active-staged &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/active-staged.trace &&
+		test_trace2_data semantic_verify active-filters 1 \
+			<.git/active-staged.trace &&
+		! test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/active-staged.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'sparse index rebuilds semantic history without expansion' '
 	test_when_finished "rm -rf sparse-semantic" &&
