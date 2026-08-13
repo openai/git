@@ -135,6 +135,30 @@ void test_attr_fingerprint__does_not_observe_disabled_sources(void)
 	remove_directory(directory);
 }
 
+void test_attr_fingerprint__treats_empty_source_paths_as_absent(void)
+{
+	const struct git_hash_algo *algos[] = {
+		&hash_algos[GIT_HASH_SHA1],
+		&hash_algos[GIT_HASH_SHA256],
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(algos); i++) {
+		const struct git_hash_algo *algo = algos[i];
+		struct attr_fingerprint empty, absent;
+
+		fingerprint("", 1, algo, &empty);
+		fingerprint(NULL, 1, algo, &absent);
+		cl_assert(!empty.sources_present);
+		cl_assert(!absent.sources_present);
+		cl_assert(!memcmp(empty.content_hash, absent.content_hash,
+				  algo->rawsz));
+		cl_assert(!memcmp(empty.portable_namespace_hash,
+				  absent.portable_namespace_hash, algo->rawsz));
+		cl_assert(memcmp(empty.namespace_hash, absent.namespace_hash,
+				 algo->rawsz));
+	}
+}
+
 void test_attr_fingerprint__equates_distinct_absent_source_paths(void)
 {
 #ifndef O_NONBLOCK
