@@ -1076,13 +1076,34 @@ static int restore_external_semantic_history(
 	struct clean_status_identity before_identity, after_identity;
 	struct stat before, after;
 	unsigned char witness_hash[GIT_MAX_RAWSZ];
+	struct clean_status_state *state = istate->clean_status;
 	char *path = NULL;
 	int fd = -1, transferred = 0;
+	int missing_current = 0, seeded_current = 0;
 
 	if (!checkpoint->source_alias_valid ||
-	    !has_usable_on_index_builtin_token(istate) ||
 	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC)
 		goto done;
+	if (!has_usable_on_index_builtin_token(istate)) {
+		if (!state || istate != istate->repo->index ||
+		    istate->split_index ||
+		    istate->sparse_index != INDEX_EXPANDED ||
+		    istate->fsmonitor_extension_seen ||
+		    istate->fsmonitor_token_valid ||
+		    istate->fsmonitor_last_update ||
+		    istate->fsmonitor_last_update_pending ||
+		    istate->fsmonitor_dirty ||
+		    istate->fsmonitor_untracked_extension_seen ||
+		    istate->fsmonitor_untracked_token ||
+		    istate->fsmonitor_untracked_valid ||
+		    state->disk_config_seen || state->disk_config_invalid ||
+		    state->filter_configured ||
+		    state->current_attr_sources_present ||
+		    !istate->repo->config_values_private_.trust_ctime ||
+		    !istate->repo->config_values_private_.check_stat)
+			goto done;
+		missing_current = 1;
+	}
 	path = clean_status_history_store_witness_path(
 		istate->repo->index_file, proof_namespace,
 		istate->repo->hash_algo);
@@ -1112,6 +1133,12 @@ static int restore_external_semantic_history(
 		checkpoint->fsmonitor_config_len,
 		istate->repo->hash_algo))
 		goto done;
+	if (missing_current &&
+	    ((proof.flags & FSMONITOR_CLEAN_PROOF_ALL) !=
+		FSMONITOR_CLEAN_PROOF_ALL || !checkpoint->fsmonitor_len ||
+	     !checkpoint->untracked_cache_len ||
+	     !checkpoint->fsmonitor_untracked_len))
+		goto done;
 	clean_status_release(&witness);
 	clean_status_attach_config(&witness);
 	clean_status_read_fsmonitor_config(
@@ -1124,14 +1151,48 @@ static int restore_external_semantic_history(
 	clean_status_prepare_fsmonitor_config(&witness);
 	if (!current_proof_is_writable(&witness) ||
 	    query_builtin_fsmonitor(witness.fsmonitor_last_update, &old) !=
-		FSMONITOR_QUERY_DELTA ||
-	    query_builtin_fsmonitor(istate->fsmonitor_last_update, &current) !=
-		FSMONITOR_QUERY_DELTA ||
-	    strcmp(old.token.buf, current.token.buf) ||
-	    !external_semantic_delta_is_safe(&old.paths, &witness, istate) ||
-	    !clean_status_index_snapshot_still_matches_proof_epoch(
-		    snapshot, istate))
+		FSMONITOR_QUERY_DELTA)
 		goto done;
+	if (!missing_current) {
+		if (query_builtin_fsmonitor(istate->fsmonitor_last_update,
+					    &current) != FSMONITOR_QUERY_DELTA ||
+		    strcmp(old.token.buf, current.token.buf) ||
+		    !external_semantic_delta_is_safe(&old.paths,
+						    &witness, istate) ||
+		    !clean_status_index_snapshot_still_matches_proof_epoch(
+			    snapshot, istate))
+			goto done;
+	}
+	if (missing_current) {
+		const char *changed = old.paths.buf;
+		const char *end = old.paths.buf + old.paths.len;
+
+		if (!has_usable_on_index_builtin_token(&witness) ||
+		    !old.token.len ||
+		    !starts_with(old.token.buf, "builtin:") ||
+		    !strcmp(old.token.buf, "builtin:fake") ||
+		    !external_semantic_delta_is_safe(&old.paths,
+						    &witness, istate) ||
+		    !clean_status_index_snapshot_still_matches_proof_epoch(
+			    snapshot, istate))
+			goto done;
+		while (changed < end) {
+			if (!strcmp(changed, FSMONITOR_PATH_GLOBAL_INVALIDATE))
+				goto done;
+			changed += strlen(changed) + 1;
+		}
+		if (changed != end)
+			goto done;
+		for (size_t i = 0; i < istate->cache_nr; i++)
+			if (istate->cache[i]->ce_flags & CE_FSMONITOR_VALID)
+				goto done;
+		istate->fsmonitor_last_update =
+			xstrdup(witness.fsmonitor_last_update);
+		istate->fsmonitor_token_valid = 1;
+		istate->fsmonitor_extension_seen = 1;
+		fill_fsmonitor_bitmap(istate);
+		seeded_current = 1;
+	}
 	if (strcmp(witness.fsmonitor_last_update,
 		   istate->fsmonitor_last_update)) {
 		clean_status_advance_fsmonitor_config_token(
@@ -1148,13 +1209,31 @@ static int restore_external_semantic_history(
 			istate, &witness, &old.paths);
 		restore_external_tracked_history(
 			istate, &witness, checkpoint, &old.paths, &proof);
+		if (missing_current && istate->fsmonitor_dirty)
+			ewah_each_bit(istate->fsmonitor_dirty,
+				      invalidate_unwatched_recovered_entry, istate);
 		restore_external_untracked_history(
 			istate, &witness, checkpoint, &old.paths, &proof);
 		trace2_data_intmax("fsmonitor", istate->repo,
 				   "history/external-semantic-restored", 1);
+		if (missing_current)
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "history/external-fsmn-recovered", 1);
 	}
 
 done:
+	if (seeded_current && !transferred) {
+		FREE_AND_NULL(istate->fsmonitor_last_update);
+		istate->fsmonitor_token_valid = 0;
+		istate->fsmonitor_extension_seen = 0;
+		if (istate->fsmonitor_dirty)
+			ewah_free(istate->fsmonitor_dirty);
+		istate->fsmonitor_dirty = NULL;
+		for (size_t i = 0; i < istate->cache_nr; i++)
+			istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
+		clean_status_release(istate);
+		clean_status_attach_config(istate);
+	}
 	if (fd >= 0)
 		close(fd);
 	free(path);
