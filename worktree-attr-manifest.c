@@ -5,6 +5,7 @@
 #include "environment.h"
 #include "gettext.h"
 #include "hash-framing.h"
+#include "mem-pool.h"
 #include "object.h"
 #include "odb.h"
 #include "parse.h"
@@ -46,18 +47,23 @@ struct attr_manifest_thread {
 };
 
 static int collect_candidates(struct index_state *istate,
-			      struct string_list *candidates)
+			      struct string_list *candidates,
+			      struct string_list *index_sources,
+			      struct mem_pool *candidate_pool)
 {
 	struct strbuf candidate = STRBUF_INIT;
 	const char *previous = NULL;
 	size_t previous_len = 0;
 	unsigned int i;
+	int sorted = 1;
 	int ret = -1;
 
-	string_list_append(candidates, GITATTRIBUTES_FILE);
+	string_list_append(candidates,
+			   mem_pool_strdup(candidate_pool, GITATTRIBUTES_FILE));
 	for (i = 0; i < istate->cache_nr; i++) {
 		const struct cache_entry *ce = istate->cache[i];
 		const char *slash = ce->name;
+		const char *basename = ce->name;
 
 		if (ce_stage(ce) || S_ISSPARSEDIR(ce->ce_mode))
 			goto done;
@@ -67,17 +73,32 @@ static int collect_candidates(struct index_state *istate,
 			if (!previous || previous_len <= len ||
 			    !is_dir_sep(previous[len]) ||
 			    fspathncmp(previous, ce->name, len)) {
+				const char *last;
+
 				strbuf_reset(&candidate);
 				strbuf_add(&candidate, ce->name, len + 1);
 				strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
-				string_list_append(candidates, candidate.buf);
+				last = candidates->items[candidates->nr - 1].string;
+				if (strcmp(last, candidate.buf) > 0)
+					sorted = 0;
+				string_list_append(
+					candidates,
+					mem_pool_strdup(candidate_pool, candidate.buf));
 			}
-			slash++;
+			basename = ++slash;
+		}
+		if (!fspathcmp(basename, GITATTRIBUTES_FILE)) {
+			strbuf_reset(&candidate);
+			strbuf_add(&candidate, ce->name, basename - ce->name);
+			strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+			string_list_append(index_sources, candidate.buf)->util =
+				(void *)ce;
 		}
 		previous = ce->name;
 		previous_len = ce->ce_namelen;
 	}
-	string_list_sort(candidates);
+	if (!sorted)
+		string_list_sort(candidates);
 	string_list_remove_duplicates(candidates, 0);
 	ret = candidates->nr <= UINT32_MAX ? 0 : -1;
 done:
@@ -86,32 +107,26 @@ done:
 }
 
 static int collect_index_sources(struct index_state *istate,
-				 struct string_list *candidates)
+				 struct string_list *candidates,
+				 struct string_list *index_sources,
+				 struct attr_manifest_candidate **states_out)
 {
-	struct strbuf candidate = STRBUF_INIT;
-	unsigned int i;
+	struct attr_manifest_candidate *states;
+	size_t i;
 	int ret = 0;
 
+	CALLOC_ARRAY(states, candidates->nr);
+	*states_out = states;
 	for (i = 0; i < candidates->nr; i++) {
-		struct attr_manifest_candidate *state;
-
-		CALLOC_ARRAY(state, 1);
-		candidates->items[i].util = state;
+		candidates->items[i].util = &states[i];
 	}
-	for (i = 0; i < istate->cache_nr; i++) {
-		const struct cache_entry *ce = istate->cache[i];
-		const char *base = strrchr(ce->name, '/');
+	for (i = 0; i < index_sources->nr; i++) {
+		const struct cache_entry *ce = index_sources->items[i].util;
 		struct string_list_item *item;
 		struct attr_manifest_candidate *state;
 
-		base = base ? base + 1 : ce->name;
-		if (fspathcmp(base, GITATTRIBUTES_FILE))
-			continue;
-		strbuf_reset(&candidate);
-		if (base != ce->name)
-			strbuf_add(&candidate, ce->name, base - ce->name);
-		strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
-		item = string_list_lookup(candidates, candidate.buf);
+		item = string_list_lookup(candidates,
+					  index_sources->items[i].string);
 		if (!item)
 			BUG("tracked attribute source lacks manifest candidate");
 		state = item->util;
@@ -125,7 +140,6 @@ static int collect_index_sources(struct index_state *istate,
 			break;
 		}
 	}
-	strbuf_release(&candidate);
 	return ret;
 }
 
@@ -244,7 +258,10 @@ int worktree_attr_manifest_build(
 	unsigned char *manifest_hash,
 	struct worktree_attr_manifest_stats *stats)
 {
-	struct string_list candidates = STRING_LIST_INIT_DUP;
+	struct string_list candidates = STRING_LIST_INIT_NODUP;
+	struct string_list index_sources = STRING_LIST_INIT_DUP;
+	struct mem_pool candidate_pool;
+	struct attr_manifest_candidate *states = NULL;
 	struct semantic_verify_root *root = NULL;
 	struct attr_manifest_writer writer;
 	const struct git_hash_algo *algo = istate->repo->hash_algo;
@@ -252,10 +269,13 @@ int worktree_attr_manifest_build(
 	int ret = -1;
 
 	memset(stats, 0, sizeof(*stats));
+	mem_pool_init(&candidate_pool, 0);
 	if (istate->sparse_index != INDEX_EXPANDED ||
 	    semantic_verify_root_init(istate->repo, &root) ||
-	    collect_candidates(istate, &candidates) ||
-	    collect_index_sources(istate, &candidates))
+	    collect_candidates(istate, &candidates, &index_sources,
+			       &candidate_pool) ||
+	    collect_index_sources(istate, &candidates, &index_sources,
+				  &states))
 		goto done;
 	stats->candidates = candidates.nr;
 	if (probe_candidates(&candidates, istate->repo, root, algo, stats))
@@ -291,7 +311,10 @@ int worktree_attr_manifest_build(
 	ret = 0;
 done:
 	semantic_verify_root_clear(root);
-	string_list_clear(&candidates, 1);
+	string_list_clear(&index_sources, 0);
+	string_list_clear(&candidates, 0);
+	mem_pool_discard(&candidate_pool, 0);
+	free(states);
 	if (ret)
 		strbuf_reset(manifest);
 	return ret;

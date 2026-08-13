@@ -723,6 +723,272 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider reset revalidates authenticated untracked directories' '
+	test_when_finished "rm -rf builtin-reset-untracked" &&
+	test_create_repo builtin-reset-untracked &&
+	(
+		cd builtin-reset-untracked &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep sibling/empty &&
+		test_write_lines "*.root-ignored" >.gitignore &&
+		test_write_lines "*.nested-ignored" >cached/.gitignore &&
+		test_write_lines tracked >cached/deep/tracked &&
+		test_write_lines sibling >sibling/empty/tracked &&
+		test_write_lines hidden >cached/deep/hidden.nested-ignored &&
+		test_write_lines hidden >sibling/hidden.root-ignored &&
+		test_write_lines visible >cached/deep/retained &&
+		git add .gitignore cached/.gitignore cached/deep/tracked \
+			sibling/empty/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test-tool chmtime =-60 cached/deep cached \
+			sibling/empty sibling . &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		for prime in first second third
+		do
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+				git status --porcelain=v2 >.git/prime || return 1
+		done &&
+		test_grep "^? cached/deep/retained$" .git/prime &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/reset.trace" \
+			git status --porcelain=v2 >.git/reset.actual &&
+		test_cmp .git/prime .git/reset.actual &&
+		test_trace2_data fsmonitor \
+			untracked/provider-reset-preserved 1 <.git/reset.trace &&
+		test_trace2_data status \
+			untracked/provider-reset-preload 1 <.git/reset.trace &&
+		test_trace2_data dir preload_untracked_cache/valid 1 \
+			<.git/reset.trace &&
+		test_trace2_data read_directory opendir 0 <.git/reset.trace &&
+		test_trace2_data fsmonitor \
+			untracked/provider-reset-revalidated 1 <.git/reset.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/reset.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'scoped provider resets validate the complete cache in parallel' '
+	test_when_finished "rm -rf builtin-reset-scoped" &&
+	test_create_repo builtin-reset-scoped &&
+	(
+		cd builtin-reset-scoped &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep &&
+		test_write_lines "*.root-ignored" >.gitignore &&
+		test_write_lines "*.nested-ignored" >cached/.gitignore &&
+		test_write_lines tracked >cached/deep/tracked &&
+		test_write_lines visible >cached/deep/retained &&
+		test_write_lines hidden >cached/deep/hidden.nested-ignored &&
+		for nr in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16
+		do
+			mkdir "outside-$nr" &&
+			test_write_lines "$nr" >"outside-$nr/tracked" || return 1
+		done &&
+		test_write_lines outside >outside-01/retained &&
+		test_write_lines hidden >outside-01/hidden.root-ignored &&
+		git add .gitignore cached/.gitignore cached/deep/tracked \
+			outside-*/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test-tool chmtime =-60 cached/deep cached outside-* . &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		for prime in first second third
+		do
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+				git status --porcelain=v2 >.git/prime || return 1
+		done &&
+		test_grep "^? cached/deep/retained$" .git/prime &&
+		test_grep "^? outside-01/retained$" .git/prime &&
+		test_grep FSUC .git/index &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				status --porcelain=v2 -- cached/deep >.git/scoped.expect &&
+		for workers in 6 8 12 16
+		do
+			rm -f .git/index.csts &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+			GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+			GIT_TEST_UNTRACKED_CACHE_THREADS="$workers" \
+			GIT_TRACE2_EVENT="$PWD/.git/scoped-$workers.trace" \
+				git status --porcelain=v2 -- cached/deep \
+				>.git/scoped.actual &&
+			test_cmp .git/scoped.expect .git/scoped.actual &&
+			test_trace2_data dir preload_untracked_cache/threads \
+				"$workers" <".git/scoped-$workers.trace" &&
+			test_trace2_data status \
+				untracked/provider-reset-scoped-preload 1 \
+				<".git/scoped-$workers.trace" &&
+			test_trace2_data fsmonitor token_closure/accepted 1 \
+				<".git/scoped-$workers.trace" || return 1
+		done &&
+
+		test_write_lines outside-new >outside-01/new &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=8 \
+		GIT_TRACE2_EVENT="$PWD/.git/outside.trace" \
+			git status --porcelain=v2 -- cached/deep \
+			>.git/outside.actual &&
+		test_cmp .git/scoped.expect .git/outside.actual &&
+		test_trace2_data dir preload_untracked_cache/valid 0 \
+			<.git/outside.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/outside.trace &&
+
+		test_write_lines retained >cached/.gitignore &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				status --porcelain=v2 -- cached/deep \
+				>.git/ignore.expect &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=8 \
+		GIT_TRACE2_EVENT="$PWD/.git/ignore.trace" \
+			git status --porcelain=v2 -- cached/deep \
+			>.git/ignore.actual &&
+		test_cmp .git/ignore.expect .git/ignore.actual &&
+		test_grep "^? cached/deep/hidden.nested-ignored$" \
+			.git/ignore.actual &&
+		test_grep ! "^? cached/deep/retained$" .git/ignore.actual &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/ignore.trace &&
+
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=// \
+		GIT_TRACE2_EVENT="$PWD/.git/global.trace" \
+			git status --porcelain=v2 -- cached/deep \
+			>.git/global.actual &&
+		test_cmp .git/ignore.expect .git/global.actual &&
+		test_trace2_data fsmonitor apply/global-invalidation 1 \
+			<.git/global.trace &&
+		! test_trace2_data status \
+			untracked/provider-reset-scoped-preload 1 \
+			<.git/global.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider reset detects new nested untracked and ignore changes' '
+	test_when_finished "rm -rf builtin-reset-changed" &&
+	test_create_repo builtin-reset-changed &&
+	(
+		cd builtin-reset-changed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep sibling/empty &&
+		test_write_lines hidden >cached/.gitignore &&
+		test_write_lines tracked >cached/deep/tracked &&
+		test_write_lines sibling >sibling/empty/tracked &&
+		test_write_lines hidden >cached/deep/hidden &&
+		git add cached/.gitignore cached/deep/tracked \
+			sibling/empty/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test-tool chmtime =-60 cached/deep cached \
+			sibling/empty sibling . &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		for prime in first second third
+		do
+			GIT_INDEX_FILE="$PWD/.git/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+				git status --porcelain=v2 >.git/prime || return 1
+		done &&
+		test_must_be_empty .git/prime &&
+		test_grep FSUC .git/index &&
+		test_write_lines visible >cached/deep/new &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				status --porcelain=v2 >.git/new.expect &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/new.trace" \
+			git status --porcelain=v2 >.git/new.actual &&
+		test_cmp .git/new.expect .git/new.actual &&
+		test_grep "^? cached/deep/new$" .git/new.actual &&
+		test_trace2_data fsmonitor \
+			untracked/provider-reset-preserved 1 <.git/new.trace &&
+		test_trace2_data dir preload_untracked_cache/valid 0 \
+			<.git/new.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/new.trace &&
+
+		test_write_lines other >cached/.gitignore &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				status --porcelain=v2 >.git/ignore.expect &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/ignore.trace" \
+			git status --porcelain=v2 >.git/ignore.actual &&
+		test_cmp .git/ignore.expect .git/ignore.actual &&
+		test_grep "^1 \\.M .* cached/.gitignore$" .git/ignore.actual &&
+		test_grep "^? cached/deep/hidden$" .git/ignore.actual &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/ignore.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'global provider invalidation never preserves untracked snapshots' '
+	test_when_finished "rm -rf builtin-reset-global" &&
+	test_create_repo builtin-reset-global &&
+	(
+		cd builtin-reset-global &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines tracked >cached/tracked &&
+		git add cached/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSUC .git/index &&
+		test_write_lines visible >cached/new &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=// \
+		GIT_TRACE2_EVENT="$PWD/.git/global.trace" \
+			git status --porcelain=v2 >.git/global.actual &&
+		test_grep "^? cached/new$" .git/global.actual &&
+		test_trace2_data fsmonitor apply/global-invalidation 1 \
+			<.git/global.trace &&
+		! test_trace2_data fsmonitor \
+			untracked/provider-reset-preserved 1 <.git/global.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'builtin changed closure rescans before acceptance' '
 	test_when_finished "rm -rf builtin-closure-changed" &&
