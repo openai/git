@@ -122,6 +122,7 @@ struct untracked_cache_preload {
 };
 
 #define UNTRACKED_CACHE_MAX_OVERLAP_THREADS 6
+#define UNTRACKED_CACHE_MAX_RECOVERY_THREADS 16
 #define UNTRACKED_CACHE_PRELOAD_COST 1000
 #define UNTRACKED_CACHE_EXCLUDE_PRELOAD_COST 256
 #define UNTRACKED_CACHE_MAX_EXCLUDE_SIZE (1024 * 1024)
@@ -451,9 +452,13 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 	if (threads > UNTRACKED_CACHE_MAX_OVERLAP_THREADS)
 		threads = UNTRACKED_CACHE_MAX_OVERLAP_THREADS;
 	test_threads = git_env_ulong("GIT_TEST_UNTRACKED_CACHE_THREADS", 0);
-	if (test_threads && HAVE_THREADS)
-		threads = test_threads > UNTRACKED_CACHE_MAX_OVERLAP_THREADS ?
-			UNTRACKED_CACHE_MAX_OVERLAP_THREADS : test_threads;
+	if (test_threads && HAVE_THREADS) {
+		unsigned long limit = fsmonitor_excludes_only ?
+			UNTRACKED_CACHE_MAX_OVERLAP_THREADS :
+			UNTRACKED_CACHE_MAX_RECOVERY_THREADS;
+
+		threads = test_threads > limit ? limit : test_threads;
+	}
 	if (threads < 1)
 		threads = 1;
 	if (preload->nr && (size_t)threads > preload->nr)
