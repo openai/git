@@ -406,31 +406,24 @@ static void symdiff_release(struct symdiff *sdiff)
 
 void prepare_diff_external_history(struct repository *repo)
 {
-	struct clean_status_sidecar_record sidecar =
-		CLEAN_STATUS_SIDECAR_RECORD_INIT;
 	struct clean_status_config_digest digest;
 	struct worktree *worktree = NULL;
 
 	if (!fstat_is_reliable() || getenv(INDEX_ENVIRONMENT) ||
 	    is_bare_repository(repo) || !repo_get_work_tree(repo) ||
 	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
-	    repo_config_values(repo)->apply_sparse_checkout ||
-	    clean_status_sidecar_load(repo_get_index_file(repo),
-				      repo->hash_algo, &sidecar))
+	    repo_config_values(repo)->apply_sparse_checkout)
 		goto done;
 	worktree = get_current_worktree(repo);
 	if (!worktree || !is_main_worktree(worktree) ||
 	    clean_status_config_read_repository(repo, &digest) ||
-	    digest.filter_configured ||
-	    memcmp(digest.hash, sidecar.sidecar.proof.config_hash,
-		   repo->hash_algo->rawsz))
+	    digest.filter_configured)
 		goto done;
 	clean_status_set_config_digest(repo, &digest);
 	clean_status_enable_external_history(repo);
 
 done:
 	free_worktree(worktree);
-	clean_status_sidecar_record_release(&sidecar);
 }
 
 int cmd_diff(int argc,

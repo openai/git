@@ -671,9 +671,11 @@ static int checkout_paths(const struct checkout_opts *opts,
 		!opts->merge && !opts->writeout_stage;
 	if ((opts->checkout_worktree && !opts->source_tree &&
 	     !opts->merge && !opts->writeout_stage) ||
-	    preserve_source_tree_history)
+	    preserve_source_tree_history) {
+		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository,
 					       &opts->clean_digest);
+	}
 	if (repo_read_index_preload(the_repository, &opts->pathspec, 0) < 0)
 		return error(_("index file corrupt"));
 
@@ -916,9 +918,11 @@ static int merge_working_tree(const struct checkout_opts *opts,
 	 * proof only after it proves that the rebuilt index is identical.
 	 */
 	if (opts->discard_changes ||
-	    (!opts->merge && !opts->new_orphan_branch))
+	    (!opts->merge && !opts->new_orphan_branch)) {
+		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository,
 					       &opts->clean_digest);
+	}
 	if (repo_read_index_preload(the_repository, NULL, 0) < 0) {
 		rollback_lock_file(&lock_file);
 		return error(_("index file corrupt"));

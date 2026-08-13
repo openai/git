@@ -162,6 +162,7 @@ static int my_app_data = 42;
 static int fsmonitor_legacy;
 static int fsmonitor_capability_superset;
 static int fsmonitor_pre_dir_metadata;
+static int fsmonitor_disconnect_first;
 
 static ipc_server_application_cb test_app_cb;
 
@@ -222,6 +223,10 @@ static int test_app_cb(void *application_data,
 	 */
 	if (application_data != (void*)&my_app_data)
 		BUG("application_cb: application_data pointer wrong");
+
+	/* Exit before the server can flush a response to this bound query. */
+	if (fsmonitor_disconnect_first && starts_with(command, "query-v1 "))
+		_exit(0);
 
 	if (command_len == 4 && !strncmp(command, "quit", 4)) {
 		/*
@@ -372,6 +377,8 @@ static int daemon__start_server(void)
 		strvec_push(&cp.args, "--fsmonitor-capability-superset");
 	if (fsmonitor_pre_dir_metadata)
 		strvec_push(&cp.args, "--fsmonitor-pre-dir-metadata");
+	if (fsmonitor_disconnect_first)
+		strvec_push(&cp.args, "--fsmonitor-disconnect-first");
 
 	cp.no_stdin = 1;
 	cp.no_stdout = 1;
@@ -672,6 +679,9 @@ int cmd__simple_ipc(int argc, const char **argv)
 		OPT_BOOL(0, "fsmonitor-pre-dir-metadata",
 			 &fsmonitor_pre_dir_metadata,
 			 N_("emulate a daemon without directory metadata filtering")),
+		OPT_BOOL(0, "fsmonitor-disconnect-first",
+			 &fsmonitor_disconnect_first,
+			 N_("disconnect while handling the first fsmonitor query")),
 
 		/*
 		 * The "byte" string here is not marked for translation and

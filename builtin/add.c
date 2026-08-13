@@ -511,11 +511,13 @@ int cmd_add(int argc,
 	 * add/remove decision below.
 	 */
 	if (refresh_only) {
+		clean_status_enable_external_history(repo);
 		clean_status_set_config_digest(repo, &clean_digest);
 	} else if (!show_only && !intent_to_add && !add_renormalize &&
 		   !chmod_arg && !include_sparse && !ignore_add_errors) {
 		preserve_add_history = 1;
 		flags |= ADD_CACHE_TRACK_CLEAN_HISTORY;
+		clean_status_enable_external_history(repo);
 		clean_status_set_config_digest(repo, &clean_digest);
 	}
 

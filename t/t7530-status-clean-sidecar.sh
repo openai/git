@@ -55,7 +55,8 @@ prime_semantic_history () {
 	repo=$1 &&
 	bulk_status -C "$repo" status --porcelain=2 >actual.1 &&
 	test_must_be_empty actual.1 &&
-	bulk_status -C "$repo" status --porcelain=2 >actual.2 &&
+	test_env GIT_INDEX_FILE="$PWD/$repo/.git/index" \
+		bulk_status -C "$repo" status --porcelain=2 >actual.2 &&
 	test_must_be_empty actual.2 &&
 	test_grep FSCF "$repo/.git/index" &&
 	rm -f "$repo"/.git/index.csh1.*
@@ -287,6 +288,675 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_grep "\"key\":\"clean-proof/hit\"" hit.trace &&
 	test_grep ! "\"label\":\"do_read_index\"" hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'ordinary clean status installs its first missing sidecar' '
+	test_when_finished "stop_daemon sidecar-plain-first" &&
+	setup_repo sidecar-plain-first &&
+	git -C sidecar-plain-first config core.autocrlf false &&
+	git -C sidecar-plain-first config core.untrackedCache true &&
+	prime_semantic_history sidecar-plain-first &&
+	test_path_is_missing sidecar-plain-first/.git/index.csts &&
+	cp sidecar-plain-first/.git/index plain-first.index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-C sidecar-plain-first status >plain-first.expect &&
+	test_env GIT_TRACE2_EVENT="$PWD/plain-first.trace" \
+		git -C sidecar-plain-first status >plain-first.actual &&
+	test_cmp plain-first.expect plain-first.actual &&
+	test_cmp plain-first.index sidecar-plain-first/.git/index &&
+	test_path_is_file sidecar-plain-first/.git/index.csts &&
+	test_trace2_data fsmonitor config/coherent 1 \
+		<plain-first.trace &&
+	! test_trace2_data fsmonitor history/external-restored 1 \
+		<plain-first.trace &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<plain-first.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<plain-first.trace &&
+	test_grep ! "\"key\":\"semantic/manifest-scan-count\"" \
+		plain-first.trace &&
+	test_grep ! "\"label\":\"do_write_index\"" plain-first.trace &&
+	assert_clean_sidecar_hit sidecar-plain-first sidecar-plain-first \
+		plain-first-hit
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'ordinary status never certifies dirty tracked or untracked files' '
+	test_when_finished "stop_daemon sidecar-plain-dirty" &&
+	setup_repo sidecar-plain-dirty &&
+	git -C sidecar-plain-dirty config core.autocrlf false &&
+	git -C sidecar-plain-dirty config core.untrackedCache true &&
+	prime_semantic_history sidecar-plain-dirty &&
+	test_path_is_missing sidecar-plain-dirty/.git/index.csts &&
+	cp sidecar-plain-dirty/tracked plain-dirty.tracked &&
+	test_write_lines changed >sidecar-plain-dirty/tracked &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-C sidecar-plain-dirty status >plain-dirty-tracked.expect &&
+	test_env GIT_TRACE2_EVENT="$PWD/plain-dirty-tracked.trace" \
+		git -C sidecar-plain-dirty status \
+			>plain-dirty-tracked.actual &&
+	test_cmp plain-dirty-tracked.expect plain-dirty-tracked.actual &&
+	test_trace2_data status count/changed 1 \
+		<plain-dirty-tracked.trace &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" \
+		plain-dirty-tracked.trace &&
+	test_path_is_missing sidecar-plain-dirty/.git/index.csts &&
+
+	cp plain-dirty.tracked sidecar-plain-dirty/tracked &&
+	test-tool chmtime -120 sidecar-plain-dirty/tracked &&
+	git -C sidecar-plain-dirty update-index --refresh &&
+	prime_semantic_history sidecar-plain-dirty &&
+	test_write_lines untracked >sidecar-plain-dirty/untracked &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-C sidecar-plain-dirty status >plain-dirty-untracked.expect &&
+	test_env GIT_TRACE2_EVENT="$PWD/plain-dirty-untracked.trace" \
+		git -C sidecar-plain-dirty status \
+			>plain-dirty-untracked.actual &&
+	test_cmp plain-dirty-untracked.expect \
+		plain-dirty-untracked.actual &&
+	test_trace2_data status count/untracked 1 \
+		<plain-dirty-untracked.trace &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" \
+		plain-dirty-untracked.trace &&
+	test_path_is_missing sidecar-plain-dirty/.git/index.csts &&
+
+	rm sidecar-plain-dirty/untracked &&
+	test_env GIT_TRACE2_EVENT="$PWD/plain-dirty-recovered.trace" \
+		git -C sidecar-plain-dirty status >plain-dirty-recovered.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		plain-dirty-recovered.actual &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<plain-dirty-recovered.trace &&
+	assert_clean_sidecar_hit sidecar-plain-dirty sidecar-plain-dirty \
+		plain-dirty-recovered-hit
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'clean sidecars revalidate tracked hardlinks and ignored aliases' '
+	test_when_finished "stop_daemon sidecar-hardlink" &&
+	setup_repo sidecar-hardlink &&
+	test_write_lines "/ignored/" >sidecar-hardlink/.gitignore &&
+	git -C sidecar-hardlink add .gitignore &&
+	git -C sidecar-hardlink commit -qm ignores &&
+	mkdir sidecar-hardlink/ignored &&
+	ln sidecar-hardlink/tracked sidecar-hardlink/ignored/alias &&
+	test-tool -C sidecar-hardlink chmtime -120 tracked .gitignore &&
+	git -C sidecar-hardlink update-index --refresh &&
+	git -C sidecar-hardlink config core.autocrlf false &&
+	git -C sidecar-hardlink config core.untrackedCache true &&
+	git -C sidecar-hardlink config core.trustctime true &&
+	git -C sidecar-hardlink config core.checkStat default &&
+	prime_semantic_history sidecar-hardlink &&
+	test_path_is_missing sidecar-hardlink/.git/index.csts &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlink-issue.trace" \
+		git -C sidecar-hardlink status >hardlink-issue.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlink-issue.actual &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-issue.trace &&
+	test_trace2_data status clean-proof/hardlink-witnesses 1 \
+		<hardlink-issue.trace &&
+	test_path_is_file sidecar-hardlink/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-hardlink sidecar-hardlink \
+		hardlink-clean-hit &&
+	test_trace2_data status clean-proof/hardlink-validated 1 \
+		<hardlink-clean-hit.trace &&
+
+	mtime=$(test-tool chmtime --get sidecar-hardlink/tracked) &&
+	printf "xxxx\\n" >sidecar-hardlink/ignored/alias &&
+	test-tool chmtime =$mtime sidecar-hardlink/ignored/alias &&
+	test "$(git -C sidecar-hardlink hash-object tracked)" != \
+		"$(git -C sidecar-hardlink rev-parse HEAD:tracked)" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/hardlink-dirty.trace" \
+		git -C sidecar-hardlink status --porcelain=v2 \
+			>hardlink-dirty.actual &&
+	test_grep "^1 \\.M .* tracked$" hardlink-dirty.actual &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" hardlink-dirty.trace &&
+	test_grep "fast-hardlink-changed" hardlink-dirty.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'explicitly invalid tracked hardlinks keep authenticated clean proofs' '
+	test_when_finished "stop_daemon sidecar-hardlinks-invalid" &&
+	setup_repo sidecar-hardlinks-invalid &&
+	test_write_lines "/ignored/" \
+		>sidecar-hardlinks-invalid/.gitignore &&
+	printf "bbbb\\n" >sidecar-hardlinks-invalid/other &&
+	git -C sidecar-hardlinks-invalid add .gitignore other &&
+	git -C sidecar-hardlinks-invalid commit -qm hardlinks &&
+	mkdir sidecar-hardlinks-invalid/ignored &&
+	ln sidecar-hardlinks-invalid/tracked \
+		sidecar-hardlinks-invalid/ignored/tracked &&
+	ln sidecar-hardlinks-invalid/other \
+		sidecar-hardlinks-invalid/ignored/other &&
+	test-tool -C sidecar-hardlinks-invalid \
+		chmtime -120 tracked other .gitignore &&
+	git -C sidecar-hardlinks-invalid update-index --refresh &&
+	git -C sidecar-hardlinks-invalid config core.autocrlf false &&
+	git -C sidecar-hardlinks-invalid config core.untrackedCache true &&
+	git -C sidecar-hardlinks-invalid config core.trustctime true &&
+	git -C sidecar-hardlinks-invalid config core.checkStat default &&
+	prime_semantic_history sidecar-hardlinks-invalid &&
+	test_grep FSCF sidecar-hardlinks-invalid/.git/index &&
+	test_grep FSUC sidecar-hardlinks-invalid/.git/index &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlinks-invalid-checkpoint.trace" \
+		git -C sidecar-hardlinks-invalid status \
+			>hardlinks-invalid-checkpoint.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlinks-invalid-checkpoint.actual &&
+	test_trace2_data fsmonitor history/external-stored 1 \
+		<hardlinks-invalid-checkpoint.trace &&
+	find sidecar-hardlinks-invalid/.git -maxdepth 1 -type f \
+		-name "index.csh1.*" >hardlinks-invalid.checkpoints &&
+	test_line_count = 1 hardlinks-invalid.checkpoints &&
+	rm -f sidecar-hardlinks-invalid/.git/index.csts &&
+	rm sidecar-hardlinks-invalid/.git/index &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-C sidecar-hardlinks-invalid read-tree HEAD &&
+	test_grep ! FSCF sidecar-hardlinks-invalid/.git/index &&
+	test_grep ! FSMN sidecar-hardlinks-invalid/.git/index &&
+	GIT_TRACE2_EVENT="$PWD/hardlinks-invalid-refresh.trace" \
+		git -C sidecar-hardlinks-invalid update-index \
+			--refresh -- tracked &&
+	test_trace2_data fsmonitor history/external-restored 1 \
+		<hardlinks-invalid-refresh.trace &&
+	test_grep FSCF sidecar-hardlinks-invalid/.git/index &&
+	test_grep FSUC sidecar-hardlinks-invalid/.git/index &&
+	test-tool -C sidecar-hardlinks-invalid dump-cache-tree \
+		>hardlinks-invalid.tree-before &&
+	test_grep ! "^invalid " hardlinks-invalid.tree-before &&
+	GIT_TRACE2_EVENT="$PWD/hardlinks-invalid-update.trace" \
+		git -C sidecar-hardlinks-invalid update-index \
+			--no-fsmonitor-valid tracked other &&
+	test_grep FSCF sidecar-hardlinks-invalid/.git/index &&
+	test_grep FSUC sidecar-hardlinks-invalid/.git/index &&
+	test-tool -C sidecar-hardlinks-invalid dump-cache-tree \
+		>hardlinks-invalid.tree-after &&
+	test_grep ! "^invalid " hardlinks-invalid.tree-after &&
+	test_cmp hardlinks-invalid.tree-before hardlinks-invalid.tree-after &&
+	GIT_TRACE2_EVENT="$PWD/hardlinks-invalid-separated.trace" \
+		git -C sidecar-hardlinks-invalid update-index \
+			--no-fsmonitor-valid -- tracked other &&
+	test_grep FSCF sidecar-hardlinks-invalid/.git/index &&
+	test_grep FSUC sidecar-hardlinks-invalid/.git/index &&
+	test-tool -C sidecar-hardlinks-invalid dump-cache-tree \
+		>hardlinks-invalid.tree-separated &&
+	test_cmp hardlinks-invalid.tree-before \
+		hardlinks-invalid.tree-separated &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlinks-invalid-issue.trace" \
+		git -C sidecar-hardlinks-invalid status \
+			>hardlinks-invalid-issue.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlinks-invalid-issue.actual &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<hardlinks-invalid-issue.trace &&
+	test_trace2_data status clean-proof/hardlink-witnesses 2 \
+		<hardlinks-invalid-issue.trace &&
+	! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+		<hardlinks-invalid-issue.trace &&
+	assert_clean_sidecar_hit sidecar-hardlinks-invalid \
+		sidecar-hardlinks-invalid hardlinks-invalid-clean-hit &&
+	test_trace2_data status clean-proof/hardlink-validated 2 \
+		<hardlinks-invalid-clean-hit.trace &&
+	mtime=$(test-tool chmtime --get \
+		sidecar-hardlinks-invalid/tracked) &&
+	printf "xxxx\\n" \
+		>sidecar-hardlinks-invalid/ignored/tracked &&
+	test-tool chmtime =$mtime \
+		sidecar-hardlinks-invalid/ignored/tracked &&
+	test "$(git -C sidecar-hardlinks-invalid hash-object tracked)" \
+		!= "$(git -C sidecar-hardlinks-invalid \
+			rev-parse HEAD:tracked)" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/hardlinks-invalid-dirty.trace" \
+		git -C sidecar-hardlinks-invalid status --porcelain=v2 \
+			>hardlinks-invalid-dirty.actual &&
+	test_grep "^1 \\.M .* tracked$" hardlinks-invalid-dirty.actual &&
+	test_grep "fast-hardlink-changed" hardlinks-invalid-dirty.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a racy scoped hardlink refresh still installs a clean sidecar' '
+	test_when_finished "stop_daemon sidecar-hardlink-racy" &&
+	setup_repo sidecar-hardlink-racy &&
+	test_write_lines "/ignored/" >sidecar-hardlink-racy/.gitignore &&
+	git -C sidecar-hardlink-racy add .gitignore &&
+	git -C sidecar-hardlink-racy commit -qm ignores &&
+	git -C sidecar-hardlink-racy config core.autocrlf false &&
+	git -C sidecar-hardlink-racy config core.untrackedCache true &&
+	git -C sidecar-hardlink-racy config core.trustctime true &&
+	git -C sidecar-hardlink-racy config core.checkStat default &&
+	prime_semantic_history sidecar-hardlink-racy &&
+	test_grep FSCF sidecar-hardlink-racy/.git/index &&
+	test_grep FSUC sidecar-hardlink-racy/.git/index &&
+	git -C sidecar-hardlink-racy update-index --refresh -- tracked &&
+	test_grep FSCF sidecar-hardlink-racy/.git/index &&
+	test_grep FSUC sidecar-hardlink-racy/.git/index &&
+	test-tool -C sidecar-hardlink-racy dump-fsmonitor \
+		>hardlink-racy.token &&
+	hardlink_token=$(sed -n "s/^fsmonitor last update //p" \
+		hardlink-racy.token) &&
+	test -n "$hardlink_token" &&
+	mkdir sidecar-hardlink-racy/ignored &&
+	ln sidecar-hardlink-racy/tracked \
+		sidecar-hardlink-racy/ignored/tracked &&
+	test-tool -C sidecar-hardlink-racy fsmonitor-client query \
+		--token "$hardlink_token" >hardlink-racy-event.out &&
+	test_env GIT_INDEX_FILE="$PWD/sidecar-hardlink-racy/.git/index" \
+		GIT_TRACE2_EVENT="$PWD/hardlink-racy-rebaseline.trace" \
+		git -C sidecar-hardlink-racy status --porcelain=v2 \
+			>hardlink-racy-rebaseline.actual &&
+	test_must_be_empty hardlink-racy-rebaseline.actual &&
+	test_trace2_data fsmonitor apply/global-invalidation 1 \
+		<hardlink-racy-rebaseline.trace &&
+	test_grep FSCF sidecar-hardlink-racy/.git/index &&
+	test_grep FSUC sidecar-hardlink-racy/.git/index &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlink-racy-update.trace" \
+		git -C sidecar-hardlink-racy update-index \
+			--no-fsmonitor-valid -- tracked &&
+	test_grep FSCF sidecar-hardlink-racy/.git/index &&
+	test_grep FSUC sidecar-hardlink-racy/.git/index &&
+	test-tool -C sidecar-hardlink-racy dump-cache-tree \
+		>hardlink-racy.tree &&
+	test_grep ! "^invalid " hardlink-racy.tree &&
+	test-tool -C sidecar-hardlink-racy chmtime -180 .git/index &&
+	rm -f sidecar-hardlink-racy/.git/index.csts &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlink-racy-issue.trace" \
+		git -C sidecar-hardlink-racy status >hardlink-racy-issue.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlink-racy-issue.actual &&
+	test_trace2_data fsmonitor history/external-save-reject racy-index \
+		<hardlink-racy-issue.trace &&
+	test_trace2_data status clean-proof/hardlink-witnesses 1 \
+		<hardlink-racy-issue.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-racy-issue.trace &&
+	test_path_is_file sidecar-hardlink-racy/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-hardlink-racy \
+		sidecar-hardlink-racy hardlink-racy-hit &&
+	test_trace2_data status clean-proof/hardlink-validated 1 \
+		<hardlink-racy-hit.trace
+'
+
+test_expect_success DURABLE_FSMONITOR,PERL_TEST_HELPERS \
+	'hardlink witnesses verify stale subsecond index stat data' '
+	test_when_finished "stop_daemon sidecar-hardlink-stale-stat" &&
+	setup_repo sidecar-hardlink-stale-stat &&
+	test_write_lines "/ignored/" \
+		>sidecar-hardlink-stale-stat/.gitignore &&
+	printf "aaaa\\n" >sidecar-hardlink-stale-stat/.npmrc &&
+	mkdir -p sidecar-hardlink-stale-stat/nested &&
+	printf "bbbb\\n" \
+		>sidecar-hardlink-stale-stat/nested/.node-version &&
+	git -C sidecar-hardlink-stale-stat add \
+		.gitignore .npmrc nested/.node-version &&
+	git -C sidecar-hardlink-stale-stat commit -qm hardlinks &&
+	git -C sidecar-hardlink-stale-stat config core.autocrlf false &&
+	git -C sidecar-hardlink-stale-stat config core.untrackedCache true &&
+	git -C sidecar-hardlink-stale-stat config core.trustctime true &&
+	git -C sidecar-hardlink-stale-stat config core.checkStat default &&
+	git -C sidecar-hardlink-stale-stat update-index \
+		--index-version 2 &&
+	prime_semantic_history sidecar-hardlink-stale-stat &&
+	test_grep FSCF sidecar-hardlink-stale-stat/.git/index &&
+	test_grep FSUC sidecar-hardlink-stale-stat/.git/index &&
+	test-tool -C sidecar-hardlink-stale-stat dump-fsmonitor \
+		>hardlink-stale-stat.token &&
+	stale_token=$(sed -n "s/^fsmonitor last update //p" \
+		hardlink-stale-stat.token) &&
+	test -n "$stale_token" &&
+	mkdir sidecar-hardlink-stale-stat/ignored &&
+	stale_same_second= &&
+	for stale_attempt in 1 2 3 4 5
+	do
+		rm -f sidecar-hardlink-stale-stat/ignored/npmrc \
+			sidecar-hardlink-stale-stat/ignored/node-version &&
+		test-tool -C sidecar-hardlink-stale-stat \
+			chmtime -1 .npmrc nested/.node-version &&
+		git -C sidecar-hardlink-stale-stat update-index \
+			--refresh -- .npmrc &&
+		npmrc_second=$(/usr/bin/stat -f %c \
+			sidecar-hardlink-stale-stat/.npmrc) &&
+		node_second=$(/usr/bin/stat -f %c \
+			sidecar-hardlink-stale-stat/nested/.node-version) &&
+		ln sidecar-hardlink-stale-stat/.npmrc \
+			sidecar-hardlink-stale-stat/ignored/npmrc &&
+		ln sidecar-hardlink-stale-stat/nested/.node-version \
+			sidecar-hardlink-stale-stat/ignored/node-version ||
+			return 1
+		if test "$npmrc_second" = "$(/usr/bin/stat -f %c \
+			sidecar-hardlink-stale-stat/.npmrc)" &&
+		   test "$node_second" = "$(/usr/bin/stat -f %c \
+			sidecar-hardlink-stale-stat/nested/.node-version)"
+		then
+			stale_same_second=1 &&
+			break
+		fi
+	done &&
+	test "$stale_same_second" = 1 &&
+	test-tool -C sidecar-hardlink-stale-stat fsmonitor-client query \
+		--token "$stale_token" >hardlink-stale-stat-event.out &&
+	test_env GIT_INDEX_FILE="$PWD/sidecar-hardlink-stale-stat/.git/index" \
+		GIT_TRACE2_EVENT="$PWD/hardlink-stale-stat-rebaseline.trace" \
+		git -C sidecar-hardlink-stale-stat status --porcelain=v2 \
+			>hardlink-stale-stat-rebaseline.actual &&
+	test_must_be_empty hardlink-stale-stat-rebaseline.actual &&
+	test_trace2_data fsmonitor apply/global-invalidation 1 \
+		<hardlink-stale-stat-rebaseline.trace &&
+	test_grep FSCF sidecar-hardlink-stale-stat/.git/index &&
+	test_grep FSUC sidecar-hardlink-stale-stat/.git/index &&
+	git -C sidecar-hardlink-stale-stat update-index \
+		--no-fsmonitor-valid -- .npmrc nested/.node-version &&
+	test_grep FSCF sidecar-hardlink-stale-stat/.git/index &&
+	test_grep FSUC sidecar-hardlink-stale-stat/.git/index &&
+	cat >sidecar-hardlink-stale-stat/.git/stale-index-stat.pl <<-\EOF &&
+	use Digest::SHA qw(sha1 sha256);
+	binmode STDIN;
+	binmode STDOUT;
+	local $/;
+	my $index = <STDIN>;
+	my $algorithm = $ARGV[0];
+	my $rawsz = $algorithm eq "sha256" ? 32 : 20;
+	my $payload = substr($index, 0, -$rawsz);
+	die "not a version 2 index\n"
+		unless substr($payload, 0, 4) eq "DIRC" &&
+		unpack("N", substr($payload, 4, 4)) == 2;
+	my $entries = unpack("N", substr($payload, 8, 4));
+	my $offset = 12;
+	my $changed = 0;
+	for (1 .. $entries) {
+		my $name_offset = $offset + 40 + $rawsz + 2;
+		my $end = index($payload, "\0", $name_offset);
+		die "unterminated index entry\n" if $end < 0;
+		my $name = substr($payload, $name_offset, $end - $name_offset);
+		if ($name eq ".npmrc" || $name eq "nested/.node-version") {
+			my $nsec = unpack("N", substr($payload, $offset + 4, 4));
+			$nsec = ($nsec + 1) % 1000000000;
+			substr($payload, $offset + 4, 4, pack("N", $nsec));
+			$changed++;
+		}
+		$offset += (($end + 1 - $offset + 7) & ~7);
+	}
+	die "did not rewrite both indexed hardlinks\n" unless $changed == 2;
+	print $payload,
+		$algorithm eq "sha256" ? sha256($payload) : sha1($payload);
+	EOF
+	perl sidecar-hardlink-stale-stat/.git/stale-index-stat.pl \
+		"$(test_oid algo)" \
+		<sidecar-hardlink-stale-stat/.git/index \
+		>sidecar-hardlink-stale-stat/.git/index.stale &&
+	mv sidecar-hardlink-stale-stat/.git/index.stale \
+		sidecar-hardlink-stale-stat/.git/index &&
+	test_grep FSCF sidecar-hardlink-stale-stat/.git/index &&
+	test_grep FSUC sidecar-hardlink-stale-stat/.git/index &&
+	rm -f sidecar-hardlink-stale-stat/.git/index.csts &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlink-stale-stat-issue.trace" \
+		git -C sidecar-hardlink-stale-stat status \
+			>hardlink-stale-stat-issue.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlink-stale-stat-issue.actual &&
+	test_trace2_data status clean-proof/hardlink-content-verified 2 \
+		<hardlink-stale-stat-issue.trace &&
+	test_trace2_data status clean-proof/hardlink-witnesses 2 \
+		<hardlink-stale-stat-issue.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-stale-stat-issue.trace &&
+	assert_clean_sidecar_hit sidecar-hardlink-stale-stat \
+		sidecar-hardlink-stale-stat hardlink-stale-stat-hit &&
+	test_trace2_data status clean-proof/hardlink-validated 2 \
+		<hardlink-stale-stat-hit.trace &&
+	cp sidecar-hardlink-stale-stat/.git/index.csts \
+		sidecar-hardlink-stale-stat/.git/index.csts.valid &&
+	for malformed in bad-checksum truncated oversized
+	do
+		cp sidecar-hardlink-stale-stat/.git/index.csts.valid \
+			sidecar-hardlink-stale-stat/.git/index.csts &&
+		case "$malformed" in
+		bad-checksum)
+			printf "invalid-checksum" \
+				>>sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		truncated)
+			printf "CSTS" \
+				>sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		oversized)
+			dd if=/dev/zero \
+				of=sidecar-hardlink-stale-stat/.git/index.csts \
+				bs=1048577 count=1 2>/dev/null
+			;;
+		esac &&
+		test_env \
+			GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-$malformed.trace" \
+			git -C sidecar-hardlink-stale-stat status \
+				>"hardlink-sidecar-$malformed.actual" &&
+		test_grep "nothing to commit, working tree clean" \
+			"hardlink-sidecar-$malformed.actual" &&
+		test_grep "fast-sidecar-missing-or-corrupt" \
+			"hardlink-sidecar-$malformed.trace" &&
+		test_trace2_data status clean-proof/hardlink-content-verified 2 \
+			<"hardlink-sidecar-$malformed.trace" &&
+		test_trace2_data status clean-proof/hardlink-witnesses 2 \
+			<"hardlink-sidecar-$malformed.trace" &&
+		test_trace2_data status clean-proof/sidecar 1 \
+			<"hardlink-sidecar-$malformed.trace" &&
+		assert_clean_sidecar_hit sidecar-hardlink-stale-stat \
+			sidecar-hardlink-stale-stat \
+			"hardlink-sidecar-$malformed-hit" &&
+		test_trace2_data status clean-proof/hardlink-validated 2 \
+			<"hardlink-sidecar-$malformed-hit.trace" || return 1
+	done &&
+	cp sidecar-hardlink-stale-stat/.git/index.csts.valid \
+		sidecar-hardlink-stale-stat/.git/index.csts.pristine &&
+	for unsafe in fifo symlink directory multilink
+	do
+		rm -rf sidecar-hardlink-stale-stat/.git/index.csts &&
+		case "$unsafe" in
+		fifo)
+			mkfifo sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		symlink)
+			ln -s index.csts.valid \
+				sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		directory)
+			mkdir sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		multilink)
+			ln sidecar-hardlink-stale-stat/.git/index.csts.valid \
+				sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		esac &&
+		test_env \
+			GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-$unsafe.trace" \
+			git -C sidecar-hardlink-stale-stat status \
+				>"hardlink-sidecar-$unsafe.actual" &&
+		test_grep "nothing to commit, working tree clean" \
+			"hardlink-sidecar-$unsafe.actual" &&
+		! test_trace2_data status clean-proof/sidecar 1 \
+			<"hardlink-sidecar-$unsafe.trace" &&
+		test_cmp sidecar-hardlink-stale-stat/.git/index.csts.pristine \
+			sidecar-hardlink-stale-stat/.git/index.csts.valid &&
+		case "$unsafe" in
+		fifo)
+			test -p sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		symlink)
+			test -h sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		directory)
+			test -d sidecar-hardlink-stale-stat/.git/index.csts
+			;;
+		multilink)
+			test "$(/usr/bin/stat -f %i \
+				sidecar-hardlink-stale-stat/.git/index.csts)" = \
+			     "$(/usr/bin/stat -f %i \
+				sidecar-hardlink-stale-stat/.git/index.csts.valid)"
+			;;
+		esac || return 1
+	done &&
+	rm -f sidecar-hardlink-stale-stat/.git/index.csts &&
+	cp sidecar-hardlink-stale-stat/.git/index.csts.valid \
+		sidecar-hardlink-stale-stat/.git/index.csts &&
+	git -C sidecar-hardlink-stale-stat status \
+		>hardlink-sidecar-repair-prime.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlink-sidecar-repair-prime.actual &&
+	assert_clean_sidecar_hit sidecar-hardlink-stale-stat \
+		sidecar-hardlink-stale-stat hardlink-sidecar-repair-prime-hit &&
+	cp sidecar-hardlink-stale-stat/.git/index \
+		sidecar-hardlink-stale-stat/.git/index.before-repair &&
+	test-tool -C sidecar-hardlink-stale-stat chmtime -60 tracked &&
+	chmod 0600 sidecar-hardlink-stale-stat/ignored/npmrc \
+		sidecar-hardlink-stale-stat/ignored/node-version &&
+	chmod 0644 sidecar-hardlink-stale-stat/ignored/npmrc \
+		sidecar-hardlink-stale-stat/ignored/node-version &&
+	test_env \
+		GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-repair-reissue.trace" \
+		git -C sidecar-hardlink-stale-stat status \
+			>hardlink-sidecar-repair-reissue.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlink-sidecar-repair-reissue.actual &&
+	test_grep "fast-hardlink-changed" \
+		hardlink-sidecar-repair-reissue.trace &&
+	test_grep "\"label\":\"do_write_index\"" \
+		hardlink-sidecar-repair-reissue.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-sidecar-repair-reissue.trace &&
+	test_trace2_data status clean-proof/postwrite-reissued 1 \
+		<hardlink-sidecar-repair-reissue.trace &&
+	! test_cmp sidecar-hardlink-stale-stat/.git/index.before-repair \
+		sidecar-hardlink-stale-stat/.git/index &&
+	assert_clean_sidecar_hit sidecar-hardlink-stale-stat \
+		sidecar-hardlink-stale-stat hardlink-sidecar-repair-hit &&
+	write_script \
+		sidecar-hardlink-stale-stat/.git/hooks/post-index-change \
+		<<-\EOF &&
+	printf "hook-created\n" >hook-created
+	printf "ran\n" >.git/post-index-change-ran
+	EOF
+	test-tool -C sidecar-hardlink-stale-stat chmtime -120 tracked &&
+	chmod 0600 sidecar-hardlink-stale-stat/ignored/npmrc \
+		sidecar-hardlink-stale-stat/ignored/node-version &&
+	chmod 0644 sidecar-hardlink-stale-stat/ignored/npmrc \
+		sidecar-hardlink-stale-stat/ignored/node-version &&
+	test_env \
+		GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-post-hook.trace" \
+		git -C sidecar-hardlink-stale-stat status \
+			>hardlink-sidecar-post-hook.actual &&
+	test_path_is_file \
+		sidecar-hardlink-stale-stat/.git/post-index-change-ran &&
+	test_path_is_file sidecar-hardlink-stale-stat/hook-created &&
+	test_grep "fast-hardlink-changed" \
+		hardlink-sidecar-post-hook.trace &&
+	test_grep "\"label\":\"do_write_index\"" \
+		hardlink-sidecar-post-hook.trace &&
+	! test_trace2_data status clean-proof/postwrite-reissued 1 \
+		<hardlink-sidecar-post-hook.trace &&
+	! test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-sidecar-post-hook.trace &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false \
+		-C sidecar-hardlink-stale-stat status --porcelain=v2 \
+			>hardlink-sidecar-post-hook.expect &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-post-hook-repeat.trace" \
+		git -C sidecar-hardlink-stale-stat status --porcelain=v2 \
+			>hardlink-sidecar-post-hook-repeat.actual &&
+	test_cmp hardlink-sidecar-post-hook.expect \
+		hardlink-sidecar-post-hook-repeat.actual &&
+	test_grep "^? hook-created$" \
+		hardlink-sidecar-post-hook-repeat.actual &&
+	! test_trace2_data status clean-proof/hit 1 \
+		<hardlink-sidecar-post-hook-repeat.trace &&
+	rm sidecar-hardlink-stale-stat/.git/hooks/post-index-change \
+		sidecar-hardlink-stale-stat/hook-created &&
+	rm -f sidecar-hardlink-stale-stat/.git/index.csts &&
+	mtime=$(test-tool chmtime --get \
+		sidecar-hardlink-stale-stat/.npmrc) &&
+	printf "xxxx\\n" \
+		>sidecar-hardlink-stale-stat/ignored/npmrc &&
+	test-tool chmtime =$mtime \
+		sidecar-hardlink-stale-stat/ignored/npmrc &&
+	test "$(git -C sidecar-hardlink-stale-stat hash-object .npmrc)" \
+		!= "$(git -C sidecar-hardlink-stale-stat \
+			rev-parse HEAD:.npmrc)" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/hardlink-stale-stat-dirty.trace" \
+		git -C sidecar-hardlink-stale-stat status --porcelain=v2 \
+			>hardlink-stale-stat-dirty.actual &&
+	test_grep "^1 \\.M .* \\.npmrc$" \
+		hardlink-stale-stat-dirty.actual &&
+	test_path_is_missing sidecar-hardlink-stale-stat/.git/index.csts &&
+	! test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-stale-stat-dirty.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a changed hardlink never receives its first clean sidecar' '
+	test_when_finished "stop_daemon sidecar-hardlink-first-dirty" &&
+	setup_repo sidecar-hardlink-first-dirty &&
+	test_write_lines "/ignored/" \
+		>sidecar-hardlink-first-dirty/.gitignore &&
+	git -C sidecar-hardlink-first-dirty add .gitignore &&
+	git -C sidecar-hardlink-first-dirty commit -qm ignores &&
+	mkdir sidecar-hardlink-first-dirty/ignored &&
+	ln sidecar-hardlink-first-dirty/tracked \
+		sidecar-hardlink-first-dirty/ignored/alias &&
+	test-tool -C sidecar-hardlink-first-dirty \
+		chmtime -120 tracked .gitignore &&
+	git -C sidecar-hardlink-first-dirty update-index --refresh &&
+	git -C sidecar-hardlink-first-dirty config core.autocrlf false &&
+	git -C sidecar-hardlink-first-dirty config core.untrackedCache true &&
+	git -C sidecar-hardlink-first-dirty config core.trustctime true &&
+	git -C sidecar-hardlink-first-dirty config core.checkStat default &&
+	prime_semantic_history sidecar-hardlink-first-dirty &&
+	test_path_is_missing sidecar-hardlink-first-dirty/.git/index.csts &&
+	mtime=$(test-tool chmtime --get \
+		sidecar-hardlink-first-dirty/tracked) &&
+	printf "xxxx\\n" \
+		>sidecar-hardlink-first-dirty/ignored/alias &&
+	test-tool chmtime =$mtime \
+		sidecar-hardlink-first-dirty/ignored/alias &&
+	test "$(git -C sidecar-hardlink-first-dirty hash-object tracked)" \
+		!= "$(git -C sidecar-hardlink-first-dirty \
+			rev-parse HEAD:tracked)" &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlink-first-dirty.trace" \
+		git -C sidecar-hardlink-first-dirty status \
+			>hardlink-first-dirty.actual &&
+	test_path_is_missing sidecar-hardlink-first-dirty/.git/index.csts &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" \
+		hardlink-first-dirty.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'weak stat identity never certifies multiply linked tracked files' '
+	test_when_finished "stop_daemon sidecar-hardlink-weak" &&
+	setup_repo sidecar-hardlink-weak &&
+	test_write_lines "/ignored/" >sidecar-hardlink-weak/.gitignore &&
+	git -C sidecar-hardlink-weak add .gitignore &&
+	git -C sidecar-hardlink-weak commit -qm ignores &&
+	mkdir sidecar-hardlink-weak/ignored &&
+	ln sidecar-hardlink-weak/tracked \
+		sidecar-hardlink-weak/ignored/alias &&
+	test-tool chmtime -120 sidecar-hardlink-weak/tracked &&
+	git -C sidecar-hardlink-weak update-index --refresh &&
+	git -C sidecar-hardlink-weak config core.autocrlf false &&
+	git -C sidecar-hardlink-weak config core.untrackedCache true &&
+	git -C sidecar-hardlink-weak config core.trustctime false &&
+	git -C sidecar-hardlink-weak config core.checkStat minimal &&
+	prime_semantic_history sidecar-hardlink-weak &&
+	test_env GIT_TRACE2_EVENT="$PWD/hardlink-weak.trace" \
+		git -C sidecar-hardlink-weak status >hardlink-weak.actual &&
+	test_grep "nothing to commit, working tree clean" \
+		hardlink-weak.actual &&
+	test_path_is_missing sidecar-hardlink-weak/.git/index.csts &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" hardlink-weak.trace
 '
 
 test_expect_success DURABLE_FSMONITOR \
@@ -862,6 +1532,9 @@ test_expect_success DURABLE_FSMONITOR \
 	test_when_finished "stop_daemon external-stat-bootstrap" &&
 	setup_repo external-stat-bootstrap &&
 	git -C external-stat-bootstrap update-index --fsmonitor &&
+	test-tool chmtime -60 external-stat-bootstrap/tracked &&
+	test-tool -C external-stat-bootstrap \
+		fsmonitor-client flush >bootstrap.flush &&
 	test_env GIT_TRACE2_EVENT="$PWD/external-stat-bootstrap.trace" \
 		git -C external-stat-bootstrap status >actual &&
 	test_trace2_data fsmonitor history/external-stored 1 \
@@ -884,7 +1557,7 @@ test_expect_success DURABLE_FSMONITOR \
 		bulk_status -C external-stat-exact status --porcelain=v2 \
 		>actual &&
 	test_must_be_empty actual &&
-	! test_trace2_data fsmonitor history/external-stored 1 \
+	test_trace2_data fsmonitor history/external-stored 1 \
 		<external-stat-exact.trace &&
 	test_path_is_missing external-stat-exact/.git/index.csts &&
 	test_grep "\"label\":\"do_write_index\"" \
@@ -1402,7 +2075,9 @@ test_expect_success DURABLE_FSMONITOR \
 	test_cmp seed.before external-history/.git/index &&
 	test_trace2_data fsmonitor history/external-stored 1 \
 		<external-seed.trace &&
-	test_path_is_missing external-history/.git/index.csts &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<external-seed.trace &&
+	test_path_is_file external-history/.git/index.csts &&
 	test_grep ! "\"label\":\"do_write_index\"" external-seed.trace &&
 	find external-history/.git -maxdepth 1 -type f \
 		-name "index.csh1.*" >external-sidecars &&
