@@ -1156,11 +1156,19 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 				   "fsmonitor_token/untracked-deferred", 1);
 		return;
 	}
-	if (has_fsmonitor)
+	if (has_fsmonitor &&
+	    (!istate->untracked ||
+	     !istate->untracked->fsmonitor_revalidation ||
+	     istate->untracked->use_fsmonitor ||
+	     !fsmonitor_pending_token_from_provider(istate)))
 		return;
 
 	s->untracked_cache_preload =
 		untracked_cache_preload_start_ordinary(istate, dir_flags);
+	if (s->untracked_cache_preload &&
+	    istate->untracked->fsmonitor_revalidation)
+		trace2_data_intmax("status", s->repo,
+				   "untracked/provider-reset-preload", 1);
 }
 
 static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
