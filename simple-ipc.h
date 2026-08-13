@@ -107,6 +107,15 @@ int ipc_client_send_command_to_connection(
 	struct strbuf *answer);
 
 /*
+ * Like ipc_client_send_command_to_connection(), but suppress the generic IPC
+ * transport diagnostic so callers can recover from a disappearing server.
+ */
+int ipc_client_send_command_to_connection_gently(
+	struct ipc_client_connection *connection,
+	const char *message, size_t message_len,
+	struct strbuf *answer);
+
+/*
  * Used by the client to synchronously connect and send and receive a
  * message to the server listening at the given path.
  *

@@ -9,10 +9,13 @@
 #include "fsmonitor-ll.h"
 #include "fsmonitor-settings.h"
 #include "lockfile.h"
+#include "object-file.h"
 #include "object-name.h"
+#include "path-namespace.h"
 #include "preload-index.h"
 #include "read-cache-ll.h"
 #include "repository.h"
+#include "semantic-verify-internal.h"
 #include "trace2.h"
 #include "wt-status.h"
 
@@ -68,7 +71,8 @@ static int history_is_certifiable(const struct index_state *istate)
 }
 
 static int fsmonitor_state_is_certifiable(
-	struct repository *repo, const struct index_state *istate)
+	struct repository *repo, const struct index_state *istate,
+	uint32_t *hardlink_nr)
 {
 	return !istate->split_index &&
 		istate->sparse_index == INDEX_EXPANDED &&
@@ -78,7 +82,101 @@ static int fsmonitor_state_is_certifiable(
 		istate->fsmonitor_last_update &&
 		strlen(istate->fsmonitor_last_update) <=
 			FSMONITOR_CLEAN_PROOF_TOKEN_MAX &&
-		clean_status_index_is_certifiable(istate);
+		clean_status_index_is_certifiable_with_hardlinks(
+			istate, hardlink_nr);
+}
+
+static int capture_hardlink_witnesses(
+	struct repository *repo, const struct index_state *istate,
+	uint32_t expected, struct strbuf *witnesses)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN && !defined(NO_NSEC)
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	unsigned int namespace_unstable = 0;
+	uint32_t captured = 0, verified = 0;
+	int ret = -1;
+
+	if (!expected)
+		return 0;
+	if (!repo->config_values_private_.trust_ctime ||
+	    !repo->config_values_private_.check_stat ||
+	    semantic_verify_root_init(repo, &root))
+		goto done;
+	path = semantic_verify_path_new(root);
+	if (!path)
+		goto done;
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *ce = istate->cache[i];
+		struct path_stat_identity identity;
+		struct stat held, named;
+		const char *basename;
+		int parent_fd, fd;
+
+		if (ce->ce_flags & CE_FSMONITOR_VALID)
+			continue;
+		if (semantic_verify_resolve_parent(
+			    path, ce->name, i, &parent_fd, &basename))
+			goto done;
+		fd = semantic_verify_openat(
+			parent_fd, basename,
+			O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+		if (fd < 0)
+			goto done;
+		if (fstat(fd, &held) || !S_ISREG(held.st_mode) ||
+		    held.st_nlink <= 1 || held.st_dev != root->stat.st_dev ||
+		    match_stat_data(&ce->ce_stat_data, &held)) {
+			close(fd);
+			goto done;
+		}
+		if (ce->ce_stat_data.sd_ctime.nsec != ST_CTIME_NSEC(held) ||
+		    ce->ce_stat_data.sd_mtime.nsec != ST_MTIME_NSEC(held)) {
+			struct object_id observed;
+			struct stat after;
+
+			if (index_fd(repo->index, &observed, xdup(fd), &held,
+				     OBJ_BLOB, ce->name, 0) ||
+			    !oideq(&observed, &ce->oid) || fstat(fd, &after) ||
+			    !path_namespace_stat_equal(&held, &after)) {
+				close(fd);
+				goto done;
+			}
+			verified++;
+		}
+		if (fstatat(parent_fd, basename, &named,
+			    AT_SYMLINK_NOFOLLOW) ||
+		    !path_namespace_stat_equal(&held, &named)) {
+			close(fd);
+			goto done;
+		}
+		path_stat_identity_init(&identity, &held);
+		close(fd);
+		if (clean_status_sidecar_append_hardlink(
+			    witnesses, ce->name, &identity))
+			goto done;
+		captured++;
+	}
+	if (captured != expected || !semantic_verify_root_stable(root))
+		goto done;
+	if (verified)
+		trace2_data_intmax("status", repo,
+				   "clean-proof/hardlink-content-verified", verified);
+	ret = 0;
+
+done:
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	if (namespace_unstable || (root && !semantic_verify_root_stable(root)))
+		ret = -1;
+	semantic_verify_root_clear(root);
+	if (ret)
+		strbuf_reset(witnesses);
+	return ret;
+#else
+	(void)repo;
+	(void)istate;
+	(void)witnesses;
+	return expected ? -1 : 0;
+#endif
 }
 
 static int untracked_scan_is_certifiable(
@@ -105,9 +203,11 @@ int clean_status_issue_sidecar(
 	struct index_state *istate = repo->index;
 	struct clean_status_index_snapshot index = { .fd = -1 };
 	struct clean_status_sidecar sidecar = { 0 };
+	struct strbuf hardlinks = STRBUF_INIT;
 	struct object_id exclude_digest, head_tree;
 	struct stat scanned_worktree;
 	unsigned char repo_hash[GIT_MAX_RAWSZ];
+	uint32_t hardlink_nr = 0;
 	int installed = 0;
 
 	if (!is_lock_file_locked(index_lock) ||
@@ -121,7 +221,7 @@ int clean_status_issue_sidecar(
 		goto done;
 	}
 	if (getenv(INDEX_ENVIRONMENT) ||
-	    !fsmonitor_state_is_certifiable(repo, istate) ||
+	    !fsmonitor_state_is_certifiable(repo, istate, &hardlink_nr) ||
 	    !untracked_scan_is_certifiable(
 		    status, &exclude_digest, &scanned_worktree)) {
 		trace_miss(repo, "issue-scan-or-index-shape");
@@ -159,6 +259,16 @@ int clean_status_issue_sidecar(
 	oidcpy(&sidecar.proof.exclude_source_digest, &exclude_digest);
 	sidecar.token = (const unsigned char *)istate->fsmonitor_last_update;
 	sidecar.token_len = strlen(istate->fsmonitor_last_update);
+	if (capture_hardlink_witnesses(
+		    repo, istate, hardlink_nr, &hardlinks)) {
+		trace_miss(repo, "issue-hardlink-witness");
+		goto done;
+	}
+	if (hardlink_nr) {
+		sidecar.hardlinks = (const unsigned char *)hardlinks.buf;
+		sidecar.hardlinks_len = hardlinks.len;
+		sidecar.hardlink_nr = hardlink_nr;
+	}
 
 	if (clean_status_sidecar_install(
 		    repo->index_file, &sidecar, &index, repo->hash_algo)) {
@@ -166,10 +276,14 @@ int clean_status_issue_sidecar(
 		goto done;
 	}
 	rollback_lock_file(index_lock);
+	if (hardlink_nr)
+		trace2_data_intmax("status", repo,
+				   "clean-proof/hardlink-witnesses", hardlink_nr);
 	trace2_data_intmax("status", repo, "clean-proof/sidecar", 1);
 	installed = 1;
 
 done:
+	strbuf_release(&hardlinks);
 	clean_status_index_snapshot_release(&index);
 	return installed;
 }

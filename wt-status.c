@@ -559,9 +559,16 @@ static struct cache_entry **wt_status_collect_preload_changes(
 		struct wt_status_change_data *d;
 		unsigned char state =
 			istate->preload_bulk_tracked_state[i];
+		unsigned int worktree_mode = 0;
 		int status;
 
 		if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED) {
+			struct stat st;
+
+			if (lstat(ce->name, &st))
+				continue;
+			worktree_mode = ce_mode_from_stat(
+				s->repo, ce, st.st_mode);
 			status = DIFF_STATUS_MODIFIED;
 			modified++;
 		} else if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED) {
@@ -575,8 +582,7 @@ static struct cache_entry **wt_status_collect_preload_changes(
 		if (!d->worktree_status)
 			d->worktree_status = status;
 		d->mode_index = ce->ce_mode;
-		d->mode_worktree = status == DIFF_STATUS_MODIFIED ?
-			ce->ce_mode : 0;
+		d->mode_worktree = worktree_mode;
 		oidcpy(&d->oid_index, &ce->oid);
 		ce_mark_uptodate(ce);
 		ALLOC_GROW(direct, *direct_nr + 1, direct_alloc);
@@ -1102,6 +1108,7 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 	unsigned int dir_flags;
 	int has_fsmonitor =
 		fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED;
+	int reopened_valid_token = 0;
 
 	if (s->untracked_cache_preload)
 		BUG("untracked-cache preload already started");
@@ -1112,9 +1119,15 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 	refresh_fsmonitor(istate);
 	if (s->certify_clean_status &&
 	    !fsmonitor_has_pending_token(istate))
-		fsmonitor_reopen_token(istate);
+		reopened_valid_token =
+			fsmonitor_reopen_token(istate) &&
+			istate->fsmonitor_untracked_valid &&
+			istate->untracked && istate->untracked->root &&
+			istate->untracked->use_fsmonitor &&
+			!clean_status_fsmonitor_semantic_adoption_needed(istate);
 	if (has_fsmonitor &&
 	    (!fsmonitor_has_pending_token(istate) ||
+	     reopened_valid_token ||
 	     !fstat_is_reliable())) {
 		s->untracked_cache_preload =
 			untracked_cache_preload_start_fsmonitor_excludes(
@@ -2057,9 +2070,24 @@ wt_status_close_semantic_fsmonitor_token(
 			istate,
 			wt_status_untracked_cache_valid(closure));
 		if (result != FSMONITOR_TOKEN_CLEAN) {
+			int reuse_semantic_subtrees =
+				result == FSMONITOR_TOKEN_CHANGED &&
+				!clean_status_filter_scope_needs_validation(istate) &&
+				!clean_status_worktree_manifest_needs_refresh(istate) &&
+				semantic_verify_proof_is_current(istate, *proof);
+
 			wt_status_discard_staged_untracked(closure);
-			untracked_cache_invalidate_all(istate);
-			fsmonitor_invalidate_semantics(istate);
+			if (reuse_semantic_subtrees) {
+				/* Recompute scanned subtrees after the localized delta. */
+				untracked_cache_recompute_fsmonitor_valid_recursive(
+					istate->untracked);
+				trace2_data_intmax(
+					"status", s->repo,
+					"fsmonitor_token/reused-semantic-subtrees", 1);
+			} else {
+				untracked_cache_invalidate_all(istate);
+				fsmonitor_invalidate_semantics(istate);
+			}
 			closure->untracked_ready = 0;
 			closure->untracked_proof_complete = 0;
 			wt_status_discard_semantic_verify(

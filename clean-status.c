@@ -16,6 +16,7 @@
 static struct repository *configured_repo;
 static unsigned char configured_hash[GIT_MAX_RAWSZ];
 static unsigned char configured_semantic_hash[GIT_MAX_RAWSZ];
+static unsigned char configured_tracked_policy_hash[GIT_MAX_RAWSZ];
 static struct repository *external_history_repo;
 static struct repository *progress_repo;
 static int configured_hash_valid;
@@ -105,6 +106,8 @@ void clean_status_set_config_digest(
 	memcpy(configured_hash, digest->hash, repo->hash_algo->rawsz);
 	memcpy(configured_semantic_hash, digest->semantic_hash,
 	       repo->hash_algo->rawsz);
+	memcpy(configured_tracked_policy_hash,
+	       digest->tracked_policy_hash, repo->hash_algo->rawsz);
 }
 
 void clean_status_attach_config(struct index_state *istate)
@@ -121,8 +124,12 @@ void clean_status_attach_config(struct index_state *istate)
 	       istate->repo->hash_algo->rawsz);
 	memcpy(state->current_semantic_hash, configured_semantic_hash,
 	       istate->repo->hash_algo->rawsz);
+	memcpy(state->current_tracked_policy_hash,
+	       configured_tracked_policy_hash,
+	       istate->repo->hash_algo->rawsz);
 	state->current_config_valid = 1;
 	state->current_semantic_valid = 1;
+	state->current_tracked_policy_valid = 1;
 	state->current_semantic_explicit = configured_semantic_explicit;
 	state->config_enforced = 1;
 	state->filter_configured = configured_filter_configured;
@@ -513,6 +520,25 @@ int clean_status_manifest_global_fallback(const struct index_state *istate)
 {
 	return istate->clean_status &&
 		istate->clean_status->manifest.global_fallback;
+}
+
+int clean_status_has_authenticated_worktree_manifest(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->disk_config_valid &&
+		!state->disk_config_invalid && istate->fsmonitor_token_valid &&
+		istate->fsmonitor_last_update && state->disk_config_token &&
+		!strcmp(state->disk_config_token,
+			istate->fsmonitor_last_update) &&
+		state->manifest.disk_valid &&
+		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+			FSMONITOR_CLEAN_PROOF_ALL &&
+		state->manifest.current_valid && state->manifest.checked &&
+		!state->manifest.current_invalidated &&
+		(state->manifest.current_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
+			FSMONITOR_CLEAN_PROOF_ALL;
 }
 
 int clean_status_worktree_manifest_needs_refresh(

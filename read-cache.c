@@ -1473,6 +1473,10 @@ static struct cache_entry *refresh_cache_ent(struct index_state *istate,
 			*err = errno;
 		return NULL;
 	}
+	if (clean_status_fsmonitor_semantic_baseline_pending(istate) &&
+	    !fsmonitor_stat_can_be_valid(&st) &&
+	    !(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED))
+		fsmonitor_invalidate_cache_entry(ce);
 
 	changed = ie_match_stat(istate, ce, &st, options);
 	if (changed_ret)

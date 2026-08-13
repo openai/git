@@ -45,9 +45,11 @@
 #include "sparse-index.h"
 #include "mailmap.h"
 #include "help.h"
+#include "hook.h"
 #include "commit-reach.h"
 #include "commit-graph.h"
 #include "pretty.h"
+#include "trace2.h"
 #include "trailer.h"
 
 static const char * const builtin_commit_usage[] = {
@@ -1641,21 +1643,35 @@ static int print_clean_sidecar(struct wt_status *s, const char *prefix)
 	return 1;
 }
 
-static int clean_status_sidecar_has_stale_index(struct repository *repo)
+static int clean_status_sidecar_needs_reissue(struct repository *repo)
 {
 	struct clean_status_sidecar_record record =
 		CLEAN_STATUS_SIDECAR_RECORD_INIT;
 	struct clean_status_index_snapshot index = { .fd = -1 };
-	int stale = 0;
+	char *path = xstrfmt("%s.csts", repo->index_file);
+	struct stat st;
+	int safe_existing = !lstat(path, &st) &&
+		S_ISREG(st.st_mode) && st.st_nlink == 1 &&
+		is_path_owned_by_current_user(path, NULL);
+	int reissue = 0;
 
 	if (!clean_status_sidecar_load(
 		    repo->index_file, repo->hash_algo, &record))
-		stale = !!clean_status_sidecar_pin_source(
-			repo->index_file, &record.sidecar,
-			repo->hash_algo, &index);
+		reissue = safe_existing &&
+			(!!clean_status_sidecar_pin_source(
+				 repo->index_file, &record.sidecar,
+				 repo->hash_algo, &index) ||
+			 record.sidecar.hardlink_nr > 0);
+	else {
+		if (lstat(path, &st) < 0)
+			reissue = errno == ENOENT;
+		else
+			reissue = safe_existing;
+	}
+	free(path);
 	clean_status_index_snapshot_release(&index);
 	clean_status_sidecar_record_release(&record);
-	return stale;
+	return reissue;
 }
 
 int cmd_status(int argc,
@@ -1676,7 +1692,9 @@ struct repository *repo UNUSED)
 	int normal_clean_query;
 	int reusable_clean_query;
 	int normal_has_head;
-	int stale_clean_sidecar = 0;
+	int reissue_clean_sidecar = 0;
+	int reissue_after_write = 0;
+	int save_history_after_write = 0;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1797,9 +1815,10 @@ struct repository *repo UNUSED)
 			return 0;
 		}
 	}
-	if (normal_clean_query && use_optional_locks())
-		stale_clean_sidecar =
-			clean_status_sidecar_has_stale_index(the_repository);
+	if (normal_clean_query && use_optional_locks() &&
+	    clean_status_identity_is_durable())
+		reissue_clean_sidecar =
+			clean_status_sidecar_needs_reissue(the_repository);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
@@ -1812,7 +1831,8 @@ struct repository *repo UNUSED)
 		clean_status_capture_external_history_source(
 			the_repository->index);
 	if (normal_clean_query && use_optional_locks() &&
-	    (stale_clean_sidecar ||
+	    clean_status_identity_is_durable() &&
+	    (reissue_clean_sidecar ||
 	     clean_status_external_history_was_restored(
 		     the_repository->index)))
 		s.certify_clean_status = 1;
@@ -1854,10 +1874,18 @@ struct repository *repo UNUSED)
 			clean_status_external_history_was_restored(
 				the_repository->index);
 		int external_saved = 0;
+		int persist_restored_boundary = 0;
 		int preserve_entry_changes =
 			(!external_restored &&
 			 (the_repository->index->cache_changed & CE_ENTRY_CHANGED)) ||
 			the_repository->index->fsmonitor_untracked_must_persist;
+		int deferred_history = preserve_entry_changes &&
+			!external_restored &&
+			clean_status_has_recovered_tracked_stat(
+				the_repository->index);
+		int preserve_history_witness = external_restored &&
+			clean_status_external_history_needs_witness_preservation(
+				the_repository->index);
 
 		/*
 		 * Publish resumable history before the physical clean proof.
@@ -1870,8 +1898,24 @@ struct repository *repo UNUSED)
 		 * entry repair durable.  Restored checkpoints stay no-spill
 		 * for foreign index writers.
 		 */
-		external_saved = clean_status_save_external_history(
-			the_repository->index);
+		if (!deferred_history && !preserve_history_witness)
+			external_saved = clean_status_save_external_history(
+				the_repository->index);
+		else if (deferred_history &&
+			 !hook_exists(the_repository, "post-index-change"))
+			save_history_after_write = 1;
+		if (external_restored && !external_saved &&
+		    clean_status_external_history_owns_index(
+			    the_repository->index) &&
+		    has_racy_timestamp(the_repository->index)) {
+			persist_restored_boundary = 1;
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "history/external-racy-index-persisted", 1);
+		}
+		reissue_after_write = normal_clean_query &&
+			reissue_clean_sidecar && preserve_entry_changes &&
+			!external_restored && !persist_restored_boundary &&
+			!hook_exists(the_repository, "post-index-change");
 
 		if (the_repository->index->fsmonitor_legacy_untracked_fallback &&
 		    !preserve_entry_changes && !external_saved) {
@@ -1883,25 +1927,46 @@ struct repository *repo UNUSED)
 				    &s, &clean_digest, &index_lock, 0))
 				fd = -1;
 			else if (!preserve_entry_changes &&
+				 !persist_restored_boundary &&
 				 (external_restored || external_saved)) {
 				rollback_lock_file(&index_lock);
 				fd = -1;
 			}
 		} else if (!preserve_entry_changes &&
+			   !persist_restored_boundary &&
 			   normal_clean_query &&
-			   (external_restored ||
-			    (stale_clean_sidecar && external_saved)) &&
+			   (external_restored || reissue_clean_sidecar) &&
 			   clean_status_issue_sidecar(
 				   &s, &clean_digest, &index_lock, 1)) {
 			fd = -1;
 		} else if (!preserve_entry_changes &&
+			   !persist_restored_boundary &&
 			   (external_restored || external_saved)) {
 			rollback_lock_file(&index_lock);
 			fd = -1;
 		}
 	}
-	if (0 <= fd)
+	if (0 <= fd) {
 		repo_update_index_if_able(the_repository, &index_lock);
+		if (save_history_after_write &&
+		    !hook_exists(the_repository, "post-index-change") &&
+		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
+			if (clean_status_save_external_history(
+				    the_repository->index))
+				trace2_data_intmax("fsmonitor", the_repository,
+						   "history/external-postwrite-stored", 1);
+			rollback_lock_file(&index_lock);
+		}
+		if (reissue_after_write &&
+		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
+			if (clean_status_issue_sidecar(
+				    &s, &clean_digest, &index_lock, 1))
+				trace2_data_intmax("status", the_repository,
+						   "clean-proof/postwrite-reissued", 1);
+			else
+				rollback_lock_file(&index_lock);
+		}
+	}
 
 	if (s.relative_paths)
 		s.prefix = prefix;

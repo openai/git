@@ -16,6 +16,11 @@ struct repository;
 int fsmonitor_ipc__get_worktree_identity(struct repository *r,
 					 struct strbuf *identity);
 
+/* Remember a bounded, worktree-specific inotify watch-limit failure. */
+void fsmonitor_ipc__record_watch_limit_failure(const char *worktree_identity);
+void fsmonitor_ipc__clear_watch_limit_failure(void);
+int fsmonitor_ipc__watch_limit_backoff(struct repository *r);
+
 /*
  * Returns true if built-in file system monitor daemon is defined
  * for this platform.
