@@ -55,7 +55,7 @@ static int hash_source(struct git_hash_ctx *content_ctx,
 	hash_length_delimited(namespace_ctx, &state, sizeof(state));
 	hash_length_delimited(portable_namespace_ctx, &state, sizeof(state));
 	*present = 0;
-	if (!source->enabled || !source->path) {
+	if (!source->enabled || !source->path || !*source->path) {
 		hash_optional_cstring(content_ctx, NULL);
 		hash_length_delimited(content_ctx, &state, sizeof(state));
 		state = 0;
@@ -222,7 +222,7 @@ static int legacy_absent_path_is_stable(const char *path)
 	char *absolute = NULL;
 	int stable = 0;
 
-	if (!path)
+	if (!path || !*path)
 		return 0;
 	absolute = absolute_pathdup(path);
 	strbuf_addstr(&normalized, absolute);
