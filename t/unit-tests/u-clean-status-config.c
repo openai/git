@@ -109,6 +109,84 @@ void test_clean_status_config__command_transport_config_does_not_change_proof(vo
 	}
 }
 
+void test_clean_status_config__command_preload_config_does_not_change_proof(void)
+{
+	static const char *const ignored_keys[] = {
+		"core.preloadindex",
+		"core.preloadindexbulk",
+	};
+	static const enum config_scope persistent_scopes[] = {
+		CONFIG_SCOPE_SYSTEM,
+		CONFIG_SCOPE_GLOBAL,
+		CONFIG_SCOPE_LOCAL,
+		CONFIG_SCOPE_WORKTREE,
+		CONFIG_SCOPE_UNKNOWN,
+	};
+	static const int algorithms[] = {
+		GIT_HASH_SHA1,
+		GIT_HASH_SHA256,
+	};
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+
+	kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+	for (size_t i = 0; i < ARRAY_SIZE(algorithms); i++) {
+		const struct git_hash_algo *algo = &hash_algos[algorithms[i]];
+		struct clean_status_config_digest baseline, digest;
+
+		clean_status_config_init(&baseline, algo);
+		clean_status_config_final(&baseline);
+		for (size_t j = 0; j < ARRAY_SIZE(ignored_keys); j++) {
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, ignored_keys[j],
+						"true", &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(hasheq(digest.hash, baseline.hash, algo));
+			cl_assert(hasheq(digest.semantic_hash,
+					 baseline.semantic_hash, algo));
+			cl_assert(hasheq(digest.tracked_policy_hash,
+					 baseline.tracked_policy_hash, algo));
+
+			for (size_t scope = 0;
+			     scope < ARRAY_SIZE(persistent_scopes); scope++) {
+				kvi.scope = persistent_scopes[scope];
+				clean_status_config_init(&digest, algo);
+				clean_status_config_add(&digest, ignored_keys[j],
+							"true", &ctx);
+				clean_status_config_final(&digest);
+				cl_assert(!hasheq(digest.hash,
+						  baseline.hash, algo));
+				cl_assert(hasheq(digest.semantic_hash,
+						 baseline.semantic_hash, algo));
+				cl_assert(hasheq(digest.tracked_policy_hash,
+						 baseline.tracked_policy_hash, algo));
+			}
+
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, ignored_keys[j],
+						"true", NULL);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		}
+
+		kvi.scope = CONFIG_SCOPE_COMMAND;
+		clean_status_config_init(&digest, algo);
+		clean_status_config_add(&digest, "core.filemode", "true", &ctx);
+		clean_status_config_final(&digest);
+		cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		cl_assert(!hasheq(digest.tracked_policy_hash,
+				  baseline.tracked_policy_hash, algo));
+
+		clean_status_config_init(&digest, algo);
+		clean_status_config_add(&digest, "core.autocrlf", "true", &ctx);
+		clean_status_config_final(&digest);
+		cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		cl_assert(!hasheq(digest.semantic_hash,
+				  baseline.semantic_hash, algo));
+	}
+}
+
 void test_clean_status_config__command_worktree_config_still_changes_proof(void)
 {
 	static const char *const retained_keys[] = {
