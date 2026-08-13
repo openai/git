@@ -5,6 +5,7 @@
 #include "environment.h"
 #include "gettext.h"
 #include "hash-framing.h"
+#include "mem-pool.h"
 #include "object.h"
 #include "odb.h"
 #include "parse.h"
@@ -47,7 +48,8 @@ struct attr_manifest_thread {
 
 static int collect_candidates(struct index_state *istate,
 			      struct string_list *candidates,
-			      struct string_list *index_sources)
+			      struct string_list *index_sources,
+			      struct mem_pool *candidate_pool)
 {
 	struct strbuf candidate = STRBUF_INIT;
 	const char *previous = NULL;
@@ -56,7 +58,8 @@ static int collect_candidates(struct index_state *istate,
 	int sorted = 1;
 	int ret = -1;
 
-	string_list_append(candidates, GITATTRIBUTES_FILE);
+	string_list_append(candidates,
+			   mem_pool_strdup(candidate_pool, GITATTRIBUTES_FILE));
 	for (i = 0; i < istate->cache_nr; i++) {
 		const struct cache_entry *ce = istate->cache[i];
 		const char *slash = ce->name;
@@ -78,7 +81,9 @@ static int collect_candidates(struct index_state *istate,
 				last = candidates->items[candidates->nr - 1].string;
 				if (strcmp(last, candidate.buf) > 0)
 					sorted = 0;
-				string_list_append(candidates, candidate.buf);
+				string_list_append(
+					candidates,
+					mem_pool_strdup(candidate_pool, candidate.buf));
 			}
 			basename = ++slash;
 		}
@@ -253,8 +258,9 @@ int worktree_attr_manifest_build(
 	unsigned char *manifest_hash,
 	struct worktree_attr_manifest_stats *stats)
 {
-	struct string_list candidates = STRING_LIST_INIT_DUP;
+	struct string_list candidates = STRING_LIST_INIT_NODUP;
 	struct string_list index_sources = STRING_LIST_INIT_DUP;
+	struct mem_pool candidate_pool;
 	struct attr_manifest_candidate *states = NULL;
 	struct semantic_verify_root *root = NULL;
 	struct attr_manifest_writer writer;
@@ -263,9 +269,11 @@ int worktree_attr_manifest_build(
 	int ret = -1;
 
 	memset(stats, 0, sizeof(*stats));
+	mem_pool_init(&candidate_pool, 0);
 	if (istate->sparse_index != INDEX_EXPANDED ||
 	    semantic_verify_root_init(istate->repo, &root) ||
-	    collect_candidates(istate, &candidates, &index_sources) ||
+	    collect_candidates(istate, &candidates, &index_sources,
+			       &candidate_pool) ||
 	    collect_index_sources(istate, &candidates, &index_sources,
 				  &states))
 		goto done;
@@ -305,6 +313,7 @@ done:
 	semantic_verify_root_clear(root);
 	string_list_clear(&index_sources, 0);
 	string_list_clear(&candidates, 0);
+	mem_pool_discard(&candidate_pool, 0);
 	free(states);
 	if (ret)
 		strbuf_reset(manifest);
