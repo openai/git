@@ -104,7 +104,8 @@ int clean_status_issue_sidecar(
 	int normal_clean_query);
 int clean_status_try_sidecar(
 	struct repository *repo,
-	const struct clean_status_config_digest *config);
+	const struct clean_status_config_digest *config,
+	int *repository_inputs_changed);
 
 int clean_status_read_fsmonitor_config(struct index_state *istate,
 				       const void *data, unsigned long size);
