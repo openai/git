@@ -21,8 +21,10 @@
 
 int clean_status_try_sidecar(
 	struct repository *repo UNUSED,
-	const struct clean_status_config_digest *config UNUSED)
+	const struct clean_status_config_digest *config UNUSED,
+	int *repository_inputs_changed)
 {
+	*repository_inputs_changed = 0;
 	return 0;
 }
 
@@ -196,7 +198,8 @@ static int current_worktree_is_main(struct repository *repo)
 
 int clean_status_try_sidecar(
 	struct repository *repo,
-	const struct clean_status_config_digest *config)
+	const struct clean_status_config_digest *config,
+	int *repository_inputs_changed)
 {
 	struct clean_status_sidecar_record record =
 		CLEAN_STATUS_SIDECAR_RECORD_INIT;
@@ -212,6 +215,7 @@ int clean_status_try_sidecar(
 	char *query_token = NULL;
 	int ret = 0;
 
+	*repository_inputs_changed = 0;
 	if (!config->finalized || config->filter_configured ||
 	    getenv(INDEX_ENVIRONMENT) || is_bare_repository(repo) ||
 	    !repo_get_work_tree(repo) ||
@@ -259,6 +263,7 @@ int clean_status_try_sidecar(
 	}
 	if (memcmp(repo_hash, record.sidecar.proof.repo_hash,
 		   repo->hash_algo->rawsz)) {
+		*repository_inputs_changed = 1;
 		trace_miss(repo, "fast-repository-input");
 		goto done;
 	}

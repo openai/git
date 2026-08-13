@@ -122,6 +122,7 @@ struct untracked_cache_preload {
 };
 
 #define UNTRACKED_CACHE_MAX_OVERLAP_THREADS 6
+#define UNTRACKED_CACHE_MAX_RECOVERY_THREADS 16
 #define UNTRACKED_CACHE_PRELOAD_COST 1000
 #define UNTRACKED_CACHE_EXCLUDE_PRELOAD_COST 256
 #define UNTRACKED_CACHE_MAX_EXCLUDE_SIZE (1024 * 1024)
@@ -451,9 +452,13 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 	if (threads > UNTRACKED_CACHE_MAX_OVERLAP_THREADS)
 		threads = UNTRACKED_CACHE_MAX_OVERLAP_THREADS;
 	test_threads = git_env_ulong("GIT_TEST_UNTRACKED_CACHE_THREADS", 0);
-	if (test_threads && HAVE_THREADS)
-		threads = test_threads > UNTRACKED_CACHE_MAX_OVERLAP_THREADS ?
-			UNTRACKED_CACHE_MAX_OVERLAP_THREADS : test_threads;
+	if (test_threads && HAVE_THREADS) {
+		unsigned long limit = fsmonitor_excludes_only ?
+			UNTRACKED_CACHE_MAX_OVERLAP_THREADS :
+			UNTRACKED_CACHE_MAX_RECOVERY_THREADS;
+
+		threads = test_threads > limit ? limit : test_threads;
+	}
 	if (threads < 1)
 		threads = 1;
 	if (preload->nr && (size_t)threads > preload->nr)
@@ -2084,12 +2089,55 @@ static void invalidate_gitignore(struct untracked_cache *uc,
 	do_invalidate_gitignore(dir);
 }
 
+static void clear_untracked_cache_validation(struct untracked_cache_dir *dir)
+{
+	size_t i;
+
+	dir->valid_recursive = 0;
+	dir->stat_checked = 0;
+	dir->stat_matches = 0;
+	dir->exclude_matches = 0;
+	for (i = 0; i < dir->dirs_nr; i++)
+		clear_untracked_cache_validation(dir->dirs[i]);
+}
+
+int untracked_cache_preserve_for_revalidation(struct index_state *istate)
+{
+	struct untracked_cache *uc = istate->untracked;
+
+	if (!uc || !uc->root || !uc->root->valid ||
+	    !uc->root->valid_recursive || uc->fsmonitor_dirty_paths.len ||
+	    !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_untracked_valid ||
+	    !istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_extension_invalid ||
+	    !istate->fsmonitor_last_update ||
+	    !istate->fsmonitor_untracked_token ||
+	    strcmp(istate->fsmonitor_last_update,
+		   istate->fsmonitor_untracked_token))
+		return 0;
+
+	/*
+	 * The paired provider proof authenticates these previously complete
+	 * lists, but its boundary is no longer replayable. Keep their ordinary
+	 * directory snapshots as candidates; every directory and exclude
+	 * source must be revalidated before a fresh provider token is closed.
+	 */
+	clear_untracked_cache_validation(uc->root);
+	uc->use_fsmonitor = 0;
+	uc->fsmonitor_revalidation = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "untracked/provider-reset-preserved", 1);
+	return 1;
+}
+
 void untracked_cache_invalidate_all(struct index_state *istate)
 {
 	if (!istate->untracked || !istate->untracked->root)
 		return;
 	invalidate_gitignore(istate->untracked, istate->untracked->root);
 	istate->untracked->use_fsmonitor = 0;
+	istate->untracked->fsmonitor_revalidation = 0;
 	istate->cache_changed |= UNTRACKED_CHANGED;
 }
 
