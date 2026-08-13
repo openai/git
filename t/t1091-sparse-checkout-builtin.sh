@@ -1274,4 +1274,63 @@ test_expect_success 'sparse-checkout operations with merge conflicts' '
 	)
 '
 
+test_expect_success 'unchanged sparse-checkout commands preserve the index' '
+	test_when_finished "rm -rf sparse-unchanged" &&
+	test_create_repo sparse-unchanged &&
+	mkdir sparse-unchanged/included sparse-unchanged/omitted &&
+	test_write_lines included >sparse-unchanged/included/tracked &&
+	test_write_lines omitted >sparse-unchanged/omitted/tracked &&
+	git -C sparse-unchanged add . &&
+	git -C sparse-unchanged commit -qm base &&
+	git -C sparse-unchanged sparse-checkout set included &&
+	for sparse_command in reapply set add
+	do
+		case "$sparse_command" in
+		reapply) set -- reapply ;;
+		set) set -- set included ;;
+		add) set -- add included ;;
+		esac &&
+		cp sparse-unchanged/.git/index \
+			"sparse-$sparse_command.index" &&
+		GIT_TRACE2_EVENT="$PWD/sparse-$sparse_command.trace" \
+			git -C sparse-unchanged sparse-checkout "$@" &&
+		test_cmp_bin "sparse-$sparse_command.index" \
+			sparse-unchanged/.git/index &&
+		test_grep ! "\"label\":\"do_write_index\"" \
+			"sparse-$sparse_command.trace" || return 1
+	done
+'
+
+test_expect_success 'sparse-checkout preserves hooks and explicit index modes' '
+	test_when_finished "rm -rf sparse-hook" &&
+	test_create_repo sparse-hook &&
+	mkdir sparse-hook/included sparse-hook/omitted &&
+	test_write_lines included >sparse-hook/included/tracked &&
+	test_write_lines omitted >sparse-hook/omitted/tracked &&
+	git -C sparse-hook add . &&
+	git -C sparse-hook commit -qm base &&
+	git -C sparse-hook sparse-checkout set included &&
+	mkdir sparse-hook/hooks &&
+	git -C sparse-hook config core.hooksPath hooks &&
+	write_script sparse-hook/hooks/post-index-change <<-\EOF &&
+	printf "%s %s\n" "$1" "$2" >>hook-actual
+	EOF
+	GIT_TRACE2_EVENT="$PWD/sparse-hook.trace" \
+		git -C sparse-hook sparse-checkout reapply &&
+	test_write_lines "0 0" >sparse-hook.expect &&
+	test_cmp sparse-hook.expect sparse-hook/hook-actual &&
+	test_grep "\"label\":\"do_write_index\"" sparse-hook.trace &&
+	rm sparse-hook/hooks/post-index-change &&
+	GIT_TRACE2_EVENT="$PWD/sparse-collapse.trace" \
+		git -C sparse-hook sparse-checkout reapply --sparse-index &&
+	git -C sparse-hook ls-files --sparse >sparse-collapsed &&
+	test_grep "^omitted/$" sparse-collapsed &&
+	test_grep "\"label\":\"do_write_index\"" sparse-collapse.trace &&
+	GIT_TRACE2_EVENT="$PWD/sparse-expand.trace" \
+		git -C sparse-hook sparse-checkout reapply --no-sparse-index &&
+	git -C sparse-hook ls-files --sparse >sparse-expanded &&
+	test_grep "^omitted/tracked$" sparse-expanded &&
+	test_grep "\"label\":\"do_write_index\"" sparse-expand.trace
+'
+
 test_done

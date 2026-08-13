@@ -8,6 +8,8 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -53,6 +55,55 @@ static int ignore_skip_worktree_entries;
 #define MARK_FLAG 1
 #define UNMARK_FLAG 2
 static struct strbuf mtime_dir = STRBUF_INIT;
+
+static int update_index_config(const char *key, const char *value,
+			       const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
+static int is_proof_preserving_rewrite(int argc, const char **argv)
+{
+	if (argc >= 4 && !strcmp(argv[1], "--refresh") &&
+	    !strcmp(argv[2], "--")) {
+		for (int i = 3; i < argc; i++) {
+			const char *base = strrchr(argv[i], '/');
+
+			base = base ? base + 1 : argv[i];
+			if (!*base || !strcasecmp(base, ".gitattributes") ||
+			    !strcasecmp(base, ".gitignore"))
+				return 0;
+		}
+		return 1;
+	}
+
+	if (argc == 2)
+		return !strcmp(argv[1], "--refresh") ||
+			!strcmp(argv[1], "--force-write-index");
+
+	if (argc != 3)
+		return 0;
+
+	return (!strcmp(argv[1], "--refresh") &&
+		!strcmp(argv[2], "--force-write-index")) ||
+		(!strcmp(argv[1], "--force-write-index") &&
+		 !strcmp(argv[2], "--refresh"));
+}
+
+static int is_fsmonitor_invalidation_rewrite(int argc, const char **argv)
+{
+	int first_path = 2;
+
+	if (argc < 3 || strcmp(argv[1], "--no-fsmonitor-valid"))
+		return 0;
+	if (!strcmp(argv[first_path], "--"))
+		return argc > ++first_path;
+	for (int i = first_path; i < argc; i++)
+		if (argv[i][0] == '-')
+			return 0;
+	return 1;
+}
 
 /* Untracked cache mode */
 enum uc_mode {
@@ -249,6 +300,14 @@ static int mark_ce_flags(const char *path, int flag, int mark)
 			the_repository->index->cache[pos]->ce_flags |= flag;
 		else
 			the_repository->index->cache[pos]->ce_flags &= ~flag;
+		if (flag == CE_FSMONITOR_VALID && !mark &&
+		    clean_status_external_history_enabled(
+			    the_repository->index) &&
+		    !the_repository->index->split_index) {
+			/* The fsmonitor bitmap does not change the indexed tree. */
+			the_repository->index->cache_changed |= FSMONITOR_CHANGED;
+			return 0;
+		}
 		the_repository->index->cache[pos]->ce_flags |= CE_UPDATE_IN_BASE;
 		cache_tree_invalidate_path(the_repository->index, path);
 		the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
@@ -261,6 +320,8 @@ static int remove_one_path(const char *path)
 {
 	if (!allow_remove)
 		return error("%s: does not exist and --remove not passed", path);
+	if (clean_status_external_history_enabled(the_repository->index))
+		clean_status_invalidate_current_proof(the_repository->index);
 	if (remove_file_from_index(the_repository->index, path))
 		return error("%s: cannot remove from the index", path);
 	return 0;
@@ -303,6 +364,12 @@ static int add_one_path(const struct cache_entry *old, const char *path, int len
 	}
 	option = allow_add ? ADD_CACHE_OK_TO_ADD : 0;
 	option |= allow_replace ? ADD_CACHE_OK_TO_REPLACE : 0;
+	if (clean_status_external_history_enabled(the_repository->index) &&
+	    (!old || old->ce_mode != ce->ce_mode ||
+	     !oideq(&old->oid, &ce->oid)) &&
+	    !clean_status_index_entry_is_semantically_safe(
+		    the_repository->index, old, ce))
+		clean_status_invalidate_current_proof(the_repository->index);
 	if (add_index_entry(the_repository->index, ce, option)) {
 		discard_cache_entry(ce);
 		return error("%s: cannot add to the index - missing --add option?", path);
@@ -337,6 +404,9 @@ static int process_directory(const char *path, int len, struct stat *st)
 {
 	struct object_id oid;
 	int pos = index_name_pos(the_repository->index, path, len);
+
+	if (clean_status_external_history_enabled(the_repository->index))
+		clean_status_invalidate_current_proof(the_repository->index);
 
 	/* Exact match: file or existing gitlink */
 	if (pos >= 0) {
@@ -917,6 +987,7 @@ int cmd_update_index(int argc,
 		     const char *prefix,
 		     struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	int newfd, entries, has_errors = 0, nul_term_line = 0;
 	enum uc_mode untracked_cache = UC_UNSPECIFIED;
 	int read_from_stdin = 0;
@@ -932,6 +1003,11 @@ int cmd_update_index(int argc,
 	struct parse_opt_ctx_t ctx;
 	strbuf_getline_fn getline_fn;
 	int parseopt_state = PARSE_OPT_UNKNOWN;
+	int preserve_fsmonitor_history =
+		is_fsmonitor_invalidation_rewrite(argc, argv);
+	int preserve_clean_history =
+		is_proof_preserving_rewrite(argc, argv) ||
+		preserve_fsmonitor_history;
 	struct repository *r = the_repository;
 	struct odb_transaction *transaction;
 	struct option options[] = {
@@ -1097,7 +1173,21 @@ int cmd_update_index(int argc,
 	show_usage_with_options_if_asked(argc, argv,
 					 update_index_usage, options);
 
-	repo_config(the_repository, git_default_config, NULL);
+	if (preserve_clean_history) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, update_index_config,
+			    &clean_digest);
+		clean_status_config_final(&clean_digest);
+		/*
+		 * These exact forms can refresh stat data, or no data at all,
+		 * but cannot change the logical contents of the index.
+		 */
+		clean_status_set_config_digest(the_repository, &clean_digest);
+		clean_status_enable_external_history(the_repository);
+	} else {
+		repo_config(the_repository, git_default_config, NULL);
+	}
 
 	prepare_repo_settings(r);
 	the_repository->settings.command_requires_full_index = 0;
@@ -1110,6 +1200,28 @@ int cmd_update_index(int argc,
 	entries = repo_read_index(the_repository);
 	if (entries < 0)
 		die("cache corrupted");
+	if (preserve_clean_history && argc >= 4 &&
+	    !strcmp(argv[1], "--refresh") && !strcmp(argv[2], "--")) {
+		if (the_repository->index->split_index ||
+		    the_repository->index->sparse_index)
+			clean_status_invalidate_current_proof(
+				the_repository->index);
+		for (int i = 3; i < argc; i++) {
+			char *path = prefix_path(the_repository, prefix,
+						 prefix_length, argv[i]);
+			int pos = index_name_pos(the_repository->index,
+						 path, strlen(path));
+			const struct cache_entry *ce = pos < 0 ? NULL :
+				the_repository->index->cache[pos];
+
+			if (!ce || !S_ISREG(ce->ce_mode) || ce_stage(ce) ||
+			    ce_skip_worktree(ce) || ce_intent_to_add(ce) ||
+			    (ce->ce_flags & CE_VALID))
+				clean_status_invalidate_current_proof(
+					the_repository->index);
+			free(path);
+		}
+	}
 
 	the_repository->index->updated_skipworktree = 1;
 
