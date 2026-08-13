@@ -241,6 +241,23 @@ test_expect_success 'core.attributesfile' '
 	attr_check global precedence
 '
 
+test_expect_success 'empty core.attributesfile disables global attributes' '
+	test_when_finished "rm -rf empty-global-attributes" &&
+	test_create_repo empty-global-attributes &&
+	(
+		cd empty-global-attributes &&
+		echo "global test=global" >.git/global-attributes &&
+		echo "local test=local" >.gitattributes &&
+		git config core.attributesfile "$PWD/.git/global-attributes" &&
+		attr_check global global &&
+		attr_check global unspecified "-c core.attributesFile=" &&
+		attr_check local local "-c core.attributesFile=" &&
+		git -c core.attributesFile= status --porcelain=v1 \
+			--untracked-files=no >actual &&
+		test_must_be_empty actual
+	)
+'
+
 test_expect_success 'attribute test: read paths from stdin' '
 	grep -v notest <expect-all >expect &&
 	sed -e "s/:.*//" <expect | git check-attr --stdin test >actual &&
