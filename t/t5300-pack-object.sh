@@ -195,6 +195,19 @@ test_expect_success 'pack with REF_DELTA' '
 	test_grep " REF_DELTA " deltas
 '
 
+test_expect_success 'index-pack rejects REF_DELTA when requested' '
+	test_must_fail git index-pack --no-ref-delta \
+		-o rejected-ref-delta.idx test-2-$packname_2.pack 2>err &&
+	test_grep "REF_DELTA not allowed by --no-ref-delta" err &&
+	test_path_is_missing rejected-ref-delta.idx
+'
+
+test_expect_success 'index-pack --stdin rejects REF_DELTA when requested' '
+	test_must_fail git index-pack --stdin --no-ref-delta \
+		<test-2-$packname_2.pack 2>err &&
+	test_grep "REF_DELTA not allowed by --no-ref-delta" err
+'
+
 test_expect_success 'unpack with REF_DELTA' '
 	check_unpack test-2-${packname_2} obj-list
 '
@@ -227,6 +240,12 @@ test_expect_success 'pack without REF_DELTA with OFS_DELTA' '
 	test-tool pack-deltas --list-deltas no-ref-ofs.idx >deltas &&
 	test_grep " OFS_DELTA " deltas &&
 	test_grep ! " REF_DELTA " deltas
+'
+
+test_expect_success 'index-pack accepts OFS_DELTA when REF_DELTA is forbidden' '
+	git index-pack --no-ref-delta -o accepted-ofs-delta.idx \
+		no-ref-ofs.pack &&
+	test_path_is_file accepted-ofs-delta.idx
 '
 
 test_expect_success 'pack without REF_DELTA reuses deltas as OFS_DELTA' '
