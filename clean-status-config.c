@@ -144,7 +144,9 @@ static int config_is_command_status_guard(
 		((!strcmp(key, "safe.barerepository") &&
 		  !strcmp(value, "explicit")) ||
 		 (!strcmp(key, "core.hookspath") &&
-		  !strcmp(value, "/dev/null")));
+		  !strcmp(value, "/dev/null")) ||
+		 (!strcmp(key, "hook.post-index-change.enabled") &&
+		  !strcmp(value, "false")));
 }
 
 static unsigned config_command_disabled_filter_part(
