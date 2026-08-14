@@ -246,11 +246,24 @@ invalid:
 void write_fsmonitor_untracked_extension(struct strbuf *sb,
 					 struct index_state *istate)
 {
+	const char *suffix;
 	uint32_t version;
 
 	put_be32(&version, FSMONITOR_UNTRACKED_EXTENSION_VERSION);
 	strbuf_add(sb, &version, sizeof(version));
-	strbuf_addstr(sb, istate->fsmonitor_last_update);
+	if (!istate->fsmonitor_untracked_valid && istate->untracked &&
+	    istate->untracked->fsmonitor_revalidation) {
+		if (!skip_prefix(istate->fsmonitor_last_update,
+				 "builtin:", &suffix) ||
+		    !*suffix || !strcmp(suffix, "fake"))
+			BUG("cannot serialize unauthenticated fsmonitor cache");
+		strbuf_addstr(sb, "pending:");
+		strbuf_addstr(sb, suffix);
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "untracked/provider-reset-pending", 1);
+	} else {
+		strbuf_addstr(sb, istate->fsmonitor_last_update);
+	}
 	strbuf_addch(sb, '\0');
 }
 
@@ -267,6 +280,9 @@ void prepare_fsmonitor_untracked(struct index_state *istate)
 	if (istate->fsmonitor_untracked_valid)
 		untracked_cache_recompute_fsmonitor_valid_recursive(
 			istate->untracked);
+	else if (istate->fsmonitor_untracked_token &&
+		 starts_with(istate->fsmonitor_untracked_token, "pending:"))
+		untracked_cache_preserve_for_revalidation(istate);
 }
 
 static struct ewah_bitmap *fsmonitor_bitmap_from_index(
@@ -1083,6 +1099,7 @@ static void invalidate_all_fsmonitor(struct index_state *istate)
 	unsigned int i;
 	int changed = 0;
 
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	for (i = 0; i < istate->cache_nr; i++) {
 		if (istate->cache[i]->ce_flags & CE_FSMONITOR_VALID)
 			changed = 1;
@@ -1160,6 +1177,8 @@ static void invalidate_fsmonitor_for_bootstrap(
 	if (physical_history_unavailable) {
 		int authenticated_manifest =
 			clean_status_has_authenticated_worktree_manifest(istate);
+		int pending_revalidation =
+			istate->fsmonitor_untracked_revalidation_authenticated;
 		int preserve_untracked = 0;
 
 		if (istate->fsmonitor_legacy_untracked_fallback) {
@@ -1169,19 +1188,30 @@ static void invalidate_fsmonitor_for_bootstrap(
 			return;
 		}
 		manifest_refresh_failed =
-			!clean_status_has_authenticated_bootstrap_manifest(istate) &&
+			(pending_revalidation ||
+			 !clean_status_has_authenticated_bootstrap_manifest(istate)) &&
 			clean_status_refresh_worktree_manifest(istate) < 0;
 		if (provider_query_success && !manifest_refresh_failed &&
 		    !clean_status_manifest_global_fallback(istate) &&
 		    !clean_status_fsmonitor_strong_mismatch(istate) &&
 		    !clean_status_filter_scope_needs_validation(istate) &&
+		    (!pending_revalidation ||
+		     (istate->fsmonitor_untracked_revalidation_authenticated &&
+		      istate->untracked && istate->untracked->root &&
+		      istate->untracked->root->valid &&
+		      clean_status_pending_revalidation_manifest_unchanged(
+			      istate))) &&
 		    istate->repo->config_values_private_.trust_ctime &&
 		    istate->repo->config_values_private_.check_stat) {
 			/* Strong stat identity survives a lost provider boundary. */
-			if (authenticated_manifest &&
-			    !clean_status_fsmonitor_config_mismatch(istate))
+			if ((authenticated_manifest &&
+			     !clean_status_fsmonitor_config_mismatch(istate)) ||
+			    pending_revalidation)
 				preserve_untracked =
 					untracked_cache_preserve_for_revalidation(istate);
+			if (pending_revalidation && preserve_untracked)
+				trace2_data_intmax("fsmonitor", istate->repo,
+						   "untracked/provider-reset-resumed", 1);
 			clean_status_begin_fsmonitor_semantic_baseline(istate);
 			invalidate_all_fsmonitor_for_baseline(istate);
 			trace2_data_intmax("fsmonitor", istate->repo,
@@ -1620,6 +1650,7 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 		BUG("valid untracked cache without a complete proof");
 	if (!fsmonitor_pending_token_from_provider(istate))
 		return;
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	FREE_AND_NULL(istate->fsmonitor_last_update);
 	istate->fsmonitor_last_update = istate->fsmonitor_last_update_pending;
 	istate->fsmonitor_last_update_pending = NULL;
@@ -1742,6 +1773,7 @@ void remove_fsmonitor(struct index_state *istate)
 {
 	istate->fsmonitor_token_valid = 0;
 	istate->fsmonitor_untracked_valid = 0;
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	FREE_AND_NULL(istate->fsmonitor_last_update_pending);
 	istate->fsmonitor_pending_token_from_provider = 0;
 	FREE_AND_NULL(istate->fsmonitor_untracked_token);
