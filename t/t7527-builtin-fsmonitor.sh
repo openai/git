@@ -2794,6 +2794,149 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'deleting a staged directory preserves unrelated attribute history' '
+	test_when_finished "rm -rf deleted-staged-directory" &&
+	test_create_repo deleted-staged-directory &&
+	(
+		cd deleted-staged-directory &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines "* text=auto" >.gitattributes &&
+		test_write_lines base >tracked &&
+		git add .gitattributes tracked &&
+		git commit -qm base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		mkdir staged &&
+		test_write_lines one >staged/one &&
+		test_write_lines two >staged/two &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=staged/one \
+			git add staged &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/staged &&
+		test_grep "^1 A\\..* staged/one$" .git/staged &&
+		test_grep "^1 A\\..* staged/two$" .git/staged &&
+		rm -rf staged &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=staged/ \
+		GIT_TRACE2_EVENT="$PWD/.git/removed.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "^1 AD .* staged/one$" .git/actual &&
+		test_grep "^1 AD .* staged/two$" .git/actual &&
+		test_trace2_data fsmonitor \
+			semantic/authenticated-removed-directory 1 \
+			<.git/removed.trace &&
+		! have_t2_data_event fsmonitor semantic/attributes-cone \
+			<.git/removed.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/removed.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'deleted staged directories never discard nested attribute sources' '
+	test_when_finished \
+		"rm -rf deleted-staged-attrs-tracked deleted-staged-attrs-untracked" &&
+	for source in tracked untracked
+	do
+		repo=deleted-staged-attrs-$source &&
+		test_create_repo "$repo" &&
+		(
+			cd "$repo" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			test_commit base tracked &&
+			git config core.untrackedCache true &&
+			git config core.fsmonitor true &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git update-index --fsmonitor &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+				git status --porcelain=v2 >.git/prime &&
+			test_must_be_empty .git/prime &&
+			mkdir staged &&
+			test_write_lines "*.txt text eol=lf" \
+				>staged/.gitattributes &&
+			test_write_lines staged >staged/file.txt &&
+			if test "$source" = tracked
+			then
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+				GIT_TEST_FSMONITOR_QUERY_PATH=staged/.gitattributes \
+					git add staged
+			else
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+				GIT_TEST_FSMONITOR_QUERY_PATH=staged/file.txt \
+					git add staged/file.txt
+			fi &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+				git status --porcelain=v2 >.git/staged &&
+			rm -rf staged &&
+			GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+				-c core.untrackedCache=false status --porcelain=v2 \
+				>.git/expect &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=staged/ \
+			GIT_TRACE2_EVENT="$PWD/.git/removed.trace" \
+				git status --porcelain=v2 >.git/actual &&
+			test_cmp .git/expect .git/actual &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<.git/removed.trace &&
+			! have_t2_data_event fsmonitor \
+				semantic/authenticated-removed-directory \
+				<.git/removed.trace
+		) || return 1
+	done
+'
+
+test_expect_success SYMLINKS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'a replacement symlink cannot impersonate a removed staged directory' '
+	test_when_finished "rm -rf deleted-staged-symlink" &&
+	test_create_repo deleted-staged-symlink &&
+	(
+		cd deleted-staged-symlink &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		mkdir staged replacement &&
+		test_write_lines staged >staged/file &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=staged/file \
+			git add staged/file &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/staged &&
+		rm -rf staged &&
+		ln -s replacement staged &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=staged/ \
+		GIT_TRACE2_EVENT="$PWD/.git/removed.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/removed.trace &&
+		! have_t2_data_event fsmonitor \
+			semantic/authenticated-removed-directory \
+			<.git/removed.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'command-scoped transport config preserves staged worktree proofs' '
 	test_when_finished "rm -rf command-transport-history" &&
 	test_create_repo command-transport-history &&
