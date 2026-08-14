@@ -261,9 +261,10 @@ void test_clean_status_config__only_safe_command_guards_are_normalized(void)
 {
 	static const char *const keys[] = {
 		"core.hookspath", "safe.barerepository",
+		"hook.post-index-change.enabled",
 	};
-	static const char *const safe[] = { "/dev/null", "explicit" };
-	static const char *const unsafe[] = { "/tmp/unsafe-hook", "all" };
+	static const char *const safe[] = { "/dev/null", "explicit", "false" };
+	static const char *const unsafe[] = { "/tmp/unsafe-hook", "all", "true" };
 	static const char *const previous[] = {
 		"true", "false", "true", "/tmp/hook", "true", NULL,
 	};
