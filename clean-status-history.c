@@ -679,16 +679,16 @@ static int has_usable_on_index_builtin_token(
 		strcmp(istate->fsmonitor_last_update, "builtin:fake");
 }
 
-static int external_token_is_replayable(const char *token)
+static enum fsmonitor_query_outcome external_token_query_outcome(
+	const char *token)
 {
 	struct fsmonitor_query_result result =
 		FSMONITOR_QUERY_RESULT_INIT;
-	int replayable =
-		query_builtin_fsmonitor(token, &result) ==
-			FSMONITOR_QUERY_DELTA;
+	enum fsmonitor_query_outcome outcome =
+		query_builtin_fsmonitor(token, &result);
 
 	fsmonitor_query_result_release(&result);
-	return replayable;
+	return outcome;
 }
 
 static int missing_fsmonitor_token_is_replayable(
@@ -1432,6 +1432,7 @@ int clean_status_restore_external_history(struct index_state *istate)
 	int missing_fsmonitor_recovery = 0;
 	int owned_index = 0;
 	int preserve_witness = 0;
+	int provider_reset_recovery = 0;
 	int restored = 0;
 
 	if (!clean_status_external_history_enabled(istate) || !state ||
@@ -1555,18 +1556,44 @@ have_index_hash:
 	 * crossed.  Probe a differing checkpoint token before replacing a
 	 * usable on-index boundary when builtin IPC can answer that question.
 	 * A successful delta is queried again by the normal refresh path; a
-	 * trivial or failed probe leaves the named index intact so its token
-	 * can take the forward-baseline fallback.
+	 * failed probe leaves the named index intact. If both tokens receive a
+	 * trivial response, neither boundary can be replayed: a complete,
+	 * authenticated checkpoint can still seed the existing forward
+	 * baseline and parallel untracked-directory revalidation.
 	 */
 	if (fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
 	    has_usable_on_index_builtin_token(istate) &&
 	    starts_with(parsed.fsmonitor_last_update, "builtin:") &&
 	    strcmp(istate->fsmonitor_last_update,
-		   parsed.fsmonitor_last_update) &&
-	    !external_token_is_replayable(parsed.fsmonitor_last_update)) {
-		trace2_data_intmax("fsmonitor", istate->repo,
-				   "history/external-token-unreplayable", 1);
-		goto done;
+		   parsed.fsmonitor_last_update)) {
+		enum fsmonitor_query_outcome outcome =
+			external_token_query_outcome(
+				parsed.fsmonitor_last_update);
+
+		if (outcome != FSMONITOR_QUERY_DELTA) {
+			if (outcome != FSMONITOR_QUERY_TRIVIAL ||
+			    !fstat_is_reliable() ||
+			    !record.checkpoint.source_alias_valid ||
+			    istate->split_index ||
+			    istate->sparse_index != INDEX_EXPANDED ||
+			    !parsed.untracked || !parsed.untracked->root ||
+			    !parsed.untracked->root->valid ||
+			    !parsed.untracked->root->valid_recursive ||
+			    !parsed.fsmonitor_untracked_valid ||
+			    !parsed.fsmonitor_untracked_extension_seen ||
+			    parsed.fsmonitor_untracked_extension_invalid ||
+			    !istate->repo->config_values_private_.trust_ctime ||
+			    !istate->repo->config_values_private_.check_stat ||
+			    external_token_query_outcome(
+				    istate->fsmonitor_last_update) !=
+					FSMONITOR_QUERY_TRIVIAL) {
+				trace2_data_intmax(
+					"fsmonitor", istate->repo,
+					"history/external-token-unreplayable", 1);
+				goto done;
+			}
+			provider_reset_recovery = 1;
+		}
 	}
 	if (!clean_status_index_snapshot_still_matches_proof_epoch(
 		    &snapshot, istate))
@@ -1632,6 +1659,9 @@ have_index_hash:
 		parsed.fsmonitor_untracked_valid;
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "history/external-restored", 1);
+	if (provider_reset_recovery)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "history/external-reset-restored", 1);
 	if (missing_fsmonitor_recovery)
 		trace2_data_intmax("fsmonitor", istate->repo,
 				   "history/external-fsmn-recovered", 1);
