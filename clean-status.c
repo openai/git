@@ -379,7 +379,7 @@ static unsigned int clean_status_directory_lower_bound(
 	return low;
 }
 
-static int clean_status_removed_directory_is_semantically_safe(
+static int clean_status_changed_directory_is_semantically_safe(
 	const struct index_state *istate, const char *name)
 {
 	const struct clean_status_state *state = istate->clean_status;
@@ -391,7 +391,7 @@ static int clean_status_removed_directory_is_semantically_safe(
 	const char *basename;
 	unsigned int first, i, namespace_unstable = 0;
 	size_t len;
-	int parent_fd, next, safe = 0;
+	int parent_fd, next, removed, safe = 0;
 
 	if (!state || !fstat_is_reliable() ||
 	    !state->current_config_valid || !state->current_attr_valid ||
@@ -434,15 +434,20 @@ static int clean_status_removed_directory_is_semantically_safe(
 	path = semantic_verify_path_new(root);
 	strbuf_addstr(&candidate, name);
 	strbuf_addstr(&candidate, ".gitattributes");
-	if (!semantic_verify_resolve_parent(path, candidate.buf, 0,
-					    &parent_fd, &basename) ||
-	    errno != ENOENT)
-		goto done;
+	if (semantic_verify_resolve_parent(path, candidate.buf, 0,
+					   &parent_fd, &basename)) {
+		if (errno != ENOENT)
+			goto done;
+		removed = 1;
+	} else {
+		removed = 0;
+	}
 
 	for (i = first; i < istate->cache_nr &&
 	     starts_with(istate->cache[i]->name, name); i++)
 		if (!clean_status_index_entry_is_semantically_safe(
-				istate, istate->cache[i], NULL))
+				istate, removed ? istate->cache[i] : NULL,
+				removed ? NULL : istate->cache[i]))
 			goto done;
 
 	semantic_verify_path_free(path, &namespace_unstable, NULL);
@@ -450,7 +455,9 @@ static int clean_status_removed_directory_is_semantically_safe(
 	safe = !namespace_unstable && semantic_verify_root_stable(root);
 	if (safe)
 		trace2_data_intmax("fsmonitor", istate->repo,
-				   "semantic/authenticated-removed-directory", 1);
+				   removed ?
+				   "semantic/authenticated-removed-directory" :
+				   "semantic/authenticated-restored-directory", 1);
 
 done:
 	if (path)
@@ -524,7 +531,7 @@ int clean_status_directory_event_is_semantically_safe(
 			path += strlen(path) + 1;
 		}
 	}
-	return clean_status_removed_directory_is_semantically_safe(
+	return clean_status_changed_directory_is_semantically_safe(
 		istate, name);
 }
 
