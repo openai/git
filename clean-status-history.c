@@ -95,6 +95,7 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 	int manifest_reusable;
 	int coherent;
 
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	if (!state || !state->current_config_valid)
 		return 0;
 	token_coherent = state->disk_config_valid &&
@@ -144,6 +145,39 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		state->manifest.disk_valid &&
 		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
 			FSMONITOR_CLEAN_PROOF_ALL;
+	istate->fsmonitor_untracked_revalidation_authenticated =
+		token_coherent && config_coherent &&
+		state->disk_semantic_valid && state->current_semantic_valid &&
+		!semantic_changed && state->disk_attr_valid &&
+		state->current_attr_valid && !attr_changed &&
+		state->disk_tracked_policy_valid &&
+		state->current_tracked_policy_valid &&
+		state->manifest.disk_valid &&
+		state->manifest.disk_flags ==
+			(FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+			 FSMONITOR_CLEAN_PROOF_FULL_INDEX) &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		istate == istate->repo->index && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED && fstat_is_reliable() &&
+		istate->repo->config_values_private_.trust_ctime &&
+		istate->repo->config_values_private_.check_stat &&
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid &&
+		istate->untracked->fsmonitor_revalidation &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		!istate->fsmonitor_untracked_valid &&
+		istate->fsmonitor_untracked_token &&
+		starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		istate->fsmonitor_last_update[strlen("builtin:")] &&
+		strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
+		starts_with(istate->fsmonitor_untracked_token, "pending:") &&
+		!strcmp(istate->fsmonitor_last_update + strlen("builtin:"),
+			istate->fsmonitor_untracked_token + strlen("pending:"));
 	manifest_reusable = token_coherent && !config_coherent &&
 		state->disk_semantic_valid && state->current_semantic_valid &&
 		!semantic_changed && state->disk_attr_valid &&
@@ -151,7 +185,9 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		!state->filter_configured && state->manifest.disk_valid &&
 		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
 			FSMONITOR_CLEAN_PROOF_ALL;
-	state->filter_scope_valid = coherent && state->filter_configured;
+	state->filter_scope_valid =
+		(coherent || istate->fsmonitor_untracked_revalidation_authenticated) &&
+		state->filter_configured;
 	state->config_revalidated = coherent;
 	state->initial_coherent = coherent;
 	FREE_AND_NULL(state->config_revalidated_token);
@@ -196,6 +232,23 @@ void clean_status_prepare_fsmonitor_config(struct index_state *istate)
 int clean_status_probe_fsmonitor_config(struct index_state *istate)
 {
 	return prepare_fsmonitor_config(istate, 0);
+}
+
+int clean_status_pending_revalidation_manifest_unchanged(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	const uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+
+	return state && istate->fsmonitor_untracked_revalidation_authenticated &&
+		state->manifest.disk_valid && state->manifest.current_valid &&
+		state->manifest.checked && !state->manifest.current_invalidated &&
+		!state->manifest.global_fallback && !state->manifest.changed &&
+		(state->manifest.disk_flags & required) == required &&
+		(state->manifest.current_flags & required) == required &&
+		!memcmp(state->manifest.disk_hash, state->manifest.current_hash,
+			istate->repo->hash_algo->rawsz);
 }
 
 int clean_status_try_preserve_tracked_config_epoch(

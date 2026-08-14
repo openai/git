@@ -146,6 +146,11 @@ static void set_index_entry(struct index_state *istate, int nr, struct cache_ent
 static void replace_index_entry(struct index_state *istate, int nr, struct cache_entry *ce)
 {
 	struct cache_entry *old = istate->cache[nr];
+	int preserve_untracked = istate->untracked &&
+		istate->untracked->fsmonitor_revalidation &&
+		istate->untracked->root && istate->untracked->root->valid &&
+		S_ISREG(old->ce_mode) && S_ISREG(ce->ce_mode) &&
+		clean_status_index_entry_is_semantically_safe(istate, old, ce);
 
 	replace_index_entry_in_base(istate, old, ce);
 	remove_name_hash(istate, old);
@@ -153,7 +158,10 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
 	ce->ce_flags &= ~CE_HASHED;
 	set_index_entry(istate, nr, ce);
 	ce->ce_flags |= CE_UPDATE_IN_BASE;
-	mark_fsmonitor_invalid(istate, ce);
+	if (preserve_untracked)
+		ce->ce_flags &= ~CE_FSMONITOR_VALID;
+	else
+		mark_fsmonitor_invalid(istate, ce);
 	istate->cache_changed |= CE_ENTRY_CHANGED;
 }
 
@@ -3055,6 +3063,37 @@ enum write_extensions {
 };
 #define WRITE_ALL_EXTENSIONS ((enum write_extensions)-1)
 
+static int fsmonitor_can_persist_untracked_revalidation(
+	const struct index_state *istate)
+{
+	return istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid &&
+		istate->untracked->fsmonitor_revalidation &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		istate->fsmonitor_last_update &&
+		starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		istate->fsmonitor_last_update[strlen("builtin:")] &&
+		strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token) &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		istate == istate->repo->index &&
+		!istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		!(istate->cache_changed &
+		  (CE_ENTRY_ADDED | CE_ENTRY_REMOVED)) &&
+		istate->repo->config_values_private_.trust_ctime &&
+		istate->repo->config_values_private_.check_stat &&
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		clean_status_fsmonitor_semantic_baseline_pending(istate);
+}
+
 /*
  * On success, `tempfile` is closed. If it is the temporary file
  * of a `struct lock_file`, we will therefore effectively perform
@@ -3306,7 +3345,8 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	if (write_extensions & WRITE_FSMONITOR_EXTENSION &&
 	    istate->untracked &&
 	    istate->fsmonitor_last_update &&
-	    istate->fsmonitor_untracked_valid &&
+	    (istate->fsmonitor_untracked_valid ||
+	     fsmonitor_can_persist_untracked_revalidation(istate)) &&
 	    !istate->fsmonitor_legacy_untracked_fallback) {
 		strbuf_reset(&sb);
 
