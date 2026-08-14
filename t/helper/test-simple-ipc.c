@@ -175,10 +175,10 @@ static int app__fsmonitor_capability_superset(
 	static const char capabilities[] = "query-v1\nquery-v2\n"
 #ifdef __APPLE__
 		"dir-metadata-filter-v1\n"
+		"hardlink-inode-v1\n"
 #endif
 		;
 	static const char pre_dir_metadata_capabilities[] = "query-v1\n";
-	static const char query_prefix[] = "query-v1 ";
 	static const char token[] = "builtin:test-capable:0";
 	const char *query;
 	size_t query_len;
@@ -198,7 +198,8 @@ static int app__fsmonitor_capability_superset(
 	query_len = query ? command_len - (query + 1 - command) : 0;
 	ret = reply_cb(reply_data, token, sizeof(token));
 	if (!ret &&
-	    (!starts_with(command, query_prefix) ||
+	    ((!starts_with(command, "query-v1 ") &&
+	      !starts_with(command, "query-v2 ")) ||
 	     query_len != sizeof(token) - 1 ||
 	     memcmp(query + 1, token, query_len)))
 		ret = reply_cb(reply_data, "/", 2);
@@ -225,7 +226,9 @@ static int test_app_cb(void *application_data,
 		BUG("application_cb: application_data pointer wrong");
 
 	/* Exit before the server can flush a response to this bound query. */
-	if (fsmonitor_disconnect_first && starts_with(command, "query-v1 "))
+	if (fsmonitor_disconnect_first &&
+	    (starts_with(command, "query-v1 ") ||
+	     starts_with(command, "query-v2 ")))
 		_exit(0);
 
 	if (command_len == 4 && !strncmp(command, "quit", 4)) {

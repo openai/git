@@ -712,7 +712,8 @@ static int missing_fsmonitor_token_is_replayable(
 		const char *base = find_last_dir_sep(path);
 
 		base = base ? base + 1 : path;
-		if (!strcmp(path, FSMONITOR_PATH_GLOBAL_INVALIDATE))
+		if (!strcmp(path, FSMONITOR_PATH_GLOBAL_INVALIDATE) ||
+		    starts_with(path, FSMONITOR_PATH_HARDLINK_INODE_PREFIX))
 			goto done;
 		if (!fspathcmp(base, ".gitattributes")) {
 			struct index_state witness = *istate;
@@ -777,7 +778,9 @@ static int external_semantic_delta_is_safe(
 		const char *base = find_last_dir_sep(path);
 
 		base = base ? base + 1 : path;
-		if (!len || !fspathcmp(base, ".gitattributes") ||
+		if (!len ||
+		    starts_with(path, FSMONITOR_PATH_HARDLINK_INODE_PREFIX) ||
+		    !fspathcmp(base, ".gitattributes") ||
 		    !fspathcmp(base, ".gitignore"))
 			return 0;
 		if (path[len - 1] == '/') {
@@ -1371,6 +1374,7 @@ static int restore_external_bootstrap_manifest(
 		base = base ? base + 1 : changed;
 		if (!len ||
 		    !strcmp(changed, FSMONITOR_PATH_GLOBAL_INVALIDATE) ||
+		    starts_with(changed, FSMONITOR_PATH_HARDLINK_INODE_PREFIX) ||
 		    changed[len - 1] == '/' ||
 		    (!fspathcmp(base, ".gitattributes") &&
 		     strcmp(changed, ".gitattributes")))

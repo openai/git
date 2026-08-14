@@ -6,6 +6,8 @@ struct strbuf;
 
 /* A provider-only marker; worktree-relative paths cannot begin with '/'. */
 #define FSMONITOR_PATH_GLOBAL_INVALIDATE "//"
+#define FSMONITOR_PATH_HARDLINK_INODE_PREFIX "//inode:"
+#define FSMONITOR_PATH_HARDLINK_INODE_HEX 16
 
 enum fsmonitor_token_result {
 	FSMONITOR_TOKEN_NOT_PENDING = 0,

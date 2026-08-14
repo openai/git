@@ -12,6 +12,8 @@
 #include "ewah/ewok_rlw.h"
 #include "fsmonitor.h"
 #include "fsmonitor-ipc.h"
+#include "hashmap.h"
+#include "hex-ll.h"
 #include "name-hash.h"
 #include "repository.h"
 #include "run-command.h"
@@ -813,6 +815,32 @@ done:
 	return valid;
 }
 
+static int fsmonitor_parse_hardlink_inode(const char *path, size_t len,
+					  uint32_t *inode)
+{
+	const char *hex;
+	uint64_t value = 0;
+	size_t i;
+
+	if (!skip_prefix(path, FSMONITOR_PATH_HARDLINK_INODE_PREFIX, &hex))
+		return 0;
+	if (len != strlen(FSMONITOR_PATH_HARDLINK_INODE_PREFIX) +
+		    FSMONITOR_PATH_HARDLINK_INODE_HEX)
+		return -1;
+	for (i = 0; i < FSMONITOR_PATH_HARDLINK_INODE_HEX; i++) {
+		unsigned int digit = hexval(hex[i]);
+
+		if (digit > 0xf)
+			return -1;
+		value = (value << 4) | digit;
+	}
+	if (!value)
+		return -1;
+	if (inode)
+		*inode = (uint32_t)value;
+	return 1;
+}
+
 enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 	const struct strbuf *raw, struct fsmonitor_query_result *result)
 {
@@ -845,6 +873,7 @@ enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 		if (!nul || nul == p)
 			goto malformed;
 		if (strcmp(p, FSMONITOR_PATH_GLOBAL_INVALIDATE) &&
+		    fsmonitor_parse_hardlink_inode(p, nul - p, NULL) <= 0 &&
 		    !fsmonitor_valid_worktree_path(p, nul - p))
 			goto malformed;
 		p = nul + 1;
@@ -913,20 +942,90 @@ enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	return result->outcome;
 }
 
+struct fsmonitor_hardlink_inode {
+	struct hashmap_entry ent;
+	uint32_t inode;
+};
+
+static int fsmonitor_hardlink_inode_cmp(const void *unused UNUSED,
+					 const struct hashmap_entry *eptr,
+					 const struct hashmap_entry *entry_or_key,
+					 const void *keydata)
+{
+	const struct fsmonitor_hardlink_inode *entry =
+		container_of(eptr, const struct fsmonitor_hardlink_inode, ent);
+	const uint32_t *inode = keydata;
+
+	if (inode)
+		return entry->inode != *inode;
+	return entry->inode !=
+		container_of(entry_or_key,
+			     const struct fsmonitor_hardlink_inode, ent)->inode;
+}
+
 static int apply_fsmonitor_paths(struct index_state *istate,
 				 const struct strbuf *paths)
 {
 	const char *p = paths->buf;
 	const char *end = paths->buf + paths->len;
+	struct hashmap inodes = HASHMAP_INIT(fsmonitor_hardlink_inode_cmp, NULL);
+	struct fsmonitor_hardlink_inode *entry;
+	unsigned int matches = 0;
 	int count = 0;
 
 	while (p < end) {
 		size_t len = strlen(p);
+		uint32_t inode;
+		int parsed = fsmonitor_parse_hardlink_inode(p, len, &inode);
 
-		fsmonitor_refresh_callback(istate, (char *)p);
-		count++;
+		if (parsed < 0) {
+			fsmonitor_refresh_callback(
+				istate, (char *)FSMONITOR_PATH_GLOBAL_INVALIDATE);
+			count++;
+			goto done;
+		}
+		if (!parsed) {
+			fsmonitor_refresh_callback(istate, (char *)p);
+			count++;
+		} else if (!hashmap_get_entry_from_hash(
+				   &inodes, memhash(&inode, sizeof(inode)), &inode,
+				   struct fsmonitor_hardlink_inode, ent)) {
+			CALLOC_ARRAY(entry, 1);
+			entry->inode = inode;
+			hashmap_entry_init(&entry->ent,
+					   memhash(&inode, sizeof(inode)));
+			hashmap_add(&inodes, &entry->ent);
+		}
 		p += len + 1;
 	}
+
+	if (hashmap_get_size(&inodes)) {
+		unsigned int i;
+
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/hardlink-inode-events",
+				   hashmap_get_size(&inodes));
+		for (i = 0; i < istate->cache_nr; i++) {
+			struct cache_entry *ce = istate->cache[i];
+			uint32_t inode = ce->ce_stat_data.sd_ino;
+
+			if (inode &&
+			    !hashmap_get_entry_from_hash(
+				    &inodes, memhash(&inode, sizeof(inode)), &inode,
+				    struct fsmonitor_hardlink_inode, ent))
+				continue;
+			fsmonitor_refresh_callback(istate, ce->name);
+			matches++;
+			count++;
+		}
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/hardlink-index-scan", 1);
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/hardlink-matches", matches);
+	}
+
+done:
+	hashmap_clear_and_free(&inodes, struct fsmonitor_hardlink_inode, ent);
 	return count;
 }
 
