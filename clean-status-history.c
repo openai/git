@@ -157,7 +157,6 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 			(FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
 			 FSMONITOR_CLEAN_PROOF_FULL_INDEX) &&
 		!getenv(INDEX_ENVIRONMENT) &&
-		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
 		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
 		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
 		istate == istate->repo->index && !istate->split_index &&

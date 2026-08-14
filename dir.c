@@ -2101,6 +2101,8 @@ static void clear_untracked_cache_validation(struct untracked_cache_dir *dir)
 		clear_untracked_cache_validation(dir->dirs[i]);
 }
 
+static int ident_in_untracked(const struct untracked_cache *uc);
+
 int untracked_cache_preserve_for_revalidation(struct index_state *istate)
 {
 	struct untracked_cache *uc = istate->untracked;
@@ -2125,6 +2127,8 @@ int untracked_cache_preserve_for_revalidation(struct index_state *istate)
 		!istate->split_index &&
 		istate->sparse_index == INDEX_EXPANDED &&
 		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		(!getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+		 ident_in_untracked(uc)) &&
 		skip_prefix(istate->fsmonitor_last_update,
 			    "builtin:", &builtin_suffix) &&
 		*builtin_suffix && strcmp(builtin_suffix, "fake") &&
