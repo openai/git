@@ -800,6 +800,80 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'index writers report missing authenticated untracked proofs' '
+	test_when_finished "rm -rf missing-untracked-proof" &&
+	test_create_repo missing-untracked-proof &&
+	(
+		cd missing-untracked-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+
+		test_write_lines changed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/healthy.trace" \
+			git add tracked &&
+		test_grep FSUC .git/index &&
+		! test_trace2_data fsmonitor untracked/proof-missing 1 \
+			<.git/healthy.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/reset.trace" \
+			git reset --hard HEAD >.git/reset.out &&
+		test_region index do_write_index .git/reset.trace &&
+		test_trace2_data fsmonitor untracked/proof-missing 1 \
+			<.git/reset.trace &&
+		test_grep FSMN .git/index &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSUC .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
+			git status --porcelain=v2 >.git/repair &&
+		test_must_be_empty .git/repair &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+
+		cp .git/index .git/alternate.index &&
+		GIT_INDEX_FILE="$PWD/.git/alternate.index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/alternate.trace" \
+			git reset --hard HEAD >.git/alternate.out &&
+		! test_trace2_data fsmonitor untracked/proof-missing 1 \
+			<.git/alternate.trace &&
+		test_grep FSUC .git/index &&
+
+		test_write_lines stashed >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=T \
+			git add tracked &&
+		test_grep "pending:" .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+			git status --porcelain=v2 >.git/staged &&
+		test_grep "^1 M\\. .* tracked$" .git/staged &&
+		test_grep FSUC .git/index &&
+		test_grep ! "pending:" .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/stash.trace" \
+			git stash push -m proof-missing >.git/stash.out &&
+		test_region index do_write_index .git/stash.trace &&
+		test_trace2_data fsmonitor untracked/proof-missing 1 \
+			<.git/stash.trace &&
+		test_grep FSMN .git/index &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'expired add preserves untracked candidates until revalidation' '
 	test_when_finished "rm -rf pending-untracked-revalidation pending-untracked-hostile" &&
 	test_create_repo pending-untracked-revalidation &&
