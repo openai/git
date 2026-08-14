@@ -801,7 +801,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'expired add preserves untracked candidates until revalidation' '
-	test_when_finished "rm -rf pending-untracked-revalidation" &&
+	test_when_finished "rm -rf pending-untracked-revalidation pending-untracked-hostile" &&
 	test_create_repo pending-untracked-revalidation &&
 	(
 		cd pending-untracked-revalidation &&
@@ -865,6 +865,38 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		else
 			:
 		fi &&
+
+		cp .git/index .git/worktree-pending.index &&
+		GIT_WORK_TREE="$PWD" \
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/worktree.trace" \
+			git status --porcelain=v2 >.git/worktree.actual &&
+		test_cmp .git/expect .git/worktree.actual &&
+		test_trace2_data fsmonitor \
+			untracked/provider-reset-resumed 1 <.git/worktree.trace &&
+		test_trace2_data read_directory opendir 0 <.git/worktree.trace &&
+		test_cmp .git/worktree-pending.index .git/index &&
+		test_grep "pending:" .git/index &&
+
+		mkdir ../pending-untracked-hostile &&
+		GIT_WORK_TREE="$PWD/../pending-untracked-hostile" \
+		GIT_OPTIONAL_LOCKS=0 git \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 >.git/worktree-hostile.expect &&
+		GIT_WORK_TREE="$PWD/../pending-untracked-hostile" \
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/worktree-hostile.trace" \
+			git status --porcelain=v2 >.git/worktree-hostile.actual &&
+		test_cmp .git/worktree-hostile.expect \
+			.git/worktree-hostile.actual &&
+		! test_trace2_data fsmonitor \
+			untracked/provider-reset-resumed 1 \
+			<.git/worktree-hostile.trace &&
+		test_cmp .git/worktree-pending.index .git/index &&
 
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
 		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
