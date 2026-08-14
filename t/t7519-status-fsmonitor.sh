@@ -836,6 +836,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_grep UNTR .git/index &&
 		test_grep ! FSUC .git/index &&
 
+		GIT_INDEX_FILE="$PWD/.git/index" \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
 			git status --porcelain=v2 >.git/repair &&
