@@ -756,6 +756,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_grep FSUC .git/index &&
 		test_grep FSCF .git/index &&
 		rm -f .git/index.csts &&
+		cp .git/index .git/reset.index &&
 		GIT_OPTIONAL_LOCKS=0 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
 		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
@@ -773,7 +774,28 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_trace2_data fsmonitor \
 			untracked/provider-reset-revalidated 1 <.git/reset.trace &&
 		test_trace2_data fsmonitor token_closure/accepted 1 \
-			<.git/reset.trace
+			<.git/reset.trace &&
+		test_cmp .git/reset.index .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCC \
+		GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+		GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+		GIT_TRACE2_EVENT="$PWD/.git/reset-write.trace" \
+			git status --porcelain=v2 >.git/reset-write.actual &&
+		test_cmp .git/prime .git/reset-write.actual &&
+		test_trace2_data fsmonitor \
+			untracked/provider-reset-revalidated 1 \
+			<.git/reset-write.trace &&
+		test_region index do_write_index .git/reset-write.trace &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+		test_write_lines changed >cached/deep/tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/reset-add.trace" \
+			git add cached/deep/tracked &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/reset-add.trace &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index
 	)
 '
 

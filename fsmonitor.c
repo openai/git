@@ -1628,9 +1628,11 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 	istate->fsmonitor_untracked_valid = !!untracked_cache_valid;
 	if (istate->untracked) {
 		if (istate->untracked->fsmonitor_revalidation &&
-		    untracked_cache_valid)
+		    untracked_cache_valid) {
+			istate->fsmonitor_untracked_must_persist = 1;
 			trace2_data_intmax("fsmonitor", istate->repo,
 					   "untracked/provider-reset-revalidated", 1);
+		}
 		istate->untracked->fsmonitor_revalidation = 0;
 		istate->untracked->use_fsmonitor = !!untracked_cache_valid;
 	}
