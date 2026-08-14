@@ -6609,9 +6609,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
 		GIT_TEST_FSMONITOR_QUERY_PATH=active.filtered \
 			git -c filter.demo.required=false add active.filtered &&
-		GIT_OPTIONAL_LOCKS=0 \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
-			test_must_fail git status --porcelain=v2 \
+		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 \
 				--untracked-files=no >.git/actual 2>.git/error &&
 		test_grep "clean filter .demo. failed" .git/error
 	)
