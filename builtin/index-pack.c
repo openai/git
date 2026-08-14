@@ -33,7 +33,7 @@
 #include "strvec.h"
 
 static const char index_pack_usage[] =
-"git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
+"git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] [--no-ref-delta] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
 
 struct object_entry {
 	struct pack_idx_entry idx;
@@ -138,6 +138,7 @@ static int strict;
 static int do_fsck_object;
 static struct fsck_options fsck_options;
 static int verbose;
+static int no_ref_delta;
 static const char *progress_title;
 static int show_resolving_progress;
 static int show_stat;
@@ -550,6 +551,9 @@ static void *unpack_raw_entry(struct object_entry *obj,
 
 	switch (obj->type) {
 	case OBJ_REF_DELTA:
+		if (no_ref_delta)
+			bad_object(obj->idx.offset,
+				   _("REF_DELTA not allowed by --no-ref-delta"));
 		oidread(ref_oid, fill(the_hash_algo->rawsz),
 			the_repository->hash_algo);
 		use(the_hash_algo->rawsz);
@@ -1937,6 +1941,8 @@ int cmd_index_pack(int argc,
 				from_stdin = 1;
 			} else if (!strcmp(arg, "--fix-thin")) {
 				fix_thin_pack = 1;
+			} else if (!strcmp(arg, "--no-ref-delta")) {
+				no_ref_delta = 1;
 			} else if (skip_to_optional_arg(arg, "--strict", &arg)) {
 				strict = 1;
 				do_fsck_object = 1;
