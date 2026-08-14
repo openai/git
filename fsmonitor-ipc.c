@@ -445,7 +445,11 @@ static int server_supports_required_capabilities(void)
 				&answer, NULL, 1) &&
 		has_capability(&answer, FSMONITOR_IPC_QUERY_VERSION) &&
 		has_capability(&answer,
-			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY);
+			       FSMONITOR_IPC_HARDLINK_QUERY_VERSION) &&
+		has_capability(&answer,
+			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY) &&
+		has_capability(&answer,
+			       FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY);
 	strbuf_release(&answer);
 	return ret;
 #else
@@ -458,7 +462,7 @@ static int query_identifies_filtered_daemon(const char *token,
 					   const struct strbuf *answer)
 {
 	static const char prefix[] =
-		"builtin:" FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX;
+		"builtin:" FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX;
 	const char *end = memchr(answer->buf, '\0', answer->len);
 
 	return starts_with(token, prefix) && end &&
@@ -901,7 +905,11 @@ int fsmonitor_ipc__send_query(const char *since_token,
 				   "query/worktree-identity-error", 1);
 		goto done;
 	}
+#ifdef __APPLE__
+	strbuf_addstr(&command, FSMONITOR_IPC_HARDLINK_QUERY_PREFIX);
+#else
 	strbuf_addstr(&command, FSMONITOR_IPC_QUERY_PREFIX);
+#endif
 	strbuf_addbuf(&command, &identity);
 	strbuf_addch(&command, '\n');
 	strbuf_addstr(&command, tok);
