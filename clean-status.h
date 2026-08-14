@@ -79,6 +79,8 @@ void clean_status_begin_fsmonitor_semantic_baseline(
 
 int clean_status_refresh_worktree_manifest(struct index_state *istate);
 int clean_status_manifest_global_fallback(const struct index_state *istate);
+int clean_status_pending_revalidation_manifest_unchanged(
+	const struct index_state *istate);
 int clean_status_has_authenticated_worktree_manifest(
 	const struct index_state *istate);
 int clean_status_has_authenticated_bootstrap_manifest(
