@@ -185,6 +185,10 @@ server advertises this capability.
 This does not imply that the server understands OBJ_OFS_DELTA entries;
 that is negotiated separately with the 'ofs-delta' capability.
 
+Protocol v2 `fetch` uses the same name for the corresponding
+upload-pack request. There, the promise covers both the inline pack and
+any packs named by a `packfile-uris` section.
+
 agent
 -----
 

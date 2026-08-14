@@ -972,6 +972,36 @@ test_expect_success 'reject client packfile-uris if not advertised' '
 		upload-pack client <input
 '
 
+test_expect_success 'fetch no-ref-delta requires advertisement' '
+	rm -rf no-ref-advertisement &&
+	git init no-ref-advertisement &&
+	test_commit -C no-ref-advertisement one &&
+	env GIT_CONFIG_COUNT=1 \
+		GIT_CONFIG_KEY_0=uploadpack.allowNoRefDelta \
+		GIT_CONFIG_VALUE_0=true \
+		test-tool -C no-ref-advertisement serve-v2 \
+		--advertise-capabilities \
+		>advertisement &&
+	test_grep "fetch=.*no-ref-delta" advertisement &&
+	{
+		packetize command=fetch &&
+		packetize object-format=$(test_oid algo) &&
+		printf 0001 &&
+		packetize no-ref-delta &&
+		packetize "want $(git -C no-ref-advertisement rev-parse HEAD)" &&
+		packetize done &&
+		printf 0000
+	} >input &&
+	test_must_fail env GIT_PROTOCOL=version=2 \
+		git upload-pack no-ref-advertisement <input &&
+	GIT_TRACE2_EVENT="$PWD/no-ref-upload.trace" \
+	GIT_PROTOCOL=version=2 \
+		git -c uploadpack.allowNoRefDelta=true \
+		upload-pack no-ref-advertisement <input >out &&
+	test_grep "\"event\":\"child_start\".*\"pack-objects\".*--no-ref-delta" \
+		no-ref-upload.trace
+'
+
 # Test protocol v2 with 'http://' transport
 #
 . "$TEST_DIRECTORY"/lib-httpd.sh
