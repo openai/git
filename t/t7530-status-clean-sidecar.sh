@@ -2291,6 +2291,58 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'expired index and checkpoint tokens preserve paired untracked history' '
+	repo=sidecar-provider-reset &&
+	test_when_finished "stop_daemon $repo" &&
+	setup_repo "$repo" &&
+	mkdir -p "$repo/cached/deep" &&
+	test_write_lines tracked >"$repo/cached/deep/tracked" &&
+	test_write_lines hidden >"$repo/cached/deep/visible.ignored" &&
+	test_write_lines "*.ignored" >"$repo/.gitignore" &&
+	test-tool chmtime -120 "$repo/cached/deep/tracked" \
+		"$repo/.gitignore" &&
+	git -C "$repo" add .gitignore cached/deep/tracked &&
+	git -C "$repo" commit -qm nested &&
+	git -C "$repo" config core.untrackedCache true &&
+	git -C "$repo" config status.renameLimit 100 &&
+	git -C "$repo" status --porcelain=v2 >reset.prime &&
+	test_env GIT_INDEX_FILE="$PWD/$repo/.git/index" \
+		git -C "$repo" status --porcelain=v2 >reset.prime &&
+	test_must_be_empty reset.prime &&
+	test_grep FSMN "$repo/.git/index" &&
+	test_grep FSUC "$repo/.git/index" &&
+	cp "$repo/.git/index" reset.namespace-a.index &&
+	test-tool -C "$repo" fsmonitor-client flush >reset.flush &&
+	git -C "$repo" config status.renameLimit 200 &&
+	git -C "$repo" status --porcelain=v2 >reset.namespace-b &&
+	test_must_be_empty reset.namespace-b &&
+	cp reset.namespace-a.index "$repo/.git/index" &&
+	rm -f "$repo/.git/index.csts" &&
+	stop_daemon "$repo" &&
+	test_write_lines "*.other" >"$repo/.gitignore" &&
+	test_write_lines new >"$repo/cached/deep/new" &&
+	git -C "$repo" fsmonitor--daemon start --start-timeout=10 &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TEST_UNTRACKED_CACHE_AUTO_PRELOAD=1 \
+	GIT_TEST_UNTRACKED_CACHE_THREADS=4 \
+	GIT_TRACE2_EVENT="$PWD/external-provider-reset.trace" \
+		git -C "$repo" status --porcelain=v2 >reset.actual &&
+	test_grep "^1 \\.M .* \\.gitignore$" reset.actual &&
+	test_grep "^? cached/deep/new$" reset.actual &&
+	test_grep "^? cached/deep/visible\\.ignored$" reset.actual &&
+	test_trace2_data fsmonitor history/external-reset-restored 1 \
+		<external-provider-reset.trace &&
+	test_trace2_data fsmonitor history/external-restored 1 \
+		<external-provider-reset.trace &&
+	test_trace2_data fsmonitor untracked/provider-reset-preserved 1 \
+		<external-provider-reset.trace &&
+	test_trace2_data status untracked/provider-reset-preload 1 \
+		<external-provider-reset.trace &&
+	test_trace2_data fsmonitor untracked/provider-reset-revalidated 1 \
+		<external-provider-reset.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'diff restores clean history lost by a foreign index writer' '
 	diff_repo=sidecar-foreign-diff &&
 	test_when_finished "stop_daemon $diff_repo" &&
