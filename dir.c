@@ -2104,17 +2104,34 @@ static void clear_untracked_cache_validation(struct untracked_cache_dir *dir)
 int untracked_cache_preserve_for_revalidation(struct index_state *istate)
 {
 	struct untracked_cache *uc = istate->untracked;
+	const char *builtin_suffix, *pending_suffix;
+	int paired, pending;
 
 	if (!uc || !uc->root || !uc->root->valid ||
-	    !uc->root->valid_recursive || uc->fsmonitor_dirty_paths.len ||
+	    uc->fsmonitor_dirty_paths.len ||
 	    !istate->fsmonitor_token_valid ||
-	    !istate->fsmonitor_untracked_valid ||
 	    !istate->fsmonitor_untracked_extension_seen ||
 	    istate->fsmonitor_untracked_extension_invalid ||
 	    !istate->fsmonitor_last_update ||
-	    !istate->fsmonitor_untracked_token ||
-	    strcmp(istate->fsmonitor_last_update,
-		   istate->fsmonitor_untracked_token))
+	    !istate->fsmonitor_untracked_token)
+		return 0;
+
+	paired = istate->fsmonitor_untracked_valid &&
+		uc->root->valid_recursive &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token);
+	pending = !istate->fsmonitor_untracked_valid &&
+		istate == istate->repo->index &&
+		!istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		skip_prefix(istate->fsmonitor_last_update,
+			    "builtin:", &builtin_suffix) &&
+		*builtin_suffix && strcmp(builtin_suffix, "fake") &&
+		skip_prefix(istate->fsmonitor_untracked_token,
+			    "pending:", &pending_suffix) &&
+		!strcmp(builtin_suffix, pending_suffix);
+	if (!paired && !pending)
 		return 0;
 
 	/*
@@ -2126,13 +2143,15 @@ int untracked_cache_preserve_for_revalidation(struct index_state *istate)
 	clear_untracked_cache_validation(uc->root);
 	uc->use_fsmonitor = 0;
 	uc->fsmonitor_revalidation = 1;
-	trace2_data_intmax("fsmonitor", istate->repo,
-			   "untracked/provider-reset-preserved", 1);
+	if (paired || istate->fsmonitor_untracked_revalidation_authenticated)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "untracked/provider-reset-preserved", 1);
 	return 1;
 }
 
 void untracked_cache_invalidate_all(struct index_state *istate)
 {
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	if (!istate->untracked || !istate->untracked->root)
 		return;
 	invalidate_gitignore(istate->untracked, istate->untracked->root);
