@@ -6498,6 +6498,24 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! test_trace2_data index refresh/sum_lstat \
 			"[1-9][0-9]*" <.git/warm-filter-scope.trace &&
 
+		cp .git/index .git/disabled-filter.index &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/disabled-filter.trace" \
+			git -c filter.demo.clean= \
+			    -c filter.demo.smudge= \
+			    -c filter.demo.process= \
+			    -c filter.demo.required=false \
+			    status --porcelain=v2 --untracked-files=no \
+			>.git/disabled-filter.out &&
+		test_must_be_empty .git/disabled-filter.out &&
+		test_cmp .git/disabled-filter.index .git/index &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/disabled-filter.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9][0-9]*" <.git/disabled-filter.trace &&
+
 		test_write_lines "tracked filter=demo" >.git/info/attributes &&
 		GIT_TEST_PRELOAD_INDEX=1 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
@@ -6513,6 +6531,132 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/active-filter.trace &&
 		! test_trace2_data fsmonitor filter-scope/valid 1 \
 			<.git/active-filter.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'disabled filters cannot publish a proof for active filtered paths' '
+	test_when_finished "rm -rf disabled-filter-active-path" &&
+	test_create_repo disabled-filter-active-path &&
+	(
+		cd disabled-filter-active-path &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines "*.filtered filter=demo" >.gitattributes &&
+		test_write_lines base >tracked &&
+		git config filter.demo.clean "sed s/raw/converted/" &&
+		git config filter.demo.required true &&
+		git add .gitattributes tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/prime.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/prime.trace &&
+
+		test_write_lines raw >active.filtered &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=active.filtered \
+			git -c filter.demo.clean= \
+			    -c filter.demo.smudge= \
+			    -c filter.demo.process= \
+			    -c filter.demo.required=false \
+			    add active.filtered &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+			    status --porcelain=v2 --untracked-files=no \
+			>.git/expected &&
+		test_grep "^1 AM .* active.filtered$" .git/expected &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/actual.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/actual &&
+		test_cmp .git/expected .git/actual
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'partial required-filter overrides cannot hide a missing clean helper' '
+	test_when_finished "rm -rf partial-required-filter" &&
+	test_create_repo partial-required-filter &&
+	(
+		cd partial-required-filter &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines "*.filtered filter=demo" >.gitattributes &&
+		test_write_lines base >tracked &&
+		git config filter.demo.required true &&
+		git add .gitattributes tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/prime.trace" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_trace2_data fsmonitor filter-scope/valid 1 \
+			<.git/prime.trace &&
+
+		test_write_lines raw >active.filtered &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
+		GIT_TEST_FSMONITOR_QUERY_PATH=active.filtered \
+			git -c filter.demo.required=false add active.filtered &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			test_must_fail git status --porcelain=v2 \
+				--untracked-files=no >.git/actual 2>.git/error &&
+		test_grep "clean filter .demo. failed" .git/error
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'disabled filters cannot prime a reusable proof for active clean filters' '
+	test_when_finished "rm -rf disabled-filter-prime" &&
+	test_create_repo disabled-filter-prime &&
+	(
+		cd disabled-filter-prime &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines "tracked filter=demo" >.gitattributes &&
+		test_write_lines raw >tracked &&
+		git config filter.demo.clean "sed s/raw/converted/" &&
+		git config filter.demo.required true &&
+		git -c filter.demo.clean= -c filter.demo.required=false \
+			add .gitattributes tracked &&
+		git -c filter.demo.clean= -c filter.demo.required=false \
+			commit -m raw &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/disabled-prime.trace" \
+			git -c filter.demo.clean= \
+			    -c filter.demo.smudge= \
+			    -c filter.demo.process= \
+			    -c filter.demo.required=false \
+			    status --porcelain=v2 --untracked-files=no \
+			>.git/disabled &&
+		test_must_be_empty .git/disabled &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+			    status --porcelain=v2 --untracked-files=no \
+			>.git/expected &&
+		test_grep "^1 \\.M .* tracked$" .git/expected &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/normal.trace" \
+			git status --porcelain=v2 --untracked-files=no \
+			>.git/actual &&
+		test_cmp .git/expected .git/actual
 	)
 '
 
