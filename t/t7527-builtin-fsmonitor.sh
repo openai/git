@@ -2839,7 +2839,43 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! have_t2_data_event fsmonitor semantic/attributes-cone \
 			<.git/removed.trace &&
 		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
-			<.git/removed.trace
+			<.git/removed.trace &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git checkout -- staged &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/restored.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=staged/ \
+		GIT_TRACE2_EVENT="$PWD/.git/restored.trace" \
+			git status --porcelain=v2 >.git/restored.actual &&
+		test_cmp .git/restored.expect .git/restored.actual &&
+		test_grep "^1 A\\..* staged/one$" .git/restored.actual &&
+		test_grep "^1 A\\..* staged/two$" .git/restored.actual &&
+		test_trace2_data fsmonitor \
+			semantic/authenticated-restored-directory 1 \
+			<.git/restored.trace &&
+		! have_t2_data_event fsmonitor semantic/attributes-cone \
+			<.git/restored.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/restored.trace &&
+
+		test_write_lines "* text eol=lf" >staged/.gitattributes &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/new-attributes.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=staged/ \
+		GIT_TRACE2_EVENT="$PWD/.git/new-attributes.trace" \
+			git status --porcelain=v2 >.git/new-attributes.actual &&
+		test_cmp .git/new-attributes.expect \
+			.git/new-attributes.actual &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/new-attributes.trace &&
+		! have_t2_data_event fsmonitor \
+			semantic/authenticated-restored-directory \
+			<.git/new-attributes.trace
 	)
 '
 
