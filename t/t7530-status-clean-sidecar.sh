@@ -552,7 +552,9 @@ test_expect_success DURABLE_FSMONITOR \
 		git -C sidecar-hardlink-racy status --porcelain=v2 \
 			>hardlink-racy-rebaseline.actual &&
 	test_must_be_empty hardlink-racy-rebaseline.actual &&
-	test_trace2_data fsmonitor apply/global-invalidation 1 \
+	test_trace2_data fsmonitor apply/hardlink-matches 1 \
+		<hardlink-racy-rebaseline.trace &&
+	! test_trace2_data fsmonitor apply/global-invalidation 1 \
 		<hardlink-racy-rebaseline.trace &&
 	test_grep FSCF sidecar-hardlink-racy/.git/index &&
 	test_grep FSUC sidecar-hardlink-racy/.git/index &&
@@ -646,7 +648,9 @@ test_expect_success DURABLE_FSMONITOR,PERL_TEST_HELPERS \
 		git -C sidecar-hardlink-stale-stat status --porcelain=v2 \
 			>hardlink-stale-stat-rebaseline.actual &&
 	test_must_be_empty hardlink-stale-stat-rebaseline.actual &&
-	test_trace2_data fsmonitor apply/global-invalidation 1 \
+	test_trace2_data fsmonitor apply/hardlink-matches 2 \
+		<hardlink-stale-stat-rebaseline.trace &&
+	! test_trace2_data fsmonitor apply/global-invalidation 1 \
 		<hardlink-stale-stat-rebaseline.trace &&
 	test_grep FSCF sidecar-hardlink-stale-stat/.git/index &&
 	test_grep FSUC sidecar-hardlink-stale-stat/.git/index &&
