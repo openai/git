@@ -3380,6 +3380,20 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 			ret = -1;
 			goto out;
 		}
+	} else if ((write_extensions & WRITE_FSMONITOR_EXTENSION) &&
+		   (write_extensions & WRITE_UNTRACKED_CACHE_EXTENSION) &&
+		   istate == istate->repo->index &&
+		   !istate->split_index &&
+		   !getenv(INDEX_ENVIRONMENT) &&
+		   istate->untracked &&
+		   istate->fsmonitor_last_update &&
+		   starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		   istate->fsmonitor_last_update[strlen("builtin:")] &&
+		   strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
+		   !istate->fsmonitor_legacy_untracked_fallback &&
+		   fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC) {
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "untracked/proof-missing", 1);
 	}
 	if (write_extensions & WRITE_FSCF_EXTENSION &&
 	    !istate->fsmonitor_legacy_untracked_fallback &&
