@@ -12,6 +12,8 @@
 #include "ewah/ewok_rlw.h"
 #include "fsmonitor.h"
 #include "fsmonitor-ipc.h"
+#include "hashmap.h"
+#include "hex-ll.h"
 #include "name-hash.h"
 #include "repository.h"
 #include "run-command.h"
@@ -244,11 +246,24 @@ invalid:
 void write_fsmonitor_untracked_extension(struct strbuf *sb,
 					 struct index_state *istate)
 {
+	const char *suffix;
 	uint32_t version;
 
 	put_be32(&version, FSMONITOR_UNTRACKED_EXTENSION_VERSION);
 	strbuf_add(sb, &version, sizeof(version));
-	strbuf_addstr(sb, istate->fsmonitor_last_update);
+	if (!istate->fsmonitor_untracked_valid && istate->untracked &&
+	    istate->untracked->fsmonitor_revalidation) {
+		if (!skip_prefix(istate->fsmonitor_last_update,
+				 "builtin:", &suffix) ||
+		    !*suffix || !strcmp(suffix, "fake"))
+			BUG("cannot serialize unauthenticated fsmonitor cache");
+		strbuf_addstr(sb, "pending:");
+		strbuf_addstr(sb, suffix);
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "untracked/provider-reset-pending", 1);
+	} else {
+		strbuf_addstr(sb, istate->fsmonitor_last_update);
+	}
 	strbuf_addch(sb, '\0');
 }
 
@@ -265,6 +280,9 @@ void prepare_fsmonitor_untracked(struct index_state *istate)
 	if (istate->fsmonitor_untracked_valid)
 		untracked_cache_recompute_fsmonitor_valid_recursive(
 			istate->untracked);
+	else if (istate->fsmonitor_untracked_token &&
+		 starts_with(istate->fsmonitor_untracked_token, "pending:"))
+		untracked_cache_preserve_for_revalidation(istate);
 }
 
 static struct ewah_bitmap *fsmonitor_bitmap_from_index(
@@ -813,6 +831,32 @@ done:
 	return valid;
 }
 
+static int fsmonitor_parse_hardlink_inode(const char *path, size_t len,
+					  uint32_t *inode)
+{
+	const char *hex;
+	uint64_t value = 0;
+	size_t i;
+
+	if (!skip_prefix(path, FSMONITOR_PATH_HARDLINK_INODE_PREFIX, &hex))
+		return 0;
+	if (len != strlen(FSMONITOR_PATH_HARDLINK_INODE_PREFIX) +
+		    FSMONITOR_PATH_HARDLINK_INODE_HEX)
+		return -1;
+	for (i = 0; i < FSMONITOR_PATH_HARDLINK_INODE_HEX; i++) {
+		unsigned int digit = hexval(hex[i]);
+
+		if (digit > 0xf)
+			return -1;
+		value = (value << 4) | digit;
+	}
+	if (!value)
+		return -1;
+	if (inode)
+		*inode = (uint32_t)value;
+	return 1;
+}
+
 enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 	const struct strbuf *raw, struct fsmonitor_query_result *result)
 {
@@ -845,6 +889,7 @@ enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 		if (!nul || nul == p)
 			goto malformed;
 		if (strcmp(p, FSMONITOR_PATH_GLOBAL_INVALIDATE) &&
+		    fsmonitor_parse_hardlink_inode(p, nul - p, NULL) <= 0 &&
 		    !fsmonitor_valid_worktree_path(p, nul - p))
 			goto malformed;
 		p = nul + 1;
@@ -913,20 +958,90 @@ enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	return result->outcome;
 }
 
+struct fsmonitor_hardlink_inode {
+	struct hashmap_entry ent;
+	uint32_t inode;
+};
+
+static int fsmonitor_hardlink_inode_cmp(const void *unused UNUSED,
+					 const struct hashmap_entry *eptr,
+					 const struct hashmap_entry *entry_or_key,
+					 const void *keydata)
+{
+	const struct fsmonitor_hardlink_inode *entry =
+		container_of(eptr, const struct fsmonitor_hardlink_inode, ent);
+	const uint32_t *inode = keydata;
+
+	if (inode)
+		return entry->inode != *inode;
+	return entry->inode !=
+		container_of(entry_or_key,
+			     const struct fsmonitor_hardlink_inode, ent)->inode;
+}
+
 static int apply_fsmonitor_paths(struct index_state *istate,
 				 const struct strbuf *paths)
 {
 	const char *p = paths->buf;
 	const char *end = paths->buf + paths->len;
+	struct hashmap inodes = HASHMAP_INIT(fsmonitor_hardlink_inode_cmp, NULL);
+	struct fsmonitor_hardlink_inode *entry;
+	unsigned int matches = 0;
 	int count = 0;
 
 	while (p < end) {
 		size_t len = strlen(p);
+		uint32_t inode;
+		int parsed = fsmonitor_parse_hardlink_inode(p, len, &inode);
 
-		fsmonitor_refresh_callback(istate, (char *)p);
-		count++;
+		if (parsed < 0) {
+			fsmonitor_refresh_callback(
+				istate, (char *)FSMONITOR_PATH_GLOBAL_INVALIDATE);
+			count++;
+			goto done;
+		}
+		if (!parsed) {
+			fsmonitor_refresh_callback(istate, (char *)p);
+			count++;
+		} else if (!hashmap_get_entry_from_hash(
+				   &inodes, memhash(&inode, sizeof(inode)), &inode,
+				   struct fsmonitor_hardlink_inode, ent)) {
+			CALLOC_ARRAY(entry, 1);
+			entry->inode = inode;
+			hashmap_entry_init(&entry->ent,
+					   memhash(&inode, sizeof(inode)));
+			hashmap_add(&inodes, &entry->ent);
+		}
 		p += len + 1;
 	}
+
+	if (hashmap_get_size(&inodes)) {
+		unsigned int i;
+
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/hardlink-inode-events",
+				   hashmap_get_size(&inodes));
+		for (i = 0; i < istate->cache_nr; i++) {
+			struct cache_entry *ce = istate->cache[i];
+			uint32_t inode = ce->ce_stat_data.sd_ino;
+
+			if (inode &&
+			    !hashmap_get_entry_from_hash(
+				    &inodes, memhash(&inode, sizeof(inode)), &inode,
+				    struct fsmonitor_hardlink_inode, ent))
+				continue;
+			fsmonitor_refresh_callback(istate, ce->name);
+			matches++;
+			count++;
+		}
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/hardlink-index-scan", 1);
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/hardlink-matches", matches);
+	}
+
+done:
+	hashmap_clear_and_free(&inodes, struct fsmonitor_hardlink_inode, ent);
 	return count;
 }
 
@@ -984,6 +1099,7 @@ static void invalidate_all_fsmonitor(struct index_state *istate)
 	unsigned int i;
 	int changed = 0;
 
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	for (i = 0; i < istate->cache_nr; i++) {
 		if (istate->cache[i]->ce_flags & CE_FSMONITOR_VALID)
 			changed = 1;
@@ -1061,6 +1177,8 @@ static void invalidate_fsmonitor_for_bootstrap(
 	if (physical_history_unavailable) {
 		int authenticated_manifest =
 			clean_status_has_authenticated_worktree_manifest(istate);
+		int pending_revalidation =
+			istate->fsmonitor_untracked_revalidation_authenticated;
 		int preserve_untracked = 0;
 
 		if (istate->fsmonitor_legacy_untracked_fallback) {
@@ -1070,19 +1188,30 @@ static void invalidate_fsmonitor_for_bootstrap(
 			return;
 		}
 		manifest_refresh_failed =
-			!clean_status_has_authenticated_bootstrap_manifest(istate) &&
+			(pending_revalidation ||
+			 !clean_status_has_authenticated_bootstrap_manifest(istate)) &&
 			clean_status_refresh_worktree_manifest(istate) < 0;
 		if (provider_query_success && !manifest_refresh_failed &&
 		    !clean_status_manifest_global_fallback(istate) &&
 		    !clean_status_fsmonitor_strong_mismatch(istate) &&
 		    !clean_status_filter_scope_needs_validation(istate) &&
+		    (!pending_revalidation ||
+		     (istate->fsmonitor_untracked_revalidation_authenticated &&
+		      istate->untracked && istate->untracked->root &&
+		      istate->untracked->root->valid &&
+		      clean_status_pending_revalidation_manifest_unchanged(
+			      istate))) &&
 		    istate->repo->config_values_private_.trust_ctime &&
 		    istate->repo->config_values_private_.check_stat) {
 			/* Strong stat identity survives a lost provider boundary. */
-			if (authenticated_manifest &&
-			    !clean_status_fsmonitor_config_mismatch(istate))
+			if ((authenticated_manifest &&
+			     !clean_status_fsmonitor_config_mismatch(istate)) ||
+			    pending_revalidation)
 				preserve_untracked =
 					untracked_cache_preserve_for_revalidation(istate);
+			if (pending_revalidation && preserve_untracked)
+				trace2_data_intmax("fsmonitor", istate->repo,
+						   "untracked/provider-reset-resumed", 1);
 			clean_status_begin_fsmonitor_semantic_baseline(istate);
 			invalidate_all_fsmonitor_for_baseline(istate);
 			trace2_data_intmax("fsmonitor", istate->repo,
@@ -1521,6 +1650,7 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 		BUG("valid untracked cache without a complete proof");
 	if (!fsmonitor_pending_token_from_provider(istate))
 		return;
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	FREE_AND_NULL(istate->fsmonitor_last_update);
 	istate->fsmonitor_last_update = istate->fsmonitor_last_update_pending;
 	istate->fsmonitor_last_update_pending = NULL;
@@ -1529,9 +1659,11 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 	istate->fsmonitor_untracked_valid = !!untracked_cache_valid;
 	if (istate->untracked) {
 		if (istate->untracked->fsmonitor_revalidation &&
-		    untracked_cache_valid)
+		    untracked_cache_valid) {
+			istate->fsmonitor_untracked_must_persist = 1;
 			trace2_data_intmax("fsmonitor", istate->repo,
 					   "untracked/provider-reset-revalidated", 1);
+		}
 		istate->untracked->fsmonitor_revalidation = 0;
 		istate->untracked->use_fsmonitor = !!untracked_cache_valid;
 	}
@@ -1641,6 +1773,7 @@ void remove_fsmonitor(struct index_state *istate)
 {
 	istate->fsmonitor_token_valid = 0;
 	istate->fsmonitor_untracked_valid = 0;
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	FREE_AND_NULL(istate->fsmonitor_last_update_pending);
 	istate->fsmonitor_pending_token_from_provider = 0;
 	FREE_AND_NULL(istate->fsmonitor_untracked_token);

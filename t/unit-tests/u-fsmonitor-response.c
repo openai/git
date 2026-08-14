@@ -84,3 +84,34 @@ void test_fsmonitor_response__accepts_valid_builtin_responses(void)
 	check_response(trivial, sizeof(trivial) - 1, FSMONITOR_QUERY_TRIVIAL,
 		       "builtin:4", NULL, 0);
 }
+
+void test_fsmonitor_response__validates_hardlink_inode_markers(void)
+{
+	static const char inode[] =
+		"builtin:5\0//inode:f123456789abcdef\0tracked\0";
+	static const char zero_low_bits[] =
+		"builtin:6\0//inode:0000000100000000\0";
+	static const char zero[] =
+		"builtin:7\0//inode:0000000000000000\0";
+	static const char short_inode[] =
+		"builtin:8\0//inode:123456789abcdef\0";
+	static const char long_inode[] =
+		"builtin:9\0//inode:0123456789abcdef0\0";
+	static const char invalid_hex[] =
+		"builtin:10\0//inode:0123456789abcdeg\0";
+	static const char embedded_path[] =
+		"builtin:11\0//inode:0123456789abcde/\0";
+
+	check_response(inode, sizeof(inode) - 1, FSMONITOR_QUERY_DELTA,
+		       "builtin:5", inode + sizeof("builtin:5"),
+		       sizeof(inode) - 1 - sizeof("builtin:5"));
+	check_response(zero_low_bits, sizeof(zero_low_bits) - 1,
+		       FSMONITOR_QUERY_DELTA, "builtin:6",
+		       zero_low_bits + sizeof("builtin:6"),
+		       sizeof(zero_low_bits) - 1 - sizeof("builtin:6"));
+	check_malformed(zero, sizeof(zero) - 1);
+	check_malformed(short_inode, sizeof(short_inode) - 1);
+	check_malformed(long_inode, sizeof(long_inode) - 1);
+	check_malformed(invalid_hex, sizeof(invalid_hex) - 1);
+	check_malformed(embedded_path, sizeof(embedded_path) - 1);
+}

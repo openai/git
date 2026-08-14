@@ -95,6 +95,7 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 	int manifest_reusable;
 	int coherent;
 
+	istate->fsmonitor_untracked_revalidation_authenticated = 0;
 	if (!state || !state->current_config_valid)
 		return 0;
 	token_coherent = state->disk_config_valid &&
@@ -144,6 +145,38 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		state->manifest.disk_valid &&
 		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
 			FSMONITOR_CLEAN_PROOF_ALL;
+	istate->fsmonitor_untracked_revalidation_authenticated =
+		token_coherent && config_coherent &&
+		state->disk_semantic_valid && state->current_semantic_valid &&
+		!semantic_changed && state->disk_attr_valid &&
+		state->current_attr_valid && !attr_changed &&
+		state->disk_tracked_policy_valid &&
+		state->current_tracked_policy_valid &&
+		state->manifest.disk_valid &&
+		state->manifest.disk_flags ==
+			(FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+			 FSMONITOR_CLEAN_PROOF_FULL_INDEX) &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		istate == istate->repo->index && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED && fstat_is_reliable() &&
+		istate->repo->config_values_private_.trust_ctime &&
+		istate->repo->config_values_private_.check_stat &&
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid &&
+		istate->untracked->fsmonitor_revalidation &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		!istate->fsmonitor_untracked_valid &&
+		istate->fsmonitor_untracked_token &&
+		starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		istate->fsmonitor_last_update[strlen("builtin:")] &&
+		strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
+		starts_with(istate->fsmonitor_untracked_token, "pending:") &&
+		!strcmp(istate->fsmonitor_last_update + strlen("builtin:"),
+			istate->fsmonitor_untracked_token + strlen("pending:"));
 	manifest_reusable = token_coherent && !config_coherent &&
 		state->disk_semantic_valid && state->current_semantic_valid &&
 		!semantic_changed && state->disk_attr_valid &&
@@ -151,7 +184,9 @@ static int prepare_fsmonitor_config(struct index_state *istate, int trace)
 		!state->filter_configured && state->manifest.disk_valid &&
 		(state->manifest.disk_flags & FSMONITOR_CLEAN_PROOF_ALL) ==
 			FSMONITOR_CLEAN_PROOF_ALL;
-	state->filter_scope_valid = coherent && state->filter_configured;
+	state->filter_scope_valid =
+		(coherent || istate->fsmonitor_untracked_revalidation_authenticated) &&
+		state->filter_configured;
 	state->config_revalidated = coherent;
 	state->initial_coherent = coherent;
 	FREE_AND_NULL(state->config_revalidated_token);
@@ -196,6 +231,23 @@ void clean_status_prepare_fsmonitor_config(struct index_state *istate)
 int clean_status_probe_fsmonitor_config(struct index_state *istate)
 {
 	return prepare_fsmonitor_config(istate, 0);
+}
+
+int clean_status_pending_revalidation_manifest_unchanged(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	const uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+
+	return state && istate->fsmonitor_untracked_revalidation_authenticated &&
+		state->manifest.disk_valid && state->manifest.current_valid &&
+		state->manifest.checked && !state->manifest.current_invalidated &&
+		!state->manifest.global_fallback && !state->manifest.changed &&
+		(state->manifest.disk_flags & required) == required &&
+		(state->manifest.current_flags & required) == required &&
+		!memcmp(state->manifest.disk_hash, state->manifest.current_hash,
+			istate->repo->hash_algo->rawsz);
 }
 
 int clean_status_try_preserve_tracked_config_epoch(
@@ -679,16 +731,16 @@ static int has_usable_on_index_builtin_token(
 		strcmp(istate->fsmonitor_last_update, "builtin:fake");
 }
 
-static int external_token_is_replayable(const char *token)
+static enum fsmonitor_query_outcome external_token_query_outcome(
+	const char *token)
 {
 	struct fsmonitor_query_result result =
 		FSMONITOR_QUERY_RESULT_INIT;
-	int replayable =
-		query_builtin_fsmonitor(token, &result) ==
-			FSMONITOR_QUERY_DELTA;
+	enum fsmonitor_query_outcome outcome =
+		query_builtin_fsmonitor(token, &result);
 
 	fsmonitor_query_result_release(&result);
-	return replayable;
+	return outcome;
 }
 
 static int missing_fsmonitor_token_is_replayable(
@@ -712,7 +764,8 @@ static int missing_fsmonitor_token_is_replayable(
 		const char *base = find_last_dir_sep(path);
 
 		base = base ? base + 1 : path;
-		if (!strcmp(path, FSMONITOR_PATH_GLOBAL_INVALIDATE))
+		if (!strcmp(path, FSMONITOR_PATH_GLOBAL_INVALIDATE) ||
+		    starts_with(path, FSMONITOR_PATH_HARDLINK_INODE_PREFIX))
 			goto done;
 		if (!fspathcmp(base, ".gitattributes")) {
 			struct index_state witness = *istate;
@@ -777,7 +830,9 @@ static int external_semantic_delta_is_safe(
 		const char *base = find_last_dir_sep(path);
 
 		base = base ? base + 1 : path;
-		if (!len || !fspathcmp(base, ".gitattributes") ||
+		if (!len ||
+		    starts_with(path, FSMONITOR_PATH_HARDLINK_INODE_PREFIX) ||
+		    !fspathcmp(base, ".gitattributes") ||
 		    !fspathcmp(base, ".gitignore"))
 			return 0;
 		if (path[len - 1] == '/') {
@@ -1371,6 +1426,7 @@ static int restore_external_bootstrap_manifest(
 		base = base ? base + 1 : changed;
 		if (!len ||
 		    !strcmp(changed, FSMONITOR_PATH_GLOBAL_INVALIDATE) ||
+		    starts_with(changed, FSMONITOR_PATH_HARDLINK_INODE_PREFIX) ||
 		    changed[len - 1] == '/' ||
 		    (!fspathcmp(base, ".gitattributes") &&
 		     strcmp(changed, ".gitattributes")))
@@ -1428,6 +1484,7 @@ int clean_status_restore_external_history(struct index_state *istate)
 	int missing_fsmonitor_recovery = 0;
 	int owned_index = 0;
 	int preserve_witness = 0;
+	int provider_reset_recovery = 0;
 	int restored = 0;
 
 	if (!clean_status_external_history_enabled(istate) || !state ||
@@ -1551,18 +1608,44 @@ have_index_hash:
 	 * crossed.  Probe a differing checkpoint token before replacing a
 	 * usable on-index boundary when builtin IPC can answer that question.
 	 * A successful delta is queried again by the normal refresh path; a
-	 * trivial or failed probe leaves the named index intact so its token
-	 * can take the forward-baseline fallback.
+	 * failed probe leaves the named index intact. If both tokens receive a
+	 * trivial response, neither boundary can be replayed: a complete,
+	 * authenticated checkpoint can still seed the existing forward
+	 * baseline and parallel untracked-directory revalidation.
 	 */
 	if (fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
 	    has_usable_on_index_builtin_token(istate) &&
 	    starts_with(parsed.fsmonitor_last_update, "builtin:") &&
 	    strcmp(istate->fsmonitor_last_update,
-		   parsed.fsmonitor_last_update) &&
-	    !external_token_is_replayable(parsed.fsmonitor_last_update)) {
-		trace2_data_intmax("fsmonitor", istate->repo,
-				   "history/external-token-unreplayable", 1);
-		goto done;
+		   parsed.fsmonitor_last_update)) {
+		enum fsmonitor_query_outcome outcome =
+			external_token_query_outcome(
+				parsed.fsmonitor_last_update);
+
+		if (outcome != FSMONITOR_QUERY_DELTA) {
+			if (outcome != FSMONITOR_QUERY_TRIVIAL ||
+			    !fstat_is_reliable() ||
+			    !record.checkpoint.source_alias_valid ||
+			    istate->split_index ||
+			    istate->sparse_index != INDEX_EXPANDED ||
+			    !parsed.untracked || !parsed.untracked->root ||
+			    !parsed.untracked->root->valid ||
+			    !parsed.untracked->root->valid_recursive ||
+			    !parsed.fsmonitor_untracked_valid ||
+			    !parsed.fsmonitor_untracked_extension_seen ||
+			    parsed.fsmonitor_untracked_extension_invalid ||
+			    !istate->repo->config_values_private_.trust_ctime ||
+			    !istate->repo->config_values_private_.check_stat ||
+			    external_token_query_outcome(
+				    istate->fsmonitor_last_update) !=
+					FSMONITOR_QUERY_TRIVIAL) {
+				trace2_data_intmax(
+					"fsmonitor", istate->repo,
+					"history/external-token-unreplayable", 1);
+				goto done;
+			}
+			provider_reset_recovery = 1;
+		}
 	}
 	if (!clean_status_index_snapshot_still_matches_proof_epoch(
 		    &snapshot, istate))
@@ -1628,6 +1711,9 @@ have_index_hash:
 		parsed.fsmonitor_untracked_valid;
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "history/external-restored", 1);
+	if (provider_reset_recovery)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "history/external-reset-restored", 1);
 	if (missing_fsmonitor_recovery)
 		trace2_data_intmax("fsmonitor", istate->repo,
 				   "history/external-fsmn-recovered", 1);
