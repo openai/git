@@ -1414,7 +1414,7 @@ test_expect_success CASE_INSENSITIVE_FS 'fsmonitor file case wrong on disk' '
 	test_grep -q " M dir1/dir2/dir4/FILE-4-A" "$PWD/file_case_wrong-try3.out"
 '
 
-test_expect_success MACOS,HARDLINKS 'hardlink events invalidate all tracked paths' '
+test_expect_success MACOS,HARDLINKS 'hardlink inode events invalidate tracked aliases' '
 	test_when_finished "git -C hardlink-event fsmonitor--daemon stop 2>/dev/null || :" &&
 	test_create_repo hardlink-event &&
 	(
@@ -1444,7 +1444,167 @@ test_expect_success MACOS,HARDLINKS 'hardlink events invalidate all tracked path
 		touch -r .git/mtime-reference alias &&
 		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 >.git/actual &&
 		test_cmp .git/expect .git/actual &&
-		test_grep "^event: //$" ../hardlink-event.trace &&
+		test_grep "^event: //inode:" ../hardlink-event.trace &&
+		test_grep ! "^event: //$" ../hardlink-event.trace &&
+		git fsmonitor--daemon stop
+	)
+'
+
+test_expect_success MACOS,HARDLINKS 'ignored hardlinks do not invalidate unrelated tracked paths' '
+	test_when_finished "git -C ignored-hardlink fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo ignored-hardlink &&
+	(
+		cd ignored-hardlink &&
+		printf "target/\\n" >.gitignore &&
+		printf "tracked\\n" >tracked &&
+		git add .gitignore tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		start_daemon --tf "$PWD/../ignored-hardlink.trace" &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		mkdir target &&
+		printf "build artifact\\n" >target/object &&
+		ln target/object target/object-link &&
+		GIT_TRACE2_EVENT="$PWD/.git/ignored-hardlink.trace2" \
+			git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep ! "^event: //$" ../ignored-hardlink.trace &&
+		test_grep ! "apply/global-invalidation" \
+			.git/ignored-hardlink.trace2 &&
+		git fsmonitor--daemon stop
+	)
+'
+
+test_expect_success MACOS,HARDLINKS \
+	'deleted ignored hardlink aliases still invalidate tracked inodes' '
+	test_when_finished "git -C deleted-hardlink fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo deleted-hardlink &&
+	(
+		cd deleted-hardlink &&
+		printf "target/\\n" >.gitignore &&
+		printf "AAAA\\n" >tracked &&
+		git add .gitignore tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		cp -p tracked .git/mtime-reference &&
+		start_daemon --tf "$PWD/../deleted-hardlink.trace" &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		mkdir target &&
+		ln tracked target/alias &&
+		printf "BBBB\\n" >target/alias &&
+		touch -r .git/mtime-reference target/alias &&
+		rm target/alias &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/deleted-hardlink.trace2" \
+			git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \\.M .* tracked$" .git/actual &&
+		test_grep "^event: //inode:" ../deleted-hardlink.trace &&
+		test_grep ! "^event: //$" ../deleted-hardlink.trace &&
+		test_trace2_data fsmonitor apply/hardlink-matches 1 \
+			<.git/deleted-hardlink.trace2 &&
+		git fsmonitor--daemon stop
+	)
+'
+
+test_expect_success MACOS,HARDLINKS \
+	'hardlink aliases moved outside the worktree remain tracked' '
+	test_when_finished "git -C escaped-hardlink fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished "rm -f outside-hardlink" &&
+	test_create_repo escaped-hardlink &&
+	(
+		cd escaped-hardlink &&
+		printf "target/\\n" >.gitignore &&
+		printf "AAAA\\n" >tracked &&
+		git add .gitignore tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		cp -p tracked .git/mtime-reference &&
+		start_daemon --tf "$PWD/../escaped-hardlink.trace" &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		mkdir target &&
+		ln tracked target/alias &&
+		mv target/alias ../outside-hardlink &&
+		printf "BBBB\\n" >../outside-hardlink &&
+		touch -r .git/mtime-reference ../outside-hardlink &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \\.M .* tracked$" .git/actual &&
+		test_grep "^event: //inode:" ../escaped-hardlink.trace &&
+		test_grep ! "^event: //$" ../escaped-hardlink.trace &&
+		git fsmonitor--daemon stop
+	)
+'
+
+test_expect_success MACOS,HARDLINKS \
+	'ignored hardlink aliases invalidate tracked attribute sources' '
+	test_when_finished "git -C attribute-hardlink fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo attribute-hardlink &&
+	(
+		cd attribute-hardlink &&
+		printf "target/\\n" >.gitignore &&
+		printf "*.txt -text\\n" >.gitattributes &&
+		printf "tracked\\r\\n" >tracked.txt &&
+		git add .gitignore .gitattributes tracked.txt &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		cp -p .gitattributes .git/mtime-reference &&
+		start_daemon --tf "$PWD/../attribute-hardlink.trace" &&
+		git status --porcelain=v2 >/dev/null &&
+		git status --porcelain=v2 >/dev/null &&
+		mkdir target &&
+		ln .gitattributes target/alias &&
+		printf "*.txt  text\\n" >target/alias &&
+		touch -r .git/mtime-reference target/alias &&
+		rm target/alias &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \\.M .* \\.gitattributes$" .git/actual &&
+		test_grep "^1 \\.M .* tracked.txt$" .git/actual &&
+		test_grep ! "^event: //$" ../attribute-hardlink.trace &&
+		git fsmonitor--daemon stop
+	)
+'
+
+test_expect_success MACOS,HARDLINKS \
+	'ignored hardlink aliases invalidate tracked ignore sources' '
+	test_when_finished "git -C ignore-hardlink fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo ignore-hardlink &&
+	(
+		cd ignore-hardlink &&
+		printf "target/\\n*.log\\n" >.gitignore &&
+		printf "tracked\\n" >tracked &&
+		git add .gitignore tracked &&
+		git commit -m base &&
+		printf "visible\\n" >visible.log &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		cp -p .gitignore .git/mtime-reference &&
+		start_daemon --tf "$PWD/../ignore-hardlink.trace" &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		git status --porcelain=v2 >/dev/null &&
+		mkdir target &&
+		ln .gitignore target/alias &&
+		printf "target/\\n*.tmp\\n" >target/alias &&
+		touch -r .git/mtime-reference target/alias &&
+		rm target/alias &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 >.git/actual &&
+		test_grep "^1 \\.M .* \\.gitignore$" .git/actual &&
+		test_grep "^? visible.log$" .git/actual &&
+		test_grep ! "^event: //$" ../ignore-hardlink.trace &&
 		git fsmonitor--daemon stop
 	)
 '
@@ -3964,6 +4124,17 @@ test_expect_success FOREIGN_FSMONITOR_GIT,HARDLINKS,UNTRACKED_CACHE,SEMANTIC_VER
 			git status --porcelain=v2 >.git/hardlink.actual &&
 		test_cmp .git/hardlink.expect .git/hardlink.actual &&
 
+		cp .git/foreign-before.index .git/index &&
+		rm -f .git/index.csts &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=//inode:0000000000000001 \
+		GIT_TRACE2_EVENT="$PWD/.git/hardlink-inode.trace" \
+			git status --porcelain=v2 >.git/hardlink-inode.actual &&
+		test_cmp .git/hardlink.expect .git/hardlink-inode.actual &&
+		! test_trace2_data fsmonitor history/external-semantic-restored 1 \
+			<.git/hardlink-inode.trace &&
+
 		test_write_lines "*.txt text" >.gitattributes &&
 		cp .git/foreign-before.index .git/index &&
 		rm -f .git/index.csts &&
@@ -5760,7 +5931,17 @@ test_expect_success UNTRACKED_CACHE,HARDLINKS,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TEST_FSMONITOR_QUERY_PATH=ignored/alias \
 		GIT_TRACE2_EVENT="$PWD/.git/dirty.trace" \
 			git status --porcelain=v2 >.git/dirty.actual &&
-		test_grep "^1 \\.M .* tracked$" .git/dirty.actual
+		test_grep "^1 \\.M .* tracked$" .git/dirty.actual &&
+
+		cp .git/missing.index .git/index &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=//inode:0000000000000001 \
+		GIT_TRACE2_EVENT="$PWD/.git/inode.trace" \
+			git status --porcelain=v2 >.git/inode.actual &&
+		test_grep "^1 \\.M .* tracked$" .git/inode.actual &&
+		! test_trace2_data fsmonitor history/external-fsmn-recovered 1 \
+			<.git/inode.trace
 	)
 '
 
