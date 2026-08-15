@@ -5859,7 +5859,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'mixed reset drops history after a logical index change' '
+	'mixed reset preserves history across safe tracked content changes' '
 	test_when_finished "rm -rf reset-mixed-changed" &&
 	test_create_repo reset-mixed-changed &&
 	(
@@ -5889,7 +5889,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "modified:.*tracked" .git/actual &&
-		test_trace2_data fsmonitor config/coherent 0 \
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 			<.git/status.trace
 	)
 '
