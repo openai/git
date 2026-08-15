@@ -598,8 +598,8 @@ prepare_builtin_closure_repo () {
 	)
 }
 
-test_fsmonitor_pending_full_proof () {
-	perl - "$1" <<-\EOF
+test_fsmonitor_full_proof () {
+	perl - "$1" "$2" <<-\EOF
 	binmode STDIN;
 	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
 	binmode $input;
@@ -626,8 +626,10 @@ test_fsmonitor_pending_full_proof () {
 		$tokens{"FSMN"} eq $tokens{"FSCF"};
 	my ($suffix) = $tokens{"FSMN"} =~ /\Abuiltin:(.+)\z/;
 	die "missing provider token\n" unless defined $suffix;
-	die "mismatched pending untracked token\n" unless
-		$tokens{"FSUC"} eq "pending:$suffix";
+	my $untracked = $ARGV[1] eq "pending" ?
+		"pending:$suffix" : $tokens{"FSMN"};
+	die "mismatched untracked token\n" unless
+		$tokens{"FSUC"} eq $untracked;
 	EOF
 }
 
@@ -1067,6 +1069,12 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		EOF
 		write_script .git/hooks/pre-commit <<-\EOF &&
 		test -n "$GIT_INDEX_FILE" || exit 1
+		if test -n "${HOOK_GENERATE-}"
+		then
+			test "$GIT_INDEX_FILE" = "$HOOK_EXPECT_INDEX" || exit 1
+			printf "%s\n" generated >"$HOOK_GENERATE" || exit 1
+			git add -- "$HOOK_GENERATE" || exit 1
+		fi
 		git write-tree >"$HOOK_PROOF_OUTPUT" || exit 1
 		perl "$HOOK_PROOF_HELPER" <"$GIT_INDEX_FILE"
 		EOF
@@ -1150,6 +1158,36 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				"$gitdir/hook.trace" &&
 			perl "$PWD/.git/check-write-tree-proof.pl" \
 				<"$gitdir/index" &&
+			test_write_lines commit-all >"$worktree/sibling" &&
+			HOOK_GENERATE=hook-generated \
+			HOOK_EXPECT_INDEX="$gitdir/index.lock" \
+			HOOK_PROOF_HELPER="$PWD/.git/check-write-tree-proof.pl" \
+			HOOK_PROOF_OUTPUT="$gitdir/hook-all-tree" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=sibling \
+			GIT_TRACE2_EVENT="$gitdir/hook-all.trace" \
+				git -C "$worktree" commit -aqm commit-all &&
+			test_file_not_empty "$gitdir/hook-all-tree" &&
+			git -C "$worktree" ls-tree HEAD hook-generated \
+				>"$gitdir/hook-all-entry" &&
+			test_grep "hook-generated$" "$gitdir/hook-all-entry" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/hook-all.trace" &&
+			perl "$PWD/.git/check-write-tree-proof.pl" \
+				<"$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/hook-all-before-status" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/hook-all-status.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/hook-all-status" &&
+			test_must_be_empty "$gitdir/hook-all-status" &&
+			test_cmp_bin "$gitdir/hook-all-before-status" \
+				"$gitdir/index" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/hook-all-status.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/hook-all-status.trace" &&
 			cp "$gitdir/index" "$gitdir/readonly.index" &&
 			cp "$gitdir/index" "$gitdir/snapshot.index" &&
 			test_write_lines snapshot >"$worktree/snapshot-new" &&
@@ -1685,6 +1723,86 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'clean sequencer operations preserve authenticated worktree proofs' '
+	test_when_finished "rm -rf sequencer-proof sequencer-linked" &&
+	test_create_repo sequencer-proof &&
+	(
+		cd sequencer-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines picked >tracked &&
+		git add tracked &&
+		git commit -qm picked &&
+		picked=$(git rev-parse HEAD) &&
+		git reset --hard HEAD^ &&
+		git worktree add --detach ../sequencer-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../sequencer-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			for operation in pick revert
+			do
+				case "$operation" in
+				pick) set -- cherry-pick --no-edit "$picked" ;;
+				revert) set -- revert --no-edit HEAD ;;
+				esac &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+				GIT_TRACE2_EVENT="$gitdir/$operation.trace" \
+					git -C "$worktree" "$@" \
+						>"$gitdir/$operation" &&
+				test_fsmonitor_full_proof \
+					"$gitdir/index" paired &&
+				cp "$gitdir/index" \
+					"$gitdir/$operation.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$operation-status.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/$operation-status" &&
+				test_must_be_empty "$gitdir/$operation-status" &&
+				test_cmp_bin "$gitdir/$operation.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/$operation-status.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/$operation-status.trace" || return 1
+			done || return 1
+		done &&
+		test_write_lines conflicting >tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git add tracked &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git commit -qm local-conflict &&
+		test_must_fail env \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			git cherry-pick --no-edit "$picked" \
+				>.git/conflict.out 2>.git/conflict.err &&
+		if test_fsmonitor_full_proof .git/index paired \
+			>/dev/null 2>&1
+		then
+			return 1
+		fi &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/conflict &&
+		test_grep "^u UU .* tracked$" .git/conflict
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'expired add preserves untracked candidates until revalidation' '
 	test_when_finished "rm -rf pending-untracked-revalidation pending-untracked-hostile" &&
 	test_create_repo pending-untracked-revalidation &&
@@ -2112,6 +2230,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		git config core.fsmonitor true &&
 		git -c core.fsmonitor=false worktree add --detach \
 			../builtin-diff-reset-linked HEAD &&
+		git config filter.lfs.clean "git-lfs clean -- %f" &&
+		git config filter.lfs.smudge "git-lfs smudge -- %f" &&
+		git config filter.lfs.process "git-lfs filter-process" &&
+		git config filter.lfs.required true &&
 		for worktree in "$PWD" "$PWD/../builtin-diff-reset-linked"
 		do
 			gitdir=$(git -C "$worktree" \
@@ -2152,7 +2274,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_grep FSMN "$gitdir/index" &&
 			test_grep FSUC "$gitdir/index" &&
 			test_grep "pending:test:[2-9]" "$gitdir/index" &&
-			test_fsmonitor_pending_full_proof "$gitdir/index" &&
+			test_fsmonitor_full_proof "$gitdir/index" pending &&
 			cp "$gitdir/index" "$gitdir/pending.index" &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
@@ -2176,7 +2298,17 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_must_be_empty "$gitdir/next.actual" &&
 			test_trace2_data index preload/sum_lstat 0 \
 				<"$gitdir/next.trace" || return 1
-		done
+		done &&
+		git config filter.lfs.process "" &&
+		git config filter.lfs.clean false &&
+		test_write_lines "tracked filter=lfs" >.gitattributes &&
+		cp .git/index .git/filtered.index &&
+		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+			git diff >.git/filtered.out 2>.git/filtered.err &&
+		test_grep "clean filter .lfs. failed" .git/filtered.err &&
+		test_cmp_bin .git/filtered.index .git/index
 	)
 '
 
@@ -3758,6 +3890,10 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		git worktree add --detach ../daemon-diff-linked HEAD &&
 		git config core.untrackedCache true &&
 		git config core.fsmonitor true &&
+		git config filter.lfs.clean "git-lfs clean -- %f" &&
+		git config filter.lfs.smudge "git-lfs smudge -- %f" &&
+		git config filter.lfs.process "git-lfs filter-process" &&
+		git config filter.lfs.required true &&
 		for worktree in "$PWD" "$PWD/../daemon-diff-linked"
 		do
 			gitdir=$(git -C "$worktree" \
@@ -3785,7 +3921,7 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 			test_trace2_data fsmonitor \
 				untracked/provider-reset-pending 1 \
 				<"$gitdir/diff.trace" &&
-			test_fsmonitor_pending_full_proof "$gitdir/index" &&
+			test_fsmonitor_full_proof "$gitdir/index" pending &&
 			cp "$gitdir/index" "$gitdir/readonly.index" &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TRACE2_EVENT="$gitdir/readonly.trace" \
@@ -3861,20 +3997,36 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_must_be_empty "$gitdir/tracked-only" &&
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/tracked-only.trace" &&
-			test_grep ! FSUC "$gitdir/index" &&
+			test_trace2_data fsmonitor \
+				untracked/provider-reset-pending 1 \
+				<"$gitdir/tracked-only.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" pending &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 				git -C "$worktree" -c core.untrackedCache=false \
 					status --porcelain=v2 >"$gitdir/expect" &&
 			test_grep "^? cached/deep/new-untracked$" \
 				"$gitdir/expect" &&
-			cp "$gitdir/index" "$gitdir/readonly.index" &&
-			GIT_OPTIONAL_LOCKS=0 \
-			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-				git -C "$worktree" status --porcelain=v2 \
-					>"$gitdir/readonly" &&
-			test_cmp "$gitdir/expect" "$gitdir/readonly" &&
-			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			for pass in first second
+			do
+				cp "$gitdir/index" "$gitdir/readonly-$pass.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/readonly-$pass.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/readonly-$pass" &&
+				test_cmp "$gitdir/expect" \
+					"$gitdir/readonly-$pass" &&
+				test_cmp_bin "$gitdir/readonly-$pass.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/readonly-$pass.trace" || return 1
+			done &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 				git -C "$worktree" status --porcelain=v2 \
 					>"$gitdir/writable" &&
@@ -3922,18 +4074,34 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 			test_must_be_empty "$gitdir/tracked-only" &&
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/tracked-only.trace" &&
-			test_grep ! FSUC "$gitdir/index" &&
+			test_trace2_data fsmonitor \
+				untracked/provider-reset-pending 1 \
+				<"$gitdir/tracked-only.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" pending &&
 			GIT_OPTIONAL_LOCKS=0 \
 				git -C "$worktree" -c core.untrackedCache=false \
 					status --porcelain=v2 >"$gitdir/expect" &&
 			test_grep "^? cached/deep/new-untracked$" \
 				"$gitdir/expect" &&
-			cp "$gitdir/index" "$gitdir/readonly.index" &&
-			GIT_OPTIONAL_LOCKS=0 \
-				git -C "$worktree" status --porcelain=v2 \
-					>"$gitdir/readonly" &&
-			test_cmp "$gitdir/expect" "$gitdir/readonly" &&
-			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			for pass in first second
+			do
+				cp "$gitdir/index" "$gitdir/readonly-$pass.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TRACE2_EVENT="$gitdir/readonly-$pass.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/readonly-$pass" &&
+				test_cmp "$gitdir/expect" \
+					"$gitdir/readonly-$pass" &&
+				test_cmp_bin "$gitdir/readonly-$pass.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/readonly-$pass.trace" || return 1
+			done &&
 			git -C "$worktree" status --porcelain=v2 \
 				>"$gitdir/writable" &&
 			test_cmp "$gitdir/expect" "$gitdir/writable" &&

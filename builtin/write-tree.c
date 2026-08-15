@@ -34,22 +34,27 @@ static int write_tree_uses_worktree_index(void)
 	const char *index_file = getenv(INDEX_ENVIRONMENT);
 	struct strbuf worktree_index = STRBUF_INIT;
 	struct stat st;
-	char *expected = NULL, *actual = NULL;
+	char *expected = NULL, *expected_lock = NULL, *actual = NULL;
 	int matches = 0;
 
 	if (!index_file)
 		return 1;
-	if (lstat(index_file, &st) || S_ISLNK(st.st_mode))
+	if (lstat(index_file, &st) || !S_ISREG(st.st_mode))
 		return 0;
 
 	strbuf_addf(&worktree_index, "%s/index",
 		    repo_get_git_dir(the_repository));
 	expected = real_pathdup(worktree_index.buf, 0);
 	actual = real_pathdup(index_file, 0);
-	if (expected && actual && !strcmp(expected, actual))
-		matches = 1;
+	if (expected && actual) {
+		expected_lock = xstrfmt("%s.lock", expected);
+		if (!strcmp(expected, actual) ||
+		    !strcmp(expected_lock, actual))
+			matches = 1;
+	}
 
 	free(expected);
+	free(expected_lock);
 	free(actual);
 	strbuf_release(&worktree_index);
 	return matches;
