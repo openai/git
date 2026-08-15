@@ -589,6 +589,7 @@ static void unstage_changes_unless_new(struct object_id *orig_tree)
 			struct stat st;
 
 			ce = the_repository->index->cache[pos];
+			clean_status_invalidate_current_proof(the_repository->index);
 			if (!lstat(ce->name, &st)) {
 				/* Conflicting path present; relocate it */
 				struct strbuf new_path = STRBUF_INIT;
@@ -629,6 +630,12 @@ static void unstage_changes_unless_new(struct object_id *orig_tree)
 					      &p->one->oid,
 					      p->one->path,
 					      0, 0);
+			if (!clean_status_index_entry_is_semantically_safe(
+				    the_repository->index,
+				    pos >= 0 ? the_repository->index->cache[pos] : NULL,
+				    ce))
+				clean_status_invalidate_current_proof(
+					the_repository->index);
 			add_index_entry(the_repository->index, ce, option);
 		}
 	}
@@ -655,6 +662,12 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	struct object_id index_tree;
 	struct tree *head, *merge, *merge_base;
 	struct lock_file lock = LOCK_INIT;
+
+	if (!getenv(INDEX_ENVIRONMENT)) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository,
+					       &stash_clean_digest);
+	}
 
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET, 0, 0,
@@ -761,10 +774,14 @@ restore_untracked:
 		 */
 		cp.git_cmd = 1;
 		cp.dir = prefix;
-		strvec_pushf(&cp.env, GIT_WORK_TREE_ENVIRONMENT"=%s",
-			     absolute_path(repo_get_work_tree(the_repository)));
-		strvec_pushf(&cp.env, GIT_DIR_ENVIRONMENT"=%s",
-			     absolute_path(repo_get_git_dir(the_repository)));
+		/* Keep discovered config origins stable unless discovery is overridden. */
+		if (getenv(GIT_DIR_ENVIRONMENT) ||
+		    getenv(GIT_WORK_TREE_ENVIRONMENT)) {
+			strvec_pushf(&cp.env, GIT_WORK_TREE_ENVIRONMENT"=%s",
+				     absolute_path(repo_get_work_tree(the_repository)));
+			strvec_pushf(&cp.env, GIT_DIR_ENVIRONMENT"=%s",
+				     absolute_path(repo_get_git_dir(the_repository)));
+		}
 		strvec_push(&cp.args, "status");
 		run_command(&cp);
 	}
