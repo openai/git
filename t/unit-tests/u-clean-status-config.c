@@ -187,6 +187,151 @@ void test_clean_status_config__command_preload_config_does_not_change_proof(void
 	}
 }
 
+void test_clean_status_config__only_complete_disabled_filters_are_normalized(void)
+{
+	static const char *const keys[] = {
+		"filter.demo.clean", "filter.demo.smudge",
+		"filter.demo.process", "filter.demo.required",
+	};
+	static const char *const values[] = { "", "", "", "false" };
+	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+
+	kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+	for (size_t a = 0; a < ARRAY_SIZE(algorithms); a++) {
+		const struct git_hash_algo *algo = &hash_algos[algorithms[a]];
+		struct clean_status_config_digest baseline, digest;
+
+		kvi.scope = CONFIG_SCOPE_LOCAL;
+		clean_status_config_init(&baseline, algo);
+		clean_status_config_add(&baseline, keys[0], "configured", &ctx);
+		clean_status_config_final(&baseline);
+
+		for (unsigned mask = 0; mask < (1U << ARRAY_SIZE(keys)); mask++) {
+			clean_status_config_init(&digest, algo);
+			kvi.scope = CONFIG_SCOPE_LOCAL;
+			clean_status_config_add(&digest, keys[0], "configured", &ctx);
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			for (size_t part = 0; part < ARRAY_SIZE(keys); part++) {
+				if (mask & (1U << part))
+					clean_status_config_add(&digest, keys[part],
+								values[part], &ctx);
+			}
+			clean_status_config_final(&digest);
+			cl_assert_equal_i(hasheq(digest.hash, baseline.hash, algo),
+					  !mask || mask == 15);
+			if (mask == 15) {
+				cl_assert(hasheq(digest.semantic_hash,
+						 baseline.semantic_hash, algo));
+				cl_assert(hasheq(digest.tracked_policy_hash,
+						 baseline.tracked_policy_hash, algo));
+			}
+		}
+
+		for (unsigned hostile = 0; hostile < 5; hostile++) {
+			clean_status_config_init(&digest, algo);
+			kvi.scope = CONFIG_SCOPE_LOCAL;
+			clean_status_config_add(&digest, keys[0], "configured", &ctx);
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			for (size_t part = 0; part < ARRAY_SIZE(keys); part++) {
+				const char *key = keys[part];
+				const char *value = values[part];
+
+				if (hostile == 0 && part == 1)
+					clean_status_config_add(&digest, keys[0], "", &ctx);
+				if (hostile == 1 && part == 1)
+					clean_status_config_add(&digest, "core.hookspath",
+								"/dev/null", &ctx);
+				if (hostile == 2 && part == 2)
+					key = "filter.other.process";
+				if (hostile == 3 && part == 0)
+					value = "unsafe-helper";
+				if (hostile == 4 && part == 3)
+					value = "true";
+				clean_status_config_add(&digest, key, value, &ctx);
+			}
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		}
+	}
+}
+
+void test_clean_status_config__only_safe_command_guards_are_normalized(void)
+{
+	static const char *const keys[] = {
+		"core.hookspath", "safe.barerepository",
+		"hook.post-index-change.enabled",
+	};
+	static const char *const safe[] = { "/dev/null", "explicit", "false" };
+	static const char *const unsafe[] = { "/tmp/unsafe-hook", "all", "true" };
+	static const char *const previous[] = {
+		"true", "false", "true", "/tmp/hook", "true", NULL,
+	};
+	static const char *const next[] = {
+		"true", "false", "false", "true", "/tmp/hook", "true",
+	};
+	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+
+	kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+	for (size_t a = 0; a < ARRAY_SIZE(algorithms); a++) {
+		const struct git_hash_algo *algo = &hash_algos[algorithms[a]];
+		struct clean_status_config_digest baseline, digest;
+
+		clean_status_config_init(&baseline, algo);
+		clean_status_config_final(&baseline);
+		for (size_t guard = 0; guard < ARRAY_SIZE(keys); guard++) {
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, keys[guard], safe[guard], &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(hasheq(digest.hash, baseline.hash, algo));
+			cl_assert(hasheq(digest.semantic_hash,
+					 baseline.semantic_hash, algo));
+			cl_assert(hasheq(digest.tracked_policy_hash,
+					 baseline.tracked_policy_hash, algo));
+
+			kvi.scope = CONFIG_SCOPE_LOCAL;
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, keys[guard], safe[guard], &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, keys[guard], unsafe[guard], &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, keys[guard], safe[guard], NULL);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		}
+
+		for (size_t state = 0; state < ARRAY_SIZE(previous); state++) {
+			kvi.scope = CONFIG_SCOPE_LOCAL;
+			clean_status_config_init(&baseline, algo);
+			if (previous[state])
+				clean_status_config_add(&baseline, "core.fsmonitor",
+							previous[state], &ctx);
+			clean_status_config_final(&baseline);
+
+			clean_status_config_init(&digest, algo);
+			if (previous[state])
+				clean_status_config_add(&digest, "core.fsmonitor",
+							previous[state], &ctx);
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_add(&digest, "core.fsmonitor", next[state], &ctx);
+			clean_status_config_final(&digest);
+			cl_assert_equal_i(hasheq(digest.hash, baseline.hash, algo),
+					  state < 2);
+		}
+	}
+}
+
 void test_clean_status_config__command_empty_attributes_do_not_change_proof(void)
 {
 	static const enum config_scope persistent_scopes[] = {

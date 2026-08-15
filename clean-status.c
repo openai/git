@@ -379,6 +379,94 @@ static unsigned int clean_status_directory_lower_bound(
 	return low;
 }
 
+static int clean_status_changed_directory_is_semantically_safe(
+	const struct index_state *istate, const char *name)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct strbuf candidate = STRBUF_INIT;
+	const char *basename;
+	unsigned int first, i, namespace_unstable = 0;
+	size_t len;
+	int parent_fd, next, removed, safe = 0;
+
+	if (!state || !fstat_is_reliable() ||
+	    !state->current_config_valid || !state->current_attr_valid ||
+	    !state->config_enforced || !state->config_revalidated ||
+	    !clean_status_revalidated_token_matches(istate) ||
+	    !state->manifest.current_valid || !state->manifest.checked ||
+	    state->manifest.current_invalidated ||
+	    (state->manifest.current_flags & FSMONITOR_CLEAN_PROOF_ALL) !=
+		FSMONITOR_CLEAN_PROOF_ALL ||
+	    (state->filter_configured && !state->filter_scope_valid) ||
+	    istate->split_index || istate->sparse_index ||
+	    !istate->repo->config_values_private_.trust_ctime ||
+	    !istate->repo->config_values_private_.check_stat)
+		return 0;
+
+	len = strlen(name);
+	if (!len || name[len - 1] != '/')
+		return 0;
+	first = clean_status_directory_lower_bound(istate, name);
+	if (first >= istate->cache_nr ||
+	    !starts_with(istate->cache[first]->name, name))
+		return 0;
+	/* Each descendant independently authenticates its attribute ancestry. */
+	if (istate->cache_nr - first > 64 &&
+	    starts_with(istate->cache[first + 64]->name, name))
+		return 0;
+
+	if (attr_manifest_cursor_init(&cursor,
+				      state->manifest.current.buf,
+				      state->manifest.current.len,
+				      istate->repo->hash_algo))
+		return 0;
+	while ((next = attr_manifest_cursor_next(&cursor, &entry)) > 0)
+		if (entry.path_len >= len &&
+		    !memcmp(entry.path, name, len))
+			return 0;
+	if (next < 0 || semantic_verify_root_init(istate->repo, &root))
+		return 0;
+
+	path = semantic_verify_path_new(root);
+	strbuf_addstr(&candidate, name);
+	strbuf_addstr(&candidate, ".gitattributes");
+	if (semantic_verify_resolve_parent(path, candidate.buf, 0,
+					   &parent_fd, &basename)) {
+		if (errno != ENOENT)
+			goto done;
+		removed = 1;
+	} else {
+		removed = 0;
+	}
+
+	for (i = first; i < istate->cache_nr &&
+	     starts_with(istate->cache[i]->name, name); i++)
+		if (!clean_status_index_entry_is_semantically_safe(
+				istate, removed ? istate->cache[i] : NULL,
+				removed ? NULL : istate->cache[i]))
+			goto done;
+
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	path = NULL;
+	safe = !namespace_unstable && semantic_verify_root_stable(root);
+	if (safe)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   removed ?
+				   "semantic/authenticated-removed-directory" :
+				   "semantic/authenticated-restored-directory", 1);
+
+done:
+	if (path)
+		semantic_verify_path_free(path, &namespace_unstable, NULL);
+	semantic_verify_root_clear(root);
+	strbuf_release(&candidate);
+	return safe;
+}
+
 void clean_status_set_authenticated_new_directories(
 	struct index_state *istate, const struct index_state *old_index,
 	const struct strbuf *paths)
@@ -427,22 +515,24 @@ int clean_status_directory_event_is_semantically_safe(
 	const struct clean_status_state *state = istate->clean_status;
 	const char *path, *end;
 
-	if (!state || !state->authenticated_new_directories_token ||
-	    !clean_status_revalidated_token_matches(istate) ||
-	    strcmp(state->authenticated_new_directories_token,
-		   istate->fsmonitor_last_update))
+	if (!state || !clean_status_revalidated_token_matches(istate))
 		return 0;
-	path = state->authenticated_new_directories.buf;
-	end = path + state->authenticated_new_directories.len;
-	while (path < end) {
-		if (!strcmp(path, name)) {
-			trace2_data_intmax("fsmonitor", istate->repo,
-					   "semantic/authenticated-new-directory", 1);
-			return 1;
+	if (state->authenticated_new_directories_token &&
+	    !strcmp(state->authenticated_new_directories_token,
+		    istate->fsmonitor_last_update)) {
+		path = state->authenticated_new_directories.buf;
+		end = path + state->authenticated_new_directories.len;
+		while (path < end) {
+			if (!strcmp(path, name)) {
+				trace2_data_intmax("fsmonitor", istate->repo,
+					"semantic/authenticated-new-directory", 1);
+				return 1;
+			}
+			path += strlen(path) + 1;
 		}
-		path += strlen(path) + 1;
 	}
-	return 0;
+	return clean_status_changed_directory_is_semantically_safe(
+		istate, name);
 }
 
 int clean_status_capture_attr_snapshot(
