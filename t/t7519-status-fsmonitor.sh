@@ -1023,6 +1023,15 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
 			$tokens{"FSMN"} eq $tokens{"FSCF"};
 		EOF
+		cat >.git/check-write-tree-unbound.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my $offset = index($index, "FSCF");
+		die "missing FSCF extension\n" if $offset < 0;
+		my $flags = unpack("N", substr($index, $offset + 16, 4));
+		die "unexpected FSCF flags $flags\n" if $flags != 9;
+		EOF
 		for worktree in "$PWD" "$PWD/../write-tree-linked"
 		do
 			gitdir=$(git -C "$worktree" \
@@ -1066,6 +1075,29 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				<"$gitdir/status.trace" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/status.trace" &&
+			cp "$gitdir/index" "$gitdir/snapshot.index" &&
+			test_write_lines snapshot >"$worktree/snapshot-new" &&
+			printf "%s\n" snapshot-new |
+			GIT_INDEX_FILE="$gitdir/snapshot.index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/snapshot-add.trace" \
+				git -C "$worktree" add --sparse \
+					--pathspec-from-file=- &&
+			perl "$PWD/.git/check-write-tree-unbound.pl" \
+				<"$gitdir/snapshot.index" &&
+			GIT_INDEX_FILE="$gitdir/snapshot.index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/snapshot-tree.trace" \
+				git -C "$worktree" write-tree \
+					>"$gitdir/snapshot-tree" &&
+			test_file_not_empty "$gitdir/snapshot-tree" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/snapshot-tree.trace" &&
+			git -C "$worktree" ls-tree \
+				"$(cat "$gitdir/snapshot-tree")" snapshot-new \
+				>"$gitdir/snapshot-entry" &&
+			test_grep "snapshot-new$" "$gitdir/snapshot-entry" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
 			test_write_lines "*.asset text" \
 				>"$worktree/.gitattributes" &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
