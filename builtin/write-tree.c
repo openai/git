@@ -5,12 +5,14 @@
  */
 #define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "abspath.h"
 #include "clean-status.h"
 #include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
+#include "strbuf.h"
 #include "tree.h"
 #include "cache-tree.h"
 #include "parse-options.h"
@@ -25,6 +27,32 @@ static int write_tree_config(const char *key, const char *value,
 {
 	clean_status_config_add(data, key, value, ctx);
 	return git_default_config(key, value, ctx, NULL);
+}
+
+static int write_tree_uses_worktree_index(void)
+{
+	const char *index_file = getenv(INDEX_ENVIRONMENT);
+	struct strbuf worktree_index = STRBUF_INIT;
+	struct stat st;
+	char *expected = NULL, *actual = NULL;
+	int matches = 0;
+
+	if (!index_file)
+		return 1;
+	if (lstat(index_file, &st) || S_ISLNK(st.st_mode))
+		return 0;
+
+	strbuf_addf(&worktree_index, "%s/index",
+		    repo_get_git_dir(the_repository));
+	expected = real_pathdup(worktree_index.buf, 0);
+	actual = real_pathdup(index_file, 0);
+	if (expected && actual && !strcmp(expected, actual))
+		matches = 1;
+
+	free(expected);
+	free(actual);
+	strbuf_release(&worktree_index);
+	return matches;
 }
 
 int cmd_write_tree(int argc,
@@ -57,7 +85,7 @@ int cmd_write_tree(int argc,
 	show_usage_with_options_if_asked(argc, argv,
 					 write_tree_usage, write_tree_options);
 
-	if (!getenv(INDEX_ENVIRONMENT)) {
+	if (write_tree_uses_worktree_index()) {
 		clean_status_config_init(&clean_digest,
 					 the_repository->hash_algo);
 		repo_config(the_repository, write_tree_config, &clean_digest);
