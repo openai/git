@@ -2,9 +2,12 @@
 
 #include "git-compat-util.h"
 #include "builtin.h"
+#include "clean-status-config.h"
+#include "clean-status.h"
 #include "parse-options.h"
 #include "diff.h"
 #include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "revision.h"
 #include "rerere.h"
@@ -115,6 +118,7 @@ static int run_sequencer(int argc, const char **argv, const char *prefix,
 	const char sentinel_value = 0; /* value not important */
 	const char *strategy = &sentinel_value;
 	const char *gpg_sign = &sentinel_value;
+	struct clean_status_config_digest clean_digest;
 	enum empty_action empty_opt = EMPTY_COMMIT_UNSPECIFIED;
 	int cmd = 0;
 	struct option base_options[] = {
@@ -172,6 +176,12 @@ static int run_sequencer(int argc, const char **argv, const char *prefix,
 	argc = parse_options(argc, argv, prefix, options, usage_str,
 			PARSE_OPT_KEEP_ARGV0 |
 			PARSE_OPT_KEEP_UNKNOWN_OPT);
+	if (fstat_is_reliable() && !getenv(INDEX_ENVIRONMENT) &&
+	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	}
 
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
