@@ -987,6 +987,105 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'write-tree preserves authenticated primary and linked index proofs' '
+	test_when_finished "rm -rf write-tree-bound-proof write-tree-linked" &&
+	test_create_repo write-tree-bound-proof &&
+	(
+		cd write-tree-bound-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git worktree add --detach ../write-tree-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		cat >.git/check-write-tree-proof.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my %tokens;
+		for my $name ("FSMN", "FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			my $payload = substr($index, $offset + 8, $size);
+			if ($name eq "FSCF") {
+				my $flags = unpack("N", substr($payload, 8, 4));
+				die "unbound FSCF flags $flags\n" if $flags != 15;
+				my $length = unpack("N", substr($payload, 12, 4));
+				$tokens{$name} = substr($payload, 20, $length);
+			} else {
+				my $end = index($payload, "\0", 4);
+				die "invalid $name token\n" if $end < 0;
+				$tokens{$name} = substr($payload, 4, $end - 4);
+			}
+		}
+		die "mismatched provider tokens\n" unless
+			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+			$tokens{"FSMN"} eq $tokens{"FSCF"};
+		EOF
+		for worktree in "$PWD" "$PWD/../write-tree-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			test_write_lines changed >"$worktree/tracked" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+				git -C "$worktree" add tracked &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_grep "^1 M\\. .* tracked$" "$gitdir/prime" &&
+			perl "$PWD/.git/check-write-tree-proof.pl" \
+				<"$gitdir/index" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/write-tree.trace" \
+				git -C "$worktree" write-tree \
+					>"$gitdir/tree" &&
+			test_file_not_empty "$gitdir/tree" &&
+			test_region index do_write_index \
+				"$gitdir/write-tree.trace" &&
+			! test_trace2_data fsmonitor untracked/proof-missing 1 \
+				<"$gitdir/write-tree.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/write-tree.trace" &&
+			perl "$PWD/.git/check-write-tree-proof.pl" \
+				<"$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/status.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/status" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			test_grep "^1 M\\. .* tracked$" "$gitdir/status" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/status.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/status.trace" &&
+			test_write_lines "*.asset text" \
+				>"$worktree/.gitattributes" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" add .gitattributes &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/attributes.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/attributes" &&
+			test_trace2_data fsmonitor config/coherent 0 \
+				<"$gitdir/attributes.trace" &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/attributes.trace" &&
+			test_grep "^1 A\\. .* \\.gitattributes$" \
+				"$gitdir/attributes" || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'expired add preserves untracked candidates until revalidation' '
 	test_when_finished "rm -rf pending-untracked-revalidation pending-untracked-hostile" &&
 	test_create_repo pending-untracked-revalidation &&
