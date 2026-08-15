@@ -5,6 +5,8 @@
  */
 #define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -18,11 +20,19 @@ static const char * const write_tree_usage[] = {
 	NULL
 };
 
+static int write_tree_config(const char *key, const char *value,
+			     const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
 int cmd_write_tree(int argc,
 		   const char **argv,
 		   const char *cmd_prefix,
 		   struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	int flags = 0, ret;
 	const char *tree_prefix = NULL;
 	struct object_id oid;
@@ -44,7 +54,11 @@ int cmd_write_tree(int argc,
 		OPT_END()
 	};
 
-	repo_config(the_repository, git_default_config, NULL);
+	clean_status_config_init(&clean_digest, the_repository->hash_algo);
+	repo_config(the_repository, write_tree_config, &clean_digest);
+	clean_status_config_final(&clean_digest);
+	clean_status_set_config_digest(the_repository, &clean_digest);
+	clean_status_enable_external_history(the_repository);
 	argc = parse_options(argc, argv, cmd_prefix, write_tree_options,
 			     write_tree_usage, 0);
 
