@@ -88,7 +88,11 @@ static int is_proof_preserving_rewrite(int argc, const char **argv)
 	return (!strcmp(argv[1], "--refresh") &&
 		!strcmp(argv[2], "--force-write-index")) ||
 		(!strcmp(argv[1], "--force-write-index") &&
-		 !strcmp(argv[2], "--refresh"));
+		 !strcmp(argv[2], "--refresh")) ||
+		(!strcmp(argv[1], "--untracked-cache") &&
+		 !strcmp(argv[2], "--force-write-index")) ||
+		(!strcmp(argv[1], "--force-write-index") &&
+		 !strcmp(argv[2], "--untracked-cache"));
 }
 
 static int is_fsmonitor_invalidation_rewrite(int argc, const char **argv)
