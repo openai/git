@@ -3689,6 +3689,13 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 		git -C "$worktree" config core.autocrlf false &&
 		git -C "$worktree" config core.untrackedCache true &&
 		git -C "$worktree" config core.fsmonitor true &&
+		git -C "$worktree" config filter.lfs.clean \
+			"git-lfs clean -- %f" &&
+		git -C "$worktree" config filter.lfs.smudge \
+			"git-lfs smudge -- %f" &&
+		git -C "$worktree" config filter.lfs.process \
+			"git-lfs filter-process" &&
+		git -C "$worktree" config filter.lfs.required true &&
 		git -C "$worktree" config index.recordEndOfIndexEntries false &&
 		test-tool chmtime -120 \
 			"$worktree/existing/tracked" "$worktree/existing/sibling" &&
@@ -3735,6 +3742,43 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 		test_grep UNTR "$gitdir/index" &&
 		test_grep ! FSUC "$gitdir/index" &&
 		test_grep ! FSCF "$gitdir/index" &&
+		for command in diff diff-files diff-index
+		do
+			case "$command" in
+			diff-index) set -- "$command" HEAD ;;
+			*) set -- "$command" ;;
+			esac &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" -c core.fsmonitor=false \
+					-c core.untrackedCache=false "$@" \
+					>"$gitdir/$command.expect" &&
+			cp "$gitdir/index" "$gitdir/$command.before" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TRACE2_EVENT="$gitdir/$command.trace" \
+				git -C "$worktree" "$@" \
+					>"$gitdir/$command.actual" &&
+			test_cmp "$gitdir/$command.expect" \
+				"$gitdir/$command.actual" &&
+			test_cmp_bin "$gitdir/$command.before" "$gitdir/index" &&
+			{
+				test_trace2_data fsmonitor history/external-restored 1 \
+					<"$gitdir/$command.trace" ||
+				test_trace2_data fsmonitor \
+					history/external-semantic-restored 1 \
+					<"$gitdir/$command.trace"
+			} &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/$command.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/$command.trace" &&
+			! test_trace2_data index preload/sum_lstat \
+				"[2-9][0-9]*" <"$gitdir/$command.trace" &&
+			! test_trace2_data index preload/sum_lstat \
+				"1[0-9][0-9]*" <"$gitdir/$command.trace" ||
+				return 1
+		done &&
 		test_write_lines dirty >"$worktree/existing/tracked" &&
 		for run in first second
 		do
@@ -3775,7 +3819,24 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 				"$gitdir/status-$run" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/status-$run.trace" || return 1
-		done
+		done &&
+		git -C "$worktree" config filter.lfs.process "" &&
+		git -C "$worktree" config filter.lfs.clean false &&
+		test_write_lines "existing/tracked filter=lfs" \
+			>"$worktree/.gitattributes" &&
+		cp "$gitdir/index" "$gitdir/active-filter.before" &&
+		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$gitdir/active-filter.trace" \
+			git -C "$worktree" diff \
+				>"$gitdir/active-filter.out" \
+				2>"$gitdir/active-filter.err" &&
+		test_grep "clean filter .lfs. failed" \
+			"$gitdir/active-filter.err" &&
+		test_cmp_bin "$gitdir/active-filter.before" "$gitdir/index" &&
+		! test_trace2_data fsmonitor history/external-restored 1 \
+			<"$gitdir/active-filter.trace" &&
+		! test_trace2_data fsmonitor history/external-semantic-restored 1 \
+			<"$gitdir/active-filter.trace"
 	)
 '
 

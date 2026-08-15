@@ -456,8 +456,7 @@ void prepare_diff_external_history(struct repository *repo)
 	    clean_status_config_read_repository(repo, &digest))
 		goto done;
 	clean_status_set_config_digest(repo, &digest);
-	if (!digest.filter_configured)
-		clean_status_enable_external_history(repo);
+	clean_status_enable_external_history(repo);
 
 done:
 	free_worktree(worktree);
