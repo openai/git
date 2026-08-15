@@ -1545,6 +1545,12 @@ int clean_status_restore_external_history(struct index_state *istate)
 			goto have_index_hash;
 		}
 	}
+	if (!record_loaded && !use_optional_locks()) {
+		if (missing_fsmonitor_recovery)
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "history/external-proof-invalidated", 1);
+		goto done;
+	}
 	if (clean_status_index_logical_digest(istate, index_hash))
 		goto done;
 
