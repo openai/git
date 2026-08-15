@@ -101,6 +101,90 @@ void test_clean_status_history__reads_valid_history_once(void)
 	fixture_release(&fixture);
 }
 
+static void check_existing_proof_is_replaced(
+	const struct git_hash_algo *algo, int semantic)
+{
+	struct history_fixture fixture;
+	struct index_state dst;
+	struct clean_status_state *src_state, *dst_state;
+	struct stat st;
+	int source_fd;
+
+	fixture_init(&fixture, algo);
+	index_state_init(&dst, &fixture.repo);
+	clean_status_read_fsmonitor_config(
+		&fixture.istate, fixture.encoded.buf, fixture.encoded.len);
+	src_state = install_current(&fixture);
+	clean_status_prepare_fsmonitor_config(&fixture.istate);
+	cl_assert(src_state->config_revalidated);
+
+	clean_status_read_fsmonitor_config(
+		&dst, fixture.encoded.buf, fixture.encoded.len);
+	dst_state = dst.clean_status;
+	memcpy(dst_state->current_config_hash,
+	       src_state->current_config_hash, algo->rawsz);
+	memcpy(dst_state->current_semantic_hash,
+	       src_state->current_semantic_hash, algo->rawsz);
+	memcpy(dst_state->current_attr_hash,
+	       src_state->current_attr_hash, algo->rawsz);
+	dst_state->current_config_valid = 1;
+	dst_state->current_semantic_valid = 1;
+	dst_state->current_attr_valid = 1;
+	dst_state->config_enforced = 1;
+	dst.fsmonitor_last_update = xstrdup("builtin:1:2");
+	dst.fsmonitor_token_valid = 1;
+	clean_status_prepare_fsmonitor_config(&dst);
+	clean_status_invalidate_current_proof(&dst);
+	cl_assert(dst_state->disk_config_seen);
+	cl_assert(dst_state->disk_config_valid);
+
+	source_fd = dup(1);
+	cl_assert(source_fd >= 0);
+	dst_state->source_index_fd = source_fd;
+	dst_state->source_logical_hash_valid = 1;
+	dst_state->external_history_restored = 1;
+	memset(dst_state->source_logical_hash, 0x5a, algo->rawsz);
+
+	if (semantic)
+		cl_assert(clean_status_transfer_current_proof_if_semantically_same_index(
+			&dst, &fixture.istate));
+	else
+		cl_assert(clean_status_transfer_current_proof_if_same_index(
+			&dst, &fixture.istate));
+	cl_assert(dst.clean_status == dst_state);
+	cl_assert(dst_state->disk_config_seen);
+	cl_assert(dst_state->disk_config_valid);
+	cl_assert(!dst_state->disk_config_invalid);
+	cl_assert(dst_state->config_revalidated);
+	cl_assert_equal_s(dst_state->disk_config_token, "builtin:1:2");
+	cl_assert_equal_i(dst_state->source_index_fd, source_fd);
+	cl_assert_equal_i(fstat(source_fd, &st), 0);
+	cl_assert(dst_state->source_logical_hash_valid);
+	cl_assert_equal_i(dst_state->source_logical_hash[0], 0x5a);
+	cl_assert(dst_state->external_history_restored);
+
+	clean_status_read_fsmonitor_config(
+		&dst, fixture.encoded.buf, fixture.encoded.len);
+	cl_assert(dst_state->disk_config_invalid);
+	cl_assert(!dst_state->disk_config_valid);
+
+	clean_status_release(&dst);
+	free(dst.fsmonitor_last_update);
+	fixture_release(&fixture);
+}
+
+void test_clean_status_history__replaces_existing_identical_index_proofs(void)
+{
+	check_existing_proof_is_replaced(&hash_algos[GIT_HASH_SHA1], 0);
+	check_existing_proof_is_replaced(&hash_algos[GIT_HASH_SHA256], 0);
+}
+
+void test_clean_status_history__replaces_existing_semantic_index_proofs(void)
+{
+	check_existing_proof_is_replaced(&hash_algos[GIT_HASH_SHA1], 1);
+	check_existing_proof_is_replaced(&hash_algos[GIT_HASH_SHA256], 1);
+}
+
 void test_clean_status_history__adopts_only_coherent_proofs(void)
 {
 	struct history_fixture fixture;
