@@ -9,6 +9,7 @@
 
 #include "builtin.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "clean-status-sidecar.h"
 #include "config.h"
 #include "ewah/ewok.h"
@@ -29,9 +30,11 @@
 #include "revision.h"
 #include "log-tree.h"
 #include "setup.h"
+#include "thread-utils.h"
 #include "oid-array.h"
 #include "tree.h"
 #include "worktree.h"
+#include "wt-status.h"
 
 #define DIFF_NO_INDEX_EXPLICIT 1
 #define DIFF_NO_INDEX_IMPLICIT 2
@@ -241,6 +244,29 @@ static void builtin_diff_combined(struct rev_info *revs,
 	oid_array_clear(&parents);
 }
 
+static pthread_mutex_t diff_refresh_warning_mutex;
+static int diff_refresh_warning_seen;
+
+static void capture_diff_refresh_warning(const char *message UNUSED,
+					 va_list params UNUSED)
+{
+	pthread_mutex_lock(&diff_refresh_warning_mutex);
+	diff_refresh_warning_seen = 1;
+	pthread_mutex_unlock(&diff_refresh_warning_mutex);
+}
+
+static int can_close_diff_fsmonitor_token(struct index_state *istate)
+{
+	return fsmonitor_pending_token_from_provider(istate) &&
+		fstat_is_reliable() &&
+		the_repository->config_values_private_.trust_ctime &&
+		the_repository->config_values_private_.check_stat &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!istate->split_index && istate->sparse_index == INDEX_EXPANDED &&
+		!unmerged_index(istate) &&
+		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC;
+}
+
 static void refresh_index_quietly(void)
 {
 	struct lock_file lock_file = LOCK_INIT;
@@ -253,19 +279,111 @@ static void refresh_index_quietly(void)
 	if (!use_optional_locks())
 		return;
 
+	can_close_token = can_close_diff_fsmonitor_token(istate);
+	if (can_close_token &&
+	    !repo_config_values(the_repository)->apply_sparse_checkout &&
+	    istate->untracked &&
+	    istate->untracked->root &&
+	    istate->fsmonitor_untracked_extension_seen &&
+	    !istate->fsmonitor_untracked_extension_invalid &&
+	    !istate->fsmonitor_untracked_valid) {
+		struct clean_status_index_snapshot source = { .fd = -1 };
+		struct clean_status_config_digest digest;
+		struct object_id exclude_digest;
+		struct stat scanned_worktree;
+		struct wt_status status;
+		report_fn original_warning;
+		int proof_complete;
+		int warning_seen;
+
+		if (clean_status_index_snapshot_open_allow_null_checksum(
+			    &source, repo_get_index_file(the_repository),
+			    the_repository->hash_algo))
+			return;
+		if (clean_status_config_read_repository(the_repository,
+						       &digest)) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		clean_status_set_config_digest(the_repository, &digest);
+		discard_index(istate);
+		repo_read_index(the_repository);
+		if (!clean_status_index_snapshot_still_matches_proof_epoch(
+			    &source, istate)) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		refresh_fsmonitor(istate);
+		if (!can_close_diff_fsmonitor_token(istate) ||
+		    repo_config_values(the_repository)->apply_sparse_checkout ||
+		    !istate->untracked || !istate->untracked->root ||
+		    !istate->fsmonitor_untracked_extension_seen ||
+		    istate->fsmonitor_untracked_extension_invalid ||
+		    istate->fsmonitor_untracked_valid) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		if (pthread_mutex_init(&diff_refresh_warning_mutex, NULL)) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		diff_refresh_warning_seen = 0;
+		original_warning = get_warn_routine();
+		set_warn_routine(capture_diff_refresh_warning);
+		wt_status_prepare(the_repository, &status);
+		status.certify_clean_status = 1;
+		status.show_untracked_files = istate->untracked->dir_flags ?
+			SHOW_NORMAL_UNTRACKED_FILES : SHOW_ALL_UNTRACKED_FILES;
+		wt_status_start_untracked_cache_preload(&status);
+		wt_status_refresh_index(&status,
+					REFRESH_QUIET | REFRESH_UNMERGED |
+					REFRESH_DEFER_BULK_DIRTY, 1);
+		proof_complete = !status.certify_untracked_scan_failed &&
+			!wt_status_certified_excludes_digest(
+				&status, &exclude_digest, &scanned_worktree) &&
+			!fsmonitor_has_pending_token(istate) &&
+			istate->fsmonitor_untracked_valid &&
+			istate->fsmonitor_last_update &&
+			istate->fsmonitor_untracked_token &&
+			!strcmp(istate->fsmonitor_last_update,
+				istate->fsmonitor_untracked_token) &&
+			(!istate->clean_status ||
+			 clean_status_revalidated_token_matches(istate));
+		wt_status_collect_free_buffers(&status);
+		set_warn_routine(original_warning);
+		pthread_mutex_lock(&diff_refresh_warning_mutex);
+		warning_seen = diff_refresh_warning_seen;
+		pthread_mutex_unlock(&diff_refresh_warning_mutex);
+		pthread_mutex_destroy(&diff_refresh_warning_mutex);
+		string_list_clear(&status.untracked, 0);
+		string_list_clear(&status.ignored, 0);
+		free(status.branch);
+		if (!proof_complete || warning_seen) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		fd = repo_hold_locked_index(the_repository, &lock_file, 0);
+		if (fd < 0) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		if (!clean_status_index_snapshot_still_matches_path(
+			    &source, repo_get_index_file(the_repository),
+			    the_repository->hash_algo)) {
+			rollback_lock_file(&lock_file);
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		repo_update_index_if_able(the_repository, &lock_file);
+		clean_status_index_snapshot_release(&source);
+		return;
+	}
 	fd = repo_hold_locked_index(the_repository, &lock_file, 0);
 	if (fd < 0)
 		return;
 	discard_index(istate);
 	repo_read_index(the_repository);
-	can_close_token = fstat_is_reliable() &&
-		the_repository->config_values_private_.trust_ctime &&
-		the_repository->config_values_private_.check_stat &&
-		!getenv(INDEX_ENVIRONMENT) &&
-		!istate->split_index && istate->sparse_index == INDEX_EXPANDED &&
-		!unmerged_index(istate) &&
-		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
-		fsmonitor_pending_token_from_provider(istate);
+	can_close_token = can_close_diff_fsmonitor_token(istate);
 	refreshed = refresh_index(istate,
 			REFRESH_QUIET | REFRESH_UNMERGED |
 			(can_close_token ? REFRESH_IN_PROOF_EPOCH : 0),
