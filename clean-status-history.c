@@ -23,6 +23,8 @@
 
 #define CLEAN_STATUS_HISTORY_SCHEMA "builtin-fsmonitor-history-v2"
 
+static struct repository *external_history_source_repo;
+
 static void invalidate_disk_history(struct clean_status_state *state)
 {
 	state->disk_config_seen = 1;
@@ -514,6 +516,11 @@ done:
 	free(gitdir);
 	free(commondir);
 	return ret;
+}
+
+void clean_status_require_external_history_source(struct repository *repo)
+{
+	external_history_source_repo = repo;
 }
 
 void clean_status_capture_external_history_source(
@@ -1545,7 +1552,7 @@ int clean_status_restore_external_history(struct index_state *istate)
 			goto have_index_hash;
 		}
 	}
-	if (!record_loaded && !use_optional_locks()) {
+	if (!record_loaded && external_history_source_repo != istate->repo) {
 		if (missing_fsmonitor_recovery)
 			trace2_data_intmax("fsmonitor", istate->repo,
 					   "history/external-proof-invalidated", 1);

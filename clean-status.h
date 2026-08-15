@@ -140,6 +140,7 @@ int clean_status_has_recovered_tracked_stat(
 	const struct index_state *istate);
 int clean_status_external_history_owns_index(
 	const struct index_state *istate);
+void clean_status_require_external_history_source(struct repository *repo);
 void clean_status_capture_external_history_source(
 	struct index_state *istate);
 int clean_status_save_external_history(struct index_state *istate);
