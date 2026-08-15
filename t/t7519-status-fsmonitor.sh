@@ -2218,7 +2218,7 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'diff preserves pending reset proofs in main and linked worktrees' '
+	'diff fully revalidates reset proofs in main and linked worktrees' '
 	test_when_finished "rm -rf builtin-diff-reset builtin-diff-reset-linked" &&
 	test_create_repo builtin-diff-reset &&
 	(
@@ -2267,14 +2267,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_must_be_empty "$gitdir/reset.actual" &&
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/reset.trace" &&
-			test_trace2_data fsmonitor \
-				untracked/provider-reset-pending 1 \
-				<"$gitdir/reset.trace" &&
 			test_region index do_write_index "$gitdir/reset.trace" &&
-			test_grep FSMN "$gitdir/index" &&
-			test_grep FSUC "$gitdir/index" &&
-			test_grep "pending:test:[2-9]" "$gitdir/index" &&
-			test_fsmonitor_full_proof "$gitdir/index" pending &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
 			cp "$gitdir/index" "$gitdir/pending.index" &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
@@ -2287,6 +2281,12 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				<"$gitdir/pending-status.trace" &&
 			! test_trace2_data fsmonitor \
 				semantic/manifest-scan-count 1 \
+				<"$gitdir/pending-status.trace" &&
+			! test_trace2_data dir preload_untracked_cache/dirs \
+				"[2-9][0-9]*" \
+				<"$gitdir/pending-status.trace" &&
+			! test_trace2_data dir preload_untracked_cache/dirs \
+				"1[0-9][0-9]*" \
 				<"$gitdir/pending-status.trace" &&
 			! test_region index do_write_index \
 				"$gitdir/pending-status.trace" &&
@@ -4031,15 +4031,21 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 				"$worktree/cached/deep/tracked" &&
 			git -C "$worktree" fsmonitor--daemon start \
 				--start-timeout=10 &&
+			cp "$gitdir/index" "$gitdir/locked.index" &&
+			: >"$gitdir/index.lock" &&
+			GIT_TRACE2_EVENT="$gitdir/locked.trace" \
+				git -C "$worktree" diff >"$gitdir/locked" &&
+			rm -f "$gitdir/index.lock" &&
+			test_must_be_empty "$gitdir/locked" &&
+			test_cmp_bin "$gitdir/locked.index" "$gitdir/index" &&
+			! test_region index do_write_index \
+				"$gitdir/locked.trace" &&
 			GIT_TRACE2_EVENT="$gitdir/diff.trace" \
 				git -C "$worktree" diff >"$gitdir/diff" &&
 			test_must_be_empty "$gitdir/diff" &&
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/diff.trace" &&
-			test_trace2_data fsmonitor \
-				untracked/provider-reset-pending 1 \
-				<"$gitdir/diff.trace" &&
-			test_fsmonitor_full_proof "$gitdir/index" pending &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
 			cp "$gitdir/index" "$gitdir/readonly.index" &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TRACE2_EVENT="$gitdir/readonly.trace" \
@@ -4051,6 +4057,12 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 				<"$gitdir/readonly.trace" &&
 			! test_trace2_data fsmonitor \
 				semantic/manifest-scan-count 1 \
+				<"$gitdir/readonly.trace" &&
+			! test_trace2_data dir preload_untracked_cache/dirs \
+				"[2-9][0-9]*" \
+				<"$gitdir/readonly.trace" &&
+			! test_trace2_data dir preload_untracked_cache/dirs \
+				"1[0-9][0-9]*" \
 				<"$gitdir/readonly.trace" &&
 			! test_region index do_write_index \
 				"$gitdir/readonly.trace" &&
