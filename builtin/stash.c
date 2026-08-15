@@ -1664,6 +1664,7 @@ static int create_stash(int argc, const char **argv, const char *prefix UNUSED,
 	strbuf_join_argv(&stash_msg_buf, argc - 1, ++argv, ' ');
 
 	memset(&ps, 0, sizeof(ps));
+	clean_status_enable_external_history(the_repository);
 	clean_status_set_config_digest(the_repository, &stash_clean_digest);
 	if (!check_changes_tracked_files(&ps))
 		return 0;
