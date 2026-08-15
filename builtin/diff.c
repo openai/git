@@ -17,6 +17,7 @@
 #include "commit.h"
 #include "environment.h"
 #include "gettext.h"
+#include "fsmonitor-ll.h"
 #include "fsmonitor-settings.h"
 #include "tag.h"
 #include "diff.h"
@@ -242,7 +243,10 @@ static void builtin_diff_combined(struct rev_info *revs,
 static void refresh_index_quietly(void)
 {
 	struct lock_file lock_file = LOCK_INIT;
+	struct index_state *istate = the_repository->index;
+	int can_close_token;
 	int fd;
+	int refreshed;
 
 	if (!use_optional_locks())
 		return;
@@ -250,10 +254,28 @@ static void refresh_index_quietly(void)
 	fd = repo_hold_locked_index(the_repository, &lock_file, 0);
 	if (fd < 0)
 		return;
-	discard_index(the_repository->index);
+	discard_index(istate);
 	repo_read_index(the_repository);
-	refresh_index(the_repository->index, REFRESH_QUIET|REFRESH_UNMERGED, NULL, NULL,
-		      NULL);
+	can_close_token = fstat_is_reliable() &&
+		the_repository->config_values_private_.trust_ctime &&
+		the_repository->config_values_private_.check_stat &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!istate->split_index && istate->sparse_index == INDEX_EXPANDED &&
+		!unmerged_index(istate) &&
+		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+		fsmonitor_pending_token_from_provider(istate);
+	refreshed = refresh_index(istate,
+			REFRESH_QUIET | REFRESH_UNMERGED |
+			(can_close_token ? REFRESH_IN_PROOF_EPOCH : 0),
+			NULL, NULL, NULL);
+	/* A complete tracked refresh cannot also authenticate untracked files. */
+	if (!refreshed && can_close_token &&
+	    fsmonitor_pending_token_from_provider(istate) &&
+	    fsmonitor_query_pending_token(istate, 0) == FSMONITOR_TOKEN_CLEAN) {
+		clean_status_mark_fsmonitor_config_valid(
+			istate, istate->fsmonitor_last_update_pending);
+		fsmonitor_accept_pending_token(istate, 0, 0);
+	}
 	repo_update_index_if_able(the_repository, &lock_file);
 }
 
