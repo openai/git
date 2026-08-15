@@ -1289,6 +1289,70 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'diff closes reset fsmonitor tokens in main and linked worktrees' '
+	test_when_finished "rm -rf builtin-diff-reset builtin-diff-reset-linked" &&
+	test_create_repo builtin-diff-reset &&
+	(
+		cd builtin-diff-reset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git -c core.fsmonitor=false worktree add --detach \
+			../builtin-diff-reset-linked HEAD &&
+		for worktree in "$PWD" "$PWD/../builtin-diff-reset-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_grep FSMN "$gitdir/index" &&
+			test_grep FSUC "$gitdir/index" &&
+			test-tool chmtime =-60 "$worktree/tracked" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/readonly.trace" \
+				git -C "$worktree" diff \
+					>"$gitdir/readonly.actual" &&
+			test_must_be_empty "$gitdir/readonly.actual" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<"$gitdir/readonly.trace" &&
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TTCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/reset.trace" \
+				git -C "$worktree" diff \
+					>"$gitdir/reset.actual" &&
+			test_must_be_empty "$gitdir/reset.actual" &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<"$gitdir/reset.trace" &&
+			test_trace2_data fsmonitor token_closure/accepted 1 \
+				<"$gitdir/reset.trace" &&
+			test_region index do_write_index "$gitdir/reset.trace" &&
+			test_grep FSMN "$gitdir/index" &&
+			test_grep ! FSUC "$gitdir/index" &&
+			test_grep "builtin:test:[2-9]" "$gitdir/index" &&
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/next.trace" \
+				git -C "$worktree" diff \
+					>"$gitdir/next.actual" &&
+			test_must_be_empty "$gitdir/next.actual" &&
+			test_trace2_data index preload/sum_lstat 0 \
+				<"$gitdir/next.trace" || return 1
+		done
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'builtin trivial closure can rescan and accept' '
 	test_when_finished "rm -rf builtin-closure-trivial" &&
