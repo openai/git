@@ -3757,21 +3757,37 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 				git -C "$worktree" -c core.fsmonitor=false \
 					-c core.untrackedCache=false diff \
 					>"$gitdir/$corruption.expect" &&
-			cp "$gitdir/index" "$gitdir/$corruption.before" &&
-			GIT_OPTIONAL_LOCKS=0 \
-			GIT_TRACE2_EVENT="$gitdir/$corruption.trace" \
-				git -C "$worktree" diff \
-					>"$gitdir/$corruption.actual" &&
-			test_cmp "$gitdir/$corruption.expect" \
-				"$gitdir/$corruption.actual" &&
-			test_cmp_bin "$gitdir/$corruption.before" \
-				"$gitdir/index" &&
-			test_trace2_data fsmonitor config/coherent 0 \
-				<"$gitdir/$corruption.trace" &&
-			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
-				<"$gitdir/$corruption.trace" &&
-			test_grep ! "\"label\":\"history_logical_digest\"" \
-				"$gitdir/$corruption.trace" || return 1
+			for locking in readonly default
+			do
+				trace="$gitdir/$corruption-$locking.trace" &&
+				cp "$gitdir/index" \
+					"$gitdir/$corruption-$locking.before" &&
+				if test "$locking" = readonly
+				then
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TRACE2_EVENT="$trace" \
+						git -C "$worktree" diff \
+							>"$gitdir/$corruption.actual"
+				else
+					sane_unset GIT_OPTIONAL_LOCKS &&
+					GIT_TRACE2_EVENT="$trace" \
+						git -C "$worktree" diff \
+							>"$gitdir/$corruption.actual"
+				fi &&
+				test_cmp "$gitdir/$corruption.expect" \
+					"$gitdir/$corruption.actual" &&
+				test_cmp_bin \
+					"$gitdir/$corruption-$locking.before" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 0 \
+					<"$trace" &&
+				test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 <"$trace" &&
+				test_grep ! "\"label\":\"history_logical_digest\"" \
+					"$trace" &&
+				! test_region index do_write_index "$trace" ||
+					return 1
+			done || return 1
 		done &&
 		rm -f "$checkpoint.wrong" &&
 		cp "$gitdir/checkpoint.valid" "$checkpoint" &&
