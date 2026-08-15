@@ -1338,6 +1338,7 @@ static void write_pack_file(void)
 	uint32_t nr_remaining = nr_result;
 	time_t last_mtime = 0;
 	struct object_entry **write_order;
+	off_t bytes_written = 0;
 
 	if (progress > pack_to_stdout)
 		progress_state = start_progress(the_repository,
@@ -1391,6 +1392,8 @@ static void write_pack_file(void)
 		}
 
 		if (pack_to_stdout) {
+			bytes_written += hashfile_total(f) +
+				the_repository->hash_algo->rawsz;
 			/*
 			 * We never fsync when writing to stdout since we may
 			 * not be writing to an actual pack file. For instance,
@@ -1511,6 +1514,9 @@ static void write_pack_file(void)
 		    written, nr_result);
 	trace2_data_intmax("pack-objects", the_repository,
 			   "write_pack_file/wrote", nr_result);
+	if (pack_to_stdout)
+		trace2_data_intmax("pack-objects", the_repository,
+				   "written/bytes", bytes_written);
 }
 
 static int no_try_delta(const char *path)

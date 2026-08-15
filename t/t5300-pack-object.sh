@@ -33,6 +33,16 @@ test_expect_success 'setup' '
 	} >expect
 '
 
+test_expect_success 'pack-object traces bytes written to stdout' '
+	test_when_finished "rm -f pack.trace pack.pack" &&
+	GIT_TRACE2_EVENT="$PWD/pack.trace" \
+		git pack-objects --quiet --revs --stdout >pack.pack <<-EOF &&
+	$commit
+	EOF
+	bytes=$(test_file_size pack.pack) &&
+	test_grep "\"key\":\"written/bytes\",\"value\":\"$bytes\"" pack.trace
+'
+
 test_expect_success 'setup pack-object <stdin' '
 	git init pack-object-stdin &&
 	test_commit -C pack-object-stdin one &&
