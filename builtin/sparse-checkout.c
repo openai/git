@@ -7,6 +7,7 @@
 #include "dir.h"
 #include "environment.h"
 #include "gettext.h"
+#include "hook.h"
 #include "object-file.h"
 #include "object-name.h"
 #include "parse-options.h"
@@ -243,9 +244,16 @@ static int update_working_directory(struct repository *r,
 		 * files in the way or dirty entries that can't be removed.
 		 */
 		result = UPDATE_SPARSITY_SUCCESS;
-	if (result == UPDATE_SPARSITY_SUCCESS)
-		write_locked_index(r->index, &lock_file, COMMIT_LOCK);
-	else
+	if (result == UPDATE_SPARSITY_SUCCESS) {
+		unsigned int flags = COMMIT_LOCK;
+
+		if (!r->index->cache_changed &&
+		    !r->index->updated_workdir &&
+		    !r->index->updated_skipworktree &&
+		    !hook_exists(r, "post-index-change"))
+			flags |= SKIP_IF_UNCHANGED;
+		write_locked_index(r->index, &lock_file, flags);
+	} else
 		rollback_lock_file(&lock_file);
 
 	clean_tracked_sparse_directories(r);
