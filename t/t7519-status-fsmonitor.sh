@@ -3742,6 +3742,39 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 		test_grep UNTR "$gitdir/index" &&
 		test_grep ! FSUC "$gitdir/index" &&
 		test_grep ! FSCF "$gitdir/index" &&
+		checkpoint=$(cat "$gitdir/checkpoints") &&
+		cp "$checkpoint" "$gitdir/checkpoint.valid" &&
+		for corruption in missing malformed wrong-namespace
+		do
+			rm -f "$checkpoint" "$checkpoint.wrong" &&
+			case "$corruption" in
+			missing) : ;;
+			malformed) printf "%s\n" corrupt >"$checkpoint" ;;
+			wrong-namespace)
+				cp "$gitdir/checkpoint.valid" "$checkpoint.wrong" ;;
+			esac &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" -c core.fsmonitor=false \
+					-c core.untrackedCache=false diff \
+					>"$gitdir/$corruption.expect" &&
+			cp "$gitdir/index" "$gitdir/$corruption.before" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$gitdir/$corruption.trace" \
+				git -C "$worktree" diff \
+					>"$gitdir/$corruption.actual" &&
+			test_cmp "$gitdir/$corruption.expect" \
+				"$gitdir/$corruption.actual" &&
+			test_cmp_bin "$gitdir/$corruption.before" \
+				"$gitdir/index" &&
+			test_trace2_data fsmonitor config/coherent 0 \
+				<"$gitdir/$corruption.trace" &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/$corruption.trace" &&
+			test_grep ! "\"label\":\"history_logical_digest\"" \
+				"$gitdir/$corruption.trace" || return 1
+		done &&
+		rm -f "$checkpoint.wrong" &&
+		cp "$gitdir/checkpoint.valid" "$checkpoint" &&
 		for command in diff diff-files diff-index
 		do
 			case "$command" in
@@ -3820,6 +3853,14 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/status-$run.trace" || return 1
 		done &&
+		rm -f "$checkpoint" &&
+		GIT_TRACE2_EVENT="$gitdir/reissue-checkpoint.trace" \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/reissue-checkpoint" &&
+		test_trace2_data fsmonitor history/external-stored 1 \
+			<"$gitdir/reissue-checkpoint.trace" &&
+		test_path_is_file "$checkpoint" &&
+		test_fsmonitor_full_proof "$gitdir/index" paired &&
 		git -C "$worktree" config filter.lfs.process "" &&
 		git -C "$worktree" config filter.lfs.clean false &&
 		test_write_lines "existing/tracked filter=lfs" \
