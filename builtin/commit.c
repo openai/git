@@ -1831,6 +1831,8 @@ struct repository *repo UNUSED)
 		if (isatty(2))
 			clean_status_enable_progress(the_repository);
 	}
+	if (use_optional_locks())
+		clean_status_require_external_history_source(the_repository);
 	repo_read_index(the_repository);
 	if (use_optional_locks())
 		clean_status_capture_external_history_source(
