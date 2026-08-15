@@ -598,6 +598,39 @@ prepare_builtin_closure_repo () {
 	)
 }
 
+test_fsmonitor_pending_full_proof () {
+	perl - "$1" <<-\EOF
+	binmode STDIN;
+	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
+	binmode $input;
+	local $/;
+	my $index = <$input>;
+	my %tokens;
+	for my $name ("FSMN", "FSUC", "FSCF") {
+		my $offset = index($index, $name);
+		die "missing $name extension\n" if $offset < 0;
+		my $size = unpack("N", substr($index, $offset + 4, 4));
+		my $payload = substr($index, $offset + 8, $size);
+		if ($name eq "FSCF") {
+			my $flags = unpack("N", substr($payload, 8, 4));
+			die "unbound FSCF flags $flags\n" if $flags != 15;
+			my $length = unpack("N", substr($payload, 12, 4));
+			$tokens{$name} = substr($payload, 20, $length);
+		} else {
+			my $end = index($payload, "\0", 4);
+			die "invalid $name token\n" if $end < 0;
+			$tokens{$name} = substr($payload, 4, $end - 4);
+		}
+	}
+	die "mismatched tracked provider token\n" unless
+		$tokens{"FSMN"} eq $tokens{"FSCF"};
+	my ($suffix) = $tokens{"FSMN"} =~ /\Abuiltin:(.+)\z/;
+	die "missing provider token\n" unless defined $suffix;
+	die "mismatched pending untracked token\n" unless
+		$tokens{"FSUC"} eq "pending:$suffix";
+	EOF
+}
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'bare status reuses a current tracked fsmonitor proof' '
 	test_when_finished "rm -rf builtin-tracked-clean" &&
@@ -1032,6 +1065,11 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		my $flags = unpack("N", substr($index, $offset + 16, 4));
 		die "unexpected FSCF flags $flags\n" if $flags != 9;
 		EOF
+		write_script .git/hooks/pre-commit <<-\EOF &&
+		test -n "$GIT_INDEX_FILE" || exit 1
+		git write-tree >"$HOOK_PROOF_OUTPUT" || exit 1
+		perl "$HOOK_PROOF_HELPER" <"$GIT_INDEX_FILE"
+		EOF
 		for worktree in "$PWD" "$PWD/../write-tree-linked"
 		do
 			gitdir=$(git -C "$worktree" \
@@ -1075,6 +1113,44 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				<"$gitdir/status.trace" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/status.trace" &&
+			test_write_lines canonical >"$worktree/sibling" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=sibling \
+				git -C "$worktree" add sibling &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/canonical-prime" &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/canonical-tree.trace" \
+				git -C "$worktree" write-tree \
+					>"$gitdir/canonical-tree" &&
+			test_region index do_write_index \
+				"$gitdir/canonical-tree.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/canonical-tree.trace" &&
+			perl "$PWD/.git/check-write-tree-proof.pl" \
+				<"$gitdir/index" &&
+			test_write_lines hooked >"$worktree/sibling" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=sibling \
+				git -C "$worktree" add sibling &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/hook-prime" &&
+			HOOK_PROOF_HELPER="$PWD/.git/check-write-tree-proof.pl" \
+			HOOK_PROOF_OUTPUT="$gitdir/hook-tree" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/hook.trace" \
+				git -C "$worktree" commit -qm hooked &&
+			test_file_not_empty "$gitdir/hook-tree" &&
+			test_grep "\"name\":\"write-tree\"" \
+				"$gitdir/hook.trace" &&
+			perl "$PWD/.git/check-write-tree-proof.pl" \
+				<"$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
 			cp "$gitdir/index" "$gitdir/snapshot.index" &&
 			test_write_lines snapshot >"$worktree/snapshot-new" &&
 			printf "%s\n" snapshot-new |
@@ -1098,6 +1174,37 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				>"$gitdir/snapshot-entry" &&
 			test_grep "snapshot-new$" "$gitdir/snapshot-entry" &&
 			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			GIT_INDEX_FILE="$gitdir/manifestless.index" \
+				git -C "$worktree" read-tree HEAD &&
+			test_grep ! FSCF "$gitdir/manifestless.index" &&
+			test_write_lines manifestless \
+				>"$worktree/manifestless-new" &&
+			printf "%s\n" manifestless-new |
+			GIT_INDEX_FILE="$gitdir/manifestless.index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/manifestless-add.trace" \
+				git -C "$worktree" add --sparse \
+					--pathspec-from-file=- &&
+			test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/manifestless-add.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/manifestless-add.trace" &&
+			GIT_INDEX_FILE="$gitdir/manifestless.index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/manifestless-tree.trace" \
+				git -C "$worktree" write-tree \
+					>"$gitdir/manifestless-tree" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/manifestless-tree.trace" &&
+			git -C "$worktree" ls-tree \
+				"$(cat "$gitdir/manifestless-tree")" \
+				manifestless-new >"$gitdir/manifestless-entry" &&
+			test_grep "manifestless-new$" \
+				"$gitdir/manifestless-entry" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
 			test_write_lines "*.asset text" \
 				>"$worktree/.gitattributes" &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
@@ -1113,6 +1220,466 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				<"$gitdir/attributes.trace" &&
 			test_grep "^1 A\\. .* \\.gitattributes$" \
 				"$gitdir/attributes" || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'fast-forward merges preserve authenticated worktree proofs' '
+	test_when_finished "rm -rf fast-forward-bound-proof fast-forward-linked fast-forward-target" &&
+	test_create_repo fast-forward-bound-proof &&
+	(
+		cd fast-forward-bound-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git worktree add --detach ../fast-forward-target HEAD &&
+		test_write_lines incoming >../fast-forward-target/tracked &&
+		git -C ../fast-forward-target add tracked &&
+		git -C ../fast-forward-target commit -qm incoming &&
+		target=$(git -C ../fast-forward-target rev-parse HEAD) &&
+		git worktree add --detach ../fast-forward-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		cat >.git/check-merge-proof.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my %tokens;
+		for my $name ("FSMN", "FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			my $payload = substr($index, $offset + 8, $size);
+			if ($name eq "FSCF") {
+				my $flags = unpack("N", substr($payload, 8, 4));
+				die "unbound FSCF flags $flags\n" if $flags != 15;
+				my $length = unpack("N", substr($payload, 12, 4));
+				$tokens{$name} = substr($payload, 20, $length);
+			} else {
+				my $end = index($payload, "\0", 4);
+				die "invalid $name token\n" if $end < 0;
+				$tokens{$name} = substr($payload, 4, $end - 4);
+			}
+		}
+		die "mismatched provider tokens\n" unless
+			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+			$tokens{"FSMN"} eq $tokens{"FSCF"};
+		EOF
+		for worktree in "$PWD" "$PWD/../fast-forward-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			perl "$PWD/.git/check-merge-proof.pl" \
+				<"$gitdir/index" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/merge.trace" \
+				git -C "$worktree" merge --ff-only "$target" \
+					>"$gitdir/merge" &&
+			test_region index do_write_index "$gitdir/merge.trace" &&
+			! test_trace2_data fsmonitor untracked/proof-missing 1 \
+				<"$gitdir/merge.trace" &&
+			perl "$PWD/.git/check-merge-proof.pl" \
+				<"$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/status.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/status" &&
+			test_must_be_empty "$gitdir/status" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/status.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/status.trace" &&
+			test_write_lines "*.asset text" \
+				>"$worktree/.gitattributes" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" add .gitattributes &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/attributes.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/attributes" &&
+			test_trace2_data fsmonitor config/coherent 0 \
+				<"$gitdir/attributes.trace" &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/attributes.trace" &&
+			test_grep "^1 A\\. .* \\.gitattributes$" \
+				"$gitdir/attributes" || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'full status durably repairs missing mixed-writer index proofs' '
+	test_when_finished "rm -rf mixed-writer-missing-proofs" &&
+	test_create_repo mixed-writer-missing-proofs &&
+	(
+		cd mixed-writer-missing-proofs &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+		cat >.git/remove-mixed-writer-proofs.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $algorithm = $ARGV[0];
+		my $rawsz = $algorithm eq "sha256" ? 32 : 20;
+		for my $name ("FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			substr($index, $offset, 8 + $size, "");
+		}
+		my $payload = substr($index, 0, -$rawsz);
+		print $payload,
+			$algorithm eq "sha256" ? sha256($payload) : sha1($payload);
+		EOF
+		perl .git/remove-mixed-writer-proofs.pl "$(test_oid algo)" \
+			<.git/index >.git/index.mixed &&
+		mv .git/index.mixed .git/index &&
+		test_grep FSMN .git/index &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSUC .git/index &&
+		test_grep ! FSCF .git/index &&
+		cp .git/index .git/cold.before &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/cold.trace" \
+			git status --porcelain=v2 >.git/cold &&
+		test_must_be_empty .git/cold &&
+		test_cmp_bin .git/cold.before .git/index &&
+		! test_region index do_write_index .git/cold.trace &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
+			git status >.git/repair &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/repair.trace &&
+		test_region index do_write_index .git/repair.trace &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+		cat >.git/check-mixed-writer-proof.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my %tokens;
+		for my $name ("FSMN", "FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			my $payload = substr($index, $offset + 8, $size);
+			if ($name eq "FSCF") {
+				my $flags = unpack("N", substr($payload, 8, 4));
+				die "unbound FSCF flags $flags\n" if $flags != 15;
+				my $length = unpack("N", substr($payload, 12, 4));
+				$tokens{$name} = substr($payload, 20, $length);
+			} else {
+				my $end = index($payload, "\0", 4);
+				$tokens{$name} = substr($payload, 4, $end - 4);
+			}
+		}
+		die "mismatched provider tokens\n" unless
+			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+			$tokens{"FSMN"} eq $tokens{"FSCF"};
+		EOF
+		perl .git/check-mixed-writer-proof.pl <.git/index &&
+		for run in first second
+		do
+			cp .git/index ".git/readonly-$run.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/readonly-$run.trace" \
+				git status --porcelain=v2 >".git/readonly-$run" &&
+			test_must_be_empty ".git/readonly-$run" &&
+			test_cmp_bin ".git/readonly-$run.index" .git/index &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<".git/readonly-$run.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<".git/readonly-$run.trace" &&
+			! test_region index do_write_index \
+				".git/readonly-$run.trace" || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'ordinary removals and renames preserve safe worktree proofs' '
+	test_when_finished "rm -rf rm-mv-bound-proof rm-mv-linked" &&
+	test_create_repo rm-mv-bound-proof &&
+	(
+		cd rm-mv-bound-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines remove >remove-me &&
+		test_write_lines move >move-me &&
+		test_write_lines sibling >sibling &&
+		test_write_lines "*.asset text" >.gitattributes &&
+		test_write_lines "*.ignored" >.gitignore &&
+		git add remove-me move-me sibling .gitattributes .gitignore &&
+		git commit -qm base &&
+		test_write_lines successor >sibling &&
+		git add sibling &&
+		git commit -qm successor &&
+		git worktree add --detach ../rm-mv-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		cat >.git/check-rm-mv-proof.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my %tokens;
+		for my $name ("FSMN", "FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			my $payload = substr($index, $offset + 8, $size);
+			if ($name eq "FSCF") {
+				my $flags = unpack("N", substr($payload, 8, 4));
+				die "unbound FSCF flags $flags\n" if $flags != 15;
+				my $length = unpack("N", substr($payload, 12, 4));
+				$tokens{$name} = substr($payload, 20, $length);
+			} else {
+				my $end = index($payload, "\0", 4);
+				$tokens{$name} = substr($payload, 4, $end - 4);
+			}
+		}
+		die "mismatched provider tokens\n" unless
+			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+			$tokens{"FSMN"} eq $tokens{"FSCF"};
+		EOF
+		for worktree in "$PWD" "$PWD/../rm-mv-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			for operation in remove rename mixed-reset
+			do
+				case "$operation" in
+				remove) set -- rm --quiet remove-me ;;
+				rename) set -- mv move-me renamed ;;
+				mixed-reset) set -- reset --mixed HEAD~1 ;;
+				esac &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$operation.trace" \
+					git -C "$worktree" "$@" &&
+				perl "$PWD/.git/check-rm-mv-proof.pl" \
+					<"$gitdir/index" &&
+				! test_trace2_data fsmonitor untracked/proof-missing 1 \
+					<"$gitdir/$operation.trace" &&
+				cp "$gitdir/index" "$gitdir/$operation.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$operation-status.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/$operation-status" &&
+				test_cmp_bin "$gitdir/$operation.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/$operation-status.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/$operation-status.trace" || return 1
+			done &&
+			test_write_lines exposed >"$worktree/hidden.ignored" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" rm --quiet .gitignore &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/ignore-removed" &&
+			test_grep "^? hidden\\.ignored$" \
+				"$gitdir/ignore-removed" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" mv .gitattributes \
+					moved.attributes &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/attributes.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/attributes" &&
+			test_trace2_data fsmonitor config/coherent 0 \
+				<"$gitdir/attributes.trace" &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/attributes.trace" || return 1
+		done &&
+		test_write_lines "*.filtered filter=demo" >.gitattributes &&
+		git config filter.demo.clean cat &&
+		git config filter.demo.required true &&
+		test_write_lines raw >active.filtered &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git add .gitattributes active.filtered &&
+		git config filter.demo.clean false &&
+		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 --untracked-files=no \
+				>.git/filtered 2>.git/filter-error &&
+		test_grep "clean filter .demo. failed" .git/filter-error
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'configured pulls preserve authenticated worktree proofs' '
+	test_when_finished "rm -rf pull-proof-origin.git pull-proof-seed pull-proof-ff pull-proof-ff-linked pull-proof-rebase pull-proof-rebase-linked pull-proof-autostash pull-proof-autostash-linked" &&
+	git init --bare pull-proof-origin.git &&
+	test_create_repo pull-proof-seed &&
+	(
+		cd pull-proof-seed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git branch -M main &&
+		git remote add origin "$PWD/../pull-proof-origin.git" &&
+		git push --quiet -u origin main &&
+		git --git-dir="$PWD/../pull-proof-origin.git" \
+			symbolic-ref HEAD refs/heads/main &&
+		cat >.git/check-pull-proof.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my %tokens;
+		for my $name ("FSMN", "FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			my $payload = substr($index, $offset + 8, $size);
+			if ($name eq "FSCF") {
+				my $flags = unpack("N", substr($payload, 8, 4));
+				die "unbound FSCF flags $flags\n" if $flags != 15;
+				my $length = unpack("N", substr($payload, 12, 4));
+				$tokens{$name} = substr($payload, 20, $length);
+			} else {
+				my $end = index($payload, "\0", 4);
+				$tokens{$name} = substr($payload, 4, $end - 4);
+			}
+		}
+		die "mismatched provider tokens\n" unless
+			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+			$tokens{"FSMN"} eq $tokens{"FSCF"};
+		EOF
+		for mode in ff rebase autostash
+		do
+			git clone --quiet "$PWD/../pull-proof-origin.git" \
+				"$PWD/../pull-proof-$mode" &&
+			repo="$PWD/../pull-proof-$mode" &&
+			linked="$PWD/../pull-proof-$mode-linked" &&
+			git -C "$repo" worktree add --quiet \
+				-b "linked-$mode" "$linked" origin/main &&
+			git -C "$linked" branch --quiet \
+				--set-upstream-to=origin/main &&
+			if test "$mode" = ff
+			then
+				git -C "$repo" config pull.ff only
+			else
+				git -C "$repo" config pull.rebase true
+			fi &&
+			git -C "$repo" config core.untrackedCache true &&
+			git -C "$repo" config core.fsmonitor true &&
+			for role in main linked
+			do
+				case "$role" in
+				main) worktree="$repo" ;;
+				linked) worktree="$linked" ;;
+				esac &&
+				if test "$mode" != ff
+				then
+					test_write_lines "$mode-$role" \
+						>"$worktree/local-$role" &&
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+						git -C "$worktree" add "local-$role" &&
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+						git -C "$worktree" commit \
+							-qm "local-$mode-$role" || return 1
+				fi &&
+				gitdir=$(git -C "$worktree" \
+					rev-parse --absolute-git-dir) &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+					git -C "$worktree" update-index --fsmonitor &&
+				GIT_INDEX_FILE="$gitdir/index" \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/prime" &&
+				test_must_be_empty "$gitdir/prime" &&
+				perl "$PWD/.git/check-pull-proof.pl" \
+					<"$gitdir/index" &&
+				test_write_lines "$mode-$role" \
+					>"upstream-$mode-$role" &&
+				git add "upstream-$mode-$role" &&
+				git commit -qm "upstream-$mode-$role" &&
+				git push --quiet origin main &&
+				if test "$mode" = autostash
+				then
+					test_write_lines dirty >"$worktree/tracked" &&
+					set -- pull --quiet --rebase --autostash
+				else
+					set -- pull --quiet
+				fi &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+				GIT_TRACE2_EVENT="$gitdir/pull.trace" \
+					git -C "$worktree" "$@" \
+						>"$gitdir/pull" &&
+				if test "$mode" != ff
+				then
+					test_grep "\"name\":\"rebase\"" \
+						"$gitdir/pull.trace" &&
+					test_path_is_file "$worktree/local-$role" ||
+						return 1
+				fi &&
+				! test_trace2_data fsmonitor config/coherent 0 \
+					<"$gitdir/pull.trace" &&
+				! test_trace2_data fsmonitor untracked/proof-missing 1 \
+					<"$gitdir/pull.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/pull.trace" &&
+				perl "$PWD/.git/check-pull-proof.pl" \
+					<"$gitdir/index" &&
+				cp "$gitdir/index" "$gitdir/readonly.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+				GIT_TRACE2_EVENT="$gitdir/status.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/status" &&
+				if test "$mode" = autostash
+				then
+					test_grep "^1 \\.M .* tracked$" \
+						"$gitdir/status" || return 1
+				else
+					test_must_be_empty "$gitdir/status" || return 1
+				fi &&
+				test_cmp_bin "$gitdir/readonly.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/status.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/status.trace" || return 1
+			done || return 1
 		done
 	)
 '
@@ -1533,7 +2100,7 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'diff closes reset fsmonitor tokens in main and linked worktrees' '
+	'diff preserves pending reset proofs in main and linked worktrees' '
 	test_when_finished "rm -rf builtin-diff-reset builtin-diff-reset-linked" &&
 	test_create_repo builtin-diff-reset &&
 	(
@@ -1578,12 +2145,29 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_must_be_empty "$gitdir/reset.actual" &&
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/reset.trace" &&
-			test_trace2_data fsmonitor token_closure/accepted 1 \
+			test_trace2_data fsmonitor \
+				untracked/provider-reset-pending 1 \
 				<"$gitdir/reset.trace" &&
 			test_region index do_write_index "$gitdir/reset.trace" &&
 			test_grep FSMN "$gitdir/index" &&
-			test_grep ! FSUC "$gitdir/index" &&
-			test_grep "builtin:test:[2-9]" "$gitdir/index" &&
+			test_grep FSUC "$gitdir/index" &&
+			test_grep "pending:test:[2-9]" "$gitdir/index" &&
+			test_fsmonitor_pending_full_proof "$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/pending.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/pending-status.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/pending-status" &&
+			test_must_be_empty "$gitdir/pending-status" &&
+			test_cmp_bin "$gitdir/pending.index" "$gitdir/index" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/pending-status.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/pending-status.trace" &&
+			! test_region index do_write_index \
+				"$gitdir/pending-status.trace" &&
 			GIT_TEST_PRELOAD_INDEX=1 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/next.trace" \
@@ -3059,6 +3643,301 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 				"$gitdir/status-$run" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/status-$run.trace" || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'update-index doctor permutations retain authenticated proofs' '
+	test_when_finished "rm -rf doctor-update-proof doctor-update-linked" &&
+	test_create_repo doctor-update-proof &&
+	(
+		cd doctor-update-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		git worktree add --detach ../doctor-update-linked HEAD &&
+		test-tool chmtime -120 tracked \
+			../doctor-update-linked/tracked &&
+		git update-index --refresh &&
+		git -C ../doctor-update-linked update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		cat >.git/remove-doctor-proofs.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $rawsz = $ARGV[0] eq "sha256" ? 32 : 20;
+		for my $name ("FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			substr($index, $offset, 8 + $size, "");
+		}
+		my $payload = substr($index, 0, -$rawsz);
+		print $payload, $rawsz == 32 ? sha256($payload) : sha1($payload);
+		EOF
+		for worktree in "$PWD" "$PWD/../doctor-update-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
+				git -C "$worktree" status --short \
+					>"$gitdir/checkpoint" &&
+			test_must_be_empty "$gitdir/checkpoint" &&
+			test_trace2_data fsmonitor history/external-stored 1 \
+				<"$gitdir/checkpoint.trace" &&
+			find "$gitdir" -maxdepth 1 -type f \
+				-name "index.csh1.*" >"$gitdir/checkpoints" &&
+			test_line_count = 1 "$gitdir/checkpoints" &&
+			if test_have_prereq MACOS
+			then
+				find "$gitdir" -maxdepth 1 -type f \
+					-name "index.cswi.*" >"$gitdir/witnesses" &&
+				test_line_count = 1 "$gitdir/witnesses" || return 1
+			fi &&
+			for mode in healthy history
+			do
+				for order in normal reverse
+				do
+					if test "$mode" = history
+					then
+						perl "$PWD/.git/remove-doctor-proofs.pl" \
+							"$(test_oid algo)" <"$gitdir/index" \
+							>"$gitdir/index.foreign" &&
+						mv "$gitdir/index.foreign" \
+							"$gitdir/index" &&
+						test_grep ! FSUC "$gitdir/index" &&
+						test_grep ! FSCF "$gitdir/index" || return 1
+					fi &&
+					if test "$order" = normal
+					then
+						set -- --untracked-cache --force-write-index
+					else
+						set -- --force-write-index --untracked-cache
+					fi &&
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode-$order.trace" \
+						git -C "$worktree" update-index "$@" &&
+					test_grep FSUC "$gitdir/index" &&
+					test_grep FSCF "$gitdir/index" &&
+					! test_trace2_data fsmonitor config/coherent 0 \
+						<"$gitdir/$mode-$order.trace" &&
+					! test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode-$order.trace" || return 1
+				done || return 1
+			done || return 1
+		done
+	)
+'
+
+test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider restarts keep diff and untracked status correct' '
+	test_when_finished "rm -rf daemon-diff-reset daemon-diff-linked" &&
+	test_when_finished \
+		"git -C daemon-diff-reset fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-diff-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo daemon-diff-reset &&
+	(
+		cd daemon-diff-reset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep &&
+		test_commit base cached/deep/tracked &&
+		git worktree add --detach ../daemon-diff-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../daemon-diff-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_grep FSMN "$gitdir/index" &&
+			test_grep FSUC "$gitdir/index" &&
+			test_grep FSCF "$gitdir/index" &&
+			git -C "$worktree" fsmonitor--daemon stop &&
+			test-tool chmtime =-60 \
+				"$worktree/cached/deep/tracked" &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			GIT_TRACE2_EVENT="$gitdir/diff.trace" \
+				git -C "$worktree" diff >"$gitdir/diff" &&
+			test_must_be_empty "$gitdir/diff" &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<"$gitdir/diff.trace" &&
+			test_trace2_data fsmonitor \
+				untracked/provider-reset-pending 1 \
+				<"$gitdir/diff.trace" &&
+			test_fsmonitor_pending_full_proof "$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$gitdir/readonly.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/readonly" &&
+			test_must_be_empty "$gitdir/readonly" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/readonly.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/readonly.trace" &&
+			! test_region index do_write_index \
+				"$gitdir/readonly.trace" &&
+			git -C "$worktree" fsmonitor--daemon stop &&
+			test_write_lines hidden \
+				>"$worktree/cached/deep/hidden-during-restart" &&
+			test_write_lines "tracked -text" \
+				>"$worktree/cached/deep/.gitattributes" &&
+			test-tool chmtime =-30 \
+				"$worktree/cached/deep/tracked" &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" diff >"$gitdir/hidden-diff" &&
+			test_must_be_empty "$gitdir/hidden-diff" &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" -c core.untrackedCache=false \
+					status --porcelain=v2 >"$gitdir/hidden.expect" &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/hidden.actual" &&
+			test_cmp "$gitdir/hidden.expect" \
+				"$gitdir/hidden.actual" &&
+			test_grep "^? cached/deep/hidden-during-restart$" \
+				"$gitdir/hidden.actual" &&
+			test_grep "^? cached/deep/\\.gitattributes$" \
+				"$gitdir/hidden.actual" &&
+			git -C "$worktree" fsmonitor--daemon stop || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked-only status never authenticates stale untracked history' '
+	test_when_finished "rm -rf tracked-only-reset tracked-only-linked" &&
+	test_create_repo tracked-only-reset &&
+	(
+		cd tracked-only-reset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep &&
+		test_commit base cached/deep/tracked &&
+		git worktree add --detach ../tracked-only-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../tracked-only-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_grep FSUC "$gitdir/index" &&
+			test_write_lines unexpected \
+				>"$worktree/cached/deep/new-untracked" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/tracked-only.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no >"$gitdir/tracked-only" &&
+			test_must_be_empty "$gitdir/tracked-only" &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<"$gitdir/tracked-only.trace" &&
+			test_grep ! FSUC "$gitdir/index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" -c core.untrackedCache=false \
+					status --porcelain=v2 >"$gitdir/expect" &&
+			test_grep "^? cached/deep/new-untracked$" \
+				"$gitdir/expect" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/readonly" &&
+			test_cmp "$gitdir/expect" "$gitdir/readonly" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/writable" &&
+			test_cmp "$gitdir/expect" "$gitdir/writable" || return 1
+		done
+	)
+'
+
+test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'tracked-only status preserves new files after daemon restart' '
+	test_when_finished "rm -rf daemon-tracked-only daemon-tracked-only-linked" &&
+	test_when_finished \
+		"git -C daemon-tracked-only fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-tracked-only-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo daemon-tracked-only &&
+	(
+		cd daemon-tracked-only &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep &&
+		test_commit base cached/deep/tracked &&
+		git worktree add --detach ../daemon-tracked-only-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../daemon-tracked-only-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_grep FSUC "$gitdir/index" &&
+			git -C "$worktree" fsmonitor--daemon stop &&
+			test_write_lines unexpected \
+				>"$worktree/cached/deep/new-untracked" &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			GIT_TRACE2_EVENT="$gitdir/tracked-only.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no >"$gitdir/tracked-only" &&
+			test_must_be_empty "$gitdir/tracked-only" &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<"$gitdir/tracked-only.trace" &&
+			test_grep ! FSUC "$gitdir/index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" -c core.untrackedCache=false \
+					status --porcelain=v2 >"$gitdir/expect" &&
+			test_grep "^? cached/deep/new-untracked$" \
+				"$gitdir/expect" &&
+			cp "$gitdir/index" "$gitdir/readonly.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/readonly" &&
+			test_cmp "$gitdir/expect" "$gitdir/readonly" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/writable" &&
+			test_cmp "$gitdir/expect" "$gitdir/writable" &&
+			git -C "$worktree" fsmonitor--daemon stop || return 1
 		done
 	)
 '

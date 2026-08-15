@@ -2,6 +2,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "attr.h"
 #include "clean-status.h"
 #include "clean-status-manifest.h"
@@ -1173,6 +1174,34 @@ static void invalidate_fsmonitor_for_bootstrap(
 		invalidate_all_fsmonitor(istate);
 		return;
 	}
+	if (getenv(INDEX_ENVIRONMENT) &&
+	    !clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+	    !clean_status_has_worktree_manifest_history(istate)) {
+		char *physical = xstrfmt("%s/index", repo_get_git_dir(istate->repo));
+		char *selected = real_pathdup(repo_get_index_file(istate->repo), 0);
+		char *canonical = real_pathdup(physical, 0);
+		char *physical_lock = canonical ? xstrfmt("%s.lock", canonical) : NULL;
+		struct stat selected_stat, physical_stat;
+		int temporary = selected && canonical &&
+			fspathcmp(selected, canonical) &&
+			fspathcmp(selected, physical_lock) &&
+			!stat(selected, &selected_stat) &&
+			!stat(canonical, &physical_stat) &&
+			(selected_stat.st_dev != physical_stat.st_dev ||
+			 selected_stat.st_ino != physical_stat.st_ino);
+
+		free(physical_lock);
+		free(canonical);
+		free(selected);
+		free(physical);
+		if (temporary) {
+			fsmonitor_invalidate_semantics(istate);
+			untracked_cache_invalidate_all(istate);
+			trace2_data_intmax("fsmonitor", istate->repo,
+					   "semantic/temporary-index-stat-fallback", 1);
+			return;
+		}
+	}
 
 	if (physical_history_unavailable) {
 		int authenticated_manifest =
@@ -1664,6 +1693,13 @@ void fsmonitor_accept_pending_token(struct index_state *istate,
 			trace2_data_intmax("fsmonitor", istate->repo,
 					   "untracked/provider-reset-revalidated", 1);
 		}
+		if (untracked_cache_valid &&
+		    !istate->fsmonitor_untracked_extension_seen &&
+		    istate == istate->repo->index &&
+		    !getenv(INDEX_ENVIRONMENT) && !istate->split_index &&
+		    istate->sparse_index == INDEX_EXPANDED &&
+		    fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC)
+			istate->fsmonitor_untracked_must_persist = 1;
 		istate->untracked->fsmonitor_revalidation = 0;
 		istate->untracked->use_fsmonitor = !!untracked_cache_valid;
 	}

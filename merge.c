@@ -2,6 +2,7 @@
 
 #include "git-compat-util.h"
 #include "gettext.h"
+#include "clean-status.h"
 #include "hash.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -96,6 +97,8 @@ int checkout_fast_forward(struct repository *r,
 	opts.update = 1;
 	opts.verbose_update = 1;
 	opts.merge = 1;
+	opts.preserve_semantic_history =
+		clean_status_revalidated_token_matches(r->index);
 	opts.fn = twoway_merge;
 	init_checkout_metadata(&opts.meta, NULL, remote, NULL);
 	setup_unpack_trees_porcelain(&opts, "merge");
