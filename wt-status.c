@@ -2168,8 +2168,21 @@ static int wt_status_close_fsmonitor_token(
 		.staged_ignored = STRING_LIST_INIT_DUP,
 	};
 	enum wt_status_token_closure_result result;
+	int preserve_untracked, token_accepted = 0;
 
 	refresh_fsmonitor(istate);
+	preserve_untracked = !require_untracked &&
+		s->show_untracked_files == SHOW_NO_UNTRACKED_FILES &&
+		!s->show_ignored_mode && !s->pathspec.nr &&
+		fstat_is_reliable() && !getenv(INDEX_ENVIRONMENT) &&
+		istate == istate->repo->index && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_IPC &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid &&
+		istate->untracked->fsmonitor_revalidation;
 	if (!fsmonitor_has_pending_token(istate) ||
 	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC) {
 		int attr_inputs_match =
@@ -2246,8 +2259,10 @@ static int wt_status_close_fsmonitor_token(
 	if (proof) {
 		result = wt_status_close_semantic_fsmonitor_token(
 			&closure, &proof);
-		if (result == WT_STATUS_TOKEN_CLOSURE_ACCEPTED)
+		if (result == WT_STATUS_TOKEN_CLOSURE_ACCEPTED) {
+			token_accepted = 1;
 			goto accepted;
+		}
 		if (result == WT_STATUS_TOKEN_CLOSURE_FALLBACK)
 			goto fallback;
 		wt_status_reset_attr_snapshot_if_changed(s);
@@ -2256,8 +2271,10 @@ static int wt_status_close_fsmonitor_token(
 	}
 
 	if (wt_status_close_ordinary_fsmonitor_token(
-		    &closure, refreshed_before_closure))
+		    &closure, refreshed_before_closure)) {
+		token_accepted = 1;
 		goto accepted;
+	}
 
 	/* Keep the last valid token and fall back to complete scans. */
 fallback:
@@ -2274,6 +2291,17 @@ fallback:
 	closure.refresh_result |= refresh_index(
 		istate, refresh_flags, &s->pathspec, NULL, NULL);
 accepted:
+	if (token_accepted && preserve_untracked &&
+	    !istate->fsmonitor_untracked_valid &&
+	    istate->untracked->root && istate->untracked->root->valid &&
+	    clean_status_revalidated_token_matches(istate) &&
+	    !clean_status_filter_scope_needs_validation(istate)) {
+		/* Tracked closure leaves directory snapshots unverified. */
+		istate->untracked->fsmonitor_revalidation = 1;
+		istate->fsmonitor_untracked_token =
+			xstrdup(istate->fsmonitor_last_update);
+		clean_status_begin_fsmonitor_semantic_baseline(istate);
+	}
 	wt_status_publish_staged_untracked(&closure);
 	wt_status_discard_staged_untracked(&closure);
 	trace2_region_leave("status", "fsmonitor_token_closure", s->repo);
