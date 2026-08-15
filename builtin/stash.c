@@ -1443,7 +1443,8 @@ done:
 	return ret;
 }
 
-static int stash_working_tree(struct stash_info *info, const struct pathspec *ps)
+static int stash_working_tree(struct stash_info *info, const struct pathspec *ps,
+			      int preserve_clean_history)
 {
 	int ret = 0;
 	struct rev_info rev;
@@ -1487,8 +1488,13 @@ static int stash_working_tree(struct stash_info *info, const struct pathspec *ps
 		goto done;
 	}
 
-	if (write_index_as_tree(&info->w_tree, &istate, stash_index_path.buf, 0,
-				NULL)) {
+	if (preserve_clean_history)
+		clean_status_set_config_digest(the_repository, NULL);
+	ret = write_index_as_tree(&info->w_tree, &istate, stash_index_path.buf,
+				  0, NULL);
+	if (preserve_clean_history)
+		clean_status_set_config_digest(the_repository, &stash_clean_digest);
+	if (ret) {
 		ret = -1;
 		goto done;
 	}
@@ -1605,7 +1611,8 @@ static int do_create_stash(const struct pathspec *ps, struct strbuf *stash_msg_b
 			goto done;
 		}
 	} else {
-		if (stash_working_tree(info, ps)) {
+		if (stash_working_tree(info, ps,
+				       !ps->nr && !include_untracked)) {
 			if (!quiet)
 				fprintf_ln(stderr, _("Cannot save the current "
 						     "worktree state"));
