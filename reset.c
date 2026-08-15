@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "gettext.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -166,6 +167,11 @@ int reset_working_tree(struct repository *r,
 	unpack_tree_opts.update = !dry_run;
 	unpack_tree_opts.dry_run = dry_run;
 	unpack_tree_opts.merge = 1;
+	unpack_tree_opts.preserve_semantic_history =
+		!dry_run &&
+		(!reset_hard ||
+		 (opts->flags & RESET_WORKING_TREE_PRESERVE_SEMANTIC_HISTORY)) &&
+		clean_status_revalidated_token_matches(istate);
 	unpack_tree_opts.preserve_ignored = 0; /* FIXME: !overwrite_ignore */
 	init_checkout_metadata(&unpack_tree_opts.meta, switch_to_branch, oid, NULL);
 	if (reset_hard) {

@@ -2226,6 +2226,7 @@ static int wt_status_close_fsmonitor_token(
 		(!require_untracked &&
 		 (s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
 		  s->show_ignored_mode) &&
+		 istate->fsmonitor_untracked_valid &&
 		 istate->fsmonitor_untracked_token &&
 		 istate->fsmonitor_last_update &&
 		 !strcmp(istate->fsmonitor_untracked_token,

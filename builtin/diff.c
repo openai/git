@@ -23,6 +23,7 @@
 #include "diff.h"
 #include "diff-merges.h"
 #include "diffcore.h"
+#include "dir.h"
 #include "preload-index.h"
 #include "read-cache-ll.h"
 #include "revision.h"
@@ -245,6 +246,7 @@ static void refresh_index_quietly(void)
 	struct lock_file lock_file = LOCK_INIT;
 	struct index_state *istate = the_repository->index;
 	int can_close_token;
+	int preserve_untracked;
 	int fd;
 	int refreshed;
 
@@ -268,6 +270,8 @@ static void refresh_index_quietly(void)
 			REFRESH_QUIET | REFRESH_UNMERGED |
 			(can_close_token ? REFRESH_IN_PROOF_EPOCH : 0),
 			NULL, NULL, NULL);
+	preserve_untracked = istate->untracked &&
+		istate->untracked->fsmonitor_revalidation;
 	/* A complete tracked refresh cannot also authenticate untracked files. */
 	if (!refreshed && can_close_token &&
 	    fsmonitor_pending_token_from_provider(istate) &&
@@ -275,6 +279,17 @@ static void refresh_index_quietly(void)
 		clean_status_mark_fsmonitor_config_valid(
 			istate, istate->fsmonitor_last_update_pending);
 		fsmonitor_accept_pending_token(istate, 0, 0);
+		if (preserve_untracked &&
+		    clean_status_revalidated_token_matches(istate)) {
+			/*
+			 * Preserve directory snapshots only as candidates. Their
+			 * pending proof requires a full untracked revalidation.
+			 */
+			istate->untracked->fsmonitor_revalidation = 1;
+			istate->fsmonitor_untracked_token =
+				xstrdup(istate->fsmonitor_last_update);
+			clean_status_begin_fsmonitor_semantic_baseline(istate);
+		}
 	}
 	repo_update_index_if_able(the_repository, &lock_file);
 }
@@ -437,7 +452,7 @@ void prepare_diff_external_history(struct repository *repo)
 	    repo_config_values(repo)->apply_sparse_checkout)
 		goto done;
 	worktree = get_current_worktree(repo);
-	if (!worktree || !is_main_worktree(worktree) ||
+	if (!worktree ||
 	    clean_status_config_read_repository(repo, &digest) ||
 	    digest.filter_configured)
 		goto done;

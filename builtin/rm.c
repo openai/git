@@ -8,6 +8,8 @@
 
 #include "builtin.h"
 #include "advice.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "lockfile.h"
@@ -262,17 +264,38 @@ static struct option builtin_rm_options[] = {
 	OPT_END(),
 };
 
+static int rm_config(const char *key, const char *value,
+		     const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
 int cmd_rm(int argc,
 	   const char **argv,
 	   const char *prefix,
 	   struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	struct lock_file lock_file = LOCK_INIT;
+	int preserve_clean_history = !getenv(INDEX_ENVIRONMENT);
 	int i, ret = 0;
 	struct pathspec pathspec;
 	char *seen;
 
-	repo_config(the_repository, git_default_config, NULL);
+	show_usage_with_options_if_asked(argc, argv,
+					 builtin_rm_usage, builtin_rm_options);
+
+	if (preserve_clean_history) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, rm_config, &clean_digest);
+		clean_status_config_final(&clean_digest);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+		clean_status_enable_external_history(the_repository);
+	} else {
+		repo_config(the_repository, git_default_config, NULL);
+	}
 
 	argc = parse_options(argc, argv, prefix, builtin_rm_options,
 			     builtin_rm_usage, 0);
@@ -392,8 +415,18 @@ int cmd_rm(int argc,
 	 */
 	for (i = 0; i < list.nr; i++) {
 		const char *path = list.entry[i].name;
+		int pos;
 		if (!quiet)
 			printf("rm '%s'\n", path);
+
+		pos = index_name_pos(the_repository->index,
+				     path, strlen(path));
+		if (preserve_clean_history &&
+		    (pos < 0 ||
+		     !clean_status_index_entry_is_semantically_safe(
+			     the_repository->index,
+			     the_repository->index->cache[pos], NULL)))
+			clean_status_invalidate_current_proof(the_repository->index);
 
 		if (remove_file_from_index(the_repository->index, path))
 			die(_("git rm: unable to remove %s"), path);

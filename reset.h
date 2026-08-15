@@ -30,6 +30,9 @@ enum reset_working_tree_flags {
 	 * any user-visible state.
 	 */
 	RESET_WORKING_TREE_DRY_RUN = (1 << 6),
+
+	/* Preserve authenticated semantic history during an autostash reset. */
+	RESET_WORKING_TREE_PRESERVE_SEMANTIC_HISTORY = (1 << 7),
 };
 
 struct reset_working_tree_options {

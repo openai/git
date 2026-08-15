@@ -10,6 +10,8 @@
 #include "builtin.h"
 
 #include "abspath.h"
+#include "clean-status-config.h"
+#include "clean-status.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
@@ -135,6 +137,8 @@ struct rebase_options {
 	int config_autosquash;
 	int config_rebase_merges;
 	int config_update_refs;
+	struct clean_status_config_digest clean_digest;
+	unsigned clean_history_enabled : 1;
 };
 
 #define REBASE_OPTIONS_INIT {			  	\
@@ -795,6 +799,9 @@ static int rebase_config(const char *var, const char *value,
 {
 	struct rebase_options *opts = data;
 
+	if (opts->clean_history_enabled)
+		clean_status_config_add(&opts->clean_digest, var, value, ctx);
+
 	if (!strcmp(var, "rebase.stat")) {
 		if (git_config_bool(var, value))
 			opts->flags |= REBASE_DIFFSTAT;
@@ -1261,7 +1268,17 @@ int cmd_rebase(int argc,
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
 
+	options.clean_history_enabled = !getenv(INDEX_ENVIRONMENT);
+	if (options.clean_history_enabled)
+		clean_status_config_init(&options.clean_digest,
+					 the_repository->hash_algo);
 	repo_config(the_repository, rebase_config, &options);
+	if (options.clean_history_enabled) {
+		clean_status_config_final(&options.clean_digest);
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository,
+					       &options.clean_digest);
+	}
 	/* options.gpg_sign_opt will be either "-S" or NULL */
 	gpg_sign = options.gpg_sign_opt ? "" : NULL;
 	FREE_AND_NULL(options.gpg_sign_opt);
