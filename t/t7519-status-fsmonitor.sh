@@ -875,6 +875,93 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'stash creation reports and repairs an unbound clean-status proof' '
+	test_when_finished "rm -rf stash-unbound-proof" &&
+	test_create_repo stash-unbound-proof &&
+	(
+		cd stash-unbound-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_write_lines staged >staged &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git add staged &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/stash.trace" \
+			git stash create "cmux last turn baseline" >.git/stash &&
+		test_file_not_empty .git/stash &&
+		test_region index do_write_index .git/stash.trace &&
+		test_trace2_data fsmonitor untracked/proof-missing 1 \
+			<.git/stash.trace &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/unbound.trace" \
+			git status --porcelain=v2 >.git/unbound &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/unbound.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/unbound.trace &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
+			git -c core.hooksPath=/dev/null \
+				-c hook.post-index-change.enabled=false \
+				status --porcelain=v2 --untracked-files=normal \
+				--no-ahead-behind >.git/repair &&
+		test_cmp .git/unbound .git/repair &&
+		test_region index do_write_index .git/repair.trace &&
+		test_grep FSMN .git/index &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
+		for run in first second
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$run.trace" \
+				git status --porcelain=v2 >".git/$run" &&
+			test_cmp .git/repair ".git/$run" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<".git/$run.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<".git/$run.trace" &&
+			test_grep ! \
+				"\\\"key\\\":\\\"preload/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
+				".git/$run.trace" &&
+			test_grep ! \
+				"\\\"key\\\":\\\"refresh/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
+				".git/$run.trace" || return 1
+		done &&
+		test_write_lines "*.asset text" >.gitattributes &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git add .gitattributes &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<.git/attributes.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/attributes.trace &&
+		test_grep "^1 A\\. .* \\.gitattributes$" .git/attributes
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'expired add preserves untracked candidates until revalidation' '
 	test_when_finished "rm -rf pending-untracked-revalidation pending-untracked-hostile" &&
 	test_create_repo pending-untracked-revalidation &&
@@ -2597,7 +2684,8 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 				test_trace2_data fsmonitor \
 					history/untracked-paired-new-directory-deferred 1 \
 					<".git/switch-$branch.trace" &&
-				test_grep ! FSUC .git/index
+				test_grep ! FSUC .git/index &&
+				test_grep FSCF .git/index
 			else
 				test_trace2_data fsmonitor \
 					history/untracked-paired-transfer 1 \
@@ -2633,6 +2721,9 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 				test_trace2_data fsmonitor \
 					history/external-untracked-restored 1 \
 					<".git/status-$branch.trace" &&
+				test_region index do_write_index \
+					".git/status-$branch.trace" &&
+				test_grep FSUC .git/index &&
 				visited_dirs=$(sed -n \
 					"s/.*directories-visited:\\([0-9][0-9]*\\).*/\\1/p" \
 					".git/status-$branch.perf") &&

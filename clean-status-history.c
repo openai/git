@@ -1027,14 +1027,14 @@ static int external_untracked_membership_needs_root_invalidation(
 static void restore_external_untracked_history(
 	struct index_state *istate, struct index_state *witness,
 	const struct clean_status_history_checkpoint *checkpoint,
-	const struct strbuf *paths, const struct fsmonitor_clean_proof *proof)
+	const struct strbuf *paths, const struct fsmonitor_clean_proof *proof,
+	int persist_recovered_proof)
 {
 	struct index_state parsed = INDEX_STATE_INIT(istate->repo);
 	const char *path = paths->buf;
 	const char *end = paths->buf + paths->len;
 	unsigned int old_pos = 0, new_pos = 0;
 	unsigned int targeted_membership = 0, rooted_membership = 0;
-
 	if (istate->fsmonitor_untracked_valid ||
 	    !checkpoint->untracked_cache_len ||
 	    !checkpoint->fsmonitor_untracked_len)
@@ -1062,6 +1062,10 @@ static void restore_external_untracked_history(
 	istate->fsmonitor_untracked_extension_seen = 1;
 	istate->fsmonitor_untracked_extension_invalid = 0;
 	istate->fsmonitor_untracked_valid = 1;
+	if (persist_recovered_proof) {
+		istate->cache_changed |= UNTRACKED_CHANGED;
+		istate->fsmonitor_untracked_must_persist = 1;
+	}
 	while (old_pos < witness->cache_nr || new_pos < istate->cache_nr) {
 		const struct cache_entry *old_entry =
 			old_pos < witness->cache_nr ?
@@ -1135,6 +1139,10 @@ static int restore_external_semantic_history(
 	char *path = NULL;
 	int fd = -1, transferred = 0;
 	int missing_current = 0, seeded_current = 0;
+	int persist_recovered_proof =
+		!istate->fsmonitor_untracked_extension_seen && state &&
+		state->initial_coherent &&
+		clean_status_has_persistent_fsmonitor_semantic_history(istate);
 
 	if (!checkpoint->source_alias_valid ||
 	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC)
@@ -1268,7 +1276,8 @@ static int restore_external_semantic_history(
 			ewah_each_bit(istate->fsmonitor_dirty,
 				      invalidate_unwatched_recovered_entry, istate);
 		restore_external_untracked_history(
-			istate, &witness, checkpoint, &old.paths, &proof);
+			istate, &witness, checkpoint, &old.paths, &proof,
+			persist_recovered_proof);
 		trace2_data_intmax("fsmonitor", istate->repo,
 				   "history/external-semantic-restored", 1);
 		if (missing_current)
@@ -1863,12 +1872,34 @@ static int same_persistent_index_contents(const struct index_state *a,
 	return 1;
 }
 
+static int replace_current_fsmonitor_proof(struct index_state *dst,
+					   const struct index_state *src)
+{
+	struct index_state replacement = INDEX_STATE_INIT(dst->repo);
+	struct strbuf proof = STRBUF_INIT;
+	int transferred = 0;
+
+	/* Preserve the destination's source identity and retained index fd. */
+	clean_status_write_fsmonitor_config(&proof, src);
+	clean_status_read_fsmonitor_config(&replacement, proof.buf, proof.len);
+	if (replacement.clean_status &&
+	    replacement.clean_status->disk_config_valid &&
+	    !replacement.clean_status->disk_config_invalid) {
+		dst->fsmonitor_token_valid = src->fsmonitor_token_valid;
+		clean_status_copy_fsmonitor_history(dst, &replacement);
+		clean_status_attach_config(dst);
+		clean_status_prepare_fsmonitor_config(dst);
+		transferred = current_proof_is_writable(dst);
+	}
+	clean_status_release(&replacement);
+	strbuf_release(&proof);
+
+	return transferred;
+}
+
 int clean_status_transfer_current_proof_if_same_index(
 	struct index_state *dst, const struct index_state *src)
 {
-	struct strbuf proof = STRBUF_INIT;
-	int transferred;
-
 	if (!current_proof_is_writable(src) ||
 	    !src->fsmonitor_last_update ||
 	    !dst->fsmonitor_last_update ||
@@ -1881,15 +1912,7 @@ int clean_status_transfer_current_proof_if_same_index(
 	 * reattach the current command's digest. This copies only a proof
 	 * which the destination's identical logical entries can support.
 	 */
-	clean_status_write_fsmonitor_config(&proof, src);
-	dst->fsmonitor_token_valid = src->fsmonitor_token_valid;
-	clean_status_read_fsmonitor_config(dst, proof.buf, proof.len);
-	clean_status_attach_config(dst);
-	clean_status_prepare_fsmonitor_config(dst);
-	transferred = current_proof_is_writable(dst);
-	strbuf_release(&proof);
-
-	return transferred;
+	return replace_current_fsmonitor_proof(dst, src);
 }
 
 int clean_status_transfer_current_proof_if_semantically_same_index(
@@ -1897,7 +1920,6 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 {
 	const unsigned int semantic_flags =
 		CE_STAGEMASK | CE_VALID | CE_EXTENDED_FLAGS;
-	struct strbuf proof = STRBUF_INIT;
 	unsigned int src_pos = 0, dst_pos = 0;
 	int transferred;
 
@@ -1969,16 +1991,10 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 		return 1;
 	}
 
-	clean_status_write_fsmonitor_config(&proof, src);
-	dst->fsmonitor_token_valid = src->fsmonitor_token_valid;
-	clean_status_read_fsmonitor_config(dst, proof.buf, proof.len);
-	clean_status_attach_config(dst);
-	clean_status_prepare_fsmonitor_config(dst);
-	transferred = current_proof_is_writable(dst);
+	transferred = replace_current_fsmonitor_proof(dst, src);
 	if (transferred)
 		trace2_data_intmax("fsmonitor", dst->repo,
 				   "history/semantic-transferred", 1);
-	strbuf_release(&proof);
 
 	return transferred;
 }
