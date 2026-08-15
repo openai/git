@@ -875,89 +875,105 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'stash creation reports and repairs an unbound clean-status proof' '
-	test_when_finished "rm -rf stash-unbound-proof" &&
+	'repeated stash creation preserves bound worktree proofs' '
+	test_when_finished "rm -rf stash-unbound-proof stash-unbound-linked" &&
 	test_create_repo stash-unbound-proof &&
 	(
 		cd stash-unbound-proof &&
 		sane_unset GIT_TEST_SPLIT_INDEX &&
 		test_commit base tracked &&
 		test_commit sibling sibling &&
+		git worktree add --detach ../stash-unbound-linked HEAD &&
 		git config core.untrackedCache true &&
 		git config core.fsmonitor true &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
-			git update-index --fsmonitor &&
-		GIT_INDEX_FILE="$PWD/.git/index" \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			git status --porcelain=v2 >.git/prime &&
-		test_must_be_empty .git/prime &&
-		test_write_lines staged >staged &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			git add staged &&
-		test_grep FSMN .git/index &&
-		test_grep FSUC .git/index &&
-		test_grep FSCF .git/index &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-		GIT_TRACE2_EVENT="$PWD/.git/stash.trace" \
-			git stash create "cmux last turn baseline" >.git/stash &&
-		test_file_not_empty .git/stash &&
-		test_region index do_write_index .git/stash.trace &&
-		test_trace2_data fsmonitor untracked/proof-missing 1 \
-			<.git/stash.trace &&
-		test_grep FSMN .git/index &&
-		test_grep FSUC .git/index &&
-		test_grep FSCF .git/index &&
-		GIT_OPTIONAL_LOCKS=0 \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-		GIT_TRACE2_EVENT="$PWD/.git/unbound.trace" \
-			git status --porcelain=v2 >.git/unbound &&
-		test_trace2_data fsmonitor config/coherent 0 \
-			<.git/unbound.trace &&
-		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
-			<.git/unbound.trace &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
-			git -c core.hooksPath=/dev/null \
-				-c hook.post-index-change.enabled=false \
-				status --porcelain=v2 --untracked-files=normal \
-				--no-ahead-behind >.git/repair &&
-		test_cmp .git/unbound .git/repair &&
-		test_region index do_write_index .git/repair.trace &&
-		test_grep FSMN .git/index &&
-		test_grep FSUC .git/index &&
-		test_grep FSCF .git/index &&
-		for run in first second
+		cat >.git/check-stash-proof.pl <<-\EOF &&
+		binmode STDIN;
+		local $/;
+		my $index = <STDIN>;
+		my %tokens;
+		for my $name ("FSMN", "FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			my $payload = substr($index, $offset + 8, $size);
+			if ($name eq "FSCF") {
+				my $flags = unpack("N", substr($payload, 8, 4));
+				die "unbound FSCF flags $flags\n" if $flags != 15;
+				my $length = unpack("N", substr($payload, 12, 4));
+				$tokens{$name} = substr($payload, 20, $length);
+			} else {
+				my $end = index($payload, "\0", 4);
+				die "invalid $name token\n" if $end < 0;
+				$tokens{$name} = substr($payload, 4, $end - 4);
+			}
+		}
+		die "mismatched provider tokens\n" unless
+			$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+			$tokens{"FSMN"} eq $tokens{"FSCF"};
+		EOF
+		for worktree in "$PWD" "$PWD/../stash-unbound-linked"
 		do
-			GIT_OPTIONAL_LOCKS=0 \
-			GIT_TEST_PRELOAD_INDEX=1 \
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			GIT_TRACE2_EVENT="$PWD/.git/$run.trace" \
-				git status --porcelain=v2 >".git/$run" &&
-			test_cmp .git/repair ".git/$run" &&
-			test_trace2_data fsmonitor config/coherent 1 \
-				<".git/$run.trace" &&
-			! test_trace2_data fsmonitor \
-				semantic/manifest-scan-count 1 \
-				<".git/$run.trace" &&
-			test_grep ! \
-				"\\\"key\\\":\\\"preload/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
-				".git/$run.trace" &&
-			test_grep ! \
-				"\\\"key\\\":\\\"refresh/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
-				".git/$run.trace" || return 1
-		done &&
-		test_write_lines "*.asset text" >.gitattributes &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			git add .gitattributes &&
-		GIT_OPTIONAL_LOCKS=0 \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
-			git status --porcelain=v2 >.git/attributes &&
-		test_trace2_data fsmonitor config/coherent 0 \
-			<.git/attributes.trace &&
-		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
-			<.git/attributes.trace &&
-		test_grep "^1 A\\. .* \\.gitattributes$" .git/attributes
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_write_lines staged >"$worktree/staged" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" add staged &&
+			for run in first second
+			do
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/stash-$run.trace" \
+					git -C "$worktree" stash create \
+						"cmux last turn baseline" \
+						>"$gitdir/stash-$run" &&
+				test_file_not_empty "$gitdir/stash-$run" &&
+				! test_trace2_data fsmonitor \
+					untracked/proof-missing 1 \
+					<"$gitdir/stash-$run.trace" &&
+				perl "$PWD/.git/check-stash-proof.pl" \
+					<"$gitdir/index" &&
+				cp "$gitdir/index" "$gitdir/readonly.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_PRELOAD_INDEX=1 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/status-$run.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/status-$run" &&
+				test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/status-$run.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/status-$run.trace" &&
+				test_grep ! \
+					"\\\"key\\\":\\\"preload/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
+					"$gitdir/status-$run.trace" &&
+				test_grep ! \
+					"\\\"key\\\":\\\"refresh/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
+					"$gitdir/status-$run.trace" || return 1
+			done &&
+			test_write_lines "*.asset text" \
+				>"$worktree/.gitattributes" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" add .gitattributes &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/attributes.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/attributes" &&
+			test_trace2_data fsmonitor config/coherent 0 \
+				<"$gitdir/attributes.trace" &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/attributes.trace" &&
+			test_grep "^1 A\\. .* \\.gitattributes$" \
+				"$gitdir/attributes" || return 1
+		done
 	)
 '
 

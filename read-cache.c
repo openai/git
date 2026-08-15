@@ -3383,6 +3383,7 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	} else if ((write_extensions & WRITE_FSMONITOR_EXTENSION) &&
 		   (write_extensions & WRITE_UNTRACKED_CACHE_EXTENSION) &&
 		   istate == istate->repo->index &&
+		   !alternate_index_output &&
 		   !istate->split_index &&
 		   !getenv(INDEX_ENVIRONMENT) &&
 		   istate->untracked &&
