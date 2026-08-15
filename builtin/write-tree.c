@@ -54,11 +54,19 @@ int cmd_write_tree(int argc,
 		OPT_END()
 	};
 
-	clean_status_config_init(&clean_digest, the_repository->hash_algo);
-	repo_config(the_repository, write_tree_config, &clean_digest);
-	clean_status_config_final(&clean_digest);
-	clean_status_set_config_digest(the_repository, &clean_digest);
-	clean_status_enable_external_history(the_repository);
+	show_usage_with_options_if_asked(argc, argv,
+					 write_tree_usage, write_tree_options);
+
+	if (!getenv(INDEX_ENVIRONMENT)) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, write_tree_config, &clean_digest);
+		clean_status_config_final(&clean_digest);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+		clean_status_enable_external_history(the_repository);
+	} else {
+		repo_config(the_repository, git_default_config, NULL);
+	}
 	argc = parse_options(argc, argv, cmd_prefix, write_tree_options,
 			     write_tree_usage, 0);
 
