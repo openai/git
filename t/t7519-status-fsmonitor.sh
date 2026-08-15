@@ -2824,6 +2824,114 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'stash creation restores linked external clean history' '
+	test_when_finished "rm -rf stash-linked-history stash-linked-worktree" &&
+	test_when_finished \
+		"git -C stash-linked-worktree fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo stash-linked-history &&
+	(
+		cd stash-linked-history &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir existing &&
+		test_commit base existing/tracked &&
+		test_commit sibling existing/sibling &&
+		git worktree add --detach ../stash-linked-worktree HEAD &&
+		worktree="$PWD/../stash-linked-worktree" &&
+		gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+		git -C "$worktree" config core.autocrlf false &&
+		git -C "$worktree" config core.untrackedCache true &&
+		git -C "$worktree" config core.fsmonitor true &&
+		git -C "$worktree" config index.recordEndOfIndexEntries false &&
+		test-tool chmtime -120 \
+			"$worktree/existing/tracked" "$worktree/existing/sibling" &&
+		git -C "$worktree" fsmonitor--daemon start --start-timeout=10 &&
+		git -C "$worktree" update-index --refresh &&
+		git -C "$worktree" update-index --fsmonitor &&
+		git -C "$worktree" status --porcelain=v2 >"$gitdir/prime" &&
+		test_must_be_empty "$gitdir/prime" &&
+		find "$gitdir" -maxdepth 1 -type f -name "index.csh1.*" \
+			>"$gitdir/checkpoints" &&
+		test_line_count = 1 "$gitdir/checkpoints" &&
+		find "$gitdir" -maxdepth 1 -type f -name "index.cswi.*" \
+			>"$gitdir/witnesses" &&
+		test_line_count = 1 "$gitdir/witnesses" &&
+		test_write_lines staged >"$worktree/existing/staged" &&
+		git -C "$worktree" add existing/staged &&
+		GIT_INDEX_FILE="$gitdir/index" \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/physical-prime" &&
+		test_grep FSMN "$gitdir/index" &&
+		test_grep UNTR "$gitdir/index" &&
+		test_grep FSUC "$gitdir/index" &&
+		test_grep FSCF "$gitdir/index" &&
+		cat >"$gitdir/remove-proofs.pl" <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $rawsz = $ARGV[0] eq "sha256" ? 32 : 20;
+		for my $extension ("FSUC", "FSCF") {
+			my $offset = index($index, $extension);
+			next if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			substr($index, $offset, 8 + $size, "");
+		}
+		my $payload = substr($index, 0, -$rawsz);
+		print $payload, $rawsz == 32 ? sha256($payload) : sha1($payload);
+		EOF
+		perl "$gitdir/remove-proofs.pl" "$(test_oid algo)" \
+			<"$gitdir/index" >"$gitdir/index.foreign" &&
+		mv "$gitdir/index.foreign" "$gitdir/index" &&
+		test_grep FSMN "$gitdir/index" &&
+		test_grep UNTR "$gitdir/index" &&
+		test_grep ! FSUC "$gitdir/index" &&
+		test_grep ! FSCF "$gitdir/index" &&
+		test_write_lines dirty >"$worktree/existing/tracked" &&
+		for run in first second
+		do
+			GIT_TRACE2_EVENT="$gitdir/stash-$run.trace" \
+				git -C "$worktree" stash create \
+					"cmux last turn baseline" \
+					>"$gitdir/stash-$run" &&
+			test_file_not_empty "$gitdir/stash-$run" &&
+			! test_trace2_data fsmonitor config/coherent 0 \
+				<"$gitdir/stash-$run.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/stash-$run.trace" &&
+			! test_trace2_data fsmonitor untracked/proof-missing 1 \
+				<"$gitdir/stash-$run.trace" &&
+			if test "$run" = first
+			then
+				{
+					test_trace2_data fsmonitor history/external-restored 1 \
+						<"$gitdir/stash-$run.trace" ||
+					test_trace2_data fsmonitor \
+						history/external-semantic-restored 1 \
+						<"$gitdir/stash-$run.trace"
+				} &&
+				test_region index do_write_index \
+					"$gitdir/stash-$run.trace"
+			fi &&
+			test_grep FSUC "$gitdir/index" &&
+			test_grep FSCF "$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/index.before-status" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$gitdir/status-$run.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/status-$run" &&
+			test_cmp_bin "$gitdir/index.before-status" "$gitdir/index" &&
+			test_grep "^1 A\\. .* existing/staged$" \
+				"$gitdir/status-$run" &&
+			test_grep "^1 \\.M .* existing/tracked$" \
+				"$gitdir/status-$run" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/status-$run.trace" || return 1
+		done
+	)
+'
+
 test_expect_success PTHREADS,UNTRACKED_CACHE,SHA1 'load cache-tree and untracked-cache extensions in parallel' '
 	test_create_repo parallel-extensions &&
 	(
