@@ -925,9 +925,11 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_write_lines staged >"$worktree/staged" &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 				git -C "$worktree" add staged &&
+			test_write_lines modified >"$worktree/tracked" &&
 			for run in first second
 			do
-				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 				GIT_TRACE2_EVENT="$gitdir/stash-$run.trace" \
 					git -C "$worktree" stash create \
 						"cmux last turn baseline" \
@@ -935,6 +937,11 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				test_file_not_empty "$gitdir/stash-$run" &&
 				! test_trace2_data fsmonitor \
 					untracked/proof-missing 1 \
+					<"$gitdir/stash-$run.trace" &&
+				! test_trace2_data fsmonitor config/coherent 0 \
+					<"$gitdir/stash-$run.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
 					<"$gitdir/stash-$run.trace" &&
 				perl "$PWD/.git/check-stash-proof.pl" \
 					<"$gitdir/index" &&
@@ -946,17 +953,19 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 					git -C "$worktree" status --porcelain=v2 \
 						>"$gitdir/status-$run" &&
 				test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+				test_grep "^1 A\\. .* staged$" \
+					"$gitdir/status-$run" &&
+				test_grep "^1 \\.M .* tracked$" \
+					"$gitdir/status-$run" &&
 				test_trace2_data fsmonitor config/coherent 1 \
 					<"$gitdir/status-$run.trace" &&
 				! test_trace2_data fsmonitor \
 					semantic/manifest-scan-count 1 \
 					<"$gitdir/status-$run.trace" &&
-				test_grep ! \
-					"\\\"key\\\":\\\"preload/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
-					"$gitdir/status-$run.trace" &&
-				test_grep ! \
-					"\\\"key\\\":\\\"refresh/sum_lstat\\\",\\\"value\\\":\\\"[1-9]" \
-					"$gitdir/status-$run.trace" || return 1
+				test_trace2_data index preload/sum_lstat 1 \
+					<"$gitdir/status-$run.trace" &&
+				test_trace2_data index refresh/sum_lstat 1 \
+					<"$gitdir/status-$run.trace" || return 1
 			done &&
 			test_write_lines "*.asset text" \
 				>"$worktree/.gitattributes" &&
