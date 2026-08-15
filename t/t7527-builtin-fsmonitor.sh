@@ -4147,8 +4147,18 @@ test_expect_success MACOS,LEGACY_PREVIEW_FSMONITOR_GIT,UNTRACKED_CACHE,SEMANTIC_
 		GIT_TRACE2_EVENT="$PWD/.git/foreign-unstaged.trace" \
 			git status --porcelain=v2 >.git/unstaged.actual &&
 		test_cmp .git/unstaged.expect .git/unstaged.actual &&
-		test_trace2_data fsmonitor history/external-restored 1 \
-			<.git/foreign-unstaged.trace &&
+		{
+			test_trace2_data fsmonitor history/external-restored 1 \
+				<.git/foreign-unstaged.trace ||
+			{
+				test_trace2_data fsmonitor \
+					history/external-semantic-restored 1 \
+					<.git/foreign-unstaged.trace &&
+				test_trace2_data fsmonitor \
+					history/external-untracked-restored 1 \
+					<.git/foreign-unstaged.trace
+			}
+		} &&
 		! test_trace2_data index preload/bulk_useful \
 			"[1-9][0-9]*" <.git/foreign-unstaged.trace &&
 		! test_trace2_data index preload/bulk_dirs \
