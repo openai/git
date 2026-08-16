@@ -512,7 +512,8 @@ static struct untracked_cache_preload *untracked_cache_preload_start_1(
 		fsmonitor_excludes_only, preload->pathspec);
 	strbuf_release(&path);
 	if (fsmonitor_excludes_only) {
-		if (!pthread_mutex_init(&preload->normalized_mutex, NULL)) {
+		if (!HAVE_THREADS ||
+		    !pthread_mutex_init(&preload->normalized_mutex, NULL)) {
 			preload->normalized_mutex_initialized = 1;
 			oidmap_init(&preload->normalized_excludes, 0);
 		}
