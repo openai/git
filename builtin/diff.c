@@ -8,6 +8,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "attr-fingerprint.h"
 #include "clean-status.h"
 #include "clean-status-index.h"
 #include "clean-status-sidecar.h"
@@ -21,6 +22,7 @@
 #include "fsmonitor-ll.h"
 #include "fsmonitor-settings.h"
 #include "tag.h"
+#include "trace2.h"
 #include "diff.h"
 #include "diff-merges.h"
 #include "diffcore.h"
@@ -267,6 +269,45 @@ static int can_close_diff_fsmonitor_token(struct index_state *istate)
 		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC;
 }
 
+static int reuse_diff_recovery_observations(
+	struct index_state *istate,
+	const struct clean_status_index_snapshot *source)
+{
+	struct attr_source_snapshot *attrs = NULL;
+	struct clean_status_proof_epoch *epoch = NULL;
+	int reused = 0;
+	unsigned int i;
+
+	if (!clean_status_index_snapshot_still_matches_proof_epoch(
+		    source, istate) ||
+	    !clean_status_index_can_reuse_source_logical_hash(istate) ||
+	    !clean_status_fsmonitor_semantic_baseline_pending(istate) ||
+	    clean_status_fsmonitor_strong_mismatch(istate) ||
+	    clean_status_filter_scope_needs_validation(istate) ||
+	    clean_status_manifest_global_fallback(istate) ||
+	    clean_status_worktree_manifest_needs_refresh(istate) ||
+	    clean_status_capture_attr_snapshot(istate, &attrs) || !attrs)
+		goto done;
+
+	epoch = clean_status_capture_proof_epoch(istate, attrs, 0);
+	if (!epoch || !clean_status_proof_epoch_prime_matches(istate, epoch))
+		goto done;
+
+	/* Observations made before the proof epoch cannot certify tracked files. */
+	for (i = 0; i < istate->cache_nr; i++)
+		istate->cache[i]->ce_flags &=
+			~(CE_UPTODATE | CE_FSMONITOR_VALID);
+	preload_index_bulk_result_clear(istate);
+	reused = 1;
+	trace2_data_intmax("diff", istate->repo,
+			   "recovery/reused-provider-observations", 1);
+
+done:
+	clean_status_release_proof_epoch(epoch);
+	attr_source_snapshot_free(attrs);
+	return reused;
+}
+
 static void refresh_index_quietly(void)
 {
 	struct lock_file lock_file = LOCK_INIT;
@@ -306,8 +347,10 @@ static void refresh_index_quietly(void)
 			return;
 		}
 		clean_status_set_config_digest(the_repository, &digest);
-		discard_index(istate);
-		repo_read_index(the_repository);
+		if (!reuse_diff_recovery_observations(istate, &source)) {
+			discard_index(istate);
+			repo_read_index(the_repository);
+		}
 		if (!clean_status_index_snapshot_still_matches_proof_epoch(
 			    &source, istate)) {
 			clean_status_index_snapshot_release(&source);
