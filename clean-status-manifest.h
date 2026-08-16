@@ -5,6 +5,7 @@
 #include "strbuf.h"
 
 struct index_state;
+struct semantic_verify_proof;
 
 struct clean_status_manifest_state {
 	struct strbuf disk;
@@ -31,6 +32,11 @@ void clean_status_manifest_adopt_disk(
 	struct clean_status_manifest_state *state);
 int clean_status_manifest_refresh(struct index_state *istate,
 				  struct clean_status_manifest_state *state);
+void clean_status_manifest_begin_directory_delta(
+	struct index_state *istate, const struct semantic_verify_proof *proof);
+int clean_status_manifest_end_directory_delta(struct index_state *istate);
+int clean_status_manifest_directory_unchanged(
+	struct index_state *istate, const char *directory);
 int clean_status_manifest_reconcile_deleted_attribute(
 	struct index_state *istate, const char *path);
 int clean_status_manifest_reconcile_display_only_attribute(
