@@ -1241,8 +1241,7 @@ static void invalidate_fsmonitor_for_bootstrap(
 		return;
 	}
 	if (getenv(INDEX_ENVIRONMENT) &&
-	    !clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
-	    !clean_status_has_worktree_manifest_history(istate)) {
+	    !clean_status_has_persistent_fsmonitor_semantic_history(istate)) {
 		char *physical = xstrfmt("%s/index", repo_get_git_dir(istate->repo));
 		char *selected = real_pathdup(repo_get_index_file(istate->repo), 0);
 		char *canonical = real_pathdup(physical, 0);
