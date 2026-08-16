@@ -5199,6 +5199,13 @@ static void write_one_dir(struct untracked_cache_dir *untracked,
 	uint8_t intlen;
 	int i = wd->index++;
 
+	/* Pending provider paths are process-local and cannot survive index I/O. */
+	if (untracked->fsmonitor_dirty) {
+		untracked->valid = 0;
+		untracked->valid_recursive = 0;
+		untracked->fsmonitor_dirty = 0;
+	}
+
 	/*
 	 * untracked_nr should be reset whenever valid is clear, but
 	 * for safety..
