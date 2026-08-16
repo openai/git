@@ -259,6 +259,23 @@ static int source_matches(struct exclude_source_capture *capture,
 	return ret;
 }
 
+static int source_matches_after_read(struct exclude_source_capture *capture,
+				     const struct stat *expected)
+{
+#if EXCLUDE_SOURCE_PROOF_HAS_ANCHORED_OPEN
+	if (S_ISREG(expected->st_mode)) {
+		struct stat named;
+		int flags = capture->nofollow ? AT_SYMLINK_NOFOLLOW : 0;
+
+		/* The final reopened descriptor still proves readability. */
+		return !fstatat(capture->parent_fd, capture->relative,
+				&named, flags) &&
+			path_namespace_stat_equal(expected, &named);
+	}
+#endif
+	return source_matches(capture, expected);
+}
+
 static int same_observation(
 	const struct exclude_source_proof_entry *entry,
 	int exists, size_t size, const struct object_id *oid)
@@ -384,7 +401,7 @@ static int proof_entry_matches(
 	if ((size_t)read_in_full(fd, buf, size) != size ||
 	    fstat(fd, &after) ||
 	    !path_namespace_stat_equal(&before, &after) ||
-	    !source_matches(capture, &after))
+	    !source_matches_after_read(capture, &after))
 		goto done;
 	hash_object_file(proof->istate->repo->hash_algo, buf, size,
 			 OBJ_BLOB, &oid);
