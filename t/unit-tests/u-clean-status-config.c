@@ -207,6 +207,7 @@ void test_clean_status_config__only_complete_disabled_filters_are_normalized(voi
 		clean_status_config_init(&baseline, algo);
 		clean_status_config_add(&baseline, keys[0], "configured", &ctx);
 		clean_status_config_final(&baseline);
+		cl_assert(!baseline.normalized_filter_disable);
 
 		for (unsigned mask = 0; mask < (1U << ARRAY_SIZE(keys)); mask++) {
 			clean_status_config_init(&digest, algo);
@@ -221,6 +222,8 @@ void test_clean_status_config__only_complete_disabled_filters_are_normalized(voi
 			clean_status_config_final(&digest);
 			cl_assert_equal_i(hasheq(digest.hash, baseline.hash, algo),
 					  !mask || mask == 15);
+			cl_assert_equal_i(digest.normalized_filter_disable,
+					  mask == 15);
 			if (mask == 15) {
 				cl_assert(hasheq(digest.semantic_hash,
 						 baseline.semantic_hash, algo));
