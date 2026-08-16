@@ -3079,6 +3079,7 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		printf x >"$resume" &&
 		wait "$fsmonitor_query_pid" &&
 		fsmonitor_query_pid= &&
+		trap - 0 &&
 		test_must_be_empty .git/actual &&
 		test_cmp_bin .git/competing.index .git/index &&
 		! test_region index do_write_index .git/diff.trace &&
@@ -4153,6 +4154,7 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			printf x >"$resume" &&
 			wait "$fsmonitor_query_pid" &&
 			fsmonitor_query_pid= &&
+			trap - 0 &&
 			test_cmp .git/expect .git/actual &&
 			test_grep "^1 \\.M .* cached/tracked$" .git/actual &&
 			test_grep "^? sibling-1/visible$" .git/actual &&
