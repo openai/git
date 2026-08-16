@@ -2161,7 +2161,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_OPTIONAL_LOCKS=0 \
 			git -c core.fsmonitor=false -c core.untrackedCache=false \
 				status --porcelain=v2 -- cached/deep >.git/scoped.expect &&
-		for workers in 6 8 12 16
+		if test_have_prereq PTHREADS
+		then
+			worker_counts="6 8 12 16"
+		else
+			worker_counts=1
+		fi &&
+		for workers in $worker_counts
 		do
 			rm -f .git/index.csts &&
 			GIT_OPTIONAL_LOCKS=0 \
