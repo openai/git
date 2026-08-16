@@ -2211,9 +2211,11 @@ test_expect_success PIPE,DURABLE_FSMONITOR \
 	'an existing exclude FIFO cannot block fast-path capture' '
 	test_when_finished "stop_daemon sidecar-exclude-fifo" &&
 	setup_repo sidecar-exclude-fifo &&
-	exclude_file=$(mktemp \
+	exclude_dir=$(mktemp -d \
 		"${TMPDIR:-/tmp}/git-status-exclude-fifo.XXXXXX") &&
-	test_when_finished "rm -f \"$exclude_file\"" &&
+	test_when_finished "rm -rf \"$exclude_dir\"" &&
+	exclude_file=$exclude_dir/global &&
+	: >"$exclude_file" &&
 	git -C sidecar-exclude-fifo config core.excludesFile \
 		"$exclude_file" &&
 	issue_sidecar sidecar-exclude-fifo &&
@@ -2231,9 +2233,10 @@ test_expect_success PIPE,DURABLE_FSMONITOR \
 	test_when_finished "stop_daemon sidecar-exclude-race" &&
 	test_when_finished "cleanup_fast_race" &&
 	setup_repo sidecar-exclude-race &&
-	exclude_file=$(mktemp \
+	exclude_dir=$(mktemp -d \
 		"${TMPDIR:-/tmp}/git-status-exclude-race.XXXXXX") &&
-	test_when_finished "rm -f \"$exclude_file\"" &&
+	test_when_finished "rm -rf \"$exclude_dir\"" &&
+	exclude_file=$exclude_dir/global &&
 	test_write_lines ignored >"$exclude_file" &&
 	git -C sidecar-exclude-race config core.excludesFile \
 		"$exclude_file" &&
