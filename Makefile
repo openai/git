@@ -1579,6 +1579,7 @@ CLAR_TEST_SUITES += u-clean-status-history-store
 CLAR_TEST_SUITES += u-clean-status-identity
 CLAR_TEST_SUITES += u-clean-status-index
 CLAR_TEST_SUITES += u-clean-status-manifest
+CLAR_TEST_SUITES += u-clean-status-progress
 CLAR_TEST_SUITES += u-clean-status-sidecar
 CLAR_TEST_SUITES += u-clean-status-store
 CLAR_TEST_SUITES += u-ctype

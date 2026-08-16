@@ -53,7 +53,7 @@ struct clean_status_progress *clean_status_start_progress(
 	if (repo != progress_repo)
 		return NULL;
 	CALLOC_ARRAY(progress, 1);
-	if (pthread_mutex_init(&progress->mutex, NULL))
+	if (HAVE_THREADS && pthread_mutex_init(&progress->mutex, NULL))
 		BUG("could not initialize clean status progress mutex");
 	progress->display = start_delayed_progress(repo, title, total);
 	return progress;
