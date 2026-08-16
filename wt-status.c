@@ -1108,6 +1108,7 @@ static void wt_status_prepare_bulk_recovery(struct wt_status *s)
 	struct index_state *istate = s->repo->index;
 	struct untracked_cache *uc = istate->untracked;
 
+	istate->preload_bulk_recovery_requested = 0;
 	if (!uc || !uc->fsmonitor_legacy_discarded)
 		return;
 	uc->fsmonitor_legacy_discarded = 0;
@@ -1127,14 +1128,19 @@ static void wt_status_prepare_bulk_recovery(struct wt_status *s)
 	    uc->fsmonitor_revalidation ||
 	    clean_status_filter_scope_needs_validation(istate) ||
 	    clean_status_manifest_global_fallback(istate) ||
-	    clean_status_worktree_manifest_needs_refresh(istate) ||
-	    !preload_index_bulk_can_close_provider(istate))
+	    clean_status_worktree_manifest_needs_refresh(istate))
 		return;
+	istate->preload_bulk_recovery_requested = 1;
+	if (!preload_index_bulk_can_close_provider(istate)) {
+		istate->preload_bulk_recovery_requested = 0;
+		return;
+	}
 
 	/*
 	 * The index read discarded an unauthenticated directory tree. A
 	 * read-only caller cannot publish its replacement, so let the
-	 * already enabled bulk scan supply complete untracked results.
+	 * bulk scan supply both tracked and complete untracked results.
+	 * Explicit configuration still takes precedence over this request.
 	 * If that scan cannot close, ordinary traversal still supplies them.
 	 */
 	remove_untracked_cache(istate);
@@ -2371,6 +2377,7 @@ int wt_status_refresh_index(struct wt_status *s,
 	proof = wt_status_prepare_semantic_verify(s, refresh_flags);
 	ret = wt_status_close_fsmonitor_token(
 		s, proof, refresh_flags, require_untracked, 0);
+	istate->preload_bulk_recovery_requested = 0;
 	if (istate->preload_untracked == &s->untracked) {
 		s->untracked_from_preload =
 			istate->preload_untracked_complete;
