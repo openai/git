@@ -20,6 +20,7 @@
 #include "environment.h"
 #include "gettext.h"
 #include "fsmonitor-ll.h"
+#include "fsmonitor.h"
 #include "fsmonitor-settings.h"
 #include "tag.h"
 #include "trace2.h"
@@ -32,6 +33,7 @@
 #include "revision.h"
 #include "log-tree.h"
 #include "setup.h"
+#include "symlinks.h"
 #include "thread-utils.h"
 #include "oid-array.h"
 #include "tree.h"
@@ -50,6 +52,32 @@ static const char builtin_diff_usage[] =
 "   or: git diff [<options>] --no-index [--] <path> <path> [<pathspec>...]"
 "\n"
 COMMON_DIFF_OPTIONS_HELP;
+
+static int scoped_diff_bootstrap_used;
+
+static int diff_has_bounded_regular_pathspec(const struct pathspec *pathspec)
+{
+	int i;
+
+	if (pathspec->nr <= 0 || pathspec->nr > 64 ||
+	    pathspec->has_wildcard ||
+	    (pathspec->magic &
+	     (PATHSPEC_GLOB | PATHSPEC_ICASE |
+	      PATHSPEC_EXCLUDE | PATHSPEC_ATTR)))
+		return 0;
+	for (i = 0; i < pathspec->nr; i++) {
+		const struct pathspec_item *item = &pathspec->items[i];
+		struct stat st;
+
+		if (!item->match || item->len <= 0 ||
+		    item->match[item->len - 1] == '/' ||
+		    !strcmp(item->match, ".") ||
+		    has_symlink_leading_path(item->match, item->len) ||
+		    lstat(item->match, &st) || !S_ISREG(st.st_mode))
+			return 0;
+	}
+	return 1;
+}
 
 static const char *blob_path(struct object_array_entry *entry)
 {
@@ -152,6 +180,8 @@ static void builtin_diff_index(struct rev_info *revs,
 			       int argc, const char **argv)
 {
 	unsigned int option = 0;
+	int scoped_bootstrap;
+
 	while (1 < argc) {
 		const char *arg = argv[1];
 		if (!strcmp(arg, "--cached") || !strcmp(arg, "--staged"))
@@ -170,8 +200,13 @@ static void builtin_diff_index(struct rev_info *revs,
 	    revs->max_count != -1 || revs->min_age != -1 ||
 	    revs->max_age != -1)
 		usage(builtin_diff_usage);
-	if (!(option & DIFF_INDEX_CACHED)) {
+	if (!(option & DIFF_INDEX_CACHED))
 		setup_work_tree(the_repository);
+	scoped_bootstrap = (option & DIFF_INDEX_CACHED) ||
+		diff_has_bounded_regular_pathspec(&revs->diffopt.pathspec);
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
+	if (!(option & DIFF_INDEX_CACHED)) {
 		if (repo_read_index_preload(the_repository,
 					    &revs->diffopt.pathspec, 0) < 0) {
 			die_errno("repo_read_index_preload");
@@ -179,6 +214,9 @@ static void builtin_diff_index(struct rev_info *revs,
 	} else if (repo_read_index(the_repository) < 0) {
 		die_errno("repo_read_cache");
 	}
+	if (scoped_bootstrap)
+		scoped_diff_bootstrap_used |=
+			fsmonitor_end_scoped_bootstrap(the_repository->index);
 	run_diff_index(revs, option);
 }
 
@@ -459,6 +497,7 @@ static void refresh_index_quietly(void)
 static void builtin_diff_files(struct rev_info *revs, int argc, const char **argv)
 {
 	unsigned int options = 0;
+	int scoped_bootstrap;
 
 	while (1 < argc && argv[1][0] == '-') {
 		if (!strcmp(argv[1], "--base"))
@@ -489,10 +528,17 @@ static void builtin_diff_files(struct rev_info *revs, int argc, const char **arg
 		diff_merges_set_dense_combined_if_unset(revs);
 
 	setup_work_tree(the_repository);
+	scoped_bootstrap =
+		diff_has_bounded_regular_pathspec(&revs->diffopt.pathspec);
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
 	if (repo_read_index_preload(the_repository, &revs->diffopt.pathspec,
 				    0) < 0) {
 		die_errno("repo_read_index_preload");
 	}
+	if (scoped_bootstrap)
+		scoped_diff_bootstrap_used |=
+			fsmonitor_end_scoped_bootstrap(the_repository->index);
 	run_diff_files(revs, options);
 }
 
@@ -638,6 +684,8 @@ int cmd_diff(int argc,
 	int nongit = 0, no_index = 0;
 	int result;
 	struct symdiff sdiff;
+
+	scoped_diff_bootstrap_used = 0;
 
 	/*
 	 * We could get N tree-ish in the rev.pending_objects list.
@@ -875,7 +923,8 @@ int cmd_diff(int argc,
 				      ent.objects, ent.nr,
 				      first_non_parent);
 	result = diff_result_code(&rev);
-	if (1 < rev.diffopt.skip_stat_unmatch)
+	if (1 < rev.diffopt.skip_stat_unmatch &&
+	    !scoped_diff_bootstrap_used)
 		refresh_index_quietly();
 	release_revisions(&rev);
 	object_array_clear(&ent);
