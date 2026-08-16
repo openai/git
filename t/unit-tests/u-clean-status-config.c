@@ -335,6 +335,94 @@ void test_clean_status_config__only_safe_command_guards_are_normalized(void)
 	}
 }
 
+void test_clean_status_config__only_redundant_disabled_submodule_recursion_is_normalized(void)
+{
+	static const struct {
+		const char *first;
+		enum config_scope first_scope;
+		const char *second;
+		enum config_scope second_scope;
+		const char *override;
+		int normalized;
+	} cases[] = {
+		{ NULL, 0, NULL, 0, "false", 1 },
+		{ NULL, 0, NULL, 0, "0", 1 },
+		{ NULL, 0, NULL, 0, "off", 1 },
+		{ NULL, 0, NULL, 0, "no", 1 },
+		{ "false", CONFIG_SCOPE_LOCAL, NULL, 0, "0", 1 },
+		{ "no", CONFIG_SCOPE_GLOBAL, NULL, 0, "off", 1 },
+		{ "true", CONFIG_SCOPE_LOCAL, NULL, 0, "false", 0 },
+		{ "invalid", CONFIG_SCOPE_LOCAL, NULL, 0, "false", 0 },
+		{ "false", CONFIG_SCOPE_UNKNOWN, NULL, 0, "false", 0 },
+		{ "false", CONFIG_SCOPE_SUBMODULE, NULL, 0, "false", 0 },
+		{ "true", CONFIG_SCOPE_GLOBAL,
+		  "false", CONFIG_SCOPE_LOCAL, "false", 1 },
+		{ "false", CONFIG_SCOPE_GLOBAL,
+		  "true", CONFIG_SCOPE_LOCAL, "false", 0 },
+		{ NULL, 0, NULL, 0, "true", 0 },
+		{ NULL, 0, NULL, 0, "invalid", 0 },
+		{ "false", CONFIG_SCOPE_LOCAL, NULL, 0, "true", 0 },
+		{ "true", CONFIG_SCOPE_COMMAND,
+		  "false", CONFIG_SCOPE_COMMAND, "false", 1 },
+	};
+	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+
+	for (size_t a = 0; a < ARRAY_SIZE(algorithms); a++) {
+		const struct git_hash_algo *algo = &hash_algos[algorithms[a]];
+
+		for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+			struct clean_status_config_digest baseline, digest;
+
+			clean_status_config_init(&baseline, algo);
+			clean_status_config_init(&digest, algo);
+			if (cases[i].first) {
+				kvi.scope = cases[i].first_scope;
+				clean_status_config_add(&baseline, "submodule.recurse",
+							cases[i].first, &ctx);
+				clean_status_config_add(&digest, "submodule.recurse",
+							cases[i].first, &ctx);
+			}
+			if (cases[i].second) {
+				kvi.scope = cases[i].second_scope;
+				clean_status_config_add(&baseline, "submodule.recurse",
+							cases[i].second, &ctx);
+				clean_status_config_add(&digest, "submodule.recurse",
+							cases[i].second, &ctx);
+			}
+			clean_status_config_final(&baseline);
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_add(&digest, "submodule.recurse",
+						cases[i].override, &ctx);
+			clean_status_config_final(&digest);
+			cl_assert_equal_i(hasheq(digest.hash, baseline.hash, algo),
+					  cases[i].normalized);
+			cl_assert(hasheq(digest.semantic_hash,
+					 baseline.semantic_hash, algo));
+			cl_assert(hasheq(digest.tracked_policy_hash,
+					 baseline.tracked_policy_hash, algo));
+		}
+
+		{
+			struct clean_status_config_digest baseline, digest;
+
+			clean_status_config_init(&baseline, algo);
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&baseline, "submodule.recurse",
+						"false", NULL);
+			clean_status_config_add(&digest, "submodule.recurse",
+						"false", NULL);
+			clean_status_config_final(&baseline);
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_add(&digest, "submodule.recurse",
+						"false", &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		}
+	}
+}
+
 void test_clean_status_config__command_empty_attributes_do_not_change_proof(void)
 {
 	static const enum config_scope persistent_scopes[] = {
