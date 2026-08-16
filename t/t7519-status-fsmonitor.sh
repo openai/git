@@ -1334,7 +1334,43 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		! test_trace2_data status untracked/bulk-recovery 1 \
 			<.git/writable.trace &&
 		test_region index do_write_index .git/writable.trace &&
-		test_fsmonitor_full_proof .git/index paired
+		test_fsmonitor_full_proof .git/index paired &&
+		cp .git/index .git/writable.index &&
+		find .git -maxdepth 1 -type f \
+			\( -name "index.csts" -o -name "index.csh1.*" \
+				-o -name "index.cswi.*" \) |
+			sort >.git/sidecars.before &&
+		git hash-object --no-filters --stdin-paths \
+			<.git/sidecars.before >.git/sidecar-hashes.before &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/follower.trace" \
+			git status --porcelain=v2 >.git/follower &&
+		test_cmp .git/expect .git/follower &&
+		test_cmp_bin .git/writable.index .git/index &&
+		test_fsmonitor_full_proof .git/index paired &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/follower.trace &&
+		! test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+			<.git/follower.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count \
+			"[1-9][0-9]*" <.git/follower.trace &&
+		! test_trace2_data read_directory opendir \
+			"[1-9][0-9]*" <.git/follower.trace &&
+		! test_trace2_data index preload/bulk_dirs \
+			"[1-9][0-9]*" <.git/follower.trace &&
+		! test_trace2_data index preload/sum_lstat \
+			"[1-9][0-9]*" <.git/follower.trace &&
+		! test_region index do_write_index .git/follower.trace &&
+		find .git -maxdepth 1 -type f \
+			\( -name "index.csts" -o -name "index.csh1.*" \
+				-o -name "index.cswi.*" \) |
+			sort >.git/sidecars.after &&
+		test_cmp .git/sidecars.before .git/sidecars.after &&
+		git hash-object --no-filters --stdin-paths \
+			<.git/sidecars.after >.git/sidecar-hashes.after &&
+		test_cmp .git/sidecar-hashes.before .git/sidecar-hashes.after
 	)
 '
 
