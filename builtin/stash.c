@@ -1169,7 +1169,7 @@ static int do_store_stash(const struct object_id *w_commit, const char *stash_ms
 			  int quiet)
 {
 	struct stash_info info;
-	char revision[GIT_MAX_HEXSZ];
+	char revision[GIT_MAX_HEXSZ + 1];
 
 	oid_to_hex_r(revision, w_commit);
 	assert_stash_like(&info, revision);
