@@ -231,7 +231,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 					--no-ext-diff --no-textconv -- tracked \
 					>"$gitdir/required-filter.actual" \
 					2>"$gitdir/required-filter.error" &&
-			test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			test_must_fail env \
+				GIT_INDEX_FILE="$gitdir/same-stat.oracle.index" \
+				GIT_OPTIONAL_LOCKS=0 \
 				git -c core.fsmonitor=false \
 					-c core.untrackedCache=false \
 					-c core.trustctime=true \
