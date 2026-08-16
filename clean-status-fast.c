@@ -216,7 +216,8 @@ int clean_status_try_sidecar(
 	int ret = 0;
 
 	*repository_inputs_changed = 0;
-	if (!config->finalized || config->filter_configured ||
+	if (!config->finalized ||
+	    (config->filter_configured && config->normalized_filter_disable) ||
 	    getenv(INDEX_ENVIRONMENT) || is_bare_repository(repo) ||
 	    !repo_get_work_tree(repo) ||
 	    !current_worktree_is_main(repo) ||
@@ -291,7 +292,9 @@ int clean_status_try_sidecar(
 	}
 
 	if (clean_status_config_read_repository(repo, &fresh_config) ||
-	    fresh_config.filter_configured ||
+	    fresh_config.filter_configured != config->filter_configured ||
+	    (fresh_config.filter_configured &&
+	     fresh_config.normalized_filter_disable) ||
 	    memcmp(fresh_config.hash, config->hash,
 		   repo->hash_algo->rawsz)) {
 		trace_miss(repo, "fast-config-raced");
