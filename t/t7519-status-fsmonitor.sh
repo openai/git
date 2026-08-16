@@ -2282,13 +2282,22 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/readonly.trace" &&
 			GIT_TEST_PRELOAD_INDEX=1 \
-			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TTCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/reset.trace" \
 				git -C "$worktree" diff \
 					>"$gitdir/reset.actual" &&
 			test_must_be_empty "$gitdir/reset.actual" &&
 			test_trace2_data fsm_client query/trivial-response 1 \
 				<"$gitdir/reset.trace" &&
+			test_trace2_data diff recovery/reused-provider-observations 1 \
+				<"$gitdir/reset.trace" &&
+			test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/reset.trace" >"$gitdir/reset.manifests" &&
+			test_line_count = 1 "$gitdir/reset.manifests" &&
+			test_grep \
+				"\"event\":\"region_enter\".*\"category\":\"index\",\"label\":\"do_read_index\"" \
+				"$gitdir/reset.trace" >"$gitdir/reset.reads" &&
+			test_line_count = 1 "$gitdir/reset.reads" &&
 			test_region index do_write_index "$gitdir/reset.trace" &&
 			test_fsmonitor_full_proof "$gitdir/index" paired &&
 			cp "$gitdir/index" "$gitdir/pending.index" &&
@@ -2331,6 +2340,63 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			git diff >.git/filtered.out 2>.git/filtered.err &&
 		test_grep "clean filter .lfs. failed" .git/filtered.err &&
 		test_cmp_bin .git/filtered.index .git/index
+	)
+'
+
+test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider-reset diff never overwrites a competing skipHash writer' '
+	test_when_finished "rm -rf diff-recovery-competing-writer" &&
+	test_create_repo diff-recovery-competing-writer &&
+	(
+		cd diff-recovery-competing-writer &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		fsmonitor_query_pid= &&
+		trap cleanup_fsmonitor_query_barrier 0 &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git config index.skipHash true &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_trailing_hash .git/index >.git/index.hash &&
+		test_oid zero >.git/zero &&
+		test_cmp .git/zero .git/index.hash &&
+		test-tool chmtime =-60 tracked &&
+		ready="$PWD/.git/provider.ready" &&
+		resume="$PWD/.git/provider.resume" &&
+		mkfifo "$resume" &&
+		{
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_BARRIER_AT=2 \
+			GIT_TEST_FSMONITOR_QUERY_BARRIER_READY="$ready" \
+			GIT_TEST_FSMONITOR_QUERY_BARRIER_RESUME="$resume" \
+			GIT_TRACE2_EVENT="$PWD/.git/diff.trace" \
+				git diff >.git/actual 2>.git/error &
+			fsmonitor_query_pid=$!
+		} &&
+		wait_for_fsmonitor_query_barrier \
+			"$ready" "$fsmonitor_query_pid" &&
+		test_trace2_data diff recovery/reused-provider-observations 1 \
+			<.git/diff.trace &&
+		test_path_is_missing .git/index.lock &&
+		test_write_lines competing >sibling &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			add sibling &&
+		cp .git/index .git/competing.index &&
+		printf x >"$resume" &&
+		wait "$fsmonitor_query_pid" &&
+		fsmonitor_query_pid= &&
+		test_must_be_empty .git/actual &&
+		test_cmp_bin .git/competing.index .git/index &&
+		! test_region index do_write_index .git/diff.trace &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			diff --cached --name-only >.git/staged &&
+		test_grep "^sibling$" .git/staged
 	)
 '
 
