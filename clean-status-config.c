@@ -382,7 +382,7 @@ static int config_epoch_command_is_safe(
 {
 	return starts_with(key, "advice.") ||
 		!strcmp(key, "user.name") || !strcmp(key, "user.email") ||
-		!strcmp(key, "core.preloadindexbulk") ||
+		config_is_command_acceleration(key, ctx) ||
 		config_is_command_transport(key, ctx);
 }
 
