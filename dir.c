@@ -4427,15 +4427,12 @@ int untracked_cache_adopt_legacy(struct index_state *istate)
 
 void untracked_cache_discard_legacy(struct index_state *istate)
 {
-	int had_root;
-
 	if (!istate->untracked ||
 	    !legacy_ident_in_untracked(istate->untracked))
 		return;
-	had_root = !!istate->untracked->root;
 	free_untracked_cache(istate->untracked);
 	new_untracked_cache(istate, -1);
-	istate->untracked->fsmonitor_legacy_discarded = had_root;
+	istate->untracked->fsmonitor_legacy_discarded = 1;
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "untracked/legacy-discarded", 1);
 }
