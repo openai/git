@@ -13,6 +13,7 @@
 #include "commit.h"
 #include "clean-status.h"
 #include "clean-status-index.h"
+#include "clean-status-manifest.h"
 #include "diff.h"
 #include "environment.h"
 #include "exclude-source-proof.h"
@@ -2067,6 +2068,8 @@ wt_status_close_semantic_fsmonitor_token(
 	}
 
 	if (defer_untracked) {
+		int directory_delta_reused;
+
 		closure->untracked_ready =
 			wt_status_stage_untracked(closure);
 		closure->untracked_proof_complete =
@@ -2081,15 +2084,23 @@ wt_status_close_semantic_fsmonitor_token(
 
 		/* A second query closes the subsequent untracked scan. */
 		closure->queries++;
+		clean_status_manifest_begin_directory_delta(istate, *proof);
 		result = fsmonitor_query_pending_token(
 			istate,
 			wt_status_untracked_cache_valid(closure));
+		directory_delta_reused =
+			clean_status_manifest_end_directory_delta(istate);
 		if (result != FSMONITOR_TOKEN_CLEAN) {
+			/* Only directory reuse adds an unobserved exclude risk. */
 			int reuse_semantic_subtrees =
 				result == FSMONITOR_TOKEN_CHANGED &&
 				!clean_status_filter_scope_needs_validation(istate) &&
 				!clean_status_worktree_manifest_needs_refresh(istate) &&
-				semantic_verify_proof_is_current(istate, *proof);
+				semantic_verify_proof_is_current(istate, *proof) &&
+				(!directory_delta_reused ||
+				 (s->certify_exclude_proof &&
+				  exclude_source_proof_validate(
+					  s->certify_exclude_proof)));
 
 			wt_status_discard_staged_untracked(closure);
 			if (reuse_semantic_subtrees) {
