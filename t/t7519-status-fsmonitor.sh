@@ -3327,8 +3327,8 @@ test_expect_success HARDLINKS,!MINGW,!CYGWIN \
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'second closing-query change preserves verified sibling subtrees' '
 	test_when_finished \
-		"rm -rf second-query-changed-file second-query-changed-directory" &&
-	for event in file directory
+		"rm -rf second-query-changed-file second-query-changed-directory second-query-changed-large-directory" &&
+	for event in file directory large-directory
 	do
 		test_create_repo "second-query-changed-$event" &&
 		(
@@ -3339,6 +3339,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_write_lines "*.ignored" >cached/.gitignore &&
 		printf "aaaa\n" >cached/tracked &&
 		test_write_lines ignored >cached/junk.ignored &&
+		if test "$event" = large-directory
+		then
+			for descendant in $(test_seq 1 128)
+			do
+				test_write_lines "$descendant" \
+					>"cached/retained-$descendant" || return 1
+			done
+		fi &&
 		for sibling in $(test_seq 1 12)
 		do
 			mkdir "sibling-$sibling" &&
@@ -3348,6 +3356,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				>"sibling-$sibling/retained.ignored" || return 1
 		done &&
 		git add .gitignore cached/.gitignore cached/tracked sibling-* &&
+		if test "$event" = large-directory
+		then
+			git add cached/retained-*
+		fi &&
 		git commit -m base &&
 		git config core.trustctime false &&
 		git config core.checkStat minimal &&
@@ -3373,7 +3385,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			-c core.trustctime=true -c core.checkStat=default \
 			status --porcelain=v2 >.git/expect &&
 
-		if test "$event" = directory
+		if test "$event" != file
 		then
 			changed_path=cached/
 		else
@@ -3395,7 +3407,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/status.trace &&
 		test_trace2_data fsmonitor token_closure/apply_count 1 \
 			<.git/status.trace &&
-		if test "$event" = directory
+		if test "$event" != file
 		then
 			test_trace2_data fsmonitor \
 				semantic/manifest-directory-reused 1 \
@@ -3437,8 +3449,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test "$initial_opened" -gt 8 &&
 		test $((retry_opened - initial_opened)) -gt 0 &&
 		test $((retry_opened - initial_opened)) -le 2 &&
-		test_trace2_data index refresh/sum_lstat "[0-2]" \
-			<.git/status.trace &&
+		if test "$event" = large-directory
+		then
+			test_trace2_data index refresh/sum_lstat 130 \
+				<.git/status.trace
+		else
+			test_trace2_data index refresh/sum_lstat "[0-2]" \
+				<.git/status.trace
+		fi &&
 		test_trace2_data status \
 			fsmonitor_token/untracked-after-retry 1 \
 			<.git/status.trace &&
@@ -3447,6 +3465,63 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_fsmonitor_full_proof .git/index paired
 		) || return 1
 	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'directory closure rejects too many distinct attribute candidates' '
+	test_when_finished "rm -rf directory-many-attribute-candidates" &&
+	test_create_repo directory-many-attribute-candidates &&
+	(
+		cd directory-many-attribute-candidates &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached sibling &&
+		for descendant in $(test_seq 1 64)
+		do
+			mkdir "cached/child-$descendant" &&
+			printf "aaaa\n" \
+				>"cached/child-$descendant/tracked" || return 1
+		done &&
+		test_write_lines retained >sibling/tracked &&
+		git add cached sibling &&
+		git commit -qm base &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		git config core.untrackedCache true &&
+		test_write_lines visible >sibling/visible &&
+		git -c core.fsmonitor=false status --porcelain=v2 >.git/prime &&
+		test_grep "^? sibling/visible$" .git/prime &&
+		test-tool chmtime =-60 cached/child-1/tracked &&
+		git update-index --refresh &&
+		mtime=$(test-tool chmtime --get cached/child-1/tracked) &&
+		printf "bbbb\n" >cached/child-1/tracked &&
+		test-tool chmtime =$mtime cached/child-1/tracked &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor-valid cached/child-1/tracked &&
+		GIT_OPTIONAL_LOCKS=0 git \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.trustctime=true -c core.checkStat=default \
+			status --porcelain=v2 >.git/expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/ \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "^1 \\.M .* cached/child-1/tracked$" .git/actual &&
+		test_grep "^? sibling/visible$" .git/actual &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 2 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-directory-reused 1 \
+			<.git/status.trace &&
+		! test_trace2_data status \
+			fsmonitor_token/reused-semantic-subtrees 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test_fsmonitor_full_proof .git/index paired
+	)
 '
 
 test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
@@ -3465,13 +3540,19 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_write_lines "*.ignored" >cached/.gitignore &&
 			printf "aaaa\n" >cached/tracked &&
 			test_write_lines ignored >cached/junk.ignored &&
+			for descendant in $(test_seq 1 128)
+			do
+				test_write_lines "$descendant" \
+					>"cached/retained-$descendant" || return 1
+			done &&
 			for sibling in $(test_seq 1 8)
 			do
 				mkdir "sibling-$sibling" &&
 				test_write_lines "$sibling" \
 					>"sibling-$sibling/tracked" || return 1
 			done &&
-			git add .gitignore cached/.gitignore cached/tracked sibling-* &&
+			git add .gitignore cached/.gitignore cached/tracked \
+				cached/retained-* sibling-* &&
 			git commit -qm base &&
 			git config core.trustctime false &&
 			git config core.checkStat minimal &&
