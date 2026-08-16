@@ -19,6 +19,7 @@ struct clean_status_config_digest {
 	unsigned initialized : 1;
 	unsigned finalized : 1;
 	unsigned filter_configured : 1;
+	unsigned normalized_filter_disable : 1;
 	unsigned semantic_config_explicit : 1;
 	unsigned attribute_tree_configured : 1;
 	unsigned fsmonitor_value_seen : 1;
