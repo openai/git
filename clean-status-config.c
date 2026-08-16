@@ -139,6 +139,21 @@ static int config_is_command_status_guard(
 		digest->fsmonitor_value_enabled = boolean > 0;
 		return redundant;
 	}
+	if (!strcmp(key, "submodule.recurse")) {
+		int boolean = git_parse_maybe_bool(value);
+		int known_scope = ctx && ctx->kvi &&
+			ctx->kvi->scope > CONFIG_SCOPE_UNKNOWN &&
+			ctx->kvi->scope <= CONFIG_SCOPE_COMMAND;
+		int redundant = command && !boolean &&
+			(!digest->submodule_recurse_seen ||
+			 digest->submodule_recurse_known_false);
+
+		/* Recursion defaults to off; retain every effective change. */
+		digest->submodule_recurse_seen = 1;
+		digest->submodule_recurse_known_false =
+			known_scope && !boolean;
+		return redundant;
+	}
 
 	return command && value &&
 		((!strcmp(key, "safe.barerepository") &&

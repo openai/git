@@ -4304,6 +4304,125 @@ test_expect_success MACOS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success MACOS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'redundant disabled recursion preserves linked pre-commit diff proofs' '
+	test_when_finished "rm -rf precommit-linked-proof precommit-linked-worktree" &&
+	test_create_repo precommit-linked-proof &&
+	(
+		cd precommit-linked-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git worktree add --detach ../precommit-linked-worktree HEAD &&
+		git config index.skipHash true &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		worktree="$PWD/../precommit-linked-worktree" &&
+		gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+		test-tool chmtime -120 "$worktree/tracked" "$worktree/sibling" &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git -C "$worktree" update-index --refresh &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git -C "$worktree" update-index --fsmonitor &&
+		GIT_INDEX_FILE="$gitdir/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/prime" &&
+		test_must_be_empty "$gitdir/prime" &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
+			git -C "$worktree" status >"$gitdir/checkpoint.out" &&
+		test_trace2_data fsmonitor history/external-stored 1 \
+			<"$gitdir/checkpoint.trace" &&
+		test_fsmonitor_full_proof "$gitdir/index" paired &&
+		test_trailing_hash "$gitdir/index" >"$gitdir/index.hash" &&
+		test_oid zero >"$gitdir/zero" &&
+		test_cmp "$gitdir/zero" "$gitdir/index.hash" &&
+		find "$gitdir" -maxdepth 1 -type f -name "index.csh1.*" \
+			>"$gitdir/checkpoints" &&
+		find "$gitdir" -maxdepth 1 -type f -name "index.cswi.*" \
+			>"$gitdir/witnesses" &&
+		test_line_count = 1 "$gitdir/checkpoints" &&
+		test_line_count = 1 "$gitdir/witnesses" &&
+		checkpoint=$(cat "$gitdir/checkpoints") &&
+		witness=$(cat "$gitdir/witnesses") &&
+		cp "$checkpoint" "$gitdir/checkpoint.before" &&
+		cp "$witness" "$gitdir/witness.before" &&
+
+		test_write_lines dirty >"$worktree/tracked" &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$gitdir/checkout.trace" \
+			git -C "$worktree" -c submodule.recurse=0 \
+				checkout -- . &&
+		test_region index do_write_index "$gitdir/checkout.trace" &&
+		test_fsmonitor_full_proof "$gitdir/index" paired &&
+		test_trailing_hash "$gitdir/index" >"$gitdir/index.hash" &&
+		test_cmp "$gitdir/zero" "$gitdir/index.hash" &&
+		test_cmp_bin "$gitdir/checkpoint.before" "$checkpoint" &&
+		test_cmp_bin "$gitdir/witness.before" "$witness" &&
+		cp "$gitdir/index" "$gitdir/index.before-diff" &&
+		git -C "$worktree" --no-optional-locks \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.trustctime=true -c core.checkStat=default \
+			diff --no-ext-diff --no-textconv --ignore-submodules \
+				>"$gitdir/expect" &&
+		test_cmp_bin "$gitdir/index.before-diff" "$gitdir/index" &&
+		for attempt in first second
+		do
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/diff-$attempt.trace" \
+				git -C "$worktree" diff \
+					--no-ext-diff --no-textconv --ignore-submodules \
+						>"$gitdir/diff-$attempt.actual" &&
+			test_cmp "$gitdir/expect" "$gitdir/diff-$attempt.actual" &&
+			test_cmp_bin "$gitdir/index.before-diff" "$gitdir/index" &&
+			test_cmp_bin "$gitdir/checkpoint.before" "$checkpoint" &&
+			test_cmp_bin "$gitdir/witness.before" "$witness" &&
+			test_grep ! "\"label\":\"history_logical_digest\"" \
+				"$gitdir/diff-$attempt.trace" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/diff-$attempt.trace" &&
+			! test_trace2_data fsmonitor history/external-restored 1 \
+				<"$gitdir/diff-$attempt.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<"$gitdir/diff-$attempt.trace" &&
+			! test_region index do_write_index \
+				"$gitdir/diff-$attempt.trace" || return 1
+		done &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<"$gitdir/checkout.trace" &&
+
+		git -C "$worktree" config submodule.recurse true &&
+		GIT_INDEX_FILE="$gitdir/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/enabled.prime" &&
+		test_must_be_empty "$gitdir/enabled.prime" &&
+		test_fsmonitor_full_proof "$gitdir/index" paired &&
+		test_write_lines dirty >"$worktree/tracked" &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$gitdir/enabled.checkout.trace" \
+			git -C "$worktree" -c submodule.recurse=false \
+				checkout -- . &&
+		test_trace2_data fsmonitor config/coherent 0 \
+			<"$gitdir/enabled.checkout.trace" &&
+		cp "$gitdir/index" "$gitdir/enabled.index" &&
+		git -C "$worktree" --no-optional-locks \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.trustctime=true -c core.checkStat=default \
+			diff --no-ext-diff --no-textconv --ignore-submodules \
+				>"$gitdir/enabled.expect" &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git -C "$worktree" diff \
+				--no-ext-diff --no-textconv --ignore-submodules \
+					>"$gitdir/enabled.actual" &&
+		test_cmp "$gitdir/enabled.expect" "$gitdir/enabled.actual" &&
+		test_cmp_bin "$gitdir/enabled.index" "$gitdir/index"
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'global second closing-query change rejects verified subtree reuse' '
 	test_when_finished "rm -rf second-query-global" &&
