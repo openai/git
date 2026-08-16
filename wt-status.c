@@ -1103,6 +1103,44 @@ static int wt_status_begin_attr_snapshot(struct wt_status *s)
 	return ret;
 }
 
+static void wt_status_prepare_bulk_recovery(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	struct untracked_cache *uc = istate->untracked;
+
+	if (!uc || !uc->fsmonitor_legacy_discarded)
+		return;
+	uc->fsmonitor_legacy_discarded = 0;
+	if (use_optional_locks() || uc->root ||
+	    s->show_untracked_files != SHOW_NORMAL_UNTRACKED_FILES ||
+	    s->show_ignored_mode || s->pathspec.nr ||
+	    getenv(INDEX_ENVIRONMENT) || istate != istate->repo->index ||
+	    istate->split_index || istate->sparse_index != INDEX_EXPANDED ||
+	    !fstat_is_reliable() ||
+	    !repo_config_values(s->repo)->trust_ctime ||
+	    !repo_config_values(s->repo)->check_stat ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC ||
+	    !fsmonitor_pending_token_from_provider(istate) ||
+	    istate->fsmonitor_untracked_valid ||
+	    istate->fsmonitor_untracked_revalidation_authenticated ||
+	    istate->fsmonitor_legacy_untracked_fallback ||
+	    uc->fsmonitor_revalidation ||
+	    clean_status_filter_scope_needs_validation(istate) ||
+	    clean_status_manifest_global_fallback(istate) ||
+	    clean_status_worktree_manifest_needs_refresh(istate) ||
+	    !preload_index_bulk_can_close_provider(istate))
+		return;
+
+	/*
+	 * The index read discarded an unauthenticated directory tree. A
+	 * read-only caller cannot publish its replacement, so let the
+	 * already enabled bulk scan supply complete untracked results.
+	 * If that scan cannot close, ordinary traversal still supplies them.
+	 */
+	remove_untracked_cache(istate);
+	trace2_data_intmax("status", s->repo, "untracked/bulk-recovery", 1);
+}
+
 void wt_status_start_untracked_cache_preload(struct wt_status *s)
 {
 	struct index_state *istate = s->repo->index;
@@ -1118,6 +1156,7 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 	wt_status_begin_attr_snapshot(s);
 	/* Record the provider token before either filesystem traversal. */
 	refresh_fsmonitor(istate);
+	wt_status_prepare_bulk_recovery(s);
 	if (s->certify_clean_status &&
 	    !fsmonitor_has_pending_token(istate))
 		reopened_valid_token =
