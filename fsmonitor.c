@@ -20,6 +20,7 @@
 #include "run-command.h"
 #include "strbuf.h"
 #include "trace2.h"
+#include "wrapper.h"
 
 #define INDEX_EXTENSION_VERSION1	(1)
 #define INDEX_EXTENSION_VERSION2	(2)
@@ -410,7 +411,8 @@ void fsmonitor_invalidate_cache_entry(struct cache_entry *ce)
 }
 
 static size_t handle_path_with_trailing_slash(
-	struct index_state *istate, const char *name, int pos);
+	struct index_state *istate, const char *name, int pos,
+	int directory_is_semantically_safe);
 
 int fsmonitor_invalidate_attributes_path(struct index_state *istate,
 					 const char *name)
@@ -547,7 +549,9 @@ static size_t handle_using_dir_name_hash_icase(
 	pos = index_name_pos(istate, canonical_path.buf,
 			     canonical_path.len);
 	nr_in_cone = handle_path_with_trailing_slash(
-		istate, canonical_path.buf, pos);
+		istate, canonical_path.buf, pos,
+		clean_status_directory_event_is_semantically_safe(
+			istate, canonical_path.buf));
 	strbuf_release(&canonical_path);
 	return nr_in_cone;
 }
@@ -603,7 +607,9 @@ static size_t handle_path_without_trailing_slash(
 		strbuf_addch(&work_path, '/');
 		pos = index_name_pos(istate, work_path.buf, work_path.len);
 		nr_in_cone = handle_path_with_trailing_slash(
-			istate, work_path.buf, pos);
+			istate, work_path.buf, pos,
+			clean_status_directory_event_is_semantically_safe(
+				istate, work_path.buf));
 		strbuf_release(&work_path);
 		return nr_in_cone;
 	}
@@ -642,7 +648,8 @@ static size_t handle_path_without_trailing_slash(
  * untracked or case-incorrect.
  */
 static size_t handle_path_with_trailing_slash(
-	struct index_state *istate, const char *name, int pos)
+	struct index_state *istate, const char *name, int pos,
+	int directory_is_semantically_safe)
 {
 	int i;
 	size_t nr_in_cone = 0;
@@ -667,8 +674,7 @@ static size_t handle_path_with_trailing_slash(
 		nr_in_cone++;
 	}
 
-	if (nr_in_cone &&
-	    !clean_status_directory_event_is_semantically_safe(istate, name)) {
+	if (nr_in_cone && !directory_is_semantically_safe) {
 		/*
 		 * A matched directory event may stand in for a nested
 		 * attribute-file change.
@@ -681,7 +687,8 @@ static size_t handle_path_with_trailing_slash(
 	return nr_in_cone;
 }
 
-static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
+static void fsmonitor_refresh_callback(struct index_state *istate, char *name,
+				       int closing_delta)
 {
 	int len = strlen(name);
 	int pos;
@@ -724,10 +731,13 @@ static void fsmonitor_refresh_callback(struct index_state *istate, char *name)
 			fsmonitor_invalidate_attributes_path(istate, name);
 	}
 	directory_is_semantically_safe = name[len - 1] == '/' &&
-		clean_status_directory_event_is_semantically_safe(istate, name);
+		(clean_status_directory_event_is_semantically_safe(istate, name) ||
+		 (closing_delta &&
+		  clean_status_manifest_directory_unchanged(istate, name)));
 
 	if (name[len - 1] == '/')
-		nr_in_cone = handle_path_with_trailing_slash(istate, name, pos);
+		nr_in_cone = handle_path_with_trailing_slash(
+			istate, name, pos, directory_is_semantically_safe);
 	else
 		nr_in_cone = handle_path_without_trailing_slash(istate, name, pos);
 	if (pos < 0 && nr_in_cone && !directory_is_semantically_safe)
@@ -907,6 +917,45 @@ malformed:
 	return FSMONITOR_QUERY_ERROR;
 }
 
+static int fsmonitor_test_query_barrier(size_t query_nr)
+{
+	const char *at = getenv("GIT_TEST_FSMONITOR_QUERY_BARRIER_AT");
+	const char *ready = getenv("GIT_TEST_FSMONITOR_QUERY_BARRIER_READY");
+	const char *resume = getenv("GIT_TEST_FSMONITOR_QUERY_BARRIER_RESUME");
+	struct stat st;
+	uintmax_t selected;
+	char *end;
+	char resumed;
+	int fd, ret;
+
+	if (!at && !ready && !resume)
+		return 0;
+	if (!at || !ready || !resume || !*at || !*ready || !*resume ||
+	    !isdigit((unsigned char)*at))
+		return -1;
+	errno = 0;
+	selected = strtoumax(at, &end, 10);
+	if (errno || *end || !selected)
+		return -1;
+	if (selected != (uintmax_t)query_nr)
+		return 0;
+	if (lstat(resume, &st) || !S_ISFIFO(st.st_mode))
+		return -1;
+	fd = open(ready, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return -1;
+	ret = write_in_full(fd, "ready\n", 6) == 6 ? 0 : -1;
+	if (close(fd) || ret)
+		return -1;
+	fd = open(resume, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	ret = read_in_full(fd, &resumed, 1) == 1 ? 0 : -1;
+	if (close(fd))
+		ret = -1;
+	return ret;
+}
+
 enum fsmonitor_query_outcome query_builtin_fsmonitor(
 	const char *since_token, struct fsmonitor_query_result *result)
 {
@@ -927,6 +976,8 @@ enum fsmonitor_query_outcome query_builtin_fsmonitor(
 		if (query_nr >= strlen(test_sequence))
 			return FSMONITOR_QUERY_ERROR;
 		outcome = test_sequence[query_nr++];
+		if (fsmonitor_test_query_barrier(query_nr))
+			return FSMONITOR_QUERY_ERROR;
 		if (outcome == 'E')
 			return FSMONITOR_QUERY_ERROR;
 
@@ -981,7 +1032,7 @@ static int fsmonitor_hardlink_inode_cmp(const void *unused UNUSED,
 }
 
 static int apply_fsmonitor_paths(struct index_state *istate,
-				 const struct strbuf *paths)
+				 const struct strbuf *paths, int closing_delta)
 {
 	const char *p = paths->buf;
 	const char *end = paths->buf + paths->len;
@@ -990,6 +1041,20 @@ static int apply_fsmonitor_paths(struct index_state *istate,
 	unsigned int matches = 0;
 	int count = 0;
 
+	if (closing_delta) {
+		for (const char *changed = p; changed < end;
+		     changed += strlen(changed) + 1) {
+			size_t changed_len = strlen(changed);
+
+			if (!strcmp(changed, FSMONITOR_PATH_GLOBAL_INVALIDATE) ||
+			    fsmonitor_parse_hardlink_inode(
+				    changed, changed_len, NULL)) {
+				closing_delta = 0;
+				break;
+			}
+		}
+	}
+
 	while (p < end) {
 		size_t len = strlen(p);
 		uint32_t inode;
@@ -997,12 +1062,13 @@ static int apply_fsmonitor_paths(struct index_state *istate,
 
 		if (parsed < 0) {
 			fsmonitor_refresh_callback(
-				istate, (char *)FSMONITOR_PATH_GLOBAL_INVALIDATE);
+				istate, (char *)FSMONITOR_PATH_GLOBAL_INVALIDATE, 0);
 			count++;
 			goto done;
 		}
 		if (!parsed) {
-			fsmonitor_refresh_callback(istate, (char *)p);
+			fsmonitor_refresh_callback(
+				istate, (char *)p, closing_delta);
 			count++;
 		} else if (!hashmap_get_entry_from_hash(
 				   &inodes, memhash(&inode, sizeof(inode)), &inode,
@@ -1031,7 +1097,7 @@ static int apply_fsmonitor_paths(struct index_state *istate,
 				    &inodes, memhash(&inode, sizeof(inode)), &inode,
 				    struct fsmonitor_hardlink_inode, ent))
 				continue;
-			fsmonitor_refresh_callback(istate, ce->name);
+			fsmonitor_refresh_callback(istate, ce->name, 0);
 			matches++;
 			count++;
 		}
@@ -1453,20 +1519,21 @@ apply_results:
 		int count = 0;
 
 		if (fsm_mode == FSMONITOR_MODE_IPC) {
-			count = apply_fsmonitor_paths(istate, &query_result);
+			count = apply_fsmonitor_paths(istate, &query_result, 0);
 		} else {
 			buf = query_result.buf;
 			for (i = bol; i < query_result.len; i++) {
 				if (buf[i] != '\0')
 					continue;
 				if (i > bol) {
-					fsmonitor_refresh_callback(istate, buf + bol);
+					fsmonitor_refresh_callback(
+						istate, buf + bol, 0);
 					count++;
 				}
 				bol = i + 1;
 			}
 			if (bol < query_result.len) {
-				fsmonitor_refresh_callback(istate, buf + bol);
+				fsmonitor_refresh_callback(istate, buf + bol, 0);
 				count++;
 			}
 		}
@@ -1659,7 +1726,7 @@ enum fsmonitor_token_result fsmonitor_query_pending_token(
 		goto done;
 	}
 
-	count = apply_fsmonitor_paths(istate, &result.paths);
+	count = apply_fsmonitor_paths(istate, &result.paths, 1);
 	if (istate->untracked)
 		istate->untracked->use_fsmonitor = !!untracked_ready;
 	trace2_data_intmax("fsmonitor", istate->repo,

@@ -633,6 +633,28 @@ test_fsmonitor_full_proof () {
 	EOF
 }
 
+wait_for_fsmonitor_query_barrier () {
+	for attempt in $(test_seq 1 500)
+	do
+		if test "$(cat "$1" 2>/dev/null)" = ready
+		then
+			return 0
+		fi
+		kill -0 "$2" 2>/dev/null || return 1
+		sleep 0.01
+	done
+	return 1
+}
+
+cleanup_fsmonitor_query_barrier () {
+	if test -n "${fsmonitor_query_pid-}"
+	then
+		kill "$fsmonitor_query_pid" 2>/dev/null || :
+		wait "$fsmonitor_query_pid" 2>/dev/null || :
+		fsmonitor_query_pid=
+	fi
+}
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'bare status reuses a current tracked fsmonitor proof' '
 	test_when_finished "rm -rf builtin-tracked-clean" &&
@@ -3100,10 +3122,13 @@ test_expect_success HARDLINKS,!MINGW,!CYGWIN \
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'second closing-query change preserves verified sibling subtrees' '
-	test_when_finished "rm -rf second-query-changed" &&
-	test_create_repo second-query-changed &&
-	(
-		cd second-query-changed &&
+	test_when_finished \
+		"rm -rf second-query-changed-file second-query-changed-directory" &&
+	for event in file directory
+	do
+		test_create_repo "second-query-changed-$event" &&
+		(
+		cd "second-query-changed-$event" &&
 		sane_unset GIT_TEST_SPLIT_INDEX &&
 		mkdir cached &&
 		test_write_lines "*.ignored" >.gitignore &&
@@ -3144,8 +3169,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			-c core.trustctime=true -c core.checkStat=default \
 			status --porcelain=v2 >.git/expect &&
 
+		if test "$event" = directory
+		then
+			changed_path=cached/
+		else
+			changed_path=cached/tracked
+		fi &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
-		GIT_TEST_FSMONITOR_QUERY_PATH=cached/tracked \
+		GIT_TEST_FSMONITOR_QUERY_PATH="$changed_path" \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 		GIT_TRACE2_PERF="$PWD/.git/status.perf" \
 			git status --porcelain=v2 >.git/actual &&
@@ -3160,6 +3191,19 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/status.trace &&
 		test_trace2_data fsmonitor token_closure/apply_count 1 \
 			<.git/status.trace &&
+		if test "$event" = directory
+		then
+			test_trace2_data fsmonitor \
+				semantic/manifest-directory-reused 1 \
+				<.git/status.trace
+		else
+			! test_trace2_data fsmonitor \
+				semantic/manifest-directory-reused 1 \
+				<.git/status.trace
+		fi &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/status.trace >.git/manifest-scans &&
+		test_line_count = 1 .git/manifest-scans &&
 		test_trace2_data status \
 			fsmonitor_token/reused-semantic-subtrees 1 \
 			<.git/status.trace &&
@@ -3196,9 +3240,106 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/status.trace &&
 		test_trace2_data fsmonitor token_closure/accepted 1 \
 			<.git/status.trace &&
-		test_grep FSCF .git/index &&
-		test_grep FSUC .git/index
-	)
+		test_fsmonitor_full_proof .git/index paired
+		) || return 1
+	done
+'
+
+test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'directory closure rejects raced attributes and rechecks raced excludes' '
+	test_when_finished "rm -rf directory-race-attributes directory-race-ignore" &&
+	for mutation in attributes ignore
+	do
+		test_create_repo "directory-race-$mutation" &&
+		(
+			cd "directory-race-$mutation" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			fsmonitor_query_pid= &&
+			trap cleanup_fsmonitor_query_barrier 0 &&
+			mkdir cached &&
+			test_write_lines "*.ignored" >.gitignore &&
+			test_write_lines "*.ignored" >cached/.gitignore &&
+			printf "aaaa\n" >cached/tracked &&
+			test_write_lines ignored >cached/junk.ignored &&
+			for sibling in $(test_seq 1 8)
+			do
+				mkdir "sibling-$sibling" &&
+				test_write_lines "$sibling" \
+					>"sibling-$sibling/tracked" || return 1
+			done &&
+			git add .gitignore cached/.gitignore cached/tracked sibling-* &&
+			git commit -qm base &&
+			git config core.trustctime false &&
+			git config core.checkStat minimal &&
+			git config core.untrackedCache true &&
+			test_write_lines visible >sibling-1/visible &&
+			git -c core.fsmonitor=false status --porcelain=v2 \
+				>.git/prime &&
+			test_grep "^? sibling-1/visible$" .git/prime &&
+			test-tool chmtime =-60 cached/tracked &&
+			git update-index --refresh &&
+			mtime=$(test-tool chmtime --get cached/tracked) &&
+			printf "bbbb\n" >cached/tracked &&
+			test-tool chmtime =$mtime cached/tracked &&
+			git config core.fsmonitor true &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git update-index --fsmonitor &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git update-index --fsmonitor-valid cached/tracked &&
+			ready="$PWD/.git/provider.ready" &&
+			resume="$PWD/.git/provider.resume" &&
+			mkfifo "$resume" &&
+			{
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=cached/ \
+				GIT_TEST_FSMONITOR_QUERY_BARRIER_AT=3 \
+				GIT_TEST_FSMONITOR_QUERY_BARRIER_READY="$ready" \
+				GIT_TEST_FSMONITOR_QUERY_BARRIER_RESUME="$resume" \
+				GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+					git status --porcelain=v2 \
+						>.git/actual 2>.git/error &
+				fsmonitor_query_pid=$!
+			} &&
+			wait_for_fsmonitor_query_barrier \
+				"$ready" "$fsmonitor_query_pid" &&
+			if test "$mutation" = attributes
+			then
+				test_write_lines "tracked text eol=crlf" \
+					>cached/.gitattributes
+			else
+				test_write_lines "!junk.ignored" >cached/.gitignore
+			fi &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-c core.trustctime=true \
+					-c core.checkStat=default \
+					status --porcelain=v2 >.git/expect &&
+			printf x >"$resume" &&
+			wait "$fsmonitor_query_pid" &&
+			fsmonitor_query_pid= &&
+			test_cmp .git/expect .git/actual &&
+			test_grep "^1 \\.M .* cached/tracked$" .git/actual &&
+			test_grep "^? sibling-1/visible$" .git/actual &&
+			if test "$mutation" = attributes
+			then
+				test_grep "^? cached/\\.gitattributes$" \
+					.git/actual &&
+				test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 2 \
+					<.git/status.trace &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-directory-reused 1 \
+					<.git/status.trace
+			else
+				test_grep "^1 \\.M .* cached/\\.gitignore$" \
+					.git/actual &&
+				test_grep "^? cached/junk\\.ignored$" .git/actual
+			fi &&
+			test_trace2_data fsmonitor token_closure/accepted 1 \
+				<.git/status.trace
+		) || return 1
+	done
 '
 
 test_expect_success MACOS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
@@ -3336,6 +3477,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_line_count = 1 .git/actual &&
 		test_grep "^1 \.M .* cached/tracked$" .git/actual &&
 		test_trace2_data fsmonitor apply/global-invalidation 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 2 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-directory-reused 1 \
 			<.git/status.trace &&
 		test_trace2_data fsmonitor semantic/strong-invalidation 1 \
 			<.git/status.trace >.git/strong-invalidations &&
