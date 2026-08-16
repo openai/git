@@ -757,7 +757,7 @@ prepare_builtin_closure_repo () {
 }
 
 test_fsmonitor_full_proof () {
-	perl - "$1" "$2" <<-\EOF
+	perl - "$@" <<-\EOF
 	binmode STDIN;
 	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
 	binmode $input;
@@ -788,6 +788,8 @@ test_fsmonitor_full_proof () {
 		"pending:$suffix" : $tokens{"FSMN"};
 	die "mismatched untracked token\n" unless
 		$tokens{"FSUC"} eq $untracked;
+	die "unexpected provider token\n" if defined($ARGV[2]) &&
+		$tokens{"FSMN"} ne $ARGV[2];
 	EOF
 }
 
@@ -5472,6 +5474,156 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		! test_trace2_data read_directory opendir 0 \
 			<.git/reader.trace &&
 		! test_region index do_write_index .git/reader.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'am preserves complete worktree proofs at an unchanged provider token' '
+	test_when_finished "rm -rf am-provider-proof am-provider-proof-linked \
+				am-provider-proof.patch \
+				am-provider-proof.expected-tree" &&
+	test_create_repo am-provider-proof &&
+	(
+		cd am-provider-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines base >tracked &&
+		test_write_lines sibling >sibling &&
+		git add tracked sibling &&
+		git commit -qm base &&
+		test_write_lines patched >tracked &&
+		git add tracked &&
+		git commit -qm patched &&
+		git rev-parse HEAD^{tree} >../am-provider-proof.expected-tree &&
+		git format-patch -1 --stdout >../am-provider-proof.patch &&
+		git reset --hard -q HEAD^ &&
+		git worktree add --detach -q \
+			../am-provider-proof-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../am-provider-proof-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			test-tool chmtime -120 \
+				"$worktree/tracked" "$worktree/sibling" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" update-index --refresh &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index \
+					--force-write-index &&
+			test_fsmonitor_full_proof "$gitdir/index" paired \
+				"builtin:test:1" &&
+
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/am.trace" \
+				git -C "$worktree" am --quiet \
+					"$PWD/../am-provider-proof.patch" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired \
+				"builtin:test:1" &&
+			test_trace2_data fsmonitor config/coherent 1 \
+				<"$gitdir/am.trace" &&
+			git -C "$worktree" rev-parse HEAD^{tree} \
+				>"$gitdir/actual-tree" &&
+			test_cmp "$PWD/../am-provider-proof.expected-tree" \
+				"$gitdir/actual-tree" &&
+			test_write_lines patched >"$gitdir/expected-tracked" &&
+			test_cmp "$gitdir/expected-tracked" \
+				"$worktree/tracked" &&
+			cp "$gitdir/index" "$gitdir/index.snapshot" &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status --porcelain=v2 >"$gitdir/expected" &&
+			test_must_be_empty "$gitdir/expected" &&
+			test_cmp_bin "$gitdir/index.snapshot" "$gitdir/index" &&
+			for reader in first second
+			do
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$reader.trace" \
+					git --no-optional-locks -C "$worktree" \
+						status --porcelain=v2 \
+						>"$gitdir/$reader.actual" &&
+				test_cmp "$gitdir/expected" \
+					"$gitdir/$reader.actual" &&
+				test_cmp_bin "$gitdir/index.snapshot" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/$reader.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/$reader.trace" &&
+				test_region ! index do_write_index \
+					"$gitdir/$reader.trace" || return 1
+			done || return 1
+		done
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'am invalidates proofs when a patch changes attribute semantics' '
+	test_when_finished "rm -rf am-provider-attributes \
+				am-provider-attributes.patch" &&
+	test_create_repo am-provider-attributes &&
+	(
+		cd am-provider-attributes &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines base >tracked &&
+		test_write_lines sibling >sibling &&
+		test_write_lines "tracked text" >.gitattributes &&
+		git add tracked sibling .gitattributes &&
+		git commit -qm base &&
+		test_write_lines patched >tracked &&
+		test_write_lines "tracked -text" >.gitattributes &&
+		git add tracked .gitattributes &&
+		git commit -qm "change attribute semantics" &&
+		git rev-parse HEAD^{tree} >.git/expected-tree &&
+		git format-patch -1 --stdout >../am-provider-attributes.patch &&
+		git reset --hard -q HEAD^ &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test-tool chmtime -120 tracked sibling .gitattributes &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --refresh &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_fsmonitor_full_proof .git/index paired &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --force-write-index &&
+		test_fsmonitor_full_proof .git/index paired \
+			"builtin:test:1" &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/am.trace" \
+			git am --quiet ../am-provider-attributes.patch &&
+		! test_fsmonitor_full_proof .git/index paired &&
+		! test_trace2_data fsmonitor \
+			apply/untracked-replacement-preserved 1 \
+			<.git/am.trace &&
+		git rev-parse HEAD^{tree} >.git/actual-tree &&
+		test_cmp .git/expected-tree .git/actual-tree &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git --no-optional-locks status --porcelain=v2 \
+				>.git/actual &&
+		git --no-optional-locks \
+			-c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			-c core.trustctime=true \
+			-c core.checkStat=default \
+			status --porcelain=v2 >.git/expected &&
+		test_cmp .git/expected .git/actual
 	)
 '
 
