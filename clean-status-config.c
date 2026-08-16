@@ -224,6 +224,9 @@ static void flush_pending_filter(struct clean_status_config_digest *digest)
 
 	if (!pending)
 		return;
+	/* Remember command overrides omitted from the authenticated digest. */
+	if (pending->mask == CLEAN_STATUS_FILTER_COMPLETE)
+		digest->normalized_filter_disable = 1;
 	for (unsigned i = 0; i < pending->nr; i++) {
 		struct clean_status_pending_filter_entry *entry =
 			&pending->entries[i];

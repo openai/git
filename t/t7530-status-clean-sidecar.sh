@@ -291,6 +291,132 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
+	'inactive configured filters can issue authenticated clean sidecars' '
+	test_when_finished "stop_daemon sidecar-inactive-filter" &&
+	setup_repo sidecar-inactive-filter &&
+	git -C sidecar-inactive-filter config core.autocrlf false &&
+	git -C sidecar-inactive-filter config core.untrackedCache true &&
+	git -C sidecar-inactive-filter config filter.sidecar.clean cat &&
+	git -C sidecar-inactive-filter config filter.sidecar.smudge cat &&
+	git -C sidecar-inactive-filter config filter.sidecar.process \
+		"missing-inactive-filter-process" &&
+	git -C sidecar-inactive-filter config filter.sidecar.required true &&
+	prime_semantic_history sidecar-inactive-filter &&
+	cp sidecar-inactive-filter/.git/index inactive-filter.index &&
+
+	test_env GIT_TRACE2_EVENT="$PWD/inactive-filter.issue.trace" \
+		bulk_status -C sidecar-inactive-filter \
+			status --porcelain=v2 >inactive-filter.issue &&
+	test_must_be_empty inactive-filter.issue &&
+	test_cmp_bin inactive-filter.index \
+		sidecar-inactive-filter/.git/index &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<inactive-filter.issue.trace &&
+	test_path_is_file sidecar-inactive-filter/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-inactive-filter \
+		sidecar-inactive-filter inactive-filter.hit &&
+	assert_clean_sidecar_hit sidecar-inactive-filter \
+		sidecar-inactive-filter inactive-filter.hit-again &&
+
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/inactive-filter.config.trace" \
+		git -c filter.sidecar.required=false \
+			-C sidecar-inactive-filter status --porcelain=v2 \
+			>inactive-filter.config &&
+	test_must_be_empty inactive-filter.config &&
+	test_trace2_data status clean-proof/miss fast-config-changed \
+		<inactive-filter.config.trace &&
+
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/inactive-filter.disabled-read.trace" \
+		git -c filter.sidecar.clean= \
+			-c filter.sidecar.smudge= \
+			-c filter.sidecar.process= \
+			-c filter.sidecar.required=false \
+			-C sidecar-inactive-filter status --porcelain=v2 \
+			>inactive-filter.disabled-read &&
+	test_must_be_empty inactive-filter.disabled-read &&
+	test_trace2_data status clean-proof/miss fast-repository-shape \
+		<inactive-filter.disabled-read.trace &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" \
+		inactive-filter.disabled-read.trace &&
+
+	rm sidecar-inactive-filter/.git/index.csts &&
+	test_env GIT_TRACE2_EVENT="$PWD/inactive-filter.disabled-issue.trace" \
+		bulk_status -c filter.sidecar.clean= \
+			-c filter.sidecar.smudge= \
+			-c filter.sidecar.process= \
+			-c filter.sidecar.required=false \
+			-C sidecar-inactive-filter status --porcelain=v2 \
+			>inactive-filter.disabled-issue &&
+	test_must_be_empty inactive-filter.disabled-issue &&
+	test_path_is_missing sidecar-inactive-filter/.git/index.csts &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" \
+		inactive-filter.disabled-issue.trace &&
+
+	bulk_status -C sidecar-inactive-filter \
+		status --porcelain=v2 >inactive-filter.reissue &&
+	test_must_be_empty inactive-filter.reissue &&
+	test_path_is_file sidecar-inactive-filter/.git/index.csts &&
+	test_write_lines "tracked -text" \
+		>sidecar-inactive-filter/.git/info/attributes &&
+	assert_fallback_matches_oracle sidecar-inactive-filter \
+		inactive-filter.external-attrs.trace &&
+	test_trace2_data status clean-proof/miss \
+		fast-repository-unavailable \
+		<inactive-filter.external-attrs.trace
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'active and command-disabled filters cannot reuse clean sidecars' '
+	test_when_finished "stop_daemon sidecar-active-filter" &&
+	setup_repo sidecar-active-filter &&
+	git -C sidecar-active-filter config core.autocrlf false &&
+	git -C sidecar-active-filter config core.untrackedCache true &&
+	git -C sidecar-active-filter config filter.sidecar.clean \
+		"sed s/base/converted/" &&
+	git -C sidecar-active-filter config filter.sidecar.required true &&
+	prime_semantic_history sidecar-active-filter &&
+	bulk_status -C sidecar-active-filter \
+		status --porcelain=v2 >active-filter.issue &&
+	test_must_be_empty active-filter.issue &&
+	test_path_is_file sidecar-active-filter/.git/index.csts &&
+
+	test_write_lines "tracked filter=sidecar" \
+		>sidecar-active-filter/.gitattributes &&
+	assert_fallback_matches_oracle sidecar-active-filter \
+		active-filter.activation.trace &&
+	test_grep "^1 \\.M .* tracked$" actual &&
+	test_grep "^? \\.gitattributes$" actual &&
+
+	git -c filter.sidecar.clean= \
+		-c filter.sidecar.smudge= \
+		-c filter.sidecar.process= \
+		-c filter.sidecar.required=false \
+		-C sidecar-active-filter add .gitattributes &&
+	git -c filter.sidecar.clean= \
+		-c filter.sidecar.smudge= \
+		-c filter.sidecar.process= \
+		-c filter.sidecar.required=false \
+		-C sidecar-active-filter commit -qm "activate disabled filter" &&
+	rm -f sidecar-active-filter/.git/index.csts &&
+	test_env GIT_TRACE2_EVENT="$PWD/active-filter.disabled.trace" \
+		bulk_status -c filter.sidecar.clean= \
+			-c filter.sidecar.smudge= \
+			-c filter.sidecar.process= \
+			-c filter.sidecar.required=false \
+			-C sidecar-active-filter status --porcelain=v2 \
+			>active-filter.disabled &&
+	test_must_be_empty active-filter.disabled &&
+	test_path_is_missing sidecar-active-filter/.git/index.csts &&
+	test_grep ! "\"key\":\"clean-proof/sidecar\"" \
+		active-filter.disabled.trace &&
+	assert_fallback_matches_oracle sidecar-active-filter \
+		active-filter.restored.trace &&
+	test_grep "^1 \\.M .* tracked$" actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
 	'ordinary clean status installs its first missing sidecar' '
 	test_when_finished "stop_daemon sidecar-plain-first" &&
 	setup_repo sidecar-plain-first &&
