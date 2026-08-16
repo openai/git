@@ -1137,7 +1137,7 @@ static void wt_status_prepare_bulk_recovery(struct wt_status *s)
 	}
 
 	/*
-	 * The index read discarded an unauthenticated directory tree. A
+	 * The index read discarded an unauthenticated legacy cache. A
 	 * read-only caller cannot publish its replacement, so let the
 	 * bulk scan supply both tracked and complete untracked results.
 	 * Explicit configuration still takes precedence over this request.
