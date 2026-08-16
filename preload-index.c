@@ -322,11 +322,11 @@ static int preload_bulk_config_enabled(struct index_state *index)
 	int control;
 
 	control = git_env_bool("GIT_TEST_PRELOAD_INDEX_BULK", -1);
-	if (control < 0)
-		repo_config_get_bool(index->repo, "core.preloadindexbulk",
-				     &enabled);
-	else
-		enabled = control;
+	if (control >= 0)
+		return control;
+	if (repo_config_get_bool(index->repo, "core.preloadindexbulk",
+				 &enabled))
+		enabled = index->preload_bulk_recovery_requested;
 	return enabled;
 }
 
