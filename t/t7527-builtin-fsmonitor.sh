@@ -6855,6 +6855,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/prime.trace &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index &&
+		test_path_is_missing .git/index.csts &&
+		cp .git/index .git/preload.index &&
 
 		for label in bulk preload both bulk-false preload-false
 		do
@@ -6865,10 +6867,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			bulk-false) set -- -c core.preloadIndexBulk=false ;;
 			preload-false) set -- -c core.preloadIndex=false ;;
 			esac &&
+			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
 			GIT_TRACE2_EVENT="$PWD/.git/$label.trace" \
 				git "$@" status --porcelain=v2 >.git/$label &&
 			test_must_be_empty .git/$label &&
+			test_cmp_bin .git/preload.index .git/index &&
+			test_path_is_missing .git/index.csts &&
 			test_trace2_data fsmonitor config/coherent 1 \
 				<.git/$label.trace &&
 			! test_trace2_data fsmonitor semantic/initial-mismatch 1 \
@@ -6879,10 +6884,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				<.git/$label.trace &&
 			! test_trace2_data index refresh/sum_lstat \
 				"[1-9][0-9]*" <.git/$label.trace &&
+			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
 			GIT_TRACE2_EVENT="$PWD/.git/$label-plain.trace" \
 				git status --porcelain=v2 >.git/$label-plain &&
 			test_must_be_empty .git/$label-plain &&
+			test_cmp_bin .git/preload.index .git/index &&
+			test_path_is_missing .git/index.csts &&
 			test_trace2_data fsmonitor config/coherent 1 \
 				<.git/$label-plain.trace &&
 			! have_t2_data_event fsmonitor semantic/manifest-scan-count \
