@@ -1015,7 +1015,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
-	'discarded legacy caches reuse an explicit bulk recovery pass' '
+	'discarded legacy caches select one bulk recovery pass' '
 	test_when_finished "rm -rf legacy-discard-bulk" &&
 	if test_have_prereq STATUS_BULK_PRELOAD
 	then
@@ -1122,26 +1122,43 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		test_cmp .git/paired .git/expect &&
 		test_cmp_bin .git/legacy.index .git/index &&
 
-		GIT_OPTIONAL_LOCKS=0 \
-		GIT_TEST_PRELOAD_INDEX=1 \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
-		GIT_TRACE2_EVENT="$PWD/.git/disabled.trace" \
-			git -c core.preloadIndexBulk=false \
-				status --porcelain=v2 >.git/disabled &&
-		test_cmp .git/expect .git/disabled &&
-		test_cmp_bin .git/legacy.index .git/index &&
-		test_trace2_data fsm_client query/trivial-response 1 \
-			<.git/disabled.trace &&
-		test_trace2_data fsmonitor untracked/legacy-preserved 1 \
-			<.git/disabled.trace &&
-		test_trace2_data fsmonitor untracked/legacy-discarded 1 \
-			<.git/disabled.trace &&
-		! test_trace2_data status untracked/bulk-recovery 1 \
-			<.git/disabled.trace &&
-		! test_trace2_data index preload/bulk_untracked_complete 1 \
-			<.git/disabled.trace &&
-		test_region dir read_directory .git/disabled.trace &&
-		! test_region index do_write_index .git/disabled.trace &&
+		for disabled in bulk environment preload
+		do
+			case "$disabled" in
+			bulk)
+				set -- git -c core.preloadIndexBulk=false
+				;;
+			environment)
+				set -- test_env GIT_TEST_PRELOAD_INDEX_BULK=0 \
+					git -c core.preloadIndexBulk=true
+				;;
+			preload)
+				set -- git -c core.preloadIndex=false \
+					-c core.preloadIndexBulk=true
+				;;
+			esac &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$disabled.trace" \
+				"$@" status --porcelain=v2 \
+				>".git/$disabled.actual" &&
+			test_cmp .git/expect ".git/$disabled.actual" &&
+			test_cmp_bin .git/legacy.index .git/index &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<".git/$disabled.trace" &&
+			test_trace2_data fsmonitor untracked/legacy-preserved 1 \
+				<".git/$disabled.trace" &&
+			test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+				<".git/$disabled.trace" &&
+			! test_trace2_data status untracked/bulk-recovery 1 \
+				<".git/$disabled.trace" &&
+			! test_trace2_data index preload/bulk_untracked_complete 1 \
+				<".git/$disabled.trace" &&
+			test_region dir read_directory ".git/$disabled.trace" &&
+			! test_region index do_write_index \
+				".git/$disabled.trace" || return 1
+		done &&
 
 		cp .git/paired.index .git/index &&
 		GIT_OPTIONAL_LOCKS=0 \
@@ -1159,14 +1176,19 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 			<.git/paired.trace &&
 
 		cp .git/legacy.index .git/index &&
-		for run in first second
+		for run in first second auto
 		do
+			if test "$run" = auto
+			then
+				set -- git
+			else
+				set -- git -c core.preloadIndexBulk=true
+			fi &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_PRELOAD_INDEX=1 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
 			GIT_TRACE2_EVENT="$PWD/.git/$run.trace" \
-				git -c core.preloadIndexBulk=true \
-					status --porcelain=v2 \
+				"$@" status --porcelain=v2 \
 					>".git/$run.actual" &&
 			test_cmp .git/expect ".git/$run.actual" &&
 			test_cmp_bin .git/legacy.index .git/index &&

@@ -199,6 +199,8 @@ struct index_state {
 		 fsmonitor_legacy_untracked_fallback : 1,
 		 fsmonitor_pending_token_from_provider : 1,
 		 preload_untracked_complete : 1,
+		 /* Read-only status request; never serialized. */
+		 preload_bulk_recovery_requested : 1,
 		 preload_bulk_provider_pending : 1,
 		 preload_bulk_excludes_digest_pending : 1,
 		 preload_bulk_excludes_digest_valid : 1;
