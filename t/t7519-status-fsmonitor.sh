@@ -1062,6 +1062,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		local $/;
 		my $index = <STDIN>;
 		my $algorithm = $ARGV[0];
+		my $empty = $ARGV[1] && $ARGV[1] =~ /^(current-)?empty$/;
+		my $current = $ARGV[1] && $ARGV[1] eq "current-empty";
 		my $rawsz = $algorithm eq "sha256" ? 32 : 20;
 		my $body = substr($index, 0, -$rawsz);
 		my $offset = index($body, "UNTR");
@@ -1089,14 +1091,21 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		my $suffix = ", cache version 2\0";
 		die "unexpected current UNTR identity\n"
 			unless substr($ident, -length($suffix)) eq $suffix;
-		substr($ident, -length($suffix), length($suffix), "\0");
+		substr($ident, -length($suffix), length($suffix), "\0")
+			unless $current;
 		my $length = length($ident);
 		my @bytes = ($length & 127);
 		while ($length >>= 7) {
 			unshift @bytes, 128 | ((--$length) & 127);
 		}
-		my $replacement = pack("C*", @bytes) . $ident .
-			substr($payload, $cursor + $ident_length);
+		my $tail = substr($payload, $cursor + $ident_length);
+		if ($empty) {
+			my $exclude = index($tail, "\0", 76 + 2 * $rawsz);
+			die "missing UNTR per-directory exclude name\n"
+				if $exclude < 0;
+			$tail = substr($tail, 0, $exclude + 1) . "\0";
+		}
+		my $replacement = pack("C*", @bytes) . $ident . $tail;
 		substr($body, $offset, 8 + $size,
 			"UNTR" . pack("N", length($replacement)) . $replacement);
 		my $fsuc = index($body, "FSUC");
@@ -1105,6 +1114,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		die "invalid FSUC extension size\n"
 			if $fsuc + 8 + $fsuc_size > length($body);
 		substr($body, $fsuc, 8 + $fsuc_size, "");
+		if ($empty) {
+			my $fscf = index($body, "FSCF");
+			die "missing FSCF extension\n" if $fscf < 0;
+			my $fscf_size = unpack("N", substr($body, $fscf + 4, 4));
+			die "invalid FSCF extension size\n"
+				if $fscf + 8 + $fscf_size > length($body);
+			substr($body, $fscf, 8 + $fscf_size, "");
+		}
 		print $body,
 			$algorithm eq "sha256" ? sha256($body) : sha1($body);
 		EOF
@@ -1223,6 +1240,87 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 					".git/$run.trace"
 			fi || return 1
 		done &&
+
+		perl .git/restore-legacy-untracked.pl "$(test_oid algo)" \
+			current-empty <.git/paired.index >.git/current.index &&
+		cp .git/current.index .git/index &&
+		test_grep FSMN .git/index &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/current.trace" \
+			git status --porcelain=v2 >.git/current.actual &&
+		test_cmp .git/expect .git/current.actual &&
+		test_cmp_bin .git/current.index .git/index &&
+		test_path_is_missing .git/index.csts &&
+		find .git -maxdepth 1 -type f \
+			\( -name "index.csh1.*" -o -name "index.cswi.*" \) \
+			>.git/current.checkpoints &&
+		test_must_be_empty .git/current.checkpoints &&
+		! test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+			<.git/current.trace &&
+		! test_trace2_data status untracked/bulk-recovery 1 \
+			<.git/current.trace &&
+		! test_region index do_write_index .git/current.trace &&
+		test_region dir read_directory .git/current.trace &&
+
+		perl .git/restore-legacy-untracked.pl "$(test_oid algo)" \
+			empty <.git/paired.index >.git/empty.index &&
+		cp .git/empty.index .git/index &&
+		test_grep FSMN .git/index &&
+		test_grep UNTR .git/index &&
+		test_grep ! FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+		for run in empty-explicit empty-auto
+		do
+			if test "$run" = empty-auto
+			then
+				set -- git
+			else
+				set -- git -c core.preloadIndexBulk=true
+			fi &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$run.trace" \
+				"$@" status --porcelain=v2 \
+					>".git/$run.actual" &&
+			test_cmp .git/expect ".git/$run.actual" &&
+			test_cmp_bin .git/empty.index .git/index &&
+			test_path_is_missing .git/index.csts &&
+			find .git -maxdepth 1 -type f \
+				\( -name "index.csh1.*" \
+					-o -name "index.cswi.*" \) \
+				>".git/$run.checkpoints" &&
+			test_must_be_empty ".git/$run.checkpoints" &&
+			test_trace2_data fsmonitor untracked/legacy-preserved 1 \
+				<".git/$run.trace" &&
+			test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+				<".git/$run.trace" &&
+			! test_trace2_data fsm_client query/trivial-response 1 \
+				<".git/$run.trace" &&
+			! test_region index do_write_index ".git/$run.trace" &&
+			if test "$bulk_available" = yes
+			then
+				test_trace2_data status untracked/bulk-recovery 1 \
+					<".git/$run.trace" &&
+				test_trace2_data index \
+					preload/bulk_untracked_complete 1 \
+					<".git/$run.trace" &&
+				! test_region dir read_directory \
+					".git/$run.trace"
+			else
+				! test_trace2_data index \
+					preload/bulk_untracked_complete 1 \
+					<".git/$run.trace" &&
+				test_region dir read_directory \
+					".git/$run.trace"
+			fi || return 1
+		done &&
+		cp .git/legacy.index .git/index &&
 
 		GIT_TEST_PRELOAD_INDEX=1 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
