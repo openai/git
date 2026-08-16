@@ -61,6 +61,26 @@ test_lazy_prereq HARDLINKS '
 	ln hardlink-a hardlink-b
 '
 
+test_lazy_prereq STATUS_BULK_PRELOAD '
+	test_create_repo status-bulk-preload-prereq &&
+	(
+		cd status-bulk-preload-prereq &&
+		test_write_lines tracked >tracked &&
+		test_write_lines sibling >sibling &&
+		git add tracked sibling &&
+		git commit -qm base &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/bulk.trace" \
+			git -c core.fsmonitor=false \
+				-c core.preloadIndexBulk=true \
+				status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data index preload/bulk_result complete \
+			<.git/bulk.trace
+	)
+'
+
 test_expect_success 'FSMN parser fails closed' '
 	test-tool read-cache --test-fsmn-parser
 '
@@ -991,6 +1011,209 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			<.git/reset-add.trace &&
 		test_grep FSMN .git/index &&
 		test_grep FSUC .git/index
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'discarded legacy caches reuse an explicit bulk recovery pass' '
+	test_when_finished "rm -rf legacy-discard-bulk" &&
+	if test_have_prereq STATUS_BULK_PRELOAD
+	then
+		bulk_available=yes
+	else
+		bulk_available=no
+	fi &&
+	test_create_repo legacy-discard-bulk &&
+	(
+		cd legacy-discard-bulk &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p cached/deep sibling/empty &&
+		test_write_lines "*.ignored" >.gitignore &&
+		test_write_lines tracked >cached/deep/tracked &&
+		test_write_lines sibling >sibling/empty/tracked &&
+		test_write_lines hidden >cached/deep/hidden.ignored &&
+		test_write_lines visible >cached/deep/visible &&
+		git add .gitignore cached/deep/tracked sibling/empty/tracked &&
+		git commit -qm base &&
+		test-tool chmtime -120 .gitignore cached/deep/tracked \
+			sibling/empty/tracked &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/paired &&
+		test_grep "^? cached/deep/visible$" .git/paired &&
+		test_grep ! hidden.ignored .git/paired &&
+		test_fsmonitor_full_proof .git/index paired &&
+		test_path_is_missing .git/index.csts &&
+		find .git -maxdepth 1 -type f \
+			\( -name "index.csh1.*" -o -name "index.cswi.*" \) \
+			>.git/checkpoints &&
+		test_must_be_empty .git/checkpoints &&
+		cp .git/index .git/paired.index &&
+
+		cat >.git/restore-legacy-untracked.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $algorithm = $ARGV[0];
+		my $rawsz = $algorithm eq "sha256" ? 32 : 20;
+		my $body = substr($index, 0, -$rawsz);
+		my $offset = index($body, "UNTR");
+		die "missing UNTR extension\n" if $offset < 0;
+		my $size = unpack("N", substr($body, $offset + 4, 4));
+		die "invalid UNTR extension size\n"
+			if $offset + 8 + $size > length($body);
+		my $payload = substr($body, $offset + 8, $size);
+		die "missing populated UNTR directory root\n"
+			unless index($payload, "cached\0") >= 0 &&
+				index($payload, "visible\0") >= 0;
+		my $cursor = 0;
+		my $byte = ord(substr($payload, $cursor++, 1));
+		my $ident_length = $byte & 127;
+		while ($byte & 128) {
+			die "truncated UNTR identity length\n"
+				if $cursor >= length($payload);
+			$ident_length++;
+			$byte = ord(substr($payload, $cursor++, 1));
+			$ident_length = ($ident_length << 7) + ($byte & 127);
+		}
+		die "truncated UNTR identity\n"
+			if $cursor + $ident_length > length($payload);
+		my $ident = substr($payload, $cursor, $ident_length);
+		my $suffix = ", cache version 2\0";
+		die "unexpected current UNTR identity\n"
+			unless substr($ident, -length($suffix)) eq $suffix;
+		substr($ident, -length($suffix), length($suffix), "\0");
+		my $length = length($ident);
+		my @bytes = ($length & 127);
+		while ($length >>= 7) {
+			unshift @bytes, 128 | ((--$length) & 127);
+		}
+		my $replacement = pack("C*", @bytes) . $ident .
+			substr($payload, $cursor + $ident_length);
+		substr($body, $offset, 8 + $size,
+			"UNTR" . pack("N", length($replacement)) . $replacement);
+		my $fsuc = index($body, "FSUC");
+		die "missing paired FSUC extension\n" if $fsuc < 0;
+		my $fsuc_size = unpack("N", substr($body, $fsuc + 4, 4));
+		die "invalid FSUC extension size\n"
+			if $fsuc + 8 + $fsuc_size > length($body);
+		substr($body, $fsuc, 8 + $fsuc_size, "");
+		print $body,
+			$algorithm eq "sha256" ? sha256($body) : sha1($body);
+		EOF
+		perl .git/restore-legacy-untracked.pl "$(test_oid algo)" \
+			<.git/paired.index >.git/legacy.index &&
+		cp .git/legacy.index .git/index &&
+		test_grep FSMN .git/index &&
+		test_grep UNTR .git/index &&
+		test_grep FSCF .git/index &&
+		test_grep ! FSUC .git/index &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				status --porcelain=v2 >.git/expect &&
+		test_cmp .git/paired .git/expect &&
+		test_cmp_bin .git/legacy.index .git/index &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/disabled.trace" \
+			git -c core.preloadIndexBulk=false \
+				status --porcelain=v2 >.git/disabled &&
+		test_cmp .git/expect .git/disabled &&
+		test_cmp_bin .git/legacy.index .git/index &&
+		test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/disabled.trace &&
+		test_trace2_data fsmonitor untracked/legacy-preserved 1 \
+			<.git/disabled.trace &&
+		test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+			<.git/disabled.trace &&
+		! test_trace2_data status untracked/bulk-recovery 1 \
+			<.git/disabled.trace &&
+		! test_trace2_data index preload/bulk_untracked_complete 1 \
+			<.git/disabled.trace &&
+		test_region dir read_directory .git/disabled.trace &&
+		! test_region index do_write_index .git/disabled.trace &&
+
+		cp .git/paired.index .git/index &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/paired.trace" \
+			git -c core.preloadIndexBulk=true \
+				status --porcelain=v2 >.git/paired.actual &&
+		test_cmp .git/expect .git/paired.actual &&
+		test_cmp_bin .git/paired.index .git/index &&
+		test_fsmonitor_full_proof .git/index paired &&
+		! test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+			<.git/paired.trace &&
+		! test_trace2_data status untracked/bulk-recovery 1 \
+			<.git/paired.trace &&
+
+		cp .git/legacy.index .git/index &&
+		for run in first second
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$run.trace" \
+				git -c core.preloadIndexBulk=true \
+					status --porcelain=v2 \
+					>".git/$run.actual" &&
+			test_cmp .git/expect ".git/$run.actual" &&
+			test_cmp_bin .git/legacy.index .git/index &&
+			test_path_is_missing .git/index.csts &&
+			find .git -maxdepth 1 -type f \
+				\( -name "index.csh1.*" \
+					-o -name "index.cswi.*" \) \
+				>".git/$run.checkpoints" &&
+			test_must_be_empty ".git/$run.checkpoints" &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<".git/$run.trace" &&
+			test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+				<".git/$run.trace" &&
+			! test_region index do_write_index ".git/$run.trace" &&
+			if test "$bulk_available" = yes
+			then
+				test_trace2_data status untracked/bulk-recovery 1 \
+					<".git/$run.trace" &&
+				test_trace2_data index \
+					preload/bulk_untracked_complete 1 \
+					<".git/$run.trace" &&
+				test_trace2_data index \
+					preload/bulk_provider_applied \
+					"[1-9][0-9]*" <".git/$run.trace" &&
+				! test_region dir read_directory \
+					".git/$run.trace"
+			else
+				! test_trace2_data index \
+					preload/bulk_untracked_complete 1 \
+					<".git/$run.trace" &&
+				test_region dir read_directory \
+					".git/$run.trace"
+			fi || return 1
+		done &&
+
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/writable.trace" \
+			git -c core.preloadIndexBulk=true \
+				status --porcelain=v2 >.git/writable &&
+		test_cmp .git/expect .git/writable &&
+		test_trace2_data fsmonitor untracked/legacy-discarded 1 \
+			<.git/writable.trace &&
+		! test_trace2_data status untracked/bulk-recovery 1 \
+			<.git/writable.trace &&
+		test_region index do_write_index .git/writable.trace &&
+		test_fsmonitor_full_proof .git/index paired
 	)
 '
 
