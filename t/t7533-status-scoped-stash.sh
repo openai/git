@@ -577,8 +577,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		GIT_CONFIG_PARAMETERS="${SQ}core.fsmonitor=false${SQ}" \
 			test-tool dump-untracked-cache >.git/dirty-cache &&
 		test_grep "^/nested/ .* recurse$" .git/dirty-cache &&
-		! test_grep "^/nested/ .* valid" .git/dirty-cache &&
-		! test_grep "^existing-untracked$" .git/dirty-cache &&
+		test_grep ! "^/nested/ .* valid" .git/dirty-cache &&
+		test_grep ! "^existing-untracked$" .git/dirty-cache &&
 		cp .git/index .git/before-reader &&
 		scoped_stash_control_git --no-optional-locks \
 			status --porcelain=v2 >.git/control-before &&
@@ -723,8 +723,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		GIT_CONFIG_PARAMETERS="${SQ}core.fsmonitor=false${SQ}" \
 			test-tool dump-untracked-cache >.git/serialized-cache &&
 		test_grep "^/nested/ .* recurse$" .git/serialized-cache &&
-		! test_grep "^/nested/ .* valid" .git/serialized-cache &&
-		! test_grep "^existing-untracked$" \
+		test_grep ! "^/nested/ .* valid" .git/serialized-cache &&
+		test_grep ! "^existing-untracked$" \
 			.git/serialized-cache &&
 		cp .git/index .git/after-apply &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
