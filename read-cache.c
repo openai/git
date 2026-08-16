@@ -33,6 +33,7 @@
 #include "path.h"
 #include "preload-index.h"
 #include "read-cache.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "resolve-undo.h"
 #include "revision.h"
@@ -143,12 +144,42 @@ static void set_index_entry(struct index_state *istate, int nr, struct cache_ent
 	add_name_hash(istate, ce);
 }
 
-static void replace_index_entry(struct index_state *istate, int nr, struct cache_entry *ce)
+static void replace_index_entry(struct index_state *istate, int nr,
+				struct cache_entry *ce, int options)
 {
 	struct cache_entry *old = istate->cache[nr];
+	int preserve_paired_history =
+		(options & ADD_CACHE_PRESERVE_CLEAN_HISTORY) &&
+		fstat_is_reliable() && istate == istate->repo->index &&
+		!alternate_index_output && !getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(DB_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		!istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		!repo_config_values(istate->repo)->apply_sparse_checkout &&
+		istate->repo->config_values_private_.trust_ctime &&
+		istate->repo->config_values_private_.check_stat &&
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		!repo_has_replace_refs_uncached(istate->repo) &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_untracked_valid &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		istate->fsmonitor_last_update &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token) &&
+		clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		clean_status_revalidated_token_matches(istate);
+	/* Keep invalid nodes invalid; write_one_dir() expires pending events. */
 	int preserve_untracked = istate->untracked &&
-		istate->untracked->fsmonitor_revalidation &&
-		istate->untracked->root && istate->untracked->root->valid &&
+		istate->untracked->root &&
+		((istate->untracked->fsmonitor_revalidation &&
+		  istate->untracked->root->valid) ||
+		 (preserve_paired_history &&
+		  istate->untracked->use_fsmonitor)) &&
 		S_ISREG(old->ce_mode) && S_ISREG(ce->ce_mode) &&
 		clean_status_index_entry_is_semantically_safe(istate, old, ce);
 
@@ -162,6 +193,9 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
 		ce->ce_flags &= ~CE_FSMONITOR_VALID;
 	else
 		mark_fsmonitor_invalid(istate, ce);
+	if (preserve_paired_history && preserve_untracked)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/untracked-replacement-preserved", 1);
 	istate->cache_changed |= CE_ENTRY_CHANGED;
 }
 
@@ -236,7 +270,7 @@ void refresh_index_entry_stat(struct index_state *istate, int nr,
 			      struct stat *st)
 {
 	replace_index_entry(istate, nr, make_refreshed_cache_entry(
-		istate, istate->cache[nr], st, 1));
+		istate, istate->cache[nr], st, 1), 0);
 }
 
 static unsigned int st_mode_from_ce(const struct cache_entry *ce)
@@ -1351,7 +1385,7 @@ static int add_index_entry_with_check(struct index_state *istate, struct cache_e
 	/* existing match? Just replace it. */
 	if (pos >= 0) {
 		if (!new_only)
-			replace_index_entry(istate, pos, ce);
+			replace_index_entry(istate, pos, ce, option);
 		return 0;
 	}
 	pos = -pos-1;
@@ -1708,7 +1742,7 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 				 clean_status_fsmonitor_semantic_baseline_pending(
 					 istate));
 
-			replace_index_entry(istate, i, new_entry);
+			replace_index_entry(istate, i, new_entry, 0);
 			if (fsmonitor_valid)
 				mark_fsmonitor_valid(istate,
 						     istate->cache[i]);
