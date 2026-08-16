@@ -263,6 +263,7 @@ void test_exclude_source_proof__honors_nofollow(void)
 	char *parent = make_path("parent");
 	char *source = make_path("parent/source");
 	char *target = make_path("parent/target");
+	char *replacement = make_path("parent/replacement");
 	int fd;
 
 	cl_must_pass(mkdir(parent, 0700));
@@ -275,12 +276,54 @@ void test_exclude_source_proof__honors_nofollow(void)
 	cl_must_pass(fd);
 	cl_must_pass(close(fd));
 	exclude_source_capture_release(capture);
+	record_file(proof, source);
+	cl_assert(exclude_source_proof_validate(proof));
+	write_file_buf(replacement, "content", 7);
+	cl_must_pass(unlink(source));
+	cl_must_pass(symlink("replacement", source));
+	cl_assert(exclude_source_proof_validate(proof));
 
 	capture = exclude_source_capture_begin(proof, source, 1);
 	cl_assert(capture != NULL);
 	fd = exclude_source_capture_open(capture);
 	cl_assert(fd < 0 && errno == ELOOP);
 	exclude_source_capture_release(capture);
+	write_file_buf(replacement, "changed", 7);
+	cl_assert(!exclude_source_proof_validate(proof));
+
+	exclude_source_proof_release(proof);
+	free(replacement);
+	free(target);
+	free(source);
+	free(parent);
+}
+
+void test_exclude_source_proof__rejects_nofollow_symlink_replacement(void)
+{
+	struct exclude_source_proof *proof = new_proof();
+	struct exclude_source_capture *capture;
+	char *parent = make_path("parent");
+	char *source = make_path("parent/source");
+	char *target = make_path("parent/target");
+	struct stat st;
+	int fd;
+
+	cl_must_pass(mkdir(parent, 0700));
+	write_file_buf(source, "content", 7);
+	write_file_buf(target, "content", 7);
+	capture = exclude_source_capture_begin(proof, source, 1);
+	cl_assert(capture != NULL);
+	fd = exclude_source_capture_open(capture);
+	cl_must_pass(fd);
+	cl_must_pass(fstat(fd, &st));
+	exclude_source_capture_record(capture, fd, &st, "content", 7);
+	exclude_source_capture_release(capture);
+	cl_must_pass(close(fd));
+	cl_assert(exclude_source_proof_validate(proof));
+
+	cl_must_pass(unlink(source));
+	cl_must_pass(symlink("target", source));
+	cl_assert(!exclude_source_proof_validate(proof));
 
 	exclude_source_proof_release(proof);
 	free(target);
@@ -450,6 +493,7 @@ SKIP_TEST(test_exclude_source_proof__digest_deduplicates_and_ignores_identity)
 SKIP_TEST(test_exclude_source_proof__rejects_open_failure)
 SKIP_TEST(test_exclude_source_proof__fails_closed_without_parent_opener)
 SKIP_TEST(test_exclude_source_proof__honors_nofollow)
+SKIP_TEST(test_exclude_source_proof__rejects_nofollow_symlink_replacement)
 SKIP_TEST(test_exclude_source_proof__opens_directory_sources)
 SKIP_TEST(test_exclude_source_proof__accepts_same_content_parent_replacement)
 SKIP_TEST(test_exclude_source_proof__reresolves_absent_source_parent)
