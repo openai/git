@@ -1646,6 +1646,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 					>"$gitdir/canonical-tree" &&
 			test_region index do_write_index \
 				"$gitdir/canonical-tree.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/canonical-tree.trace" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/canonical-tree.trace" &&
 			perl "$PWD/.git/check-write-tree-proof.pl" \
@@ -1681,6 +1684,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			git -C "$worktree" ls-tree HEAD hook-generated \
 				>"$gitdir/hook-all-entry" &&
 			test_grep "hook-generated$" "$gitdir/hook-all-entry" &&
+			! test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/hook-all.trace" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/hook-all.trace" &&
 			perl "$PWD/.git/check-write-tree-proof.pl" \
@@ -1701,27 +1707,210 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			cp "$gitdir/index" "$gitdir/readonly.index" &&
 			cp "$gitdir/index" "$gitdir/snapshot.index" &&
 			test_write_lines snapshot >"$worktree/snapshot-new" &&
-			printf "%s\n" snapshot-new |
+			printf "%s\0" snapshot-new |
+			GIT_OPTIONAL_LOCKS=0 \
 			GIT_INDEX_FILE="$gitdir/snapshot.index" \
+			GIT_LITERAL_PATHSPECS=1 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			GIT_TRACE2_EVENT="$gitdir/snapshot-add.trace" \
+			GIT_TRACE2_EVENT="$gitdir/snapshot-prime.trace" \
 				git -C "$worktree" add --sparse \
-					--pathspec-from-file=- &&
+					--pathspec-from-file=- \
+					--pathspec-file-nul &&
 			perl "$PWD/.git/check-write-tree-unbound.pl" \
 				<"$gitdir/snapshot.index" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			if test_have_prereq HARDLINKS &&
+			   test_have_prereq SYMLINKS
+			then
+				cp "$gitdir/snapshot.index" "$gitdir/index" &&
+				ln "$gitdir/index" "$gitdir/physical-hardlink" &&
+				ln -s "$gitdir/index" "$gitdir/physical-symlink" &&
+				cp "$gitdir/index" "$gitdir/index.lock" &&
+				for alias in index physical-hardlink \
+					physical-symlink index.lock
+				do
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_INDEX_FILE="$gitdir/$alias" \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/alias-$alias.trace" \
+						git -C "$worktree" status \
+							--porcelain=v2 \
+							>"$gitdir/alias-$alias" &&
+					! test_trace2_data fsmonitor \
+						semantic/temporary-index-stat-fallback 1 \
+						<"$gitdir/alias-$alias.trace" &&
+					test_cmp_bin "$gitdir/snapshot.index" \
+						"$gitdir/index" || return 1
+				done &&
+				rm -f "$gitdir/physical-hardlink" \
+					"$gitdir/physical-symlink" \
+					"$gitdir/index.lock" &&
+				cp "$gitdir/readonly.index" "$gitdir/index"
+			fi &&
+			test_write_lines next >"$worktree/snapshot-next" &&
+			printf "%s\0" snapshot-next |
+			GIT_OPTIONAL_LOCKS=0 \
 			GIT_INDEX_FILE="$gitdir/snapshot.index" \
-			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_LITERAL_PATHSPECS=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/snapshot-add.trace" \
+				git -C "$worktree" add --sparse \
+					--pathspec-from-file=- \
+					--pathspec-file-nul &&
+			test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/snapshot-add.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/snapshot-add.trace" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_INDEX_FILE="$gitdir/snapshot.index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/snapshot-tree.trace" \
 				git -C "$worktree" write-tree \
 					>"$gitdir/snapshot-tree" &&
 			test_file_not_empty "$gitdir/snapshot-tree" &&
+			test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/snapshot-tree.trace" &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 				<"$gitdir/snapshot-tree.trace" &&
 			git -C "$worktree" ls-tree \
-				"$(cat "$gitdir/snapshot-tree")" snapshot-new \
+				"$(cat "$gitdir/snapshot-tree")" \
+					snapshot-new snapshot-next \
 				>"$gitdir/snapshot-entry" &&
 			test_grep "snapshot-new$" "$gitdir/snapshot-entry" &&
+			test_grep "snapshot-next$" "$gitdir/snapshot-entry" &&
+			cp "$gitdir/readonly.index" "$gitdir/control.index" &&
+			printf "%s\0" snapshot-new snapshot-next |
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_INDEX_FILE="$gitdir/control.index" \
+			GIT_LITERAL_PATHSPECS=1 \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-C "$worktree" add --sparse \
+						--pathspec-from-file=- \
+						--pathspec-file-nul &&
+			GIT_INDEX_FILE="$gitdir/control.index" \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-C "$worktree" write-tree \
+					>"$gitdir/snapshot-expect" &&
+			test_cmp "$gitdir/snapshot-expect" "$gitdir/snapshot-tree" &&
 			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			test_write_lines "*.filtered filter=snapshot" \
+				>"$worktree/.gitattributes" &&
+			test_write_lines raw >"$worktree/snapshot.filtered" &&
+			printf "%s\0" .gitattributes snapshot.filtered |
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_INDEX_FILE="$gitdir/snapshot.index" \
+			GIT_LITERAL_PATHSPECS=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/filter-add.trace" \
+				git -c filter.snapshot.clean="sed s/raw/converted/" \
+					-c filter.snapshot.required=true \
+					-C "$worktree" add --sparse \
+						--pathspec-from-file=- \
+						--pathspec-file-nul &&
+			test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/filter-add.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/filter-add.trace" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_INDEX_FILE="$gitdir/snapshot.index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/filter-tree.trace" \
+				git -c filter.snapshot.clean="sed s/raw/converted/" \
+					-c filter.snapshot.required=true \
+					-C "$worktree" write-tree \
+						>"$gitdir/filter-tree" &&
+			test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/filter-tree.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/filter-tree.trace" &&
+			cp "$gitdir/readonly.index" "$gitdir/filter-control.index" &&
+			printf "%s\0" snapshot-new snapshot-next \
+				.gitattributes snapshot.filtered |
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_INDEX_FILE="$gitdir/filter-control.index" \
+			GIT_LITERAL_PATHSPECS=1 \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-c filter.snapshot.clean="sed s/raw/converted/" \
+					-c filter.snapshot.required=true \
+					-C "$worktree" add --sparse \
+						--pathspec-from-file=- \
+						--pathspec-file-nul &&
+			GIT_INDEX_FILE="$gitdir/filter-control.index" \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-c filter.snapshot.clean="sed s/raw/converted/" \
+					-c filter.snapshot.required=true \
+					-C "$worktree" write-tree \
+						>"$gitdir/filter-expect" &&
+			test_cmp "$gitdir/filter-expect" "$gitdir/filter-tree" &&
+			git -C "$worktree" cat-file blob \
+				"$(cat "$gitdir/filter-tree"):snapshot.filtered" \
+					>"$gitdir/filter-actual-blob" &&
+			test_write_lines converted >"$gitdir/filter-expect-blob" &&
+			test_cmp "$gitdir/filter-expect-blob" \
+				"$gitdir/filter-actual-blob" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			test_write_lines raw >"$worktree/required-failure.filtered" &&
+			printf "%s\0" required-failure.filtered \
+				>"$gitdir/required-failure.paths" &&
+			cp "$gitdir/snapshot.index" "$gitdir/filter-failure.index" &&
+			cp "$gitdir/filter-failure.index" \
+				"$gitdir/filter-failure.before" &&
+			test_must_fail env \
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_INDEX_FILE="$gitdir/filter-failure.index" \
+				GIT_LITERAL_PATHSPECS=1 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/filter-failure.trace" \
+				git -c filter.snapshot.clean=false \
+					-c filter.snapshot.required=true \
+					-C "$worktree" add --sparse \
+						--pathspec-from-file="$gitdir/required-failure.paths" \
+						--pathspec-file-nul \
+						2>"$gitdir/filter-failure.error" &&
+			test_grep "clean filter .snapshot. failed" \
+				"$gitdir/filter-failure.error" &&
+			test_trace2_data fsmonitor \
+				semantic/temporary-index-stat-fallback 1 \
+				<"$gitdir/filter-failure.trace" &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 \
+				<"$gitdir/filter-failure.trace" &&
+			test_cmp_bin "$gitdir/filter-failure.before" \
+				"$gitdir/filter-failure.index" &&
+			cp "$gitdir/readonly.index" \
+				"$gitdir/filter-control-failure.index" &&
+			test_must_fail env \
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_INDEX_FILE="$gitdir/filter-control-failure.index" \
+				GIT_LITERAL_PATHSPECS=1 \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-c filter.snapshot.clean=false \
+					-c filter.snapshot.required=true \
+					-C "$worktree" add --sparse \
+						--pathspec-from-file="$gitdir/required-failure.paths" \
+						--pathspec-file-nul \
+						2>"$gitdir/filter-control-failure.error" &&
+			test_grep "clean filter .snapshot. failed" \
+				"$gitdir/filter-control-failure.error" &&
+			test_cmp_bin "$gitdir/readonly.index" \
+				"$gitdir/filter-control-failure.index" &&
+			test_cmp_bin "$gitdir/readonly.index" "$gitdir/index" &&
+			rm -f "$worktree/.gitattributes" \
+				"$worktree/snapshot.filtered" \
+				"$worktree/required-failure.filtered" &&
 			GIT_INDEX_FILE="$gitdir/manifestless.index" \
 				git -C "$worktree" read-tree HEAD &&
 			test_grep ! FSCF "$gitdir/manifestless.index" &&
