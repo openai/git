@@ -20,11 +20,14 @@ test_lazy_prereq DURABLE_FSMONITOR '
 	(
 		cd durable-fsmonitor-probe &&
 		test_commit base tracked &&
+		test-tool chmtime =-120 tracked &&
+		git -c core.fsmonitor=false update-index --refresh &&
 		git config core.fsmonitor true &&
 		git fsmonitor--daemon start --start-timeout=10 &&
 		git status --porcelain=v2 >/dev/null &&
-		test-tool dump-fsmonitor >token &&
-		grep "^fsmonitor last update builtin:" token
+		test-tool fsmonitor-client query --token 0 >token &&
+		nul_to_q <token >token.filtered &&
+		grep "^builtin:" token.filtered
 		result=$?
 		git fsmonitor--daemon stop >/dev/null 2>&1 || :
 		exit $result
