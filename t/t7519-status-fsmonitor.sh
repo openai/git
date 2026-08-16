@@ -1146,7 +1146,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 				set -- git -c core.preloadIndexBulk=false
 				;;
 			environment)
-				set -- test_env GIT_TEST_PRELOAD_INDEX_BULK=0 \
+				set -- env GIT_TEST_PRELOAD_INDEX_BULK=0 \
 					git -c core.preloadIndexBulk=true
 				;;
 			preload)
@@ -1322,6 +1322,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		done &&
 		cp .git/legacy.index .git/index &&
 
+		GIT_OPTIONAL_LOCKS=1 \
 		GIT_TEST_PRELOAD_INDEX=1 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/writable.trace" \
