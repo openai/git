@@ -366,7 +366,8 @@ static void refresh_index_quietly(void)
 			clean_status_index_snapshot_release(&source);
 			return;
 		}
-		if (pthread_mutex_init(&diff_refresh_warning_mutex, NULL)) {
+		if (HAVE_THREADS &&
+		    pthread_mutex_init(&diff_refresh_warning_mutex, NULL)) {
 			clean_status_index_snapshot_release(&source);
 			return;
 		}
