@@ -739,7 +739,7 @@ state. Inconclusive scans are discarded before continuing with the normal
 preload. Currently this is supported on APFS, ext-family filesystems, and
 XFS, and only has an effect when `core.preloadIndex` is enabled. Defaults
 to false, except that a whole-worktree, read-only `git status` may use it
-after the native file system monitor discards a populated legacy
+after the native file system monitor discards a legacy
 untracked cache. Setting this option explicitly to false also disables
 that recovery optimization.
 
