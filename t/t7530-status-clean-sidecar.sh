@@ -318,6 +318,51 @@ test_expect_success DURABLE_FSMONITOR \
 	assert_clean_sidecar_hit sidecar-inactive-filter \
 		sidecar-inactive-filter inactive-filter.hit-again &&
 
+	for label in bulk preload both bulk-false preload-false
+	do
+		case "$label" in
+		bulk) set -- -c core.preloadIndexBulk ;;
+		preload) set -- -c core.preloadIndex ;;
+		both) set -- -c core.preloadIndexBulk -c core.preloadIndex ;;
+		bulk-false) set -- -c core.preloadIndexBulk=false ;;
+		preload-false) set -- -c core.preloadIndex=false ;;
+		esac &&
+		cp sidecar-inactive-filter/.git/index \
+			"inactive-filter-$label.index" &&
+		cp sidecar-inactive-filter/.git/index.csts \
+			"inactive-filter-$label.sidecar" &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git "$@" -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-C sidecar-inactive-filter status --porcelain=v2 \
+				>"inactive-filter-$label.expect" &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/inactive-filter-$label.trace" \
+			git "$@" -C sidecar-inactive-filter \
+				status --porcelain=v2 \
+				>"inactive-filter-$label.actual" &&
+		test_cmp "inactive-filter-$label.expect" \
+			"inactive-filter-$label.actual" &&
+		test_cmp_bin "inactive-filter-$label.index" \
+			sidecar-inactive-filter/.git/index &&
+		test_cmp_bin "inactive-filter-$label.sidecar" \
+			sidecar-inactive-filter/.git/index.csts &&
+		test_trace2_data status clean-proof/hit 1 \
+			<"inactive-filter-$label.trace" &&
+		test_grep ! "\"label\":\"do_read_index\"" \
+			"inactive-filter-$label.trace" &&
+		test_grep ! "\"category\":\"index\",\"label\":\"refresh\"" \
+			"inactive-filter-$label.trace" &&
+		test_grep ! "\"category\":\"index\",\"label\":\"preload" \
+			"inactive-filter-$label.trace" &&
+		test_grep ! "\"label\":\"read_directory\"" \
+			"inactive-filter-$label.trace" &&
+		test_grep ! "\"key\":\"semantic/manifest-scan-count\"" \
+			"inactive-filter-$label.trace" &&
+		test_grep ! "\"label\":\"do_write_index\"" \
+			"inactive-filter-$label.trace" || return 1
+	done &&
+
 	GIT_OPTIONAL_LOCKS=0 \
 	GIT_TRACE2_EVENT="$PWD/inactive-filter.config.trace" \
 		git -c filter.sidecar.required=false \
