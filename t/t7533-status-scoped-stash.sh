@@ -216,6 +216,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	scoped_stash_setup scoped-stash-staged &&
 	(
 		cd scoped-stash-staged &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
 		gitdir="$PWD/.git" &&
 		scoped_control="$PWD/../scoped-stash-staged-control" &&
 		git -c core.fsmonitor=false \
