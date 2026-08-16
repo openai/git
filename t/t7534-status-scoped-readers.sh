@@ -46,13 +46,43 @@ assert_scoped_reader () {
 	scoped_locks=$2 &&
 	shift 2 &&
 	cp "$gitdir/index" "$gitdir/$scoped_label.index" &&
-	GIT_OPTIONAL_LOCKS=0 \
-		git -c core.fsmonitor=false \
-			-c core.untrackedCache=false \
-			-c core.trustctime=true \
-			-c core.checkStat=default \
-			-C "$worktree" "$@" \
-				>"$gitdir/$scoped_label.expect" &&
+	if test "$scoped_label" = same-stat
+	then
+		scoped_oracle_index="$gitdir/$scoped_label.oracle.index" &&
+		cp "$gitdir/index" "$scoped_oracle_index" &&
+		GIT_INDEX_FILE="$scoped_oracle_index" \
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-C "$worktree" ls-files --stage -- tracked \
+				>"$gitdir/$scoped_label.stage" &&
+		test_line_count = 1 "$gitdir/$scoped_label.stage" &&
+		read scoped_mode scoped_oid scoped_stage scoped_path \
+			<"$gitdir/$scoped_label.stage" &&
+		test "$scoped_stage" = 0 &&
+		test "$scoped_path" = tracked &&
+		GIT_INDEX_FILE="$scoped_oracle_index" \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-C "$worktree" update-index \
+				--cacheinfo "$scoped_mode,$scoped_oid,$scoped_path" &&
+		GIT_INDEX_FILE="$scoped_oracle_index" \
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				-C "$worktree" "$@" \
+				>"$gitdir/$scoped_label.expect"
+	else
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				-C "$worktree" "$@" \
+				>"$gitdir/$scoped_label.expect"
+	fi &&
 	GIT_OPTIONAL_LOCKS=$scoped_locks \
 	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
 	GIT_TRACE2_EVENT="$gitdir/$scoped_label.trace" \
