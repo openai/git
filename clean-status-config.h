@@ -25,6 +25,8 @@ struct clean_status_config_digest {
 	unsigned fsmonitor_value_seen : 1;
 	unsigned fsmonitor_value_boolean : 1;
 	unsigned fsmonitor_value_enabled : 1;
+	unsigned submodule_recurse_seen : 1;
+	unsigned submodule_recurse_known_false : 1;
 };
 
 void clean_status_config_init(struct clean_status_config_digest *digest,
