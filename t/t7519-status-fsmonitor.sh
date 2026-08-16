@@ -5297,4 +5297,63 @@ test_expect_success PTHREADS,UNTRACKED_CACHE,SHA1 'load cache-tree and untracked
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'untracked provider events do not disappear across an index rewrite' '
+	test_when_finished "rm -rf untracked-provider-index-rewrite" &&
+	test_create_repo untracked-provider-index-rewrite &&
+	(
+		cd untracked-provider-index-rewrite &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines tracked >cached/tracked &&
+		test_write_lines outside >outside &&
+		git add cached/tracked outside &&
+		git commit -qm base &&
+		test-tool chmtime -120 cached/tracked outside &&
+		git update-index --refresh &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_fsmonitor_full_proof .git/index paired &&
+
+		test_write_lines visible >cached/new-visible &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/new-visible \
+		GIT_TRACE2_EVENT="$PWD/.git/writer.trace" \
+			git update-index --force-write-index &&
+		test_trace2_data fsmonitor apply_count 1 <.git/writer.trace &&
+		test_region index do_write_index .git/writer.trace &&
+		test_fsmonitor_full_proof .git/index paired &&
+		cp .git/index .git/index.snapshot &&
+
+		git --no-optional-locks \
+			-c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			-c core.trustctime=true \
+			-c core.checkStat=default \
+			status --porcelain=v2 >.git/expect &&
+		test_grep "^? cached/new-visible$" .git/expect &&
+		test_cmp_bin .git/index.snapshot .git/index &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/reader.trace" \
+			git --no-optional-locks status --porcelain=v2 \
+				>.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_cmp_bin .git/index.snapshot .git/index &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/reader.trace &&
+		test_trace2_data fsmonitor apply_count 0 \
+			<.git/reader.trace &&
+		! test_trace2_data read_directory opendir 0 \
+			<.git/reader.trace &&
+		! test_region index do_write_index .git/reader.trace
+	)
+'
+
 test_done
