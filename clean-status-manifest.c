@@ -239,7 +239,7 @@ int clean_status_manifest_directory_unchanged(
 	struct string_list candidates = STRING_LIST_INIT_DUP;
 	struct strbuf candidate = STRBUF_INIT;
 	const struct git_hash_algo *algo = istate->repo->hash_algo;
-	unsigned int first, count = 0, namespace_unstable = 0;
+	unsigned int first, namespace_unstable = 0;
 	size_t len;
 	int pos, pinned = 0, safe = 0;
 	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
@@ -303,12 +303,13 @@ int clean_status_manifest_directory_unchanged(
 	strbuf_addstr(&candidate, directory);
 	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
 	string_list_insert(&candidates, candidate.buf);
+	/* Bound attribute-source I/O, not the affected in-memory entries. */
 	for (unsigned int i = first; i < istate->cache_nr &&
 	     starts_with(istate->cache[i]->name, directory); i++) {
 		const struct cache_entry *ce = istate->cache[i];
 		const char *slash = ce->name + len;
 
-		if (++count > 64 || ce_stage(ce) || ce_skip_worktree(ce) ||
+		if (ce_stage(ce) || ce_skip_worktree(ce) ||
 		    ce_intent_to_add(ce) || (ce->ce_flags & CE_VALID) ||
 		    S_ISSPARSEDIR(ce->ce_mode))
 			goto done;
