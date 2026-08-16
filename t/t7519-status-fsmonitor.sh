@@ -1157,8 +1157,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				! test_trace2_data fsmonitor \
 					semantic/manifest-scan-count 1 \
 					<"$gitdir/status-$run.trace" &&
-				test_trace2_data index preload/sum_lstat 1 \
-					<"$gitdir/status-$run.trace" &&
+				if test_have_prereq PTHREADS
+				then
+					test_trace2_data index preload/sum_lstat 1 \
+						<"$gitdir/status-$run.trace"
+				else
+					test_region ! index preload \
+						"$gitdir/status-$run.trace"
+				fi &&
 				test_trace2_data index refresh/sum_lstat 1 \
 					<"$gitdir/status-$run.trace" || return 1
 			done &&
@@ -2465,8 +2471,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				git -C "$worktree" diff \
 					>"$gitdir/next.actual" &&
 			test_must_be_empty "$gitdir/next.actual" &&
-			test_trace2_data index preload/sum_lstat 0 \
-				<"$gitdir/next.trace" || return 1
+			if test_have_prereq PTHREADS
+			then
+				test_trace2_data index preload/sum_lstat 0 \
+					<"$gitdir/next.trace"
+			else
+				test_region ! index preload "$gitdir/next.trace"
+			fi || return 1
 		done &&
 		git config filter.lfs.process "" &&
 		git config filter.lfs.clean false &&
