@@ -56,6 +56,11 @@ static inline int fsmonitor_stat_can_be_valid(const struct stat *st)
 
 void fsmonitor_invalidate_semantics(struct index_state *istate);
 
+/* Bound conservative bootstrap to one index read; never issue a proof. */
+void fsmonitor_begin_scoped_bootstrap(struct index_state *istate);
+int fsmonitor_scoped_bootstrap_is_active(const struct index_state *istate);
+int fsmonitor_end_scoped_bootstrap(struct index_state *istate);
+
 /*
  * Check if refresh_fsmonitor has been called at least once.
  * refresh_fsmonitor is idempotent. Returns true if fsmonitor is

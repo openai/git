@@ -16,6 +16,7 @@
 #include "hashmap.h"
 #include "hex-ll.h"
 #include "name-hash.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "run-command.h"
 #include "strbuf.h"
@@ -29,6 +30,75 @@
 #define HOOK_INTERFACE_VERSION2		(2)
 
 struct trace_key trace_fsmonitor = TRACE_KEY_INIT(FSMONITOR);
+
+static struct index_state *scoped_bootstrap_index;
+static int scoped_bootstrap_eligible;
+static int scoped_bootstrap_used;
+
+static int fsmonitor_scoped_bootstrap_is_eligible(struct index_state *istate)
+{
+	struct repository *repo = istate->repo;
+	struct stat st;
+	char *physical, *selected, *canonical;
+	int eligible;
+
+	if (istate != repo->index || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    getenv(INDEX_ENVIRONMENT) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) ||
+	    getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) ||
+	    !fstat_is_reliable() ||
+	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
+	    repo_config_get_split_index(repo) > 0 ||
+	    repo_config_values(repo)->apply_sparse_checkout ||
+	    repo_has_replace_refs_uncached(repo))
+		return 0;
+
+	physical = xstrfmt("%s/index", repo_get_git_dir(repo));
+	selected = real_pathdup(repo_get_index_file(repo), 0);
+	canonical = real_pathdup(physical, 0);
+	eligible = selected && canonical &&
+		!fspathcmp(selected, canonical) &&
+		!lstat(physical, &st) && S_ISREG(st.st_mode) &&
+		st.st_nlink == 1;
+	free(canonical);
+	free(selected);
+	free(physical);
+	return eligible;
+}
+
+void fsmonitor_begin_scoped_bootstrap(struct index_state *istate)
+{
+	if (scoped_bootstrap_index)
+		BUG("nested scoped fsmonitor bootstrap");
+	scoped_bootstrap_index = istate;
+	scoped_bootstrap_eligible =
+		fsmonitor_scoped_bootstrap_is_eligible(istate);
+	scoped_bootstrap_used = 0;
+}
+
+int fsmonitor_scoped_bootstrap_is_active(const struct index_state *istate)
+{
+	return scoped_bootstrap_index == istate &&
+		scoped_bootstrap_eligible && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		!repo_config_values(istate->repo)->apply_sparse_checkout;
+}
+
+int fsmonitor_end_scoped_bootstrap(struct index_state *istate)
+{
+	int used;
+
+	if (scoped_bootstrap_index != istate)
+		BUG("scoped fsmonitor bootstrap index changed");
+	used = scoped_bootstrap_used;
+	scoped_bootstrap_index = NULL;
+	scoped_bootstrap_eligible = 0;
+	scoped_bootstrap_used = 0;
+	return used;
+}
 
 static void assert_index_minimum(struct index_state *istate, size_t pos)
 {
@@ -1266,6 +1336,15 @@ static void invalidate_fsmonitor_for_bootstrap(
 					   "semantic/temporary-index-stat-fallback", 1);
 			return;
 		}
+	}
+
+	if (fsmonitor_scoped_bootstrap_is_active(istate)) {
+		fsmonitor_invalidate_semantics(istate);
+		untracked_cache_invalidate_all(istate);
+		scoped_bootstrap_used = 1;
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "semantic/scoped-reader-stat-fallback", 1);
+		return;
 	}
 
 	if (physical_history_unavailable) {
