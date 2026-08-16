@@ -1,7 +1,12 @@
 #define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "clean-status-config.h"
+#include "clean-status.h"
+#include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hash.h"
+#include "replace-object.h"
 #include "apply.h"
 
 static const char * const apply_usage[] = {
@@ -17,6 +22,7 @@ int cmd_apply(int argc,
 	int force_apply = 0;
 	int options = 0;
 	int ret;
+	struct clean_status_config_digest clean_digest;
 	struct apply_state state;
 
 	if (init_apply_state(&state, the_repository, prefix))
@@ -42,6 +48,25 @@ int cmd_apply(int argc,
 
 	if (check_apply_state(&state, force_apply))
 		exit(128);
+
+	if (state.apply && state.check_index && !state.threeway &&
+	    !state.apply_with_reject && !state.ita_only &&
+	    !state.fake_ancestor && !state.index_file &&
+	    !getenv(INDEX_ENVIRONMENT) &&
+	    !getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+	    !getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+	    !getenv(DB_ENVIRONMENT) &&
+	    !getenv(ALTERNATE_DB_ENVIRONMENT) && fstat_is_reliable() &&
+	    !repo_config_values(the_repository)->apply_sparse_checkout &&
+	    the_repository->config_values_private_.trust_ctime &&
+	    the_repository->config_values_private_.check_stat &&
+	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+	    !repo_has_replace_refs_uncached(the_repository) &&
+	    !clean_status_config_read_repository(the_repository,
+					       &clean_digest)) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	}
 
 	ret = apply_all_patches(&state, argc, argv, options);
 

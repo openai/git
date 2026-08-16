@@ -6,6 +6,7 @@
 #include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
@@ -22,6 +23,7 @@
 #include "entry.h"
 #include "preload-index.h"
 #include "read-cache.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "rerere.h"
 #include "revision.h"
@@ -334,7 +336,8 @@ static int clear_stash(int argc, const char **argv, const char *prefix,
 	return do_clear_stash();
 }
 
-static int reset_tree(struct object_id *i_tree, int update, int reset)
+static int reset_tree(struct object_id *i_tree, int update, int reset,
+		      int preserve_semantic_history)
 {
 	int nr_trees = 1;
 	struct unpack_trees_options opts;
@@ -359,6 +362,22 @@ static int reset_tree(struct object_id *i_tree, int update, int reset)
 	opts.head_idx = 1;
 	opts.src_index = the_repository->index;
 	opts.dst_index = the_repository->index;
+	opts.preserve_semantic_history = preserve_semantic_history &&
+		!update && !reset && fstat_is_reliable() &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(DB_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		!repo_config_values(the_repository)->apply_sparse_checkout &&
+		the_repository->config_values_private_.trust_ctime &&
+		the_repository->config_values_private_.check_stat &&
+		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+		!repo_has_replace_refs_uncached(the_repository) &&
+		the_repository->index->fsmonitor_untracked_valid &&
+		clean_status_has_persistent_fsmonitor_semantic_history(
+			the_repository->index) &&
+		clean_status_revalidated_token_matches(the_repository->index);
 	opts.merge = 1;
 	opts.reset = reset ? UNPACK_RESET_PROTECT_UNTRACKED : 0;
 	opts.update = update;
@@ -754,7 +773,7 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	}
 
 	if (has_index) {
-		if (reset_tree(&index_tree, 0, 0))
+		if (reset_tree(&index_tree, 0, 0, 1))
 			ret = -1;
 	} else {
 		unstage_changes_unless_new(&c_tree);
@@ -1473,7 +1492,7 @@ static int stash_working_tree(struct stash_info *info, const struct pathspec *ps
 	copy_pathspec(&rev.prune_data, ps);
 
 	set_alternate_index_output(stash_index_path.buf);
-	if (reset_tree(&info->i_tree, 0, 0)) {
+	if (reset_tree(&info->i_tree, 0, 0, 0)) {
 		ret = -1;
 		goto done;
 	}
@@ -1629,7 +1648,9 @@ static int do_create_stash(const struct pathspec *ps, struct strbuf *stash_msg_b
 		}
 	} else {
 		if (stash_working_tree(info, ps,
-				       !ps->nr && !include_untracked)) {
+				       !include_untracked &&
+				       clean_status_external_history_enabled(
+					       the_repository->index))) {
 			if (!quiet)
 				fprintf_ln(stderr, _("Cannot save the current "
 						     "worktree state"));
@@ -1703,6 +1724,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 {
 	int ret = 0;
 	int preserve_clean_history = !ps->nr && !include_untracked;
+	int preserve_scoped_history = 0;
 	struct lock_file index_lock = LOCK_INIT;
 	struct stash_info info = STASH_INFO_INIT;
 	struct strbuf patch = STRBUF_INIT;
@@ -1731,12 +1753,26 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		goto done;
 	}
 
+	preserve_scoped_history = ps->nr && !include_untracked &&
+		!patch_mode && !only_staged && keep_index != 1 &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(DB_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) && fstat_is_reliable() &&
+		!repo_config_values(the_repository)->apply_sparse_checkout &&
+		the_repository->config_values_private_.trust_ctime &&
+		the_repository->config_values_private_.check_stat &&
+		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+		!repo_has_replace_refs_uncached(the_repository);
+
 	/*
-	 * Keep whole-worktree history bound while inspecting the worktree.
-	 * If changes are found, invalidate it before stash machinery
-	 * mutates the index or worktree.
+	 * Keep authenticated history bound while inspecting the worktree.
+	 * Whole-worktree changes still invalidate their proof below. A scoped
+	 * regular-file replacement keeps it only when each writer proves that
+	 * its provider, semantic inputs, and untracked cache remain paired.
 	 */
-	if (preserve_clean_history) {
+	if (preserve_clean_history || preserve_scoped_history) {
 		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository,
 					       &stash_clean_digest);
