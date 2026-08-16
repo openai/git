@@ -4850,6 +4850,7 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 			>"$gitdir/witnesses" &&
 		test_line_count = 1 "$gitdir/witnesses" &&
 		test_write_lines staged >"$worktree/existing/staged" &&
+		test-tool chmtime =-120 "$worktree/existing/staged" &&
 		git -C "$worktree" add existing/staged &&
 		GIT_INDEX_FILE="$gitdir/index" \
 			git -C "$worktree" status --porcelain=v2 \
