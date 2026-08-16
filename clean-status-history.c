@@ -1503,7 +1503,9 @@ int clean_status_restore_external_history(struct index_state *istate)
 	int provider_reset_recovery = 0;
 	int restored = 0;
 
-	if (!clean_status_external_history_enabled(istate) || !state ||
+	/* Split and sparse representations are known only after parsing. */
+	if (fsmonitor_scoped_bootstrap_is_active(istate) ||
+	    !clean_status_external_history_enabled(istate) || !state ||
 	    state->disk_config_invalid ||
 	    !state->config_enforced ||
 	    !state->current_config_valid || !state->current_semantic_valid ||
