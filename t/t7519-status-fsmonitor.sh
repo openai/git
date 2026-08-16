@@ -430,6 +430,144 @@ test_expect_success UNTRACKED_CACHE \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'historical normalized excludes reuse authenticated index stats' '
+	test_when_finished "rm -rf normalized-excludes-lf normalized-excludes-no-lf" &&
+	for ending in lf no-lf
+	do
+		test_create_repo "normalized-excludes-$ending" &&
+		(
+			cd "normalized-excludes-$ending" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			mkdir one two &&
+			if test "$ending" = lf
+			then
+				printf "ignored\n" >one/.gitignore
+			else
+				printf ignored >one/.gitignore
+			fi &&
+			cp one/.gitignore two/.gitignore &&
+			test_write_lines hidden >one/ignored &&
+			test_write_lines hidden >two/ignored &&
+			git add one/.gitignore two/.gitignore &&
+			git commit -qm base &&
+			test-tool chmtime -120 one/.gitignore two/.gitignore &&
+			git update-index --refresh &&
+			git config core.untrackedCache true &&
+			raw=$(git rev-parse :one/.gitignore) &&
+			normalized=$(
+				{ cat one/.gitignore && printf "\n"; } |
+				git hash-object --stdin
+			) &&
+			test "$raw" != "$normalized" &&
+
+			# Exercise the genuine historical add_patterns() encoding.
+			git update-index --assume-unchanged \
+				one/.gitignore two/.gitignore &&
+			git -c core.fsmonitor=false status --porcelain=v2 \
+				>.git/historical &&
+			test_must_be_empty .git/historical &&
+			test-tool dump-untracked-cache >.git/historical.dump &&
+			test_grep "^/one/ $normalized .*valid" \
+				.git/historical.dump &&
+			test_grep "^/two/ $normalized .*valid" \
+				.git/historical.dump &&
+			git update-index --no-assume-unchanged \
+				one/.gitignore two/.gitignore &&
+			git config core.fsmonitor true &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git update-index --fsmonitor &&
+			GIT_INDEX_FILE="$PWD/.git/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git status --porcelain=v2 >.git/prime &&
+			test_must_be_empty .git/prime &&
+			test_grep FSMN .git/index &&
+			test_grep FSUC .git/index &&
+			test_grep FSCF .git/index &&
+			cat >.git/restore-historical-excludes.pl <<-\EOF &&
+			use Digest::SHA qw(sha1 sha256);
+			binmode STDIN;
+			binmode STDOUT;
+			local $/;
+			my $index = <STDIN>;
+			my ($algorithm, $raw_hex, $normalized_hex) = @ARGV;
+			my $size = $algorithm eq "sha256" ? 32 : 20;
+			my $body = substr($index, 0, -$size);
+			my $offset = index($body, "UNTR");
+			die "missing UNTR extension\n" if $offset < 0;
+			my $length = unpack("N", substr($body, $offset + 4, 4));
+			die "invalid UNTR size\n"
+				if $offset + 8 + $length > length($body);
+			my $payload = substr($body, $offset + 8, $length);
+			my $raw = pack("H*", $raw_hex);
+			my $normalized = pack("H*", $normalized_hex);
+			my $cursor = 0;
+			my $replaced = 0;
+			while (($cursor = index($payload, $raw, $cursor)) >= 0) {
+				substr($payload, $cursor, $size, $normalized);
+				$cursor += $size;
+				$replaced++;
+			}
+			die "expected exactly two historical excludes\n"
+				unless $replaced == 2;
+			substr($body, $offset + 8, $length, $payload);
+			print $body,
+				$size == 32 ? sha256($body) : sha1($body);
+			EOF
+			perl .git/restore-historical-excludes.pl \
+				"$(test_oid algo)" "$raw" "$normalized" \
+				<.git/index >.git/index.historical &&
+			mv .git/index.historical .git/index &&
+			test-tool dump-untracked-cache >.git/restored.dump &&
+			test_grep "^/one/ $normalized " .git/restored.dump &&
+			test_grep "^/two/ $normalized " .git/restored.dump &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					status --porcelain=v2 >.git/expect &&
+			cp .git/index .git/readonly.index &&
+			for run in first second
+			do
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_UNTRACKED_CACHE_THREADS=1 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$PWD/.git/$run.trace" \
+					git status --porcelain=v2 \
+						>".git/$run.actual" &&
+				test_cmp .git/expect ".git/$run.actual" &&
+				test_cmp_bin .git/readonly.index .git/index &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<".git/$run.trace" &&
+				test_trace2_data dir \
+					preload_untracked_cache/index-excludes 1 \
+					<".git/$run.trace" &&
+				test_trace2_data dir \
+					preload_untracked_cache/index-normalized-excludes 1 \
+					<".git/$run.trace" &&
+				test_trace2_data dir \
+					preload_untracked_cache/index-normalized-objects 1 \
+					<".git/$run.trace" &&
+				test_trace2_data dir \
+					preload_untracked_cache/index-uptodate 2 \
+					<".git/$run.trace" &&
+				test_trace2_data dir \
+					preload_untracked_cache/index-invalidated 0 \
+					<".git/$run.trace" &&
+				test_trace2_data dir \
+					preload_untracked_cache/normalized-excludes 2 \
+					<".git/$run.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<".git/$run.trace" &&
+				! test_trace2_data index refresh/sum_lstat \
+					"[1-9][0-9]*" <".git/$run.trace" &&
+				! test_region index do_write_index \
+					".git/$run.trace" || return 1
+			done
+		) || return 1
+	done
+'
+
 test_expect_success UNTRACKED_CACHE,HARDLINKS,POSIXPERM,SANITY \
 	'fsmonitor rechecks cached unreadable per-directory excludes' '
 	test_when_finished "rm -rf fsmonitor-unreadable-exclude" &&
