@@ -3660,6 +3660,41 @@ test_expect_success MACOS,UNTRACKED_CACHE,PERL_TEST_HELPERS,SEMANTIC_VERIFY_ANCH
 		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 			<.git/repeat.trace &&
 
+		for legacy_preload in true false
+		do
+			cp .git/index.legacy .git/index &&
+			rm -f .git/index.csts .git/index.csh1.* \
+				.git/index.cswi.* &&
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=tracked.txt \
+			GIT_TRACE2_EVENT="$PWD/.git/legacy-preload-$legacy_preload.trace" \
+				git -c user.name=Legacy \
+					-c core.preloadIndex="$legacy_preload" \
+					status --porcelain=v2 \
+					>".git/legacy-preload-$legacy_preload.actual" &&
+			test_cmp .git/legacy.expect \
+				".git/legacy-preload-$legacy_preload.actual" ||
+				return 1
+		done &&
+		for legacy_preload in true false
+		do
+			test_trace2_data fsmonitor config/tracked-epoch-preserved 1 \
+				<".git/legacy-preload-$legacy_preload.trace" &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+				<".git/legacy-preload-$legacy_preload.trace" &&
+			! test_trace2_data index preload/bulk_useful \
+				"[1-9][0-9]*" \
+				<".git/legacy-preload-$legacy_preload.trace" &&
+			! test_trace2_data index preload/sum_lstat \
+				"\([2-9]\|[1-9][0-9][0-9]*\)" \
+				<".git/legacy-preload-$legacy_preload.trace" &&
+			! test_trace2_data index refresh/sum_lstat \
+				"\([2-9]\|[1-9][0-9][0-9]*\)" \
+				<".git/legacy-preload-$legacy_preload.trace" ||
+				return 1
+		done &&
+
 		cp .git/index.legacy .git/index &&
 		rm -f .git/index.csts .git/index.csh1.* .git/index.cswi.* &&
 		GIT_OPTIONAL_LOCKS=0 git -c advice.statusHints=true \
