@@ -423,6 +423,7 @@ static inline int index_pos_to_insert_pos(uintmax_t pos)
 #define ADD_CACHE_NEW_ONLY 16		/* Do not replace existing ones */
 #define ADD_CACHE_KEEP_CACHE_TREE 32	/* Do not invalidate cache-tree */
 #define ADD_CACHE_RENORMALIZE 64        /* Pass along HASH_RENORMALIZE */
+#define ADD_CACHE_PRESERVE_CLEAN_HISTORY 128 /* Preserve safe replacements */
 int add_index_entry(struct index_state *, struct cache_entry *ce, int option);
 void rename_index_entry_at(struct index_state *, int pos, const char *new_name);
 
