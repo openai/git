@@ -9,9 +9,12 @@
 #include "builtin.h"
 #include "abspath.h"
 #include "advice.h"
+#include "clean-status-config.h"
+#include "clean-status.h"
 #include "config.h"
 #include "editor.h"
 #include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hex.h"
 #include "parse-options.h"
@@ -2315,6 +2318,7 @@ int cmd_am(int argc,
 	   struct repository *repo UNUSED)
 {
 	struct am_state state;
+	struct clean_status_config_digest clean_digest;
 	int binary = -1;
 	int keep_cr = -1;
 	int patch_format = PATCH_FORMAT_UNKNOWN;
@@ -2463,6 +2467,13 @@ int cmd_am(int argc,
 
 	/* Ensure a valid committer ident can be constructed */
 	git_committer_info(IDENT_STRICT);
+
+	if (fstat_is_reliable() && !getenv(INDEX_ENVIRONMENT) &&
+	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	}
 
 	if (repo_read_index_preload(the_repository, NULL, 0) < 0)
 		die(_("failed to read the index"));
