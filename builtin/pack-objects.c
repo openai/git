@@ -1348,6 +1348,7 @@ static void write_pack_file(void)
 	do {
 		unsigned char hash[GIT_MAX_RAWSZ];
 		char *pack_tmp_name = NULL;
+		off_t pack_bytes;
 
 		if (pack_to_stdout) {
 			/*
@@ -1390,8 +1391,7 @@ static void write_pack_file(void)
 			display_progress(progress_state, written);
 		}
 
-		/* Every finalization path appends the pack checksum. */
-		bytes_written += hashfile_total(f) +
+		pack_bytes = hashfile_total(f) +
 			the_repository->hash_algo->rawsz;
 		if (pack_to_stdout) {
 			/*
@@ -1423,6 +1423,7 @@ static void write_pack_file(void)
 				write_bitmap_index = 0;
 			}
 		}
+		bytes_written += pack_bytes;
 
 		if (!pack_to_stdout) {
 			struct stat st;
