@@ -1569,6 +1569,153 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'commit modes restore external-only worktree proofs' '
+	test_when_finished "rm -rf commit-external-only commit-external-linked" &&
+	test_create_repo commit-external-only &&
+	(
+		cd commit-external-only &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_write_lines "tracked -text" >.gitattributes &&
+		git add .gitattributes &&
+		git commit -qm attributes &&
+		git worktree add --detach ../commit-external-linked HEAD &&
+		test-tool chmtime -120 tracked .gitattributes \
+			../commit-external-linked/tracked \
+			../commit-external-linked/.gitattributes &&
+		git update-index --refresh &&
+		git -C ../commit-external-linked update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		cat >.git/remove-paired-proofs.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $rawsz = $ARGV[0] eq "sha256" ? 32 : 20;
+		for my $name ("FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			substr($index, $offset, 8 + $size, "");
+		}
+		my $payload = substr($index, 0, -$rawsz);
+		print $payload, $rawsz == 32 ? sha256($payload) : sha1($payload);
+		EOF
+		for worktree in "$PWD" "$PWD/../commit-external-linked"
+		do
+			gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+			for mode in all include amend only attributes
+			do
+				test-tool chmtime -120 "$worktree/tracked" &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+					git -C "$worktree" update-index --refresh &&
+				rm -f "$gitdir"/index.csh1.* "$gitdir"/index.cswi.* &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+					git -C "$worktree" update-index --fsmonitor &&
+				GIT_INDEX_FILE="$gitdir/index" \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/$mode.prime" &&
+				test_must_be_empty "$gitdir/$mode.prime" &&
+				test_fsmonitor_full_proof "$gitdir/index" paired &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$mode.checkpoint.trace" \
+					git -C "$worktree" status --short \
+						>"$gitdir/$mode.checkpoint" &&
+				test_must_be_empty "$gitdir/$mode.checkpoint" &&
+				test_trace2_data fsmonitor history/external-stored 1 \
+					<"$gitdir/$mode.checkpoint.trace" &&
+				find "$gitdir" -maxdepth 1 -type f \
+					-name "index.csh1.*" >"$gitdir/$mode.csh" &&
+				test_line_count = 1 "$gitdir/$mode.csh" &&
+				perl "$PWD/.git/remove-paired-proofs.pl" \
+					"$(test_oid algo)" <"$gitdir/index" \
+					>"$gitdir/index.foreign" &&
+				mv "$gitdir/index.foreign" "$gitdir/index" &&
+				test_grep FSMN "$gitdir/index" &&
+				test_grep ! FSUC "$gitdir/index" &&
+				test_grep ! FSCF "$gitdir/index" &&
+				query=DDDDCCCCCCCCCCCC &&
+				case "$mode" in
+				all)
+					test_write_lines all >"$worktree/tracked" &&
+					path=tracked &&
+					set -- -a -qm commit-all
+					;;
+				include)
+					test_write_lines include >"$worktree/tracked" &&
+					path=tracked &&
+					set -- --include tracked -qm commit-include
+					;;
+				amend)
+					test_write_lines amend >"$worktree/tracked" &&
+					path=tracked &&
+					set -- -a --amend --no-edit -q
+					;;
+				only)
+					test_write_lines only >"$worktree/tracked" &&
+					path=tracked &&
+					query=DDDDDDCCCCCCCCCCCC &&
+					set -- --only tracked -qm commit-only
+					;;
+				attributes)
+					test_write_lines "tracked text" \
+						>"$worktree/.gitattributes" &&
+					path=.gitattributes &&
+					set -- -a -qm changed-attributes
+					;;
+				esac &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE="$query" \
+				GIT_TEST_FSMONITOR_QUERY_PATH="$path" \
+				GIT_TRACE2_EVENT="$gitdir/$mode.commit.trace" \
+					git -C "$worktree" commit "$@" &&
+				test_trace2_data fsmonitor history/external-restored 1 \
+					<"$gitdir/$mode.commit.trace" &&
+				if test "$mode" = attributes
+				then
+					test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode.commit.trace" &&
+					test_trace2_data fsmonitor semantic/manifest-invalidated 1 \
+						<"$gitdir/$mode.commit.trace" &&
+					test_trace2_data fsmonitor untracked/proof-missing 1 \
+						<"$gitdir/$mode.commit.trace"
+				else
+					! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode.commit.trace" &&
+					! test_trace2_data fsmonitor untracked/proof-missing 1 \
+						<"$gitdir/$mode.commit.trace" &&
+					if test "$mode" = only
+					then
+						test_trace2_data fsmonitor history/untracked-paired-transfer 1 \
+							<"$gitdir/$mode.commit.trace" || return 1
+					fi &&
+					test_fsmonitor_full_proof "$gitdir/index" paired
+				fi &&
+				cp "$gitdir/index" "$gitdir/$mode.before-status" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$mode.status.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/$mode.status" &&
+				test_must_be_empty "$gitdir/$mode.status" &&
+				test_cmp_bin "$gitdir/$mode.before-status" "$gitdir/index" &&
+				if test "$mode" != attributes
+				then
+					test_trace2_data fsmonitor config/coherent 1 \
+						<"$gitdir/$mode.status.trace" &&
+					! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode.status.trace" || return 1
+				fi || return 1
+			done || return 1
+		done
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'write-tree preserves authenticated primary and linked index proofs' '
 	test_when_finished "rm -rf write-tree-bound-proof write-tree-linked" &&

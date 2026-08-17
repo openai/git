@@ -358,6 +358,9 @@ static void create_base_index(const struct commit *current_head)
 	opts.head_idx = 1;
 	opts.index_only = 1;
 	opts.merge = 1;
+	opts.preserve_semantic_history =
+		clean_status_external_history_enabled(the_repository->index) &&
+		clean_status_revalidated_token_matches(the_repository->index);
 	opts.src_index = the_repository->index;
 	opts.dst_index = the_repository->index;
 
@@ -2368,6 +2371,9 @@ int cmd_commit(int argc,
 		&s, git_commit_config, &clean_digest);
 	clean_status_config_final(&clean_digest);
 	clean_status_set_config_digest(the_repository, &clean_digest);
+	if (!getenv(INDEX_ENVIRONMENT) && fstat_is_reliable() &&
+	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC)
+		clean_status_enable_external_history(the_repository);
 	s.commit_template = 1;
 	status_format = STATUS_FORMAT_NONE; /* Ignore status.short */
 	s.colopts = 0;
