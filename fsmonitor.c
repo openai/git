@@ -492,7 +492,8 @@ int fsmonitor_invalidate_attributes_path(struct index_state *istate,
 {
 	size_t len = strlen(name), base, attr_len = strlen(GITATTRIBUTES_FILE);
 	size_t invalidated = 0;
-	unsigned int i;
+	unsigned int first = 0, i;
+	int bounded = 0;
 
 	while (len && is_dir_sep(name[len - 1]))
 		len--;
@@ -504,12 +505,27 @@ int fsmonitor_invalidate_attributes_path(struct index_state *istate,
 		return 0;
 
 	git_attr_invalidate_all();
-	for (i = 0; i < istate->cache_nr; i++) {
+	if (base && !repo_ignore_case(the_repository)) {
+#if defined(GIT_WINDOWS_NATIVE) || defined(__CYGWIN__)
+		bounded = !memchr(name, '\\', base);
+#else
+		bounded = 1;
+#endif
+	}
+	if (bounded) {
+		int pos = index_name_pos_sparse(istate, name, base);
+
+		first = pos < 0 ? -pos - 1 : pos;
+	}
+	for (i = first; i < istate->cache_nr; i++) {
 		struct cache_entry *ce = istate->cache[i];
 
 		if (base && (ce->ce_namelen < base ||
-			     fspathncmp(ce->name, name, base)))
+			     fspathncmp(ce->name, name, base))) {
+			if (bounded)
+				break;
 			continue;
+		}
 		fsmonitor_invalidate_cache_entry(ce);
 		invalidated++;
 	}
