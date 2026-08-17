@@ -2031,6 +2031,12 @@ static int wt_status_close_ordinary_fsmonitor_token(
 		wt_status_reset_attr_snapshot_if_changed(s);
 		if (wt_status_refresh_invalidated_manifest(s))
 			break;
+		if (closure->queries >= FSMONITOR_TOKEN_MAX_QUERIES) {
+			trace2_data_intmax("status", s->repo,
+					   "fsmonitor_token/terminal-rescan-skipped",
+					   1);
+			break;
+		}
 		if (validate_epoch) {
 			wt_status_refresh_for_token(
 				s, closure->refresh_flags, &scan_epoch,
