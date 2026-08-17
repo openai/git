@@ -33,7 +33,6 @@
 #include "revision.h"
 #include "log-tree.h"
 #include "setup.h"
-#include "symlinks.h"
 #include "thread-utils.h"
 #include "oid-array.h"
 #include "tree.h"
@@ -54,30 +53,6 @@ static const char builtin_diff_usage[] =
 COMMON_DIFF_OPTIONS_HELP;
 
 static int scoped_diff_bootstrap_used;
-
-static int diff_has_bounded_regular_pathspec(const struct pathspec *pathspec)
-{
-	int i;
-
-	if (pathspec->nr <= 0 || pathspec->nr > 64 ||
-	    pathspec->has_wildcard ||
-	    (pathspec->magic &
-	     (PATHSPEC_GLOB | PATHSPEC_ICASE |
-	      PATHSPEC_EXCLUDE | PATHSPEC_ATTR)))
-		return 0;
-	for (i = 0; i < pathspec->nr; i++) {
-		const struct pathspec_item *item = &pathspec->items[i];
-		struct stat st;
-
-		if (!item->match || item->len <= 0 ||
-		    item->match[item->len - 1] == '/' ||
-		    !strcmp(item->match, ".") ||
-		    has_symlink_leading_path(item->match, item->len) ||
-		    lstat(item->match, &st) || !S_ISREG(st.st_mode))
-			return 0;
-	}
-	return 1;
-}
 
 static const char *blob_path(struct object_array_entry *entry)
 {
