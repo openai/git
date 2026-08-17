@@ -17,6 +17,7 @@
 #include "lockfile.h"
 #include "cache-tree.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "refs.h"
 #include "dir.h"
 #include "object-file.h"
@@ -3343,15 +3344,29 @@ int has_racy_timestamp(struct index_state *istate)
 	return 0;
 }
 
-void repo_update_index_if_able(struct repository *repo,
-			       struct lock_file *lockfile)
+static int write_locked_index_with_receipt(
+	struct index_state *istate, struct lock_file *lock,
+	unsigned flags, struct clean_status_index_write_receipt *receipt);
+
+void repo_update_index_if_able_with_receipt(
+	struct repository *repo, struct lock_file *lockfile,
+	struct clean_status_index_write_receipt *receipt)
 {
+	if (receipt)
+		clean_status_index_write_receipt_release(receipt);
 	if ((repo->index->cache_changed ||
 	     has_racy_timestamp(repo->index)) &&
 	    repo_verify_index(repo))
-		write_locked_index(repo->index, lockfile, COMMIT_LOCK);
+		write_locked_index_with_receipt(repo->index, lockfile,
+					COMMIT_LOCK, receipt);
 	else
 		rollback_lock_file(lockfile);
+}
+
+void repo_update_index_if_able(struct repository *repo,
+			       struct lock_file *lockfile)
+{
+	repo_update_index_if_able_with_receipt(repo, lockfile, NULL);
 }
 
 static int record_eoie(void)
@@ -3795,17 +3810,25 @@ static int commit_locked_index(struct lock_file *lk)
 		return commit_lock_file(lk);
 }
 
-static int do_write_locked_index(struct index_state *istate,
-				 struct lock_file *lock,
-				 unsigned flags,
-				 enum write_extensions write_extensions)
+static int do_write_locked_index(
+	struct index_state *istate, struct lock_file *lock, unsigned flags,
+	enum write_extensions write_extensions,
+	struct clean_status_index_write_receipt *receipt)
 {
 	int ret;
 	int was_full = istate->sparse_index == INDEX_EXPANDED;
+	int receipt_prepared = 0;
+
+	if (receipt && (flags & COMMIT_LOCK) && !alternate_index_output &&
+	    !(write_extensions & WRITE_SPLIT_INDEX_EXTENSION))
+		receipt_prepared = !clean_status_index_prepare_write_receipt(
+			istate, get_lock_file_fd(lock), receipt);
 
 	ret = convert_to_sparse(istate, 0);
 
 	if (ret) {
+		if (receipt_prepared)
+			clean_status_index_write_receipt_release(receipt);
 		warning(_("failed to convert to a sparse-index"));
 		return ret;
 	}
@@ -3819,12 +3842,21 @@ static int do_write_locked_index(struct index_state *istate,
 	if (was_full)
 		ensure_full_index(istate);
 
-	if (ret)
+	if (ret) {
+		if (receipt_prepared)
+			clean_status_index_write_receipt_release(receipt);
 		return ret;
+	}
 	if (flags & COMMIT_LOCK)
 		ret = commit_locked_index(lock);
 	else
 		ret = close_lock_file_gently(lock);
+	if (receipt_prepared) {
+		if (!ret)
+			clean_status_index_record_write_receipt(istate, receipt);
+		else
+			clean_status_index_write_receipt_release(receipt);
+	}
 
 	run_hooks_l(the_repository, "post-index-change",
 		    istate->updated_workdir ? "1" : "0",
@@ -3841,7 +3873,8 @@ static int write_split_index(struct index_state *istate,
 {
 	int ret;
 	prepare_to_write_split_index(istate);
-	ret = do_write_locked_index(istate, lock, flags, WRITE_ALL_EXTENSIONS);
+	ret = do_write_locked_index(istate, lock, flags, WRITE_ALL_EXTENSIONS,
+				    NULL);
 	finish_writing_split_index(istate);
 	return ret;
 }
@@ -3983,8 +4016,9 @@ static int too_many_not_shared_entries(struct index_state *istate)
 	return (int64_t)istate->cache_nr * max_split < (int64_t)not_shared * 100;
 }
 
-int write_locked_index(struct index_state *istate, struct lock_file *lock,
-		       unsigned flags)
+static int write_locked_index_with_receipt(
+	struct index_state *istate, struct lock_file *lock,
+	unsigned flags, struct clean_status_index_write_receipt *receipt)
 {
 	int new_shared_index, ret, test_split_index_env;
 	struct split_index *si = istate->split_index;
@@ -4008,7 +4042,8 @@ int write_locked_index(struct index_state *istate, struct lock_file *lock,
 	    alternate_index_output ||
 	    (istate->cache_changed & ~EXTMASK)) {
 		ret = do_write_locked_index(istate, lock, flags,
-					    ~WRITE_SPLIT_INDEX_EXTENSION);
+					    ~WRITE_SPLIT_INDEX_EXTENSION,
+					    receipt);
 		goto out;
 	}
 
@@ -4038,7 +4073,8 @@ int write_locked_index(struct index_state *istate, struct lock_file *lock,
 		free(path);
 		if (!temp) {
 			ret = do_write_locked_index(istate, lock, flags,
-						    ~WRITE_SPLIT_INDEX_EXTENSION);
+						    ~WRITE_SPLIT_INDEX_EXTENSION,
+						    receipt);
 			goto out;
 		}
 		ret = write_shared_index(istate, &temp, flags);
@@ -4066,6 +4102,12 @@ out:
 	if (flags & COMMIT_LOCK)
 		rollback_lock_file(lock);
 	return ret;
+}
+
+int write_locked_index(struct index_state *istate, struct lock_file *lock,
+		       unsigned flags)
+{
+	return write_locked_index_with_receipt(istate, lock, flags, NULL);
 }
 
 /*
