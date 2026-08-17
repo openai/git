@@ -4729,8 +4729,20 @@ test_expect_success MACOS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				test_must_be_empty ".git/$diff_case.actual"
 			fi &&
 			test_cmp_bin .git/index.before .git/index &&
-			test_trace2_data fsmonitor history/external-restored 1 \
-				<".git/$diff_case.trace" &&
+			if test "$diff_case" = cached
+			then
+				test_trace2_data fsmonitor \
+					semantic/scoped-reader-stat-fallback 1 \
+					<".git/$diff_case.trace" &&
+				! test_trace2_data fsmonitor \
+					history/external-restored 1 \
+					<".git/$diff_case.trace" &&
+				test_region ! fsmonitor history_logical_digest \
+					".git/$diff_case.trace"
+			else
+				test_trace2_data fsmonitor history/external-restored 1 \
+					<".git/$diff_case.trace"
+			fi &&
 			! test_trace2_data fsmonitor semantic/manifest-scan-count \
 				<".git/$diff_case.trace" &&
 			test_grep ! "\"label\":\"do_write_index\"" \
