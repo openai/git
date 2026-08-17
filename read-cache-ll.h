@@ -31,6 +31,7 @@ struct cache_entry {
 	char name[FLEX_ARRAY]; /* more */
 };
 
+struct clean_status_index_write_receipt;
 struct clean_status_proof_epoch;
 struct preload_bulk_stat_update;
 
@@ -359,6 +360,15 @@ int is_index_unborn(struct index_state *);
  * is written (and the lock is rolled back if `COMMIT_LOCK` is given).
  */
 int write_locked_index(struct index_state *, struct lock_file *lock, unsigned flags);
+
+/*
+ * Like repo_update_index_if_able(), with an optional receipt for the canonical
+ * file actually written. The receipt must be initialized by the caller and
+ * remains empty if the write is skipped, fails, or is not eligible.
+ */
+void repo_update_index_if_able_with_receipt(
+	struct repository *repo, struct lock_file *lock,
+	struct clean_status_index_write_receipt *receipt);
 
 void discard_index(struct index_state *);
 void move_index_extensions(struct index_state *dst, struct index_state *src);
