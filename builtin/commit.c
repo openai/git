@@ -23,6 +23,7 @@
 #include "environment.h"
 #include "diff.h"
 #include "commit.h"
+#include "fsmonitor.h"
 #include "fsmonitor-settings.h"
 #include "add-interactive.h"
 #include "gettext.h"
@@ -1882,6 +1883,7 @@ struct repository *repo UNUSED)
 	int normal_has_head;
 	int reissue_clean_sidecar = 0;
 	int repository_inputs_changed = 0;
+	int sidecar_provider_reset = 0;
 	int reissue_after_write = 0;
 	int save_history_after_write = 0;
 	int deferred_scoped_history = 0;
@@ -2003,7 +2005,8 @@ struct repository *repo UNUSED)
 	s.certify_clean_status = exact_clean_query;
 	if (reusable_clean_query &&
 	    clean_status_try_sidecar(the_repository, &clean_digest,
-				     &repository_inputs_changed)) {
+				     &repository_inputs_changed,
+				     &sidecar_provider_reset)) {
 		if (exact_clean_query ||
 		    print_clean_sidecar(&s, prefix)) {
 			wt_status_collect_free_buffers(&s);
@@ -2025,6 +2028,24 @@ struct repository *repo UNUSED)
 	if (use_optional_locks())
 		clean_status_require_external_history_source(the_repository);
 	repo_read_index(the_repository);
+	if (sidecar_provider_reset) {
+		/*
+		 * The fast probe already lost the old provider boundary. Even
+		 * if the index reader's second query is empty, it must not
+		 * revive the tracked or untracked proof we just rejected. A
+		 * provider-owned, authenticated stat baseline has already
+		 * invalidated that proof and must retain its closing token.
+		 */
+		if (!clean_status_fsmonitor_semantic_baseline_pending(
+			    the_repository->index) ||
+		    !fsmonitor_pending_token_from_provider(the_repository->index)) {
+			clean_status_invalidate_current_manifest(the_repository->index);
+			fsmonitor_invalidate_semantics(the_repository->index);
+			untracked_cache_invalidate_all(the_repository->index);
+		}
+		trace2_data_intmax("status", the_repository,
+				   "clean-proof/provider-reset-carried", 1);
+	}
 	if (use_optional_locks()) {
 		deferred_scoped_history =
 			clean_status_defer_scoped_history_capture(
