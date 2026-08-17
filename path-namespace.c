@@ -205,6 +205,18 @@ int path_namespace_stat_equal(const struct stat *a, const struct stat *b)
 	return path_stat_identity_equal(&first, &second);
 }
 
+int path_namespace_directory_stat_equal(const struct stat *a,
+				       const struct stat *b)
+{
+	struct stat_fingerprint first, second;
+
+	if (!S_ISDIR(a->st_mode) || !S_ISDIR(b->st_mode))
+		return 0;
+	stat_fingerprint_init(&first, a);
+	stat_fingerprint_init(&second, b);
+	return stat_fingerprint_equal(&first, &second);
+}
+
 int path_namespace_reopen_component(
 	int parent_fd, const char *component, int flags,
 	path_namespace_open_fn open_fn, const struct stat *expected)
