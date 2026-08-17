@@ -811,7 +811,7 @@ test_index_witness_scripted_status () (
 	witness_status_label=$1 &&
 	witness_status_key=$2 &&
 	witness_status_expected=$3 &&
-	if GIT_TRACE2_EVENT="$PWD/.git/$witness_status_label.trace" \
+	if test_env GIT_TRACE2_EVENT="$PWD/.git/$witness_status_label.trace" \
 		test_index_witness_watchdog 20 git --no-optional-locks \
 			status --porcelain=v2 >".git/$witness_status_label.actual" \
 			2>".git/$witness_status_label.err"
