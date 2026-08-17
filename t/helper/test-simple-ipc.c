@@ -3,6 +3,7 @@
  */
 
 #include "test-tool.h"
+#include "fsmonitor-ipc.h"
 #include "gettext.h"
 #include "simple-ipc.h"
 #include "parse-options.h"
@@ -162,6 +163,8 @@ static int my_app_data = 42;
 static int fsmonitor_legacy;
 static int fsmonitor_capability_superset;
 static int fsmonitor_pre_dir_metadata;
+static int fsmonitor_pre_cookie_retirement;
+static int fsmonitor_unmarked_response;
 static int fsmonitor_disconnect_first;
 
 static ipc_server_application_cb test_app_cb;
@@ -172,17 +175,43 @@ static int app__fsmonitor_capability_superset(
 	struct ipc_server_reply_data *reply_data)
 {
 	static const char capability_command[] = "get-capabilities";
-	static const char capabilities[] = "query-v1\nquery-v2\n"
+	static const char capabilities[] =
+		FSMONITOR_IPC_QUERY_VERSION "\n"
+		FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
 #ifdef __APPLE__
-		"dir-metadata-filter-v1\n"
-		"hardlink-inode-v1\n"
+		FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+		FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
 #endif
 		;
-	static const char pre_dir_metadata_capabilities[] = "query-v1\n";
-	static const char token[] = "builtin:test-capable:0";
+	static const char pre_cookie_capabilities[] =
+		FSMONITOR_IPC_QUERY_VERSION "\n"
+#ifdef __APPLE__
+		FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+		FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+		FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
+#endif
+		;
+	static const char pre_dir_metadata_capabilities[] =
+		FSMONITOR_IPC_QUERY_VERSION "\n";
+	static const char current_token[] =
+		"builtin:"
+#ifdef __APPLE__
+		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
+#endif
+		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX "test-capable:0";
+	static const char old_token[] =
+		"builtin:"
+#ifdef __APPLE__
+		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
+#endif
+		"test-pre-cookie:0";
+	const char *token;
 	const char *query;
-	size_t query_len;
+	size_t token_len, query_len;
 	int ret;
+
+	trace2_data_string("fsmonitor", NULL, "request", command);
 
 	if (command_len == sizeof(capability_command) - 1 &&
 	    !memcmp(command, capability_command, command_len)) {
@@ -190,17 +219,25 @@ static int app__fsmonitor_capability_superset(
 			return reply_cb(reply_data,
 					pre_dir_metadata_capabilities,
 					sizeof(pre_dir_metadata_capabilities) - 1);
+		if (fsmonitor_pre_cookie_retirement)
+			return reply_cb(reply_data,
+					pre_cookie_capabilities,
+					sizeof(pre_cookie_capabilities) - 1);
 		return reply_cb(reply_data, capabilities,
 				sizeof(capabilities) - 1);
 	}
 
+	token = fsmonitor_pre_dir_metadata ||
+		fsmonitor_pre_cookie_retirement || fsmonitor_unmarked_response ?
+		old_token : current_token;
+	token_len = strlen(token);
 	query = memchr(command, '\n', command_len);
 	query_len = query ? command_len - (query + 1 - command) : 0;
-	ret = reply_cb(reply_data, token, sizeof(token));
+	ret = reply_cb(reply_data, token, token_len + 1);
 	if (!ret &&
 	    ((!starts_with(command, "query-v1 ") &&
 	      !starts_with(command, "query-v2 ")) ||
-	     query_len != sizeof(token) - 1 ||
+	     query_len != token_len ||
 	     memcmp(query + 1, token, query_len)))
 		ret = reply_cb(reply_data, "/", 2);
 	return ret;
@@ -251,7 +288,8 @@ static int test_app_cb(void *application_data,
 		return SIMPLE_IPC_QUIT;
 	}
 
-	if (fsmonitor_capability_superset || fsmonitor_pre_dir_metadata)
+	if (fsmonitor_capability_superset || fsmonitor_pre_dir_metadata ||
+	    fsmonitor_pre_cookie_retirement || fsmonitor_unmarked_response)
 		return app__fsmonitor_capability_superset(
 			command, command_len, reply_cb, reply_data);
 
@@ -380,6 +418,10 @@ static int daemon__start_server(void)
 		strvec_push(&cp.args, "--fsmonitor-capability-superset");
 	if (fsmonitor_pre_dir_metadata)
 		strvec_push(&cp.args, "--fsmonitor-pre-dir-metadata");
+	if (fsmonitor_pre_cookie_retirement)
+		strvec_push(&cp.args, "--fsmonitor-pre-cookie-retirement");
+	if (fsmonitor_unmarked_response)
+		strvec_push(&cp.args, "--fsmonitor-unmarked-response");
 	if (fsmonitor_disconnect_first)
 		strvec_push(&cp.args, "--fsmonitor-disconnect-first");
 
@@ -682,6 +724,12 @@ int cmd__simple_ipc(int argc, const char **argv)
 		OPT_BOOL(0, "fsmonitor-pre-dir-metadata",
 			 &fsmonitor_pre_dir_metadata,
 			 N_("emulate a daemon without directory metadata filtering")),
+		OPT_BOOL(0, "fsmonitor-pre-cookie-retirement",
+			 &fsmonitor_pre_cookie_retirement,
+			 N_("emulate a daemon without failed-cookie token retirement")),
+		OPT_BOOL(0, "fsmonitor-unmarked-response",
+			 &fsmonitor_unmarked_response,
+			 N_("advertise token retirement but return an unmarked token")),
 		OPT_BOOL(0, "fsmonitor-disconnect-first",
 			 &fsmonitor_disconnect_first,
 			 N_("disconnect while handling the first fsmonitor query")),
