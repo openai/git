@@ -2632,11 +2632,11 @@ test_expect_success PERL_TEST_HELPERS \
 		git config core.fsmonitor true &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			git update-index --fsmonitor &&
-		GIT_INDEX_FILE="$PWD/.git/index" \
+		test_env GIT_INDEX_FILE="$PWD/.git/index" \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			bulk_status status --porcelain=v2 >.git/prime &&
 		test_must_be_empty .git/prime &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			bulk_status status --porcelain=v2 >.git/issue &&
 		test_must_be_empty .git/issue &&
 		test_path_is_file .git/index.csts &&
