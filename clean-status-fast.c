@@ -22,9 +22,10 @@
 int clean_status_try_sidecar(
 	struct repository *repo UNUSED,
 	const struct clean_status_config_digest *config UNUSED,
-	int *repository_inputs_changed)
+	int *repository_inputs_changed, int *provider_reset)
 {
 	*repository_inputs_changed = 0;
+	*provider_reset = 0;
 	return 0;
 }
 
@@ -199,7 +200,7 @@ static int current_worktree_is_main(struct repository *repo)
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config,
-	int *repository_inputs_changed)
+	int *repository_inputs_changed, int *provider_reset)
 {
 	struct clean_status_sidecar_record record =
 		CLEAN_STATUS_SIDECAR_RECORD_INIT;
@@ -216,6 +217,7 @@ int clean_status_try_sidecar(
 	int ret = 0;
 
 	*repository_inputs_changed = 0;
+	*provider_reset = 0;
 	if (!config->finalized ||
 	    (config->filter_configured && config->normalized_filter_disable) ||
 	    getenv(INDEX_ENVIRONMENT) || is_bare_repository(repo) ||
@@ -281,8 +283,13 @@ int clean_status_try_sidecar(
 	query_token = xmemdupz(
 		record.sidecar.token, record.sidecar.token_len);
 	if (query_builtin_fsmonitor(query_token, &query) !=
-		    FSMONITOR_QUERY_DELTA ||
-	    query.paths.len) {
+		    FSMONITOR_QUERY_DELTA) {
+		/* A later successful query cannot erase this lost boundary. */
+		*provider_reset = 1;
+		trace_miss(repo, "fast-provider-changed");
+		goto done;
+	}
+	if (query.paths.len) {
 		trace_miss(repo, "fast-provider-changed");
 		goto done;
 	}
