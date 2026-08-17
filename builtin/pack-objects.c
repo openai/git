@@ -1391,6 +1391,7 @@ static void write_pack_file(void)
 			display_progress(progress_state, written);
 		}
 
+		/* Every finalization path appends the pack checksum. */
 		bytes_written += hashfile_total(f) +
 			the_repository->hash_algo->rawsz;
 		if (pack_to_stdout) {
