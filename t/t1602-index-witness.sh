@@ -613,7 +613,12 @@ test_lazy_prereq INDEX_WITNESS_SCRIPTED_IPC '
 # This provider exists in the pre-fix runtime too.  Its one stable token is
 # truthful only while the worktree is unchanged: make every worktree edit
 # before starting it, and keep all later fixture writes inside .git.
-index_witness_scripted_token=builtin:test-capable:0
+if test_have_prereq MACOS
+then
+	index_witness_scripted_token=builtin:dirmeta-v1.inode-v1.cookie-v1.test-capable:0
+else
+	index_witness_scripted_token=builtin:cookie-v1.test-capable:0
+fi
 
 test_index_witness_scripted_prepare () {
 	sane_unset GIT_INDEX_FILE GIT_INDEX_VERSION \
