@@ -58,13 +58,17 @@ static int snapshot_open(
 {
 	struct clean_status_identity named;
 	struct stat fd_st, named_st;
-	int fd;
+	int fd, flags = O_RDONLY | O_CLOEXEC;
 
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->fd = -1;
-	fd = open_nofollow(path, O_RDONLY);
+#ifdef O_NONBLOCK
+	flags |= O_NONBLOCK;
+#endif
+	fd = open_nofollow(path, flags);
 	if (fd < 0 ||
 	    fstat(fd, &fd_st) ||
+	    !S_ISREG(fd_st.st_mode) ||
 	    lstat(path, &named_st) ||
 	    clean_status_identity_from_stat(&snapshot->identity, &fd_st) ||
 	    clean_status_identity_from_stat(&named, &named_st) ||

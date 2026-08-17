@@ -5,6 +5,7 @@
 #include "attr-fingerprint.h"
 #include "attr-manifest.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "clean-status-internal.h"
 #include "config.h"
 #include "dir.h"
@@ -19,6 +20,147 @@
 #include "repository.h"
 #include "setup.h"
 #include "strbuf.h"
+
+static int witness_has_only_entries(const struct index_state *istate)
+{
+	const unsigned int disk_flags =
+		CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS;
+
+	if (!istate->initialized || istate->cache_changed ||
+	    istate->name_hash_initialized || istate->cache_tree ||
+	    istate->resolve_undo || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED || istate->untracked ||
+	    istate->clean_status || istate->fsmonitor_dirty ||
+	    istate->fsmonitor_last_update ||
+	    istate->fsmonitor_last_update_pending ||
+	    istate->fsmonitor_untracked_token ||
+	    istate->fsmonitor_token_valid || istate->fsmonitor_extension_seen ||
+	    istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_valid)
+		return 0;
+	for (size_t i = 0; i < istate->cache_nr; i++)
+		if (istate->cache[i]->ce_flags & ~disk_flags)
+			return 0;
+	return 1;
+}
+
+static int compare_witness_entries(const struct index_state *witness,
+				   const struct index_state *full)
+{
+	const unsigned int disk_flags =
+		CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS;
+
+	if (witness->version != full->version ||
+	    witness->cache_nr != full->cache_nr ||
+	    !oideq(&witness->oid, &full->oid) ||
+	    witness->timestamp.sec != full->timestamp.sec ||
+	    witness->timestamp.nsec != full->timestamp.nsec)
+		return error("witness index header differs from the full reader");
+	for (size_t i = 0; i < witness->cache_nr; i++) {
+		const struct cache_entry *a = witness->cache[i];
+		const struct cache_entry *b = full->cache[i];
+
+		if (memcmp(&a->ce_stat_data, &b->ce_stat_data,
+			   sizeof(a->ce_stat_data)) ||
+		    a->ce_mode != b->ce_mode ||
+		    ((a->ce_flags ^ b->ce_flags) & disk_flags) ||
+		    !oideq(&a->oid, &b->oid) ||
+		    ce_namelen(a) != ce_namelen(b) ||
+		    memcmp(a->name, b->name, ce_namelen(a) + 1))
+			return error("witness entry %"PRIuMAX" differs from the full reader",
+				     (uintmax_t)i);
+	}
+	return 0;
+}
+
+static int test_read_index_witness(const char *path, int compare,
+				   int unlink_after_open, int expect_miss)
+{
+	struct index_state witness = INDEX_STATE_INIT(the_repository);
+	struct index_state full = INDEX_STATE_INIT(the_repository);
+	struct clean_status_index_snapshot snapshot = { .fd = -1 };
+	struct stat st;
+	int flags = O_RDONLY | O_CLOEXEC;
+	int fd = -1, ret = 1, read_result;
+
+	setup_git_directory(the_repository);
+	repo_config(the_repository, git_default_config, NULL);
+#ifdef O_NONBLOCK
+	flags |= O_NONBLOCK;
+#else
+	/* The parser is still useful for regular-file fixtures on this platform. */
+	if (lstat(path, &st) || !S_ISREG(st.st_mode)) {
+		ret = !expect_miss;
+		goto done;
+	}
+#endif
+	fd = open_nofollow(path, flags);
+	if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+		ret = !expect_miss;
+		goto done;
+	}
+	if (lseek(fd, 1, SEEK_SET) != 1)
+		goto done;
+	if (unlink_after_open &&
+	    (clean_status_index_snapshot_open_allow_null_checksum(
+		     &snapshot, path, the_repository->hash_algo) ||
+	     unlink(path)))
+		goto done;
+	read_result = read_index_entries_from_fd(&witness, fd);
+	if (fstat(fd, &st) || lseek(fd, 0, SEEK_CUR) != 1) {
+		error("witness reader consumed its borrowed descriptor");
+		goto done;
+	}
+	if (read_result) {
+		if (witness.initialized || witness.cache || witness.cache_nr ||
+		    witness.ce_mem_pool) {
+			error("failed witness read published partial state");
+			goto done;
+		}
+		ret = !expect_miss;
+		goto done;
+	}
+	if (expect_miss) {
+		error("invalid witness was accepted");
+		goto done;
+	}
+	if (!witness_has_only_entries(&witness)) {
+		error("witness reader installed non-entry state");
+		goto done;
+	}
+	if (unlink_after_open &&
+	    clean_status_index_snapshot_still_matches_path(
+		    &snapshot, path, the_repository->hash_algo)) {
+		error("unlinked witness retained its named snapshot");
+		goto done;
+	}
+	if (compare) {
+		do_read_index(&full, path, 1);
+		if (compare_witness_entries(&witness, &full))
+			goto done;
+	}
+	ret = 0;
+
+done:
+	if (fd >= 0)
+		close(fd);
+	clean_status_index_snapshot_release(&snapshot);
+	release_index(&full);
+	release_index(&witness);
+	return ret;
+}
+
+static int test_index_witness_snapshot(const char *path)
+{
+	struct clean_status_index_snapshot snapshot = { .fd = -1 };
+	int ret;
+
+	setup_git_directory(the_repository);
+	ret = clean_status_index_snapshot_open_allow_null_checksum(
+		&snapshot, path, the_repository->hash_algo);
+	clean_status_index_snapshot_release(&snapshot);
+	return !!ret;
+}
 
 static int test_fsmonitor_content_recovery(const char *path)
 {
@@ -429,6 +571,16 @@ int cmd__read_cache(int argc, const char **argv)
 	int i, cnt = 1;
 	const char *name = NULL;
 
+	if (argc == 3 && !strcmp(argv[1], "--read-index-witness"))
+		return test_read_index_witness(argv[2], 0, 0, 0);
+	if (argc == 3 && !strcmp(argv[1], "--expect-index-witness-miss"))
+		return test_read_index_witness(argv[2], 0, 0, 1);
+	if (argc == 3 && !strcmp(argv[1], "--compare-index-witness"))
+		return test_read_index_witness(argv[2], 1, 0, 0);
+	if (argc == 3 && !strcmp(argv[1], "--read-index-witness-unlink"))
+		return test_read_index_witness(argv[2], 0, 1, 0);
+	if (argc == 3 && !strcmp(argv[1], "--index-witness-snapshot"))
+		return test_index_witness_snapshot(argv[2]);
 	if (argc == 3 &&
 	    !strcmp(argv[1], "--test-fsmonitor-content-recovery"))
 		return test_fsmonitor_content_recovery(argv[2]);
