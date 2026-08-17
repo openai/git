@@ -437,7 +437,6 @@ static int server_supports_bound_queries(void)
 
 static int server_supports_required_capabilities(void)
 {
-#ifdef __APPLE__
 	struct strbuf answer = STRBUF_INIT;
 	int ret;
 
@@ -445,31 +444,35 @@ static int server_supports_required_capabilities(void)
 				&answer, NULL, 1) &&
 		has_capability(&answer, FSMONITOR_IPC_QUERY_VERSION) &&
 		has_capability(&answer,
+			       FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY);
+#ifdef __APPLE__
+	ret = ret &&
+		has_capability(&answer,
 			       FSMONITOR_IPC_HARDLINK_QUERY_VERSION) &&
 		has_capability(&answer,
 			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY) &&
 		has_capability(&answer,
 			       FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY);
+#endif
 	strbuf_release(&answer);
 	return ret;
-#else
-	return server_supports_bound_queries();
-#endif
 }
 
-#ifdef __APPLE__
-static int query_identifies_filtered_daemon(const char *token,
-					   const struct strbuf *answer)
+static int response_identifies_cookie_retiring_daemon(
+	const struct strbuf *answer)
 {
 	static const char prefix[] =
-		"builtin:" FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX;
+		"builtin:"
+#ifdef __APPLE__
+		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
+#endif
+		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX;
 	const char *end = memchr(answer->buf, '\0', answer->len);
 
-	return starts_with(token, prefix) && end &&
+	return end &&
 		(size_t)(end - answer->buf) >= sizeof(prefix) - 1 &&
 		!memcmp(answer->buf, prefix, sizeof(prefix) - 1);
 }
-#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 static int legacy_peer_credentials(
@@ -940,26 +943,32 @@ try_again:
 
 		trace2_data_intmax("fsm_client", NULL,
 				   "query/response-length", answer->len);
-#ifdef __APPLE__
-		if (!ret && !query_identifies_filtered_daemon(tok, answer) &&
-		    !server_supports_required_capabilities()) {
+		if (!ret &&
+		    !response_identifies_cookie_retiring_daemon(answer)) {
+			int compatible = server_supports_required_capabilities();
+
+			trace2_data_intmax("fsm_client", NULL,
+					   "query/unmarked-response", 1);
 			strbuf_reset(answer);
 			ret = -1;
 			if (lifecycle_attempts++ >= FSMONITOR_RESTART_ATTEMPTS ||
-			    restart_incompatible_daemon())
+			    (!compatible && restart_incompatible_daemon()))
 				goto done;
-			options.wait_if_not_found = 1;
+			options.wait_if_not_found = !compatible;
 			goto try_again;
 		}
-#endif
 		if (!ret && is_trivial_response(answer) &&
 		    !server_supports_bound_queries()) {
 			if (!try_send_attested_legacy_query(
 				    tok, &identity, answer)) {
-				if (legacy_worktree_authenticated)
-					*legacy_worktree_authenticated = 1;
-				ret = 0;
-				goto done;
+				if (response_identifies_cookie_retiring_daemon(answer)) {
+					if (legacy_worktree_authenticated)
+						*legacy_worktree_authenticated = 1;
+					ret = 0;
+					goto done;
+				}
+				trace2_data_intmax("fsm_client", NULL,
+						   "query/unmarked-response", 1);
 			}
 			/*
 			 * A daemon predating bound queries treats query-v1 as
