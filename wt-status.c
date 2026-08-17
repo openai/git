@@ -1746,6 +1746,7 @@ struct wt_status_token_closure {
 	int staged_output_matches_status;
 	int refresh_result;
 	int queries;
+	int consecutive_trivial;
 };
 
 static void wt_status_discard_staged_untracked(
@@ -1844,6 +1845,19 @@ static int fsmonitor_token_requires_rescan(enum fsmonitor_token_result result)
 {
 	return result == FSMONITOR_TOKEN_CHANGED ||
 		result == FSMONITOR_TOKEN_TRIVIAL;
+}
+
+static enum fsmonitor_token_result wt_status_query_pending_token(
+	struct wt_status_token_closure *closure, int untracked_ready)
+{
+	enum fsmonitor_token_result result = fsmonitor_query_pending_token(
+		closure->status->repo->index, untracked_ready);
+
+	if (result == FSMONITOR_TOKEN_TRIVIAL)
+		closure->consecutive_trivial++;
+	else
+		closure->consecutive_trivial = 0;
+	return result;
 }
 
 static void wt_status_release_attr_snapshot(struct wt_status *s);
@@ -1984,9 +1998,8 @@ static int wt_status_close_ordinary_fsmonitor_token(
 			    istate, scan_epoch))
 			break;
 		closure->queries++;
-		result = fsmonitor_query_pending_token(
-			istate,
-			wt_status_untracked_cache_valid(closure));
+		result = wt_status_query_pending_token(
+			closure, wt_status_untracked_cache_valid(closure));
 		if (result == FSMONITOR_TOKEN_CLEAN) {
 			if (validate_epoch &&
 			    !clean_status_proof_epoch_matches(
@@ -2031,6 +2044,12 @@ static int wt_status_close_ordinary_fsmonitor_token(
 		wt_status_reset_attr_snapshot_if_changed(s);
 		if (wt_status_refresh_invalidated_manifest(s))
 			break;
+		if (closure->consecutive_trivial >= 2) {
+			trace2_data_intmax("status", s->repo,
+					   "fsmonitor_token/repeated-trivial-fallback",
+					   1);
+			break;
+		}
 		if (closure->queries >= FSMONITOR_TOKEN_MAX_QUERIES) {
 			trace2_data_intmax("status", s->repo,
 					   "fsmonitor_token/terminal-rescan-skipped",
@@ -2089,8 +2108,8 @@ wt_status_close_semantic_fsmonitor_token(
 
 	/* The first query closes the tracked scan and its semantic proof. */
 	closure->queries++;
-	result = fsmonitor_query_pending_token(
-		istate, defer_untracked ? 0 :
+	result = wt_status_query_pending_token(
+		closure, defer_untracked ? 0 :
 		wt_status_untracked_cache_valid(closure));
 	if (result != FSMONITOR_TOKEN_CLEAN) {
 		wt_status_discard_semantic_verify(
@@ -2136,9 +2155,8 @@ wt_status_close_semantic_fsmonitor_token(
 		/* A second query closes the subsequent untracked scan. */
 		closure->queries++;
 		clean_status_manifest_begin_directory_delta(istate, *proof);
-		result = fsmonitor_query_pending_token(
-			istate,
-			wt_status_untracked_cache_valid(closure));
+		result = wt_status_query_pending_token(
+			closure, wt_status_untracked_cache_valid(closure));
 		directory_delta_reused =
 			clean_status_manifest_end_directory_delta(istate);
 		if (result != FSMONITOR_TOKEN_CLEAN) {
