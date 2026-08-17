@@ -1390,9 +1390,10 @@ static void write_pack_file(void)
 			display_progress(progress_state, written);
 		}
 
+		/* Every finalization path appends the pack checksum. */
+		bytes_written += hashfile_total(f) +
+			the_repository->hash_algo->rawsz;
 		if (pack_to_stdout) {
-			bytes_written += hashfile_total(f) +
-				the_repository->hash_algo->rawsz;
 			/*
 			 * We never fsync when writing to stdout since we may
 			 * not be writing to an actual pack file. For instance,
@@ -1513,9 +1514,8 @@ static void write_pack_file(void)
 		    written, nr_result);
 	trace2_data_intmax("pack-objects", the_repository,
 			   "write_pack_file/wrote", nr_result);
-	if (pack_to_stdout)
-		trace2_data_intmax("pack-objects", the_repository,
-				   "written/bytes", bytes_written);
+	trace2_data_intmax("pack-objects", the_repository,
+			   "write_pack_file/wrote_bytes", bytes_written);
 }
 
 static int no_try_delta(const char *path)
