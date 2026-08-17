@@ -4204,21 +4204,28 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'directory closure rejects too many distinct attribute candidates' '
+	'directory closure reuses more than 64 authenticated attribute sources' '
 	test_when_finished "rm -rf directory-many-attribute-candidates" &&
 	test_create_repo directory-many-attribute-candidates &&
 	(
 		cd directory-many-attribute-candidates &&
 		sane_unset GIT_TEST_SPLIT_INDEX &&
-		mkdir cached sibling &&
+		mkdir before cached sibling &&
 		for descendant in $(test_seq 1 64)
 		do
 			mkdir "cached/child-$descendant" &&
 			printf "aaaa\n" \
 				>"cached/child-$descendant/tracked" || return 1
 		done &&
+		test_write_lines "# unchanged before" \
+			>before/.gitattributes &&
+		test_write_lines "# unchanged inside" \
+			>cached/child-32/.gitattributes &&
+		test_write_lines "# unchanged after" \
+			>sibling/.gitattributes &&
+		test_write_lines retained >before/tracked &&
 		test_write_lines retained >sibling/tracked &&
-		git add cached sibling &&
+		git add before cached sibling &&
 		git commit -qm base &&
 		git config core.trustctime false &&
 		git config core.checkStat minimal &&
@@ -4247,11 +4254,11 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_cmp .git/expect .git/actual &&
 		test_grep "^1 \\.M .* cached/child-1/tracked$" .git/actual &&
 		test_grep "^? sibling/visible$" .git/actual &&
-		test_trace2_data fsmonitor semantic/manifest-scan-count 2 \
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
 			<.git/status.trace &&
-		! test_trace2_data fsmonitor semantic/manifest-directory-reused 1 \
+		test_trace2_data fsmonitor semantic/manifest-directory-reused 1 \
 			<.git/status.trace &&
-		! test_trace2_data status \
+		test_trace2_data status \
 			fsmonitor_token/reused-semantic-subtrees 1 \
 			<.git/status.trace &&
 		test_trace2_data fsmonitor token_closure/accepted 1 \
@@ -4262,8 +4269,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 
 test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'directory closure rejects raced attributes and rechecks raced excludes' '
-	test_when_finished "rm -rf directory-race-attributes directory-race-ignore" &&
-	for mutation in attributes ignore
+	test_when_finished "rm -rf directory-race-attributes \
+		directory-race-nested-attributes directory-race-ignore" &&
+	for mutation in attributes nested-attributes ignore
 	do
 		test_create_repo "directory-race-$mutation" &&
 		(
@@ -4281,6 +4289,16 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				test_write_lines "$descendant" \
 					>"cached/retained-$descendant" || return 1
 			done &&
+			if test "$mutation" = nested-attributes
+			then
+				for descendant in $(test_seq 1 64)
+				do
+					mkdir "cached/child-$descendant" &&
+					test_write_lines "$descendant" \
+						>"cached/child-$descendant/tracked" ||
+						return 1
+				done
+			fi &&
 			for sibling in $(test_seq 1 8)
 			do
 				mkdir "sibling-$sibling" &&
@@ -4289,6 +4307,10 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			done &&
 			git add .gitignore cached/.gitignore cached/tracked \
 				cached/retained-* sibling-* &&
+			if test "$mutation" = nested-attributes
+			then
+				git add cached/child-*
+			fi &&
 			git commit -qm base &&
 			git config core.trustctime false &&
 			git config core.checkStat minimal &&
@@ -4327,6 +4349,10 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			then
 				test_write_lines "tracked text eol=crlf" \
 					>cached/.gitattributes
+			elif test "$mutation" = nested-attributes
+			then
+				test_write_lines "tracked text eol=crlf" \
+					>cached/child-64/.gitattributes
 			else
 				test_write_lines "!junk.ignored" >cached/.gitignore
 			fi &&
@@ -4343,10 +4369,18 @@ test_expect_success PIPE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			test_cmp .git/expect .git/actual &&
 			test_grep "^1 \\.M .* cached/tracked$" .git/actual &&
 			test_grep "^? sibling-1/visible$" .git/actual &&
-			if test "$mutation" = attributes
+			if test "$mutation" = attributes ||
+				test "$mutation" = nested-attributes
 			then
-				test_grep "^? cached/\\.gitattributes$" \
-					.git/actual &&
+				if test "$mutation" = attributes
+				then
+					test_grep "^? cached/\\.gitattributes$" \
+						.git/actual
+				else
+					test_grep \
+						"^? cached/child-64/\\.gitattributes$" \
+						.git/actual
+				fi &&
 				test_trace2_data fsmonitor \
 					semantic/manifest-scan-count 2 \
 					<.git/status.trace &&
