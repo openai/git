@@ -27,6 +27,29 @@ static void check_malformed(const void *data, size_t len)
 	check_response(data, len, FSMONITOR_QUERY_ERROR, "", NULL, 0);
 }
 
+static void check_worktree_event(
+	const char *path, size_t worktree_len,
+	int is_file, int is_directory,
+	const void *expected, size_t expected_len)
+{
+	struct strbuf paths = STRBUF_INIT;
+	struct strbuf response = STRBUF_INIT;
+
+	fsmonitor_format_worktree_paths(
+		&paths, path, worktree_len, is_file, is_directory);
+	cl_assert_equal_i(paths.len, expected_len);
+	cl_assert(!expected_len || !memcmp(paths.buf, expected, expected_len));
+
+	strbuf_addstr(&response, "builtin:worktree");
+	strbuf_addch(&response, '\0');
+	strbuf_addbuf(&response, &paths);
+	check_response(response.buf, response.len, FSMONITOR_QUERY_DELTA,
+		       "builtin:worktree", expected, expected_len);
+
+	strbuf_release(&response);
+	strbuf_release(&paths);
+}
+
 void test_fsmonitor_response__rejects_malformed_framing(void)
 {
 	static const char missing_nul[] = "builtin:1";
@@ -74,6 +97,12 @@ void test_fsmonitor_response__accepts_valid_builtin_responses(void)
 	static const char delta[] = "builtin:2\0a\0dir/file\0dir/\0";
 	static const char global[] = "builtin:3\0//\0";
 	static const char trivial[] = "builtin:4\0/\0";
+	static const char stale_root[] = "/repo\0stale/path";
+	static const char global_path[] = "//\0";
+	static const char file_path[] = "tracked\0";
+	static const char directory_path[] = "nested/\0";
+	static const char both_paths[] = "merged\0merged/\0";
+	static const char case_path[] = "Tracked\0";
 
 	check_response(delta, sizeof(delta) - 1, FSMONITOR_QUERY_DELTA,
 		       "builtin:2", delta + sizeof("builtin:2"),
@@ -83,6 +112,22 @@ void test_fsmonitor_response__accepts_valid_builtin_responses(void)
 		       sizeof(global) - 1 - sizeof("builtin:3"));
 	check_response(trivial, sizeof(trivial) - 1, FSMONITOR_QUERY_TRIVIAL,
 		       "builtin:4", NULL, 0);
+
+	check_worktree_event(stale_root, strlen("/repo"), 0, 1,
+			     global_path, sizeof(global_path) - 1);
+	check_worktree_event("/repo/", strlen("/repo"), 0, 1,
+			     global_path, sizeof(global_path) - 1);
+	check_worktree_event("/repo", strlen("/repo"), 1, 1,
+			     global_path, sizeof(global_path) - 1);
+	check_worktree_event("/repo/tracked", strlen("/repo"), 1, 0,
+			     file_path, sizeof(file_path) - 1);
+	check_worktree_event("/repo/nested", strlen("/repo"), 0, 1,
+			     directory_path, sizeof(directory_path) - 1);
+	check_worktree_event("/repo/merged", strlen("/repo"), 1, 1,
+			     both_paths, sizeof(both_paths) - 1);
+	check_worktree_event("/REPO/Tracked", strlen("/repo"), 1, 0,
+			     case_path, sizeof(case_path) - 1);
+	check_worktree_event("/repo", strlen("/repo"), 0, 0, NULL, 0);
 }
 
 void test_fsmonitor_response__validates_hardlink_inode_markers(void)

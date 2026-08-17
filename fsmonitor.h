@@ -36,6 +36,15 @@ struct fsmonitor_query_result {
 }
 
 void fsmonitor_query_result_release(struct fsmonitor_query_result *result);
+
+/*
+ * Encode an already classified and alias-resolved worktree event. The caller
+ * must have verified that worktree_len names the path's worktree prefix.
+ */
+void fsmonitor_format_worktree_paths(
+	struct strbuf *paths, const char *path, size_t worktree_len,
+	int is_file, int is_directory);
+
 enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 	const struct strbuf *raw, struct fsmonitor_query_result *result);
 enum fsmonitor_query_outcome query_builtin_fsmonitor(
