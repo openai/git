@@ -266,6 +266,7 @@ integration_tests = [
   't1517-outside-repo.sh',
   't1600-index.sh',
   't1601-index-bogus.sh',
+  't1602-index-witness.sh',
   't1700-split-index.sh',
   't1701-racy-split-index.sh',
   't1800-hook.sh',
