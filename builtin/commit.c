@@ -1892,6 +1892,8 @@ struct repository *repo UNUSED)
 	struct clean_status_index_snapshot scoped_history_source = {
 		.fd = -1,
 	};
+	struct clean_status_index_write_receipt written_index =
+		CLEAN_STATUS_INDEX_WRITE_RECEIPT_INIT;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -2020,7 +2022,8 @@ struct repository *repo UNUSED)
 	    clean_status_identity_is_durable())
 		reissue_clean_sidecar =
 			clean_status_sidecar_needs_reissue(
-				the_repository, repository_inputs_changed);
+				the_repository, repository_inputs_changed ||
+				sidecar_provider_reset);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
@@ -2219,7 +2222,10 @@ struct repository *repo UNUSED)
 				   "history/scoped-source-epoch-mismatch", 1);
 	}
 	if (0 <= fd) {
-		repo_update_index_if_able(the_repository, &index_lock);
+		repo_update_index_if_able_with_receipt(the_repository, &index_lock,
+						      &written_index);
+		clean_status_index_adopt_write_receipt(the_repository->index,
+						      &written_index);
 		if (save_history_after_write &&
 		    !hook_exists(the_repository, "post-index-change") &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
@@ -2239,6 +2245,7 @@ struct repository *repo UNUSED)
 				rollback_lock_file(&index_lock);
 		}
 	}
+	clean_status_index_write_receipt_release(&written_index);
 	clean_status_index_snapshot_release(&scoped_history_source);
 
 	if (s.relative_paths)
