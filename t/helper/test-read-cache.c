@@ -191,6 +191,31 @@ static int check_invalid_fsmn(const struct strbuf *encoded,
 	return 0;
 }
 
+static int test_fsmn_bitmap_ownership(const struct strbuf *encoded)
+{
+	struct index_state parsed = INDEX_STATE_INIT(the_repository);
+	struct index_state regenerated = INDEX_STATE_INIT(the_repository);
+
+	parsed.cache_nr = 1;
+	read_fsmonitor_extension(&parsed, encoded->buf, encoded->len);
+	if (!parsed.fsmonitor_token_valid || !parsed.fsmonitor_dirty)
+		return error("raw FSMN bitmap was not published");
+	parsed.cache_nr = 0;
+	release_index(&parsed);
+
+	fill_fsmonitor_bitmap(&regenerated);
+	if (!regenerated.fsmonitor_dirty)
+		return error("initial FSMN bitmap was not published");
+	fill_fsmonitor_bitmap(&regenerated);
+	if (!regenerated.fsmonitor_dirty)
+		return error("regenerated FSMN bitmap did not replace its owner");
+	release_index(&regenerated);
+
+	if (parsed.fsmonitor_dirty || regenerated.fsmonitor_dirty)
+		return error("released index retained its FSMN bitmap");
+	return 0;
+}
+
 static int test_fsmn_parser(void)
 {
 	struct index_state duplicate = INDEX_STATE_INIT(the_repository);
@@ -243,6 +268,8 @@ static int test_fsmn_parser(void)
 	words[1] = 1;
 	make_raw_fsmn(&malformed, 1, words, 2, 1);
 	if (check_invalid_fsmn(&malformed, "non-final RLW"))
+		return 1;
+	if (test_fsmn_bitmap_ownership(&encoded))
 		return 1;
 
 	strbuf_release(&malformed);

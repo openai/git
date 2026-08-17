@@ -26,6 +26,7 @@
 #include "tree.h"
 #include "commit.h"
 #include "environment.h"
+#include "ewah/ewok.h"
 #include "gettext.h"
 #include "mem-pool.h"
 #include "name-hash.h"
@@ -2754,6 +2755,8 @@ void release_index(struct index_state *istate)
 	free(istate->fsmonitor_last_update);
 	free(istate->fsmonitor_last_update_pending);
 	free(istate->fsmonitor_untracked_token);
+	ewah_free(istate->fsmonitor_dirty);
+	istate->fsmonitor_dirty = NULL;
 	clean_status_release(istate);
 	free(istate->preload_bulk_tracked_state);
 	free(istate->preload_bulk_stat_updates);
