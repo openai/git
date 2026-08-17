@@ -1888,6 +1888,7 @@ struct repository *repo UNUSED)
 	int save_history_after_write = 0;
 	int deferred_scoped_history = 0;
 	int guarded_scoped_history_source = 0;
+	int optional_status_writes;
 	struct clean_status_index_snapshot scoped_history_source = {
 		.fd = -1,
 	};
@@ -1962,6 +1963,8 @@ struct repository *repo UNUSED)
 			     builtin_status_usage, 0);
 	finalize_colopts(&s.colopts, -1);
 	finalize_deferred_config(&s);
+	optional_status_writes = use_optional_locks() &&
+		!fsm_settings__is_watch_limit_backoff(the_repository);
 
 	handle_untracked_files_arg(&s);
 	handle_ignored_arg(&s);
@@ -2013,7 +2016,7 @@ struct repository *repo UNUSED)
 			return 0;
 		}
 	}
-	if (normal_clean_query && use_optional_locks() &&
+	if (normal_clean_query && optional_status_writes &&
 	    clean_status_identity_is_durable())
 		reissue_clean_sidecar =
 			clean_status_sidecar_needs_reissue(
@@ -2025,7 +2028,7 @@ struct repository *repo UNUSED)
 		if (isatty(2))
 			clean_status_enable_progress(the_repository);
 	}
-	if (use_optional_locks())
+	if (optional_status_writes)
 		clean_status_require_external_history_source(the_repository);
 	repo_read_index(the_repository);
 	if (sidecar_provider_reset) {
@@ -2046,7 +2049,7 @@ struct repository *repo UNUSED)
 		trace2_data_intmax("status", the_repository,
 				   "clean-proof/provider-reset-carried", 1);
 	}
-	if (use_optional_locks()) {
+	if (optional_status_writes) {
 		deferred_scoped_history =
 			clean_status_defer_scoped_history_capture(
 				&s, &scoped_history_source);
@@ -2062,7 +2065,7 @@ struct repository *repo UNUSED)
 			clean_status_capture_external_history_source(
 				the_repository->index);
 	}
-	if (normal_clean_query && use_optional_locks() &&
+	if (normal_clean_query && optional_status_writes &&
 	    clean_status_identity_is_durable() &&
 	    (reissue_clean_sidecar ||
 	     clean_status_external_history_was_restored(
@@ -2075,7 +2078,7 @@ struct repository *repo UNUSED)
 		s.show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
 		!s.show_ignored_mode);
 
-	if (use_optional_locks())
+	if (optional_status_writes)
 		fd = repo_hold_locked_index(the_repository, &index_lock, 0);
 	else
 		fd = -1;
