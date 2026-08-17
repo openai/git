@@ -6663,7 +6663,7 @@ test_expect_success LINUX_SCOPED_HISTORY,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORE
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'exhausted provider resets skip an unclosable final index refresh' '
+	'repeated provider resets fall back before an unclosable rescan' '
 	test_when_finished "rm -rf builtin-closure-terminal-reset" &&
 	prepare_builtin_closure_repo builtin-closure-terminal-reset untracked &&
 	(
@@ -6689,12 +6689,12 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_cmp .git/expected .git/actual &&
 		test_trace2_data fsmonitor token_closure/trivial 1 \
 			<.git/status.trace >.git/trivial &&
-		test_line_count = 3 .git/trivial &&
+		test_line_count = 2 .git/trivial &&
 		test_trace2_data fsmonitor semantic/proof-epoch-captured 1 \
 			<.git/status.trace >.git/epochs &&
-		test_line_count = 3 .git/epochs &&
+		test_line_count = 2 .git/epochs &&
 		test_trace2_data status \
-			fsmonitor_token/terminal-rescan-skipped 1 \
+			fsmonitor_token/repeated-trivial-fallback 1 \
 			<.git/status.trace &&
 		test_trace2_data fsmonitor token_closure/rejected 1 \
 			<.git/status.trace &&
