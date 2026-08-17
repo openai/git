@@ -2681,6 +2681,22 @@ test_expect_success PERL_TEST_HELPERS \
 				<".git/$outcome.trace" &&
 			test_trace2_data status clean-proof/provider-reset-carried 1 \
 				<".git/$outcome.trace" &&
+			case "$outcome" in
+			E)
+				! test_trace2_data fsm_client query/trivial-response 1 \
+					<".git/$outcome.trace"
+				;;
+			*)
+				test_trace2_data fsm_client query/trivial-response 1 \
+					<".git/$outcome.trace" >.git/trivial-responses &&
+				if test "$outcome" = TT
+				then
+					test_line_count = 2 .git/trivial-responses
+				else
+					test_line_count = 1 .git/trivial-responses
+				fi
+				;;
+			esac &&
 			test_grep ! "\"key\":\"clean-proof/hit\"" \
 				".git/$outcome.trace" &&
 			test_cmp_bin .git/index.before .git/index &&
@@ -2717,6 +2733,8 @@ test_expect_success PERL_TEST_HELPERS \
 			git status --porcelain=v2 >.git/actual &&
 		test_cmp .git/expect .git/actual &&
 		! test_trace2_data status clean-proof/provider-reset-carried 1 \
+			<.git/delta.trace &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
 			<.git/delta.trace &&
 		test_cmp_bin .git/index.before .git/index &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
