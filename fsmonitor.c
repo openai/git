@@ -374,7 +374,10 @@ static struct ewah_bitmap *fsmonitor_bitmap_from_index(
 
 void fill_fsmonitor_bitmap(struct index_state *istate)
 {
-	istate->fsmonitor_dirty = fsmonitor_bitmap_from_index(istate);
+	struct ewah_bitmap *bitmap = fsmonitor_bitmap_from_index(istate);
+
+	ewah_free(istate->fsmonitor_dirty);
+	istate->fsmonitor_dirty = bitmap;
 }
 
 static void serialize_fsmonitor_extension(struct strbuf *sb,
