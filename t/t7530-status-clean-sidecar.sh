@@ -23,11 +23,14 @@ test_lazy_prereq DURABLE_FSMONITOR '
 		test-tool chmtime =-120 tracked &&
 		git -c core.fsmonitor=false update-index --refresh &&
 		git config core.fsmonitor true &&
-		git fsmonitor--daemon start --start-timeout=10 &&
+		GIT_TRACE_FSMONITOR="$PWD/.git/daemon.trace" \
+			git fsmonitor--daemon start --start-timeout=10 &&
 		git status --porcelain=v2 >/dev/null &&
 		test-tool fsmonitor-client query --token 0 >token &&
 		nul_to_q <token >token.filtered &&
-		grep "^builtin:" token.filtered
+		grep "^builtin:" token.filtered &&
+		grep "cookie-seen:" .git/daemon.trace &&
+		! grep "cookie_wait timed out" .git/daemon.trace
 		result=$?
 		git fsmonitor--daemon stop >/dev/null 2>&1 || :
 		exit $result
