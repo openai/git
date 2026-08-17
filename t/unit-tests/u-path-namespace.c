@@ -96,7 +96,7 @@ void test_path_namespace__directory_identity_ignores_unrelated_entries(void)
 	changed.st_ino++;
 	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
 	changed = original;
-	changed.st_mode ^= S_IXGRP;
+	changed.st_mode ^= S_IXUSR;
 	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
 	changed = original;
 	changed.st_uid++;
