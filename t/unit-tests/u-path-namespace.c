@@ -73,6 +73,52 @@ void test_path_namespace__stat_fields(void)
 #endif
 }
 
+void test_path_namespace__directory_identity_ignores_unrelated_entries(void)
+{
+	struct stat original, changed;
+
+	cl_must_pass(stat(".", &original));
+	cl_assert(S_ISDIR(original.st_mode));
+	cl_assert(path_namespace_directory_stat_equal(&original, &original));
+
+	changed = original;
+	changed.st_nlink++;
+	changed.st_size++;
+	changed.st_mtime++;
+	changed.st_ctime++;
+	cl_assert(!path_namespace_stat_equal(&original, &changed));
+	cl_assert(path_namespace_directory_stat_equal(&original, &changed));
+
+	changed = original;
+	changed.st_dev++;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+	changed = original;
+	changed.st_ino++;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+	changed = original;
+	changed.st_mode ^= S_IXGRP;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+	changed = original;
+	changed.st_uid++;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+	changed = original;
+	changed.st_gid++;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+#ifdef __APPLE__
+	changed = original;
+	changed.st_birthtimespec.tv_sec++;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+	changed = original;
+	changed.st_gen++;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+#endif
+
+	changed = original;
+	changed.st_mode = S_IFREG | 0600;
+	cl_assert(!path_namespace_directory_stat_equal(&original, &changed));
+	cl_assert(!path_namespace_directory_stat_equal(&changed, &changed));
+}
+
 static int source_fd = -1;
 
 static int reopen_source(int dirfd UNUSED, const char *path, int flags UNUSED)
