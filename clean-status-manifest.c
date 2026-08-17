@@ -180,18 +180,29 @@ int clean_status_manifest_end_directory_delta(struct index_state *istate)
 }
 
 #if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+static int directory_manifest_entry_path_compare(
+	const struct attr_manifest_entry *entry, const char *name)
+{
+	size_t len = strlen(name);
+	size_t common = entry->path_len < len ? entry->path_len : len;
+	int cmp = memcmp(entry->path, name, common);
+
+	if (cmp)
+		return cmp;
+	return entry->path_len < len ? -1 : entry->path_len > len;
+}
+
 static int directory_attribute_source_matches(
 	struct index_state *istate, struct semantic_verify_path *path,
-	const char *name, size_t position)
+	const char *name, const struct attr_manifest_entry *entry,
+	size_t position)
 {
-	struct clean_status_state *state = istate->clean_status;
-	struct attr_manifest_entry entry;
 	const struct cache_entry *indexed;
 	const struct git_hash_algo *algo = istate->repo->hash_algo;
 	const char *basename;
 	unsigned char observed[GIT_MAX_RAWSZ];
 	struct stat st;
-	int parent_fd, found, present, pos;
+	int parent_fd, found, pos;
 
 	if (semantic_verify_resolve_parent(path, name, position,
 					   &parent_fd, &basename))
@@ -205,24 +216,22 @@ static int directory_attribute_source_matches(
 	if (worktree_attr_source_read(path, name, position, algo,
 				      observed, &found))
 		return 0;
-	present = !find_manifest_entry(&state->manifest.current,
-				       name, algo, &entry);
 	if (found)
-		return present && entry.source == ATTR_MANIFEST_WORKTREE &&
-			!memcmp(entry.hash, observed, algo->rawsz);
+		return entry && entry->source == ATTR_MANIFEST_WORKTREE &&
+			!memcmp(entry->hash, observed, algo->rawsz);
 	if (!fstatat(parent_fd, basename, &st, AT_SYMLINK_NOFOLLOW) ||
 	    errno != ENOENT)
 		return 0;
 	pos = index_name_pos(istate, name, strlen(name));
 	if (pos < 0)
-		return !present;
+		return !entry;
 	indexed = istate->cache[pos];
 	if (!S_ISREG(indexed->ce_mode) || ce_stage(indexed) ||
 	    ce_skip_worktree(indexed) || ce_intent_to_add(indexed) ||
 	    (indexed->ce_flags & CE_VALID))
 		return 0;
-	return present && entry.source == ATTR_MANIFEST_INDEX &&
-		!memcmp(entry.hash, indexed->oid.hash, algo->rawsz);
+	return entry && entry->source == ATTR_MANIFEST_INDEX &&
+		!memcmp(entry->hash, indexed->oid.hash, algo->rawsz);
 }
 #endif
 
@@ -236,12 +245,15 @@ int clean_status_manifest_directory_unchanged(
 	struct clean_status_index_snapshot snapshot;
 	struct clean_status_config_digest config;
 	struct attr_fingerprint attrs;
+	struct attr_manifest_cursor manifest_cursor;
+	struct attr_manifest_entry manifest_entry;
 	struct string_list candidates = STRING_LIST_INIT_DUP;
 	struct strbuf candidate = STRBUF_INIT;
 	const struct git_hash_algo *algo = istate->repo->hash_algo;
+	const char *previous = NULL;
 	unsigned int first, namespace_unstable = 0;
-	size_t len;
-	int pos, pinned = 0, safe = 0;
+	size_t len, previous_len = 0;
+	int pos, manifest_ret, pinned = 0, safe = 0;
 	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
 		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
 
@@ -302,8 +314,7 @@ int clean_status_manifest_directory_unchanged(
 
 	strbuf_addstr(&candidate, directory);
 	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
-	string_list_insert(&candidates, candidate.buf);
-	/* Bound attribute-source I/O, not the affected in-memory entries. */
+	string_list_append(&candidates, candidate.buf);
 	for (unsigned int i = first; i < istate->cache_nr &&
 	     starts_with(istate->cache[i]->name, directory); i++) {
 		const struct cache_entry *ce = istate->cache[i];
@@ -314,21 +325,49 @@ int clean_status_manifest_directory_unchanged(
 		    S_ISSPARSEDIR(ce->ce_mode))
 			goto done;
 		while ((slash = strchr(slash, '/')) != NULL) {
-			strbuf_reset(&candidate);
-			strbuf_add(&candidate, ce->name,
-				   slash - ce->name + 1);
-			strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
-			string_list_insert(&candidates, candidate.buf);
-			if (candidates.nr > 64)
-				goto done;
+			size_t parent_len = slash - ce->name;
+
+			if (!previous || previous_len <= parent_len ||
+			    previous[parent_len] != '/' ||
+			    memcmp(previous, ce->name, parent_len)) {
+				strbuf_reset(&candidate);
+				strbuf_add(&candidate, ce->name, parent_len + 1);
+				strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+				string_list_append(&candidates, candidate.buf);
+			}
 			slash++;
 		}
+		previous = ce->name;
+		previous_len = ce_namelen(ce);
 	}
-	for (size_t i = 0; i < candidates.nr; i++)
+	string_list_sort(&candidates);
+	string_list_remove_duplicates(&candidates, 0);
+	if (attr_manifest_cursor_init(&manifest_cursor,
+				      state->manifest.current.buf,
+				      state->manifest.current.len, algo))
+		goto done;
+	manifest_ret = attr_manifest_cursor_next(&manifest_cursor,
+						 &manifest_entry);
+	for (size_t i = 0; i < candidates.nr; i++) {
+		const char *name = candidates.items[i].string;
+		const struct attr_manifest_entry *entry = NULL;
+
+		while (manifest_ret > 0 &&
+		       directory_manifest_entry_path_compare(
+			       &manifest_entry, name) < 0)
+			manifest_ret = attr_manifest_cursor_next(
+				&manifest_cursor, &manifest_entry);
+		if (manifest_ret < 0)
+			goto done;
+		if (manifest_ret > 0 &&
+		    !directory_manifest_entry_path_compare(
+			    &manifest_entry, name))
+			entry = &manifest_entry;
 		if (!directory_attribute_source_matches(
-				istate, path, candidates.items[i].string,
+				istate, path, name, entry,
 				first + i))
 			goto done;
+	}
 
 	semantic_verify_path_free(path, &namespace_unstable, NULL);
 	path = NULL;
