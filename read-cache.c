@@ -2487,8 +2487,9 @@ static void set_new_index_sparsity(struct index_state *istate)
 		istate->sparse_index = 1;
 }
 
-/* remember to discard_cache() before reading a different cache! */
-int do_read_index(struct index_state *istate, const char *path, int must_exist)
+/* A nonnegative source_fd is owned by this reader. */
+static int do_read_index_1(struct index_state *istate, const char *path,
+			   int must_exist, int source_fd)
 {
 	int fd;
 	struct stat st;
@@ -2502,12 +2503,15 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	struct index_entry_offset_table *ieot = NULL;
 
 	clean_status_attach_config(istate);
-	if (istate->initialized)
+	if (istate->initialized) {
+		if (source_fd >= 0)
+			close(source_fd);
 		return istate->cache_nr;
+	}
 
 	istate->timestamp.sec = 0;
 	istate->timestamp.nsec = 0;
-	fd = git_open_cloexec(path, O_RDONLY);
+	fd = source_fd >= 0 ? source_fd : git_open_cloexec(path, O_RDONLY);
 	if (fd < 0) {
 		if (!must_exist && errno == ENOENT) {
 			set_new_index_sparsity(istate);
@@ -2644,6 +2648,24 @@ unmap:
 	close(fd);
 	munmap((void *)mmap, mmap_size);
 	die(_("index file corrupt"));
+}
+
+/* remember to discard_cache() before reading a different cache! */
+int do_read_index(struct index_state *istate, const char *path, int must_exist)
+{
+	return do_read_index_1(istate, path, must_exist, -1);
+}
+
+int do_read_index_from_fd(struct index_state *istate, int fd,
+			  const char *path)
+{
+	if (fd < 0)
+		return -1;
+	if (istate->initialized) {
+		close(fd);
+		return -1;
+	}
+	return do_read_index_1(istate, path, 1, fd);
 }
 
 /*

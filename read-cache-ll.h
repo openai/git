@@ -317,6 +317,9 @@ void prefetch_cache_entries(const struct index_state *istate,
 struct lock_file;
 int do_read_index(struct index_state *istate, const char *path,
 		  int must_exist); /* for testting only! */
+/* Takes ownership of fd, including when the state is already initialized. */
+int do_read_index_from_fd(struct index_state *istate, int fd,
+			  const char *path);
 int read_index_from(struct index_state *, const char *path,
 		    const char *gitdir);
 int is_index_unborn(struct index_state *);
