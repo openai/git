@@ -16,6 +16,9 @@ struct repository;
 #define FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "hardlink-inode-v1"
 #define FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX \
 	FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX "inode-v1."
+#define FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY \
+	"cookie-token-retirement-v1"
+#define FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX "cookie-v1."
 #define FSMONITOR_IPC_WORKTREE_ID_HEX 64
 
 /* Hash the canonical worktree root and its stable filesystem identity. */

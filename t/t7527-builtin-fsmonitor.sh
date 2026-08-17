@@ -74,6 +74,14 @@ then
 	test_done
 fi
 
+if test_have_prereq MACOS
+then
+	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.inode-v1.
+else
+	fsmonitor_pre_cookie_token_prefix=
+fi
+fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
+
 stop_daemon_delete_repo () {
 	r=$1 &&
 	{ maybe_timeout 30 git -C $r fsmonitor--daemon stop 2>/dev/null || :; } &&
@@ -630,13 +638,17 @@ test_expect_success 'flush cached data' '
 	# then a few (probably platform-specific number of) events in _1.
 	# These should both have the same <token_id>.
 
-	test-tool -C test_flush fsmonitor-client query --token "builtin:test_00000001:0" >actual_0 &&
+	test-tool -C test_flush fsmonitor-client query \
+		--token "builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" \
+		>actual_0 &&
 	nul_to_q <actual_0 >actual_q0 &&
 
 	>test_flush/file_1 &&
 	>test_flush/file_2 &&
 
-	test-tool -C test_flush fsmonitor-client query --token "builtin:test_00000001:0" >actual_1 &&
+	test-tool -C test_flush fsmonitor-client query \
+		--token "builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" \
+		>actual_1 &&
 	nul_to_q <actual_1 >actual_q1 &&
 
 	test_grep "file_1" actual_q1 &&
@@ -647,16 +659,24 @@ test_expect_success 'flush cached data' '
 
 	test-tool -C test_flush fsmonitor-client flush >flush_0 &&
 	nul_to_q <flush_0 >flush_q0 &&
-	test_grep "^builtin:test_00000002:0Q/Q$" flush_q0 &&
+	test_grep \
+		"^builtin:${fsmonitor_cookie_token_prefix}test_00000002:0Q/Q$" \
+		flush_q0 &&
 
-	test-tool -C test_flush fsmonitor-client query --token "builtin:test_00000002:0" >actual_2 &&
+	test-tool -C test_flush fsmonitor-client query \
+		--token "builtin:${fsmonitor_cookie_token_prefix}test_00000002:0" \
+		>actual_2 &&
 	nul_to_q <actual_2 >actual_q2 &&
 
-	test_grep "^builtin:test_00000002:0Q$" actual_q2 &&
+	test_grep \
+		"^builtin:${fsmonitor_cookie_token_prefix}test_00000002:0Q$" \
+		actual_q2 &&
 
 	>test_flush/file_3 &&
 
-	test-tool -C test_flush fsmonitor-client query --token "builtin:test_00000002:0" >actual_3 &&
+	test-tool -C test_flush fsmonitor-client query \
+		--token "builtin:${fsmonitor_cookie_token_prefix}test_00000002:0" \
+		>actual_3 &&
 	nul_to_q <actual_3 >actual_q3 &&
 
 	test_grep "file_3" actual_q3
@@ -2306,7 +2326,8 @@ test_expect_success 'bound query accepts a capability superset' '
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/status.out &&
 		test_trace2_data fsm_client query/command \
-			"builtin:test-capable:0" <.git/status.trace &&
+			"builtin:${fsmonitor_cookie_token_prefix}test-capable:0" \
+			<.git/status.trace &&
 		test_grep ! \
 			"\"key\":\"query/incompatible-daemon\"" \
 			.git/status.trace &&
