@@ -284,6 +284,9 @@ int clean_status_try_sidecar(
 		record.sidecar.token, record.sidecar.token_len);
 	if (query_builtin_fsmonitor(query_token, &query) !=
 		    FSMONITOR_QUERY_DELTA) {
+		if (query.outcome == FSMONITOR_QUERY_TRIVIAL)
+			trace2_data_intmax("fsm_client", NULL,
+					   "query/trivial-response", 1);
 		/* A later successful query cannot erase this lost boundary. */
 		*provider_reset = 1;
 		trace_miss(repo, "fast-provider-changed");
