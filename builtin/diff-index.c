@@ -6,6 +6,7 @@
 #include "diff.h"
 #include "diff-merges.h"
 #include "commit.h"
+#include "fsmonitor.h"
 #include "preload-index.h"
 #include "revision.h"
 #include "setup.h"
@@ -25,6 +26,7 @@ int cmd_diff_index(int argc,
 	unsigned int option = 0;
 	int i;
 	int result;
+	int scoped_bootstrap;
 
 	show_usage_if_asked(argc, argv, diff_cache_usage);
 
@@ -69,16 +71,27 @@ int cmd_diff_index(int argc,
 	    rev.max_count != -1 || rev.min_age != -1 || rev.max_age != -1)
 		usage(diff_cache_usage);
 	prepare_diff_external_history(the_repository);
-	if (!(option & DIFF_INDEX_CACHED)) {
+	if (!(option & DIFF_INDEX_CACHED))
 		setup_work_tree(the_repository);
+	scoped_bootstrap = (option & DIFF_INDEX_CACHED) ||
+		diff_has_bounded_regular_pathspec(&rev.diffopt.pathspec);
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
+	if (!(option & DIFF_INDEX_CACHED)) {
 		if (repo_read_index_preload(the_repository, &rev.diffopt.pathspec, 0) < 0) {
+			if (scoped_bootstrap)
+				fsmonitor_end_scoped_bootstrap(the_repository->index);
 			perror("repo_read_index_preload");
 			return -1;
 		}
 	} else if (repo_read_index(the_repository) < 0) {
+		if (scoped_bootstrap)
+			fsmonitor_end_scoped_bootstrap(the_repository->index);
 		perror("repo_read_index");
 		return -1;
 	}
+	if (scoped_bootstrap)
+		fsmonitor_end_scoped_bootstrap(the_repository->index);
 	run_diff_index(&rev, option);
 	result = diff_result_code(&rev);
 	release_revisions(&rev);
