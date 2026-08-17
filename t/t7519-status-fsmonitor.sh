@@ -1716,6 +1716,284 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'checkout-index updates restore external-only worktree proofs' '
+	test_when_finished "rm -rf checkout-external-only checkout-external-linked" &&
+	test_create_repo checkout-external-only &&
+	(
+		cd checkout-external-only &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git worktree add --detach ../checkout-external-linked HEAD &&
+		test-tool chmtime -120 tracked sibling \
+			../checkout-external-linked/tracked \
+			../checkout-external-linked/sibling &&
+		git update-index --refresh &&
+		git -C ../checkout-external-linked update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		cat >.git/remove-checkout-proofs.pl <<-\EOF &&
+		use Digest::SHA qw(sha1 sha256);
+		binmode STDIN;
+		binmode STDOUT;
+		local $/;
+		my $index = <STDIN>;
+		my $rawsz = $ARGV[0] eq "sha256" ? 32 : 20;
+		for my $name ("FSUC", "FSCF") {
+			my $offset = index($index, $name);
+			die "missing $name extension\n" if $offset < 0;
+			my $size = unpack("N", substr($index, $offset + 4, 4));
+			substr($index, $offset, 8 + $size, "");
+		}
+		my $payload = substr($index, 0, -$rawsz);
+		print $payload, $rawsz == 32 ? sha256($payload) : sha1($payload);
+		EOF
+		strip_checkout_proofs="$PWD/.git/remove-checkout-proofs.pl" &&
+		for worktree in "$PWD" "$PWD/../checkout-external-linked"
+		do
+			gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+			for mode in noop ordinary temp prefix alternate attributes
+			do
+				test-tool chmtime -120 "$worktree/tracked" &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+					git -C "$worktree" update-index --refresh &&
+				rm -f "$worktree/.gitattributes" \
+					"$gitdir"/index.csh1.* \
+					"$gitdir"/index.cswi.* \
+					"$gitdir/index.csts" &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+					git -C "$worktree" update-index --fsmonitor &&
+				GIT_INDEX_FILE="$gitdir/index" \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/$mode.prime" &&
+				test_must_be_empty "$gitdir/$mode.prime" &&
+				test_fsmonitor_full_proof "$gitdir/index" paired &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$mode.checkpoint.trace" \
+					git -C "$worktree" status --short \
+						>"$gitdir/$mode.checkpoint" &&
+				test_must_be_empty "$gitdir/$mode.checkpoint" &&
+				test_trace2_data fsmonitor history/external-stored 1 \
+					<"$gitdir/$mode.checkpoint.trace" &&
+				find "$gitdir" -maxdepth 1 -type f \
+					-name "index.csh1.*" >"$gitdir/$mode.csh" &&
+				test_line_count = 1 "$gitdir/$mode.csh" &&
+				checkpoint=$(cat "$gitdir/$mode.csh") &&
+				cp "$checkpoint" "$gitdir/$mode.checkpoint.before" &&
+				perl "$strip_checkout_proofs" "$(test_oid algo)" \
+					<"$gitdir/index" >"$gitdir/index.foreign" &&
+				mv "$gitdir/index.foreign" "$gitdir/index" &&
+				test_grep FSMN "$gitdir/index" &&
+				test_grep UNTR "$gitdir/index" &&
+				test_grep ! FSUC "$gitdir/index" &&
+				test_grep ! FSCF "$gitdir/index" &&
+				cp "$gitdir/index" "$gitdir/$mode.stripped.index" &&
+
+				case "$mode" in
+				noop)
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode.checkout.trace" \
+						git -C "$worktree" checkout-index \
+							-f -u tracked &&
+					test_trace2_data fsmonitor \
+						history/external-restored 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data index \
+						extension/fsmn/read/token builtin:test:3 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data index \
+						extension/fsmn/read/token builtin:test:1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_region ! index do_write_index \
+						"$gitdir/$mode.checkout.trace" &&
+					test_cmp_bin "$gitdir/$mode.stripped.index" \
+						"$gitdir/index"
+					;;
+				ordinary)
+					test_write_lines modified >"$worktree/tracked" &&
+					GIT_OPTIONAL_LOCKS=0 \
+						git -C "$worktree" \
+							-c core.fsmonitor=false \
+							-c core.untrackedCache=false \
+							-c core.trustctime=true \
+							-c core.checkStat=default \
+							status --porcelain=v2 \
+							>"$gitdir/$mode.expected" &&
+					test_line_count = 1 "$gitdir/$mode.expected" &&
+					test_grep "^1 \\.M .* tracked$" \
+						"$gitdir/$mode.expected" &&
+					test_cmp_bin "$gitdir/$mode.stripped.index" \
+						"$gitdir/index" &&
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCCCCCCCC \
+					GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+					GIT_TRACE2_EVENT="$gitdir/$mode.checkout.trace" \
+						git -C "$worktree" checkout-index \
+							-f -u tracked &&
+					test_trace2_data fsmonitor \
+						history/external-restored 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data fsmonitor apply_count 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_region index do_write_index \
+						"$gitdir/$mode.checkout.trace" &&
+					test_fsmonitor_full_proof "$gitdir/index" \
+						paired &&
+					! test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					cp "$gitdir/index" \
+						"$gitdir/$mode.before-status" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode.status.trace" \
+						git -C "$worktree" status --porcelain=v2 \
+							>"$gitdir/$mode.status" &&
+					test_must_be_empty "$gitdir/$mode.status" &&
+					test_cmp_bin "$gitdir/$mode.before-status" \
+						"$gitdir/index" &&
+					test_trace2_data fsmonitor config/coherent 1 \
+						<"$gitdir/$mode.status.trace" &&
+					! test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode.status.trace"
+					;;
+				temp)
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode.checkout.trace" \
+						git -C "$worktree" checkout-index \
+							-u --temp tracked \
+							>"$gitdir/$mode.output" &&
+					temp_path=$(cut -f1 "$gitdir/$mode.output") &&
+					test_path_is_file "$worktree/$temp_path" &&
+					rm "$worktree/$temp_path" &&
+					! test_trace2_data fsmonitor \
+						history/external-restored 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_cmp_bin "$gitdir/$mode.stripped.index" \
+						"$gitdir/index"
+					;;
+				prefix)
+					mkdir "$gitdir/checkout-prefix" &&
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode.checkout.trace" \
+						git -C "$worktree" checkout-index \
+							-f -u \
+							--prefix="$gitdir/checkout-prefix/" \
+							tracked &&
+					test_path_is_file \
+						"$gitdir/checkout-prefix/tracked" &&
+					! test_trace2_data fsmonitor \
+						history/external-restored 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_cmp_bin "$gitdir/$mode.stripped.index" \
+						"$gitdir/index"
+					;;
+				alternate)
+					cp "$gitdir/index" "$gitdir/alternate.index" &&
+					GIT_INDEX_FILE="$gitdir/alternate.index" \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode.checkout.trace" \
+						git -C "$worktree" checkout-index \
+							-f -u tracked &&
+					! test_trace2_data fsmonitor \
+						history/external-restored 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_cmp_bin "$gitdir/$mode.stripped.index" \
+						"$gitdir/index"
+					;;
+				attributes)
+					test_write_lines "tracked text eol=crlf" \
+						>"$worktree/.gitattributes" &&
+					test_write_lines modified >"$worktree/tracked" &&
+					GIT_OPTIONAL_LOCKS=0 \
+						git -C "$worktree" \
+							-c core.fsmonitor=false \
+							-c core.untrackedCache=false \
+							-c core.trustctime=true \
+							-c core.checkStat=default \
+							status --porcelain=v2 \
+							>"$gitdir/$mode.dirty" &&
+					test_line_count = 2 "$gitdir/$mode.dirty" &&
+					test_grep "^1 \\.M .* tracked$" \
+						"$gitdir/$mode.dirty" &&
+					test_grep "^? \\.gitattributes$" \
+						"$gitdir/$mode.dirty" &&
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCCCCCCCC \
+					GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+					GIT_TRACE2_EVENT="$gitdir/$mode.checkout.trace" \
+						git -C "$worktree" checkout-index \
+							-f -u tracked &&
+					test_trace2_data fsmonitor \
+						history/external-restored 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data fsmonitor apply_count 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data fsmonitor \
+						semantic/attributes-scope 0 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data fsmonitor \
+						semantic/manifest-invalidated 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_trace2_data fsmonitor \
+						untracked/proof-missing 1 \
+						<"$gitdir/$mode.checkout.trace" &&
+					test_region index do_write_index \
+						"$gitdir/$mode.checkout.trace" &&
+					test_grep ! FSUC "$gitdir/index" &&
+					perl - "$gitdir/index" <<-\EOF &&
+					binmode STDIN;
+					open my $input, "<", $ARGV[0] or
+						die "cannot read index: $!\n";
+					binmode $input;
+					local $/;
+					my $index = <$input>;
+					my $offset = index($index, "FSCF");
+					die "missing FSCF extension\n" if $offset < 0;
+					my $flags = unpack("N", substr($index, $offset + 16, 4));
+					die "unexpected FSCF flags $flags\n" if $flags != 9;
+					EOF
+					printf "base\r\n" >"$gitdir/$mode.converted" &&
+					test_cmp_bin "$gitdir/$mode.converted" \
+						"$worktree/tracked" &&
+					cp "$gitdir/index" "$gitdir/$mode.before-status" &&
+					GIT_OPTIONAL_LOCKS=0 \
+						git -C "$worktree" \
+							-c core.fsmonitor=false \
+							-c core.untrackedCache=false \
+							-c core.trustctime=true \
+							-c core.checkStat=default \
+							status --porcelain=v2 \
+							>"$gitdir/$mode.expected" &&
+					test_line_count = 1 "$gitdir/$mode.expected" &&
+					test_grep "^? \\.gitattributes$" \
+						"$gitdir/$mode.expected" &&
+					test_cmp_bin "$gitdir/$mode.before-status" \
+						"$gitdir/index" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/$mode.status.trace" \
+						git -C "$worktree" status --porcelain=v2 \
+							>"$gitdir/$mode.status" &&
+					test_cmp "$gitdir/$mode.expected" \
+						"$gitdir/$mode.status" &&
+					test_cmp_bin "$gitdir/$mode.before-status" \
+						"$gitdir/index"
+					;;
+				esac &&
+				test_cmp_bin "$gitdir/$mode.checkpoint.before" \
+					"$checkpoint" || return 1
+			done || return 1
+		done
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'write-tree preserves authenticated primary and linked index proofs' '
 	test_when_finished "rm -rf write-tree-bound-proof write-tree-linked" &&
