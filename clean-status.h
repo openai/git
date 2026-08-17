@@ -8,6 +8,7 @@ struct cache_entry;
 struct attr_source_snapshot;
 struct clean_status_progress;
 struct clean_status_proof_epoch;
+struct clean_status_index_snapshot;
 struct lock_file;
 struct repository;
 struct stat;
@@ -65,6 +66,8 @@ int clean_status_revalidated_token_matches(
 	const struct index_state *istate);
 
 int clean_status_has_persistent_fsmonitor_semantic_history(
+	const struct index_state *istate);
+int clean_status_has_current_full_fsmonitor_proof(
 	const struct index_state *istate);
 int clean_status_has_worktree_manifest_history(
 	const struct index_state *istate);
@@ -143,6 +146,9 @@ int clean_status_external_history_owns_index(
 void clean_status_require_external_history_source(struct repository *repo);
 void clean_status_capture_external_history_source(
 	struct index_state *istate);
+int clean_status_capture_external_history_source_from_snapshot(
+	struct index_state *istate,
+	const struct clean_status_index_snapshot *snapshot);
 int clean_status_save_external_history(struct index_state *istate);
 void clean_status_copy_fsmonitor_history(struct index_state *dst,
 					 const struct index_state *src);

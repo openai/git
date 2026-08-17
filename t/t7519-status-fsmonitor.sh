@@ -5628,4 +5628,567 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	)
 '
 
+test_lazy_prereq LINUX_SCOPED_HISTORY '
+	test "$uname_s" = Linux
+'
+
+test_expect_success LINUX_SCOPED_HISTORY,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'bounded tracked-only status verifies zero-stat entries before omitting history' '
+	test_when_finished "rm -rf nondurable-scoped-repair \
+				nondurable-scoped-repair-linked" &&
+	test_create_repo nondurable-scoped-repair &&
+	(
+		cd nondurable-scoped-repair &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines indexed >cached/tracked &&
+		test_write_lines sibling >cached/sibling &&
+		test_write_lines "* -filter" "*.asset text" >.gitattributes &&
+		test_write_lines ignored >.gitignore &&
+		git add cached/tracked cached/sibling \
+			.gitattributes .gitignore &&
+		git commit -qm base &&
+		git worktree add --detach -q \
+			../nondurable-scoped-repair-linked HEAD &&
+		git config index.skipHash true &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config filter.scoped.clean cat &&
+		git config filter.scoped.smudge cat &&
+		git config filter.scoped.required true &&
+		git config status.showUntrackedFiles no &&
+		for worktree in "$PWD" "$PWD/../nondurable-scoped-repair-linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			test_write_lines temporary \
+				>"$worktree/cached/tracked" &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				diff -- cached/tracked >"$gitdir/scoped.patch" &&
+			test_write_lines indexed \
+				>"$worktree/cached/tracked" &&
+			test-tool chmtime -120 \
+				"$worktree/cached/tracked" &&
+			test-tool chmtime -240 \
+				"$worktree/cached/sibling" \
+				"$worktree/.gitattributes" \
+				"$worktree/.gitignore" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" update-index --refresh &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=normal \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/forward.trace" \
+				git -C "$worktree" apply --cached \
+					"$gitdir/scoped.patch" &&
+			test_trace2_data fsmonitor \
+				apply/untracked-replacement-preserved 1 \
+				<"$gitdir/forward.trace" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/reverse.trace" \
+				git -C "$worktree" apply --cached --reverse \
+					"$gitdir/scoped.patch" &&
+			test_trace2_data fsmonitor \
+				apply/untracked-replacement-preserved 1 \
+				<"$gitdir/reverse.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				ls-files --debug -- cached/tracked \
+					>"$gitdir/zero-stat" &&
+			test_grep "ctime: 0:0" "$gitdir/zero-stat" &&
+			test_grep "mtime: 0:0" "$gitdir/zero-stat" &&
+			test_grep "size: 0" "$gitdir/zero-stat" &&
+			(
+				cd "$worktree" &&
+				test-tool dump-fsmonitor
+			) >"$gitdir/fsmonitor" &&
+			test_grep "[-]$" "$gitdir/fsmonitor" &&
+			(
+				cd "$worktree" &&
+				GIT_CONFIG_PARAMETERS="${SQ}core.fsmonitor=false${SQ}" \
+					test-tool dump-untracked-cache
+			) >"$gitdir/untracked" &&
+			test_grep "^/ .* valid$" "$gitdir/untracked" &&
+			test_grep "^/cached/ .* valid$" \
+				"$gitdir/untracked" &&
+			test_write_lines definitely-dirty \
+				>"$worktree/cached/tracked" &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status --porcelain=v2 --untracked-files=no \
+					-- cached/tracked >"$gitdir/dirty.expected" &&
+			test_grep "^1 \\.M .* cached/tracked$" \
+				"$gitdir/dirty.expected" &&
+
+			# Normal-untracked pathspecs must still publish global history.
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/publish.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=normal -- cached/tracked \
+						>"$gitdir/publish.actual" &&
+			test_cmp "$gitdir/dirty.expected" \
+				"$gitdir/publish.actual" &&
+			test_trace2_data fsmonitor history/external-stored 1 \
+				<"$gitdir/publish.trace" &&
+			test_region fsmonitor history_logical_digest \
+				"$gitdir/publish.trace" &&
+			find "$gitdir" -maxdepth 1 -type f \
+				-name "index.csh1.*" >"$gitdir/checkpoints" &&
+			test_line_count = 1 "$gitdir/checkpoints" &&
+			checkpoint=$(cat "$gitdir/checkpoints") &&
+			cat >"$gitdir/retoken.pl" <<-\EOF &&
+			use Digest::SHA qw(sha1 sha256);
+			binmode STDIN;
+			binmode STDOUT;
+			local $/;
+			my $index = <STDIN>;
+			my $rawsz = $ARGV[0] eq "sha256" ? 32 : 20;
+			for my $name ("FSMN", "FSUC", "FSCF") {
+				my $at = index($index, $name);
+				die "missing $name" if $at < 0;
+				my $size = unpack("N", substr($index, $at + 4, 4));
+				my $payload = substr($index, $at + 8, $size);
+				my $count = ($payload =~
+					s/builtin:test:[0-9]/builtin:test:3/g);
+				die "unexpected $name token" unless $count == 1;
+				if ($name eq "FSCF") {
+					my $proof = substr($payload, 0, -$rawsz);
+					my $checksum = $rawsz == 32 ?
+						sha256($proof) : sha1($proof);
+					substr($payload, -$rawsz, $rawsz,
+						$checksum);
+				}
+				substr($index, $at + 8, $size, $payload);
+			}
+			my $payload = substr($index, 0, -$rawsz);
+			print $payload, "\0" x $rawsz;
+			EOF
+			perl "$gitdir/retoken.pl" "$(test_oid algo)" \
+				<"$gitdir/index" >"$gitdir/index.retoken" &&
+			mv "$gitdir/index.retoken" "$gitdir/index" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired \
+				"builtin:test:3" &&
+			test_trailing_hash "$gitdir/index" \
+				>"$gitdir/initial-zero.hash" &&
+			test_oid zero >"$gitdir/zero.expected" &&
+			test_cmp "$gitdir/zero.expected" \
+				"$gitdir/initial-zero.hash" &&
+			cp "$gitdir/index" "$gitdir/zero.index" &&
+			cp "$checkpoint" "$gitdir/checkpoint.snapshot" &&
+
+			for attempt in first second
+			do
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$attempt.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						--untracked-files=no \
+						-- cached/tracked \
+							>"$gitdir/$attempt.actual" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/$attempt.trace" &&
+				! test_trace2_data fsmonitor config/invalid-extension 1 \
+					<"$gitdir/$attempt.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/$attempt.trace" &&
+				test_cmp "$gitdir/dirty.expected" \
+					"$gitdir/$attempt.actual" &&
+				test_cmp_bin "$gitdir/zero.index" \
+					"$gitdir/index" &&
+				test_cmp_bin "$gitdir/checkpoint.snapshot" \
+					"$checkpoint" &&
+				test_trace2_data fsmonitor \
+					history/scoped-source-capture-deferred 1 \
+					<"$gitdir/$attempt.trace" &&
+				test_trace2_data fsmonitor \
+					history/scoped-source-capture-skipped 1 \
+					<"$gitdir/$attempt.trace" &&
+				test_trace2_data fsmonitor config/token-advanced 1 \
+					<"$gitdir/$attempt.trace" &&
+				test_region ! fsmonitor history_logical_digest \
+					"$gitdir/$attempt.trace" &&
+				test_region ! index do_write_index \
+					"$gitdir/$attempt.trace" || return 1
+			done &&
+
+			# A zero-stat clean entry must still be physically repaired.
+			test_write_lines indexed \
+				>"$worktree/cached/tracked" &&
+			test-tool chmtime =-60 \
+				"$worktree/cached/tracked" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/repair.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no -- cached/tracked \
+						>"$gitdir/repair.actual" &&
+			test_must_be_empty "$gitdir/repair.actual" &&
+			test_trace2_data fsmonitor \
+				history/scoped-source-capture-deferred 1 \
+				<"$gitdir/repair.trace" &&
+			test_trace2_data fsmonitor \
+				history/scoped-source-repair-required 1 \
+				<"$gitdir/repair.trace" &&
+			test_trace2_data fsmonitor \
+				history/scoped-original-source-restored 1 \
+				<"$gitdir/repair.trace" &&
+			test_trace2_data fsmonitor history/external-stored 1 \
+				<"$gitdir/repair.trace" &&
+			test_region fsmonitor history_logical_digest \
+				"$gitdir/repair.trace" &&
+			test_region index do_write_index \
+				"$gitdir/repair.trace" &&
+			! test_cmp_bin "$gitdir/zero.index" \
+				"$gitdir/index" &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				ls-files --debug -- cached/tracked \
+					>"$gitdir/repaired-stat" &&
+			test_grep ! "size: 0" "$gitdir/repaired-stat" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+
+			# That repaired source still survives a subsequent foreign writer.
+			cp "$gitdir/index" "$gitdir/repaired.index" &&
+			cp "$checkpoint" "$gitdir/repaired.checkpoint" &&
+			git -C "$worktree" \
+				-c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				update-index --force-write-index &&
+			test_grep ! FSUC "$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/foreign-stripped.index" &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				status --porcelain=v2 --untracked-files=no \
+					-- cached/tracked \
+						>"$gitdir/follower.expected" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/follower.trace" \
+				git --no-optional-locks -C "$worktree" \
+					status --porcelain=v2 --untracked-files=no \
+						-- cached/tracked \
+							>"$gitdir/follower.actual" &&
+			test_cmp "$gitdir/follower.expected" \
+				"$gitdir/follower.actual" &&
+			test_cmp_bin "$gitdir/foreign-stripped.index" \
+				"$gitdir/index" &&
+			test_cmp_bin "$gitdir/repaired.checkpoint" \
+				"$checkpoint" &&
+			test_trace2_data fsmonitor history/external-restored 1 \
+				<"$gitdir/follower.trace" &&
+			test_region ! index do_write_index \
+				"$gitdir/follower.trace" &&
+			cp "$gitdir/repaired.index" "$gitdir/index" &&
+
+			# Neither a selected nor an unrelated racy CE may lose its write.
+			selected_mtime=$(test-tool chmtime --get \
+				"$worktree/cached/tracked") &&
+			test-tool chmtime =$selected_mtime "$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/selected-racy.before" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/selected-racy.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no -- cached/tracked \
+						>"$gitdir/selected-racy.actual" &&
+			test_must_be_empty "$gitdir/selected-racy.actual" &&
+			! test_trace2_data fsmonitor \
+				history/scoped-source-capture-skipped 1 \
+				<"$gitdir/selected-racy.trace" &&
+			test_trace2_data fsmonitor history/external-save-reject \
+				racy-index \
+				<"$gitdir/selected-racy.trace" &&
+			test_region index do_write_index \
+				"$gitdir/selected-racy.trace" &&
+			test-tool chmtime =-30 \
+				"$worktree/cached/sibling" &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=cached/sibling \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=normal \
+						>"$gitdir/sibling-refresh.actual" &&
+			test_must_be_empty "$gitdir/sibling-refresh.actual" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			sibling_mtime=$(test-tool chmtime --get \
+				"$worktree/cached/sibling") &&
+			test-tool chmtime =$sibling_mtime "$gitdir/index" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/unselected-racy.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no -- cached/tracked \
+						>"$gitdir/unselected-racy.actual" &&
+			test_must_be_empty "$gitdir/unselected-racy.actual" &&
+			! test_trace2_data fsmonitor \
+				history/scoped-source-capture-skipped 1 \
+				<"$gitdir/unselected-racy.trace" &&
+			test_trace2_data fsmonitor history/external-save-reject \
+				racy-index \
+				<"$gitdir/unselected-racy.trace" &&
+			test_region index do_write_index \
+				"$gitdir/unselected-racy.trace" &&
+
+			# Dirt that disappears during refresh must take the repair path.
+			if test_have_prereq PIPE
+			then
+				cp "$gitdir/zero.index" "$gitdir/index" &&
+				test_write_lines race-dirty \
+					>"$worktree/cached/tracked" &&
+				ready="$gitdir/dirty-clean.ready" &&
+				resume="$gitdir/dirty-clean.resume" &&
+				fsmonitor_query_pid= &&
+				trap cleanup_fsmonitor_query_barrier 0 &&
+				mkfifo "$resume" &&
+				{
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TEST_CLEAN_STATUS_SCOPED_HISTORY_BARRIER_READY="$ready" \
+					GIT_TEST_CLEAN_STATUS_SCOPED_HISTORY_BARRIER_RESUME="$resume" \
+					GIT_TRACE2_EVENT="$gitdir/dirty-clean.trace" \
+						git -C "$worktree" status --porcelain=v2 \
+							--untracked-files=no \
+							-- cached/tracked \
+								>"$gitdir/dirty-clean.actual" \
+								2>"$gitdir/dirty-clean.err" &
+					fsmonitor_query_pid=$!
+				} &&
+				wait_for_fsmonitor_query_barrier \
+					"$ready" "$fsmonitor_query_pid" &&
+				test_trace2_data fsmonitor \
+					history/scoped-source-capture-deferred 1 \
+					<"$gitdir/dirty-clean.trace" &&
+				test_write_lines indexed \
+					>"$worktree/cached/tracked" &&
+				test-tool chmtime =-60 \
+					"$worktree/cached/tracked" &&
+				git --no-optional-locks -C "$worktree" \
+					-c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					status --porcelain=v2 --untracked-files=no \
+						-- cached/tracked \
+							>"$gitdir/dirty-clean.expected" &&
+				printf x >"$resume" &&
+				wait "$fsmonitor_query_pid" &&
+				fsmonitor_query_pid= &&
+				trap - 0 &&
+				test_cmp "$gitdir/dirty-clean.expected" \
+					"$gitdir/dirty-clean.actual" &&
+				test_trace2_data fsmonitor \
+					history/scoped-source-repair-required 1 \
+					<"$gitdir/dirty-clean.trace" &&
+				test_trace2_data fsmonitor \
+					history/scoped-original-source-restored 1 \
+					<"$gitdir/dirty-clean.trace" &&
+				test_trace2_data fsmonitor history/external-stored 1 \
+					<"$gitdir/dirty-clean.trace" &&
+				test_region index do_write_index \
+					"$gitdir/dirty-clean.trace" &&
+				test_fsmonitor_full_proof "$gitdir/index" paired
+			else
+				:
+			fi &&
+
+			# Root equivalents and implicit -uno retain the original writer.
+			for scope in root root-dot root-magic wildcard implicit
+			do
+				case "$scope" in
+				root)
+					set -- --untracked-files=no
+					;;
+				root-dot)
+					set -- --untracked-files=no -- .
+					;;
+				root-magic)
+					set -- --untracked-files=no -- :/
+					;;
+				wildcard)
+					set -- --untracked-files=no -- "cached/*"
+					;;
+				implicit)
+					set -- -- cached/tracked
+					;;
+				esac &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$scope.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						"$@" >"$gitdir/$scope.actual" &&
+				test_must_be_empty "$gitdir/$scope.actual" &&
+				! test_trace2_data fsmonitor \
+					history/scoped-source-capture-deferred 1 \
+					<"$gitdir/$scope.trace" &&
+				test_region fsmonitor history_logical_digest \
+					"$gitdir/$scope.trace" || return 1
+			done &&
+
+			# A bounded literal must not select an attribute or exclude source.
+			for source in .gitattributes .gitignore
+			do
+				case "$source" in
+				.gitattributes)
+					label=attributes
+					;;
+				.gitignore)
+					label=ignore
+					;;
+				esac &&
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/$label.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						--untracked-files=no -- "$source" \
+							>"$gitdir/$label.actual" &&
+				test_must_be_empty "$gitdir/$label.actual" &&
+				! test_trace2_data fsmonitor \
+					history/scoped-source-capture-deferred 1 \
+					<"$gitdir/$label.trace" || return 1
+			done &&
+
+			# A mismatched config and an actual provider delta fail closed.
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/config.trace" \
+				git -C "$worktree" -c core.autocrlf=true \
+					status --porcelain=v2 \
+						--untracked-files=no -- cached/tracked \
+							>"$gitdir/config.actual" &&
+			! test_trace2_data fsmonitor \
+				history/scoped-source-capture-deferred 1 \
+				<"$gitdir/config.trace" &&
+			cp "$gitdir/zero.index" "$gitdir/index" &&
+			test_write_lines provider-dirty \
+				>"$worktree/cached/tracked" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=cached/tracked \
+			GIT_TRACE2_EVENT="$gitdir/provider.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no -- cached/tracked \
+						>"$gitdir/provider.actual" &&
+			test_grep "^1 \\.M .* cached/tracked$" \
+				"$gitdir/provider.actual" &&
+			! test_trace2_data fsmonitor \
+				history/scoped-source-capture-skipped 1 \
+				<"$gitdir/provider.trace" &&
+
+			# An active clean filter cannot enter this lane.
+			test_write_lines "cached/tracked filter=scoped" \
+				>"$worktree/.gitattributes" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+				git -C "$worktree" add -- .gitattributes &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=normal \
+						>"$gitdir/active-prime.actual" &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				status --porcelain=v2 --untracked-files=no \
+					-- cached/tracked \
+						>"$gitdir/active.expected" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/active.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					--untracked-files=no -- cached/tracked \
+						>"$gitdir/active.actual" &&
+			test_cmp "$gitdir/active.expected" \
+				"$gitdir/active.actual" &&
+			! test_trace2_data fsmonitor \
+				history/scoped-source-capture-deferred 1 \
+				<"$gitdir/active.trace" &&
+
+			# A subsequently failing required filter cannot be bypassed.
+			cp "$gitdir/index" "$gitdir/filter.before" &&
+			test_must_fail env \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+				GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+				GIT_TRACE2_EVENT="$gitdir/filter.trace" \
+				git -C "$worktree" \
+					-c filter.scoped.clean=false \
+					-c filter.scoped.smudge=cat \
+					-c filter.scoped.required=true \
+					status --porcelain=v2 --untracked-files=no \
+						-- cached/tracked \
+						>"$gitdir/filter.actual" \
+						2>"$gitdir/filter.err" &&
+			test_grep "clean filter .scoped. failed" \
+				"$gitdir/filter.err" &&
+			test_cmp_bin "$gitdir/filter.before" "$gitdir/index" &&
+			! test_trace2_data fsmonitor \
+				history/scoped-source-capture-skipped 1 \
+				<"$gitdir/filter.trace" &&
+
+			# A competing physical writer must never be overwritten.
+			if test_have_prereq PIPE
+			then
+				test_write_lines "* -filter" "*.asset text" \
+					>"$worktree/.gitattributes" &&
+				cp "$gitdir/zero.index" "$gitdir/index" &&
+				test_write_lines race-dirty \
+					>"$worktree/cached/tracked" &&
+				ready="$gitdir/foreign.ready" &&
+				resume="$gitdir/foreign.resume" &&
+				fsmonitor_query_pid= &&
+				trap cleanup_fsmonitor_query_barrier 0 &&
+				mkfifo "$resume" &&
+				{
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TEST_CLEAN_STATUS_SCOPED_HISTORY_BARRIER_READY="$ready" \
+					GIT_TEST_CLEAN_STATUS_SCOPED_HISTORY_BARRIER_RESUME="$resume" \
+					GIT_TRACE2_EVENT="$gitdir/foreign.trace" \
+						git -C "$worktree" status --porcelain=v2 \
+							--untracked-files=no \
+							-- cached/tracked \
+								>"$gitdir/foreign.actual" \
+								2>"$gitdir/foreign.err" &
+					fsmonitor_query_pid=$!
+				} &&
+				wait_for_fsmonitor_query_barrier \
+					"$ready" "$fsmonitor_query_pid" &&
+				test_trace2_data fsmonitor \
+					history/scoped-source-capture-deferred 1 \
+					<"$gitdir/foreign.trace" &&
+				test_path_is_missing "$gitdir/index.lock" &&
+				test_write_lines competing \
+					>"$worktree/cached/sibling" &&
+				git -C "$worktree" \
+					-c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					add cached/sibling &&
+				cp "$gitdir/index" "$gitdir/foreign.index" &&
+				test_trailing_hash "$gitdir/foreign.index" \
+					>"$gitdir/foreign.zero" &&
+				test_cmp "$gitdir/zero.expected" \
+					"$gitdir/foreign.zero" &&
+				printf x >"$resume" &&
+				wait "$fsmonitor_query_pid" &&
+				fsmonitor_query_pid= &&
+				trap - 0 &&
+				test_cmp_bin "$gitdir/foreign.index" \
+					"$gitdir/index" &&
+				! test_trace2_data fsmonitor \
+					history/scoped-source-capture-skipped 1 \
+					<"$gitdir/foreign.trace" &&
+				test_trace2_data fsmonitor \
+					history/scoped-source-epoch-mismatch 1 \
+					<"$gitdir/foreign.trace" &&
+				! test_trace2_data fsmonitor history/external-stored 1 \
+					<"$gitdir/foreign.trace" &&
+				test_region ! index do_write_index \
+					"$gitdir/foreign.trace"
+			else
+				:
+			fi || return 1
+		done
+	)
+'
+
 test_done
