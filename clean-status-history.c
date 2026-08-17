@@ -407,6 +407,17 @@ static int current_proof_is_writable(const struct index_state *istate)
 		clean_status_revalidated_token_matches(istate);
 }
 
+int clean_status_has_current_full_fsmonitor_proof(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return current_proof_is_writable(istate) &&
+		state->manifest.checked &&
+		!state->manifest.current_invalidated &&
+		!state->manifest.global_fallback;
+}
+
 void clean_status_advance_fsmonitor_config_token(
 	struct index_state *istate, const char *next_token)
 {
@@ -565,6 +576,62 @@ void clean_status_capture_external_history_source(
 done:
 	clean_status_index_snapshot_release(&snapshot);
 	clean_status_history_store_record_release(&record);
+}
+
+int clean_status_capture_external_history_source_from_snapshot(
+	struct index_state *istate,
+	const struct clean_status_index_snapshot *snapshot)
+{
+#ifdef __linux__
+	struct index_state original = INDEX_STATE_INIT(istate->repo);
+	struct clean_status_state *state = istate->clean_status;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int owned, captured = -1;
+
+	/*
+	 * The selected entry may already contain a legitimate stat repair.
+	 * Recover its original logical source from the still-pinned physical
+	 * descriptor instead of authenticating the mutated in-memory index.
+	 */
+	if (!state ||
+	    !clean_status_external_history_enabled(istate) ||
+	    getenv(INDEX_ENVIRONMENT) || istate != istate->repo->index ||
+	    snapshot->fd < 0 ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(
+		    snapshot, istate))
+		goto done;
+	if (state->source_logical_hash_valid) {
+		captured = 0;
+		goto done;
+	}
+	owned = fcntl(snapshot->fd, F_DUPFD_CLOEXEC, 0);
+	if (owned < 0 ||
+	    do_read_index_from_fd(&original, owned,
+				  istate->repo->index_file) < 0 ||
+	    original.repo != istate->repo ||
+	    original.version != snapshot->version ||
+	    original.cache_nr != snapshot->cache_nr ||
+	    !oideq(&original.oid, &snapshot->checksum) ||
+	    original.split_index || original.sparse_index != INDEX_EXPANDED ||
+	    clean_status_index_logical_digest(&original, hash) ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(
+		    snapshot, istate))
+		goto done;
+	memcpy(state->source_logical_hash, hash,
+	       istate->repo->hash_algo->rawsz);
+	state->source_logical_hash_valid = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/scoped-original-source-restored", 1);
+	captured = 0;
+
+done:
+	release_index(&original);
+	return captured;
+#else
+	(void)istate;
+	(void)snapshot;
+	return -1;
+#endif
 }
 
 static struct clean_status_external_checkpoint *
