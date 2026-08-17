@@ -1198,6 +1198,19 @@ done:
 }
 #endif
 
+#if defined(__APPLE__) || SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+static int open_external_history_witness(const char *path)
+{
+#ifdef O_NONBLOCK
+	return open_nofollow(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+#else
+	(void)path;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+#endif
+
 static int restore_external_semantic_history(
 	struct index_state *istate,
 	const struct clean_status_history_checkpoint *checkpoint,
@@ -1247,14 +1260,15 @@ static int restore_external_semantic_history(
 	path = clean_status_history_store_witness_path(
 		istate->repo->index_file, proof_namespace,
 		istate->repo->hash_algo);
-	fd = open_nofollow(path, O_RDONLY | O_CLOEXEC);
+	fd = open_external_history_witness(path);
 	if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) ||
 	    before.st_nlink != 1 || before.st_uid != geteuid() ||
 	    clean_status_identity_from_stat(&before_identity, &before) ||
 	    lstat(path, &after) || before.st_dev != after.st_dev ||
 	    before.st_ino != after.st_ino)
 		goto done;
-	do_read_index(&witness, path, 1);
+	if (read_index_entries_from_fd(&witness, fd))
+		goto done;
 	if (fstat(fd, &after) || after.st_nlink != 1 ||
 	    after.st_uid != geteuid() ||
 	    clean_status_identity_from_stat(&after_identity, &after) ||
@@ -1430,14 +1444,15 @@ static int restore_external_bootstrap_manifest(
 	path = clean_status_history_store_witness_path(
 		istate->repo->index_file, proof_namespace,
 		istate->repo->hash_algo);
-	fd = open_nofollow(path, O_RDONLY | O_CLOEXEC);
+	fd = open_external_history_witness(path);
 	if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) ||
 	    before.st_nlink != 1 || before.st_uid != geteuid() ||
 	    clean_status_identity_from_stat(&before_identity, &before) ||
 	    lstat(path, &after) || before.st_dev != after.st_dev ||
 	    before.st_ino != after.st_ino)
 		goto done;
-	do_read_index(&witness, path, 1);
+	if (read_index_entries_from_fd(&witness, fd))
+		goto done;
 	if (fstat(fd, &after) || after.st_nlink != 1 ||
 	    after.st_uid != geteuid() ||
 	    clean_status_identity_from_stat(&after_identity, &after) ||

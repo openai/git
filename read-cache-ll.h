@@ -320,6 +320,17 @@ int do_read_index(struct index_state *istate, const char *path,
 /* Takes ownership of fd, including when the state is already initialized. */
 int do_read_index_from_fd(struct index_state *istate, int fd,
 			  const char *path);
+/*
+ * Read only the entries of a full index into a fresh index_state. Optional
+ * extensions are ignored; split/sparse indexes, resolve-undo, malformed data,
+ * and unknown mandatory extensions are rejected. Nonzero checksums are always
+ * verified. A zero skipHash trailer requires separate authentication by the
+ * caller before using these entries as a proof.
+ *
+ * The caller owns fd. Its offset is unchanged, and failure leaves istate
+ * unchanged. Return 0 on success or -1 for a missing/unsupported witness.
+ */
+int read_index_entries_from_fd(struct index_state *istate, int fd);
 int read_index_from(struct index_state *, const char *path,
 		    const char *gitdir);
 int is_index_unborn(struct index_state *);
