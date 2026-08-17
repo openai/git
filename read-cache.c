@@ -32,6 +32,7 @@
 #include "name-hash.h"
 #include "object-name.h"
 #include "path.h"
+#include "path-namespace.h"
 #include "preload-index.h"
 #include "read-cache.h"
 #include "replace-object.h"
@@ -1849,14 +1850,10 @@ struct ondisk_cache_entry {
 	char name[FLEX_ARRAY];
 };
 
-/* These are only used for v3 or lower */
+/* Index v2/v3 entries are padded to a multiple of eight bytes. */
 #define align_padding_size(size, len) ((size + (len) + 8) & ~7) - (size + len)
-#define align_flex_name(STRUCT,len) ((offsetof(struct STRUCT,data) + (len) + 8) & ~7)
-#define ondisk_cache_entry_size(len) align_flex_name(ondisk_cache_entry,len)
 #define ondisk_data_size(flags, len) (the_hash_algo->rawsz + \
 				     ((flags & CE_EXTENDED) ? 2 : 1) * sizeof(uint16_t) + len)
-#define ondisk_data_size_max(len) (ondisk_data_size(CE_EXTENDED, len))
-#define ondisk_ce_size(ce) (ondisk_cache_entry_size(ondisk_data_size((ce)->ce_flags, ce_namelen(ce))))
 
 /* Allow fsck to force verification of the index checksum. */
 int verify_index_checksum;
@@ -1939,30 +1936,76 @@ static int read_index_extension(struct index_state *istate,
 	return 0;
 }
 
+enum index_entry_decode_error {
+	INDEX_ENTRY_DECODE_OK,
+	INDEX_ENTRY_DECODE_CORRUPT,
+	INDEX_ENTRY_DECODE_FLAGS,
+	INDEX_ENTRY_DECODE_NAME,
+};
+
+enum index_entry_decode_flags {
+	INDEX_ENTRY_ALLOW_NAME_RESTART = 1 << 0,
+	INDEX_ENTRY_VERIFY_FORMAT = 1 << 1,
+};
+
+struct decoded_index_entry {
+	struct cache_entry *ce;
+	size_t size;
+	unsigned int bad_flags;
+};
+
+static int decode_index_entry_varint(const unsigned char **cursor,
+				     const unsigned char *end,
+				     uint64_t *result)
+{
+	const unsigned char *p = *cursor;
+	unsigned char c;
+	uint64_t value;
+
+	if (p == end)
+		return -1;
+	c = *p++;
+	value = c & 127;
+	while (c & 128) {
+		value++;
+		if (!value || MSB(value, 7) || p == end)
+			return -1;
+		c = *p++;
+		value = (value << 7) + (c & 127);
+	}
+	*cursor = p;
+	*result = value;
+	return 0;
+}
+
 /*
- * Parses the contents of the cache entry contained within the 'ondisk' buffer
- * into a new incore 'cache_entry'.
+ * Decode one entry without reading beyond available bytes or reporting a
+ * fatal error. The main-index reader supplies its usual fatal wrapper below;
+ * optional index witnesses use the same decoder and treat errors as misses.
  *
- * Note that 'char *ondisk' may not be aligned to a 4-byte address interval in
- * index v4, so we cannot cast it to 'struct ondisk_cache_entry *' and access
- * its members. Instead, we use the byte offsets of members within the struct to
- * identify where 'get_be16()', 'get_be32()', and 'oidread()' (which can all
- * read from an unaligned memory buffer) should read from the 'ondisk' buffer
- * into the corresponding incore 'cache_entry' members.
+ * A v4 IEOT block starts with a complete name, but its strip count still
+ * describes the preceding block's last name. Preserve the main reader's
+ * treatment of a missing previous_ce as a name restart. The optional reader
+ * starts at the first entry and also requests the stricter format checks.
+ *
+ * V4 entries need not be aligned. Load fixed fields by their byte offsets,
+ * using get_be16(), get_be32(), and oidread() rather than a struct cast.
  */
-static struct cache_entry *create_from_disk(struct mem_pool *ce_mem_pool,
-					    unsigned int version,
-					    const char *ondisk,
-					    unsigned long *ent_size,
-					    const struct cache_entry *previous_ce)
+static enum index_entry_decode_error decode_index_entry(
+	struct mem_pool *ce_mem_pool, const struct git_hash_algo *algo,
+	unsigned int version, const char *ondisk, size_t available,
+	const struct cache_entry *previous_ce, unsigned int options,
+	struct decoded_index_entry *decoded)
 {
 	struct cache_entry *ce;
-	size_t len;
-	const char *name;
-	const unsigned hashsz = the_hash_algo->rawsz;
-	const char *flagsp = ondisk + offsetof(struct ondisk_cache_entry, data) + hashsz;
+	size_t len, suffix_len, consumed;
+	size_t fixed_size = offsetof(struct ondisk_cache_entry, data) +
+		algo->rawsz + sizeof(uint16_t);
+	const char *name, *end = ondisk + available;
+	const char *flagsp;
 	unsigned int flags;
 	size_t copy_len = 0;
+	int verify_format = options & INDEX_ENTRY_VERIFY_FORMAT;
 	/*
 	 * Adjacent cache entries tend to share the leading paths, so it makes
 	 * sense to only store the differences in later entries.  In the v4
@@ -1972,42 +2015,85 @@ static struct cache_entry *create_from_disk(struct mem_pool *ce_mem_pool,
 	 */
 	int expand_name_field = version == 4;
 
+	memset(decoded, 0, sizeof(*decoded));
+	if (available < fixed_size)
+		return INDEX_ENTRY_DECODE_CORRUPT;
+	flagsp = ondisk + fixed_size - sizeof(uint16_t);
+
 	/* On-disk flags are just 16 bits */
 	flags = get_be16(flagsp);
 	len = flags & CE_NAMEMASK;
 
 	if (flags & CE_EXTENDED) {
-		int extended_flags;
-		extended_flags = get_be16(flagsp + sizeof(uint16_t)) << 16;
+		unsigned int extended_flags;
+
+		if (available - fixed_size < sizeof(uint16_t))
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		extended_flags =
+			(unsigned int)get_be16(flagsp + sizeof(uint16_t)) << 16;
 		/* We do not yet understand any bit out of CE_EXTENDED_FLAGS */
-		if (extended_flags & ~CE_EXTENDED_FLAGS)
-			die(_("unknown index entry format 0x%08x"), extended_flags);
+		if (extended_flags & ~CE_EXTENDED_FLAGS) {
+			decoded->bad_flags = extended_flags;
+			return INDEX_ENTRY_DECODE_FLAGS;
+		}
 		flags |= extended_flags;
-		name = (const char *)(flagsp + 2 * sizeof(uint16_t));
+		fixed_size += sizeof(uint16_t);
 	}
-	else
-		name = (const char *)(flagsp + sizeof(uint16_t));
+	name = ondisk + fixed_size;
 
 	if (expand_name_field) {
 		const unsigned char *cp = (const unsigned char *)name;
-		uint64_t strip_len, previous_len;
+		uint64_t strip_len;
 
-		/* If we're at the beginning of a block, ignore the previous name */
-		strip_len = decode_varint(&cp);
+		if (decode_index_entry_varint(
+			    &cp, (const unsigned char *)end, &strip_len))
+			return INDEX_ENTRY_DECODE_CORRUPT;
 		if (previous_ce) {
-			previous_len = previous_ce->ce_namelen;
-			if (previous_len < strip_len)
-				die(_("malformed name field in the index, near path '%s'"),
-					previous_ce->name);
-			copy_len = previous_len - strip_len;
-		}
+			if (previous_ce->ce_namelen < strip_len)
+				return INDEX_ENTRY_DECODE_NAME;
+			copy_len = previous_ce->ce_namelen - strip_len;
+		} else if (strip_len &&
+			   !(options & INDEX_ENTRY_ALLOW_NAME_RESTART))
+			return INDEX_ENTRY_DECODE_NAME;
 		name = (const char *)cp;
 	}
 
 	if (len == CE_NAMEMASK) {
-		len = strlen(name);
-		if (expand_name_field)
-			len += copy_len;
+		const char *nul = memchr(name, '\0', end - name);
+
+		if (!nul || copy_len > INT_MAX ||
+		    (size_t)(nul - name) > INT_MAX - copy_len)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		suffix_len = nul - name;
+		len = copy_len + suffix_len;
+		if (verify_format && len < CE_NAMEMASK)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+	} else {
+		if (len < copy_len)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		suffix_len = len - copy_len;
+		if (suffix_len >= (size_t)(end - name) || name[suffix_len] ||
+		    (verify_format && memchr(name, '\0', suffix_len)))
+			return INDEX_ENTRY_DECODE_CORRUPT;
+	}
+	if (len > INT_MAX ||
+	    len > SIZE_MAX - offsetof(struct cache_entry, name) - 1)
+		return INDEX_ENTRY_DECODE_CORRUPT;
+
+	consumed = (name - ondisk) + suffix_len + 1;
+	if (!expand_name_field) {
+		size_t padded;
+
+		if (consumed > SIZE_MAX - 7)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		padded = (consumed + 7) & ~(size_t)7;
+		if (padded > available)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		if (verify_format)
+			for (size_t i = consumed; i < padded; i++)
+				if (ondisk[i])
+					return INDEX_ENTRY_DECODE_CORRUPT;
+		consumed = padded;
 	}
 
 	ce = mem_pool__ce_alloc(ce_mem_pool, len);
@@ -2038,18 +2124,189 @@ static struct cache_entry *create_from_disk(struct mem_pool *ce_mem_pool,
 	ce->ce_namelen = len;
 	ce->index = 0;
 	oidread(&ce->oid, (const unsigned char *)ondisk + offsetof(struct ondisk_cache_entry, data),
-		the_repository->hash_algo);
+		algo);
 
-	if (expand_name_field) {
-		if (copy_len)
-			memcpy(ce->name, previous_ce->name, copy_len);
-		memcpy(ce->name + copy_len, name, len + 1 - copy_len);
-		*ent_size = (name - ((char *)ondisk)) + len + 1 - copy_len;
-	} else {
-		memcpy(ce->name, name, len + 1);
-		*ent_size = ondisk_ce_size(ce);
+	if (copy_len)
+		memcpy(ce->name, previous_ce->name, copy_len);
+	memcpy(ce->name + copy_len, name, suffix_len + 1);
+	decoded->ce = ce;
+	decoded->size = consumed;
+	return INDEX_ENTRY_DECODE_OK;
+}
+
+static struct cache_entry *create_from_disk(
+	struct mem_pool *ce_mem_pool, unsigned int version,
+	const char *ondisk, size_t available, unsigned long *ent_size,
+	const struct cache_entry *previous_ce)
+{
+	struct decoded_index_entry decoded;
+	enum index_entry_decode_error err = decode_index_entry(
+		ce_mem_pool, the_hash_algo, version, ondisk, available,
+		previous_ce, INDEX_ENTRY_ALLOW_NAME_RESTART, &decoded);
+
+	if (err == INDEX_ENTRY_DECODE_FLAGS)
+		die(_("unknown index entry format 0x%08x"), decoded.bad_flags);
+	if (err == INDEX_ENTRY_DECODE_NAME && previous_ce)
+		die(_("malformed name field in the index, near path '%s'"),
+		    previous_ce->name);
+	if (err || decoded.size > ULONG_MAX)
+		die(_("index file corrupt"));
+	*ent_size = decoded.size;
+	return decoded.ce;
+}
+
+/* Format-level checks only: a witness must not consult worktree config. */
+static int index_witness_entry_is_valid(
+	const struct cache_entry *ce, unsigned int version,
+	const struct cache_entry *previous)
+{
+	const char *component = ce->name;
+
+	switch (ce->ce_mode) {
+	case 0100644:
+	case 0100755:
+	case 0120000:
+	case 0160000:
+		break;
+	default:
+		return 0;
 	}
-	return ce;
+	if (!ce_namelen(ce) ||
+	    (version == 2 && (ce->ce_flags & CE_EXTENDED)))
+		return 0;
+	for (;;) {
+		const char *slash = strchr(component, '/');
+		size_t len = slash ? (size_t)(slash - component) :
+			strlen(component);
+
+		if (!len || (len == 1 && component[0] == '.') ||
+		    (len == 2 && !memcmp(component, "..", 2)) ||
+		    (len == 4 && component[0] == '.' &&
+		     (component[1] == 'g' || component[1] == 'G') &&
+		     (component[2] == 'i' || component[2] == 'I') &&
+		     (component[3] == 't' || component[3] == 'T')))
+			return 0;
+		if (!slash)
+			break;
+		component = slash + 1;
+	}
+	if (previous) {
+		int cmp = strcmp(previous->name, ce->name);
+
+		if (cmp > 0 ||
+		    (!cmp && (!ce_stage(previous) ||
+			      ce_stage(previous) >= ce_stage(ce))))
+			return 0;
+	}
+	return 1;
+}
+
+int read_index_entries_from_fd(struct index_state *istate, int fd)
+{
+	struct index_state parsed = INDEX_STATE_INIT(istate->repo);
+	const struct git_hash_algo *algo;
+	struct stat before, after;
+	unsigned char header[sizeof(struct cache_header)];
+	char *data = NULL;
+	size_t size, end, offset, minimum_entry_size;
+	uint32_t nr;
+	int ret = -1;
+
+	if (!istate->repo || !istate->repo->hash_algo || fd < 0 ||
+	    istate->initialized || istate->cache || istate->cache_nr ||
+	    istate->ce_mem_pool)
+		return -1;
+	algo = istate->repo->hash_algo;
+	trace2_region_enter("index", "read_index_entries", istate->repo);
+	if (fstat(fd, &before) || !S_ISREG(before.st_mode) ||
+	    before.st_size < 0 ||
+	    (uintmax_t)before.st_size > SIZE_MAX ||
+	    (uintmax_t)before.st_size >
+		(uintmax_t)maximum_signed_value_of_type(ssize_t))
+		goto done;
+	size = (size_t)before.st_size;
+	if (size < sizeof(header) + algo->rawsz ||
+	    (size_t)pread_in_full(fd, header, sizeof(header), 0) !=
+		sizeof(header) || memcmp(header, "DIRC", 4))
+		goto done;
+	parsed.version = get_be32(header + 4);
+	if (parsed.version < INDEX_FORMAT_LB ||
+	    parsed.version > INDEX_FORMAT_UB)
+		goto done;
+	end = size - algo->rawsz;
+	nr = get_be32(header + 8);
+	offset = sizeof(header);
+	minimum_entry_size = offsetof(struct ondisk_cache_entry, data) +
+		algo->rawsz + sizeof(uint16_t) + 1 + (parsed.version == 4);
+	if (nr > INT_MAX || nr > (end - offset) / minimum_entry_size ||
+	    unsigned_mult_overflows((size_t)nr, sizeof(*parsed.cache)))
+		goto done;
+	/* A concurrent truncate must be a short read, not an mmap SIGBUS. */
+	data = malloc(size);
+	if (!data || (size_t)pread_in_full(fd, data, size, 0) != size ||
+	    memcmp(data, header, sizeof(header)))
+		goto done;
+	oidread(&parsed.oid, (const unsigned char *)data + end, algo);
+	if (!is_null_oid(&parsed.oid) &&
+	    !hashfile_checksum_valid(algo, (const unsigned char *)data, size))
+		goto done;
+	if (nr) {
+		parsed.cache = calloc(nr, sizeof(*parsed.cache));
+		if (!parsed.cache)
+			goto done;
+		parsed.ce_mem_pool = malloc(sizeof(*parsed.ce_mem_pool));
+		if (!parsed.ce_mem_pool)
+			goto done;
+		mem_pool_init(parsed.ce_mem_pool, 0);
+	}
+	parsed.cache_alloc = nr;
+	parsed.initialized = 1;
+	parsed.timestamp.sec = before.st_mtime;
+	parsed.timestamp.nsec = ST_MTIME_NSEC(before);
+	while (parsed.cache_nr < nr) {
+		struct decoded_index_entry decoded;
+		const struct cache_entry *previous = parsed.cache_nr ?
+			parsed.cache[parsed.cache_nr - 1] : NULL;
+
+		if (decode_index_entry(parsed.ce_mem_pool, algo, parsed.version,
+				       data + offset, end - offset, previous,
+				       INDEX_ENTRY_VERIFY_FORMAT, &decoded) ||
+		    !index_witness_entry_is_valid(decoded.ce, parsed.version,
+						  previous))
+			goto done;
+		parsed.cache[parsed.cache_nr++] = decoded.ce;
+		offset += decoded.size;
+	}
+	while (offset < end) {
+		const char *ext = data + offset;
+		uint32_t ext_size;
+
+		if (end - offset < 8)
+			goto done;
+		ext_size = get_be32(ext + 4);
+		if (ext_size > end - offset - 8 ||
+		    ext[0] < 'A' || ext[0] > 'Z' ||
+		    !memcmp(ext, "REUC", 4))
+			goto done;
+		/* Optional acceleration extensions are deliberately not installed. */
+		offset += 8;
+		offset += ext_size;
+	}
+	if (fstat(fd, &after) || !path_namespace_stat_equal(&before, &after))
+		goto done;
+
+	trace2_data_intmax("index", istate->repo, "read/entries-only",
+			   parsed.cache_nr);
+	release_index(istate);
+	*istate = parsed;
+	index_state_init(&parsed, istate->repo);
+	ret = 0;
+
+done:
+	free(data);
+	release_index(&parsed);
+	trace2_region_leave("index", "read_index_entries", istate->repo);
+	return ret;
 }
 
 static void check_ce_order(struct index_state *istate)
@@ -2323,20 +2580,32 @@ join_tree:
  */
 static unsigned long load_cache_entry_block(struct index_state *istate,
 			struct mem_pool *ce_mem_pool, int offset, int nr, const char *mmap,
-			unsigned long start_offset, const struct cache_entry *previous_ce)
+			size_t mmap_size, unsigned long start_offset,
+			const struct cache_entry *previous_ce)
 {
 	int i;
 	unsigned long src_offset = start_offset;
+	size_t end;
+
+	if (mmap_size < the_hash_algo->rawsz || offset < 0 || nr < 0 ||
+	    nr > INT_MAX - offset || (unsigned int)offset > istate->cache_nr ||
+	    (unsigned int)nr > istate->cache_nr - offset)
+		die(_("index file corrupt"));
+	end = mmap_size - the_hash_algo->rawsz;
 
 	for (i = offset; i < offset + nr; i++) {
 		struct cache_entry *ce;
 		unsigned long consumed;
 
+		if (src_offset > end)
+			die(_("index file corrupt"));
 		ce = create_from_disk(ce_mem_pool, istate->version,
-				      mmap + src_offset,
+				      mmap + src_offset, end - src_offset,
 				      &consumed, previous_ce);
 		set_index_entry(istate, i, ce);
 
+		if (consumed > ULONG_MAX - src_offset)
+			die(_("index file corrupt"));
 		src_offset += consumed;
 		previous_ce = ce;
 	}
@@ -2358,7 +2627,8 @@ static unsigned long load_all_cache_entries(struct index_state *istate,
 	}
 
 	consumed = load_cache_entry_block(istate, istate->ce_mem_pool,
-					0, istate->cache_nr, mmap, src_offset, NULL);
+					0, istate->cache_nr, mmap, mmap_size,
+					src_offset, NULL);
 	return consumed;
 }
 
@@ -2378,6 +2648,7 @@ struct load_cache_entries_thread_data
 	struct mem_pool *ce_mem_pool;
 	int offset;
 	const char *mmap;
+	size_t mmap_size;
 	struct index_entry_offset_table *ieot;
 	int ieot_start;		/* starting index into the ieot array */
 	int ieot_blocks;	/* count of ieot entries to process */
@@ -2396,7 +2667,8 @@ static void *load_cache_entries_thread(void *_data)
 	/* iterate across all ieot blocks assigned to this thread */
 	for (i = p->ieot_start; i < p->ieot_start + p->ieot_blocks; i++) {
 		p->consumed += load_cache_entry_block(p->istate, p->ce_mem_pool,
-			p->offset, p->ieot->entries[i].nr, p->mmap, p->ieot->entries[i].offset, NULL);
+			p->offset, p->ieot->entries[i].nr, p->mmap,
+			p->mmap_size, p->ieot->entries[i].offset, NULL);
 		p->offset += p->ieot->entries[i].nr;
 	}
 	return NULL;
@@ -2433,6 +2705,7 @@ static unsigned long load_cache_entries_threaded(struct index_state *istate, con
 		p->istate = istate;
 		p->offset = offset;
 		p->mmap = mmap;
+		p->mmap_size = mmap_size;
 		p->ieot = ieot;
 		p->ieot_start = ieot_start;
 		p->ieot_blocks = ieot_blocks;
