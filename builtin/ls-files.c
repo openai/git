@@ -588,25 +588,17 @@ static int option_parse_exclude_standard(const struct option *opt,
 	return 0;
 }
 
-static int ls_files_has_bounded_stage_request(int argc, const char **argv)
+static int ls_files_is_index_only(const struct dir_struct *dir, int show_tag)
 {
-	int i;
-	int stage = 0;
-
-	for (i = 1; i < argc && strcmp(argv[i], "--"); i++) {
-		if (!strcmp(argv[i], "--stage") || !strcmp(argv[i], "-s"))
-			stage = 1;
-		else if (strcmp(argv[i], "-z"))
-			return 0;
-	}
-	if (!stage || i == argc || argc - i - 1 <= 0 ||
-	    argc - i - 1 > 64)
+	if (show_deleted || show_others || show_unmerged ||
+	    show_resolve_undo || show_modified || show_killed ||
+	    show_valid_bit || show_fsmonitor_bit || show_eol ||
+	    recurse_submodules || show_tag || debug_mode ||
+	    with_tree || format || exc_given || dir->exclude_per_dir ||
+	    (dir->flags & DIR_SHOW_IGNORED) ||
+	    (pathspec.magic & PATHSPEC_ATTR))
 		return 0;
-	for (i++; i < argc; i++) {
-		if (!*argv[i] || starts_with(argv[i], ":(") ||
-		    strpbrk(argv[i], "*?["))
-			return 0;
-	}
+
 	return 1;
 }
 
@@ -702,7 +694,10 @@ int cmd_ls_files(int argc,
 		prefix_len = strlen(prefix);
 	repo_config(repo, git_default_config, NULL);
 
-	scoped_bootstrap = ls_files_has_bounded_stage_request(argc, argv);
+	argc = parse_options(argc, argv, prefix, builtin_ls_files_options,
+				ls_files_usage, 0);
+	parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_CWD, prefix, argv);
+	scoped_bootstrap = ls_files_is_index_only(&dir, show_tag);
 	if (scoped_bootstrap)
 		fsmonitor_begin_scoped_bootstrap(repo->index);
 	if (repo_read_index(repo) < 0)
@@ -710,8 +705,6 @@ int cmd_ls_files(int argc,
 	if (scoped_bootstrap)
 		fsmonitor_end_scoped_bootstrap(repo->index);
 
-	argc = parse_options(argc, argv, prefix, builtin_ls_files_options,
-			ls_files_usage, 0);
 	pl = add_pattern_list(&dir, EXC_CMDL, "--exclude option");
 	for (i = 0; i < exclude_list.nr; i++) {
 		add_pattern(exclude_list.items[i].string, "", 0, pl, --exclude_args);
@@ -757,10 +750,6 @@ int cmd_ls_files(int argc,
 	if (recurse_submodules && error_unmatch)
 		die("ls-files --recurse-submodules does not support "
 		    "--error-unmatch");
-
-	parse_pathspec(&pathspec, 0,
-		       PATHSPEC_PREFER_CWD,
-		       prefix, argv);
 
 	/*
 	 * Find common prefix for all pathspec's
