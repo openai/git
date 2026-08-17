@@ -851,6 +851,14 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			error(_("fsmonitor: cookie_result '%d' != SEEN"),
 			      cookie_result);
 			do_trivial = 1;
+			/*
+			 * This boundary could not be synchronized. Retire it so
+			 * a later successful cookie cannot make an old client's
+			 * token appear complete again. An aborted cookie already
+			 * belongs to a listener-initiated reset.
+			 */
+			if (cookie_result == FCIR_ERROR)
+				do_flush = 1;
 		}
 	}
 
