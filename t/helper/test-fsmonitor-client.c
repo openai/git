@@ -8,6 +8,7 @@
 #include "test-tool.h"
 #include "parse-options.h"
 #include "fsmonitor-ipc.h"
+#include "path.h"
 #include "read-cache-ll.h"
 #include "repository.h"
 #include "setup.h"
@@ -83,6 +84,38 @@ static int do_send_flush(void)
 	strbuf_release(&answer);
 
 	return 0;
+}
+
+static int do_record_watch_limit(void)
+{
+#if defined(__linux__) || defined(__APPLE__)
+	struct strbuf identity = STRBUF_INIT;
+	struct stat st;
+	char *path = NULL;
+	int ret = 1;
+
+	if (fsmonitor_ipc__get_worktree_identity(the_repository, &identity)) {
+		error("could not identify the fsmonitor worktree");
+		goto done;
+	}
+	fsmonitor_ipc__record_watch_limit_failure(identity.buf);
+	path = repo_git_path(the_repository,
+			     "fsmonitor--daemon.inotify-limit");
+	if (lstat(path, &st) || !S_ISREG(st.st_mode) ||
+	    st.st_uid != geteuid() || st.st_nlink != 1 ||
+	    (st.st_mode & 077)) {
+		error("could not record an owned fsmonitor watch-limit marker");
+		goto done;
+	}
+	ret = 0;
+
+done:
+	free(path);
+	strbuf_release(&identity);
+	return ret;
+#else
+	return error("watch-limit markers are not supported on this platform");
+#endif
 }
 
 struct hammer_thread_data
@@ -189,6 +222,7 @@ int cmd__fsmonitor_client(int argc, const char **argv)
 	const char * const fsmonitor_client_usage[] = {
 		"test-tool fsmonitor-client query [<token>]",
 		"test-tool fsmonitor-client flush",
+		"test-tool fsmonitor-client record-watch-limit",
 		"test-tool fsmonitor-client hammer [<token>] [<threads>] [<requests>]",
 		NULL,
 	};
@@ -217,6 +251,9 @@ int cmd__fsmonitor_client(int argc, const char **argv)
 
 	if (!strcmp(subcmd, "flush"))
 		return !!do_send_flush();
+
+	if (!strcmp(subcmd, "record-watch-limit"))
+		return !!do_record_watch_limit();
 
 	if (!strcmp(subcmd, "hammer"))
 		return !!do_hammer(token, nr_threads, nr_requests);
