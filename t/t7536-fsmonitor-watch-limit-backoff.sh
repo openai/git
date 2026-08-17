@@ -50,7 +50,7 @@ setup_backoff_marker_fixture () {
 check_rejected_backoff_marker () {
 	(
 		cd "$1" &&
-		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		test_env GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCCCCCC \
 		GIT_TEST_FSMONITOR_QUERY_PATH=// \
 		GIT_TRACE2_EVENT="$PWD/.git/$2.trace" \
