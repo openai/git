@@ -625,6 +625,9 @@ int clean_status_capture_external_history_source_from_snapshot(
 	captured = 0;
 
 done:
+	if (original.fsmonitor_dirty)
+		ewah_free(original.fsmonitor_dirty);
+	original.fsmonitor_dirty = NULL;
 	release_index(&original);
 	return captured;
 #else
