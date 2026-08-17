@@ -478,7 +478,21 @@ test_index_witness_issue_history () {
 	cp "$witness" .git/witness.good
 }
 
-test_expect_success INDEX_WITNESS_APFS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+test_lazy_prereq INDEX_WITNESS_HEALTHY_NATIVE_COOKIE '
+	test_have_prereq INDEX_WITNESS_APFS,FSMONITOR_DAEMON &&
+	test_create_repo index-witness-native-cookie-prerequisite &&
+	(
+		cd index-witness-native-cookie-prerequisite &&
+		trap "git fsmonitor--daemon stop >/dev/null 2>&1 || :" 0 &&
+		git config core.fsmonitor true &&
+		GIT_TRACE_FSMONITOR="$PWD/.git/witness-daemon.trace" \
+			git fsmonitor--daemon start --start-timeout=10 &&
+		test_index_witness_cookie_health native-prerequisite &&
+		test_grep ! "cookie_wait timed out" .git/witness-daemon.trace
+	)
+'
+
+test_expect_success INDEX_WITNESS_APFS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS,INDEX_WITNESS_HEALTHY_NATIVE_COOKIE \
 	'corrupt external semantic witnesses fall back with a valid main index' '
 	test_when_finished "git -C recovery fsmonitor--daemon stop 2>/dev/null || :" &&
 	test_create_repo recovery &&
@@ -532,7 +546,7 @@ test_expect_success INDEX_WITNESS_APFS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC
 	)
 '
 
-test_expect_success INDEX_WITNESS_APFS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+test_expect_success INDEX_WITNESS_APFS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS,INDEX_WITNESS_HEALTHY_NATIVE_COOKIE \
 	'bootstrap manifest recovery treats a damaged witness as a miss' '
 	test_when_finished "git -C bootstrap fsmonitor--daemon stop 2>/dev/null || :" &&
 	test_create_repo bootstrap &&
