@@ -2612,4 +2612,123 @@ test_expect_success DURABLE_FSMONITOR \
 	done
 '
 
+test_expect_success PERL_TEST_HELPERS \
+	'a trivial fast probe survives a later empty provider delta' '
+	test_when_finished "rm -rf sidecar-trivial-probe" &&
+	test_create_repo sidecar-trivial-probe &&
+	(
+		cd sidecar-trivial-probe &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime -120 tracked &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config filter.sidecar.clean "sed s/base/converted/" &&
+		git config filter.sidecar.required true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/issue &&
+		test_must_be_empty .git/issue &&
+		test_path_is_file .git/index.csts &&
+		cp .git/index .git/index.before &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/clean.trace" \
+			git status --porcelain=v2 >.git/clean &&
+		test_must_be_empty .git/clean &&
+		test_trace2_data status clean-proof/hit 1 <.git/clean.trace &&
+		test_region ! index do_read_index .git/clean.trace &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TTCCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/clean-reset.trace" \
+			git status --porcelain=v2 >.git/clean-reset &&
+		test_must_be_empty .git/clean-reset &&
+		test_trace2_data status clean-proof/provider-reset-carried 1 \
+			<.git/clean-reset.trace &&
+		test_trace2_data fsmonitor semantic/token-reset-stat-baseline 1 \
+			<.git/clean-reset.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/clean-reset.trace >.git/clean-reset.scans &&
+		test_line_count = 1 .git/clean-reset.scans &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 2 \
+			<.git/clean-reset.trace &&
+		test_cmp_bin .git/index.before .git/index &&
+		test_write_lines "tracked filter=sidecar" >.gitattributes &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				-c core.trustctime=true -c core.checkStat=default \
+				status --porcelain=v2 >.git/expect &&
+		test_grep "^1 \\.M .* tracked$" .git/expect &&
+		test_grep "^? \\.gitattributes$" .git/expect &&
+		for outcome in T E TT TE
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE="$outcome"CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$outcome.trace" \
+				git status --porcelain=v2 >.git/actual &&
+			test_cmp .git/expect .git/actual &&
+			test_trace2_data status clean-proof/miss fast-provider-changed \
+				<".git/$outcome.trace" &&
+			test_trace2_data status clean-proof/provider-reset-carried 1 \
+				<".git/$outcome.trace" &&
+			test_grep ! "\"key\":\"clean-proof/hit\"" \
+				".git/$outcome.trace" &&
+			test_cmp_bin .git/index.before .git/index &&
+			case "$outcome" in
+			TT)
+				test_trace2_data fsmonitor \
+					semantic/token-reset-stat-baseline 1 \
+					<.git/TT.trace &&
+				test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<.git/TT.trace >.git/TT.scans &&
+				test_line_count = 1 .git/TT.scans &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 2 \
+					<.git/TT.trace
+				;;
+			TE)
+				! test_trace2_data fsmonitor \
+					semantic/token-reset-stat-baseline 1 \
+					<.git/TE.trace &&
+				test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<.git/TE.trace &&
+				test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 2 \
+					<.git/TE.trace
+				;;
+			esac || return 1
+		done &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DDCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=.gitattributes \
+		GIT_TRACE2_EVENT="$PWD/.git/delta.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		! test_trace2_data status clean-proof/provider-reset-carried 1 \
+			<.git/delta.trace &&
+		test_cmp_bin .git/index.before .git/index &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/writable.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_trace2_data status clean-proof/provider-reset-carried 1 \
+			<.git/writable.trace &&
+		! test_trace2_data status clean-proof/sidecar 1 \
+			<.git/writable.trace &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/follower &&
+		test_cmp .git/expect .git/follower
+	)
+'
+
 test_done
