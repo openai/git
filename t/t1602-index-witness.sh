@@ -120,6 +120,13 @@ test_expect_success PERL_TEST_HELPERS 'write index fixture generator' '
 		$extra .= pack("a4N", $_, 4) . "junk"
 			for qw(TREE UNTR FSMN FSCF FSUC IEOT EOIE ZZZZ);
 	}
+	elsif ($case eq "high-bit-extension") {
+		my $size = 12 + $rawsz;
+		$extra = pack("a4N", "ZZZZ", $size) . ("\x95" x $size);
+	}
+	elsif ($case eq "high-bit-signature") {
+		$extra = pack("a4N", "Z\x95ZZ", 0);
+	}
 	elsif ($case eq "bad-signature") { $signature = "NOPE"; }
 	elsif ($case eq "bad-version") { $version = 5; }
 	elsif ($case eq "bad-count") { $count = 0xffffffff; }
@@ -956,5 +963,40 @@ test_expect_success INDEX_WITNESS_APFS,FSMONITOR_DAEMON,INDEX_WITNESS_SCRIPTED_I
 			history/external-bootstrap-manifest
 	)
 '
+
+# An EOIE lookup probes backwards from the checksum before it knows whether
+# the bytes are an extension signature.  Keep both the current SHA-1-sized
+# probe and a hash-sized probe inside a fixed high-bit optional payload.
+# Also exercise the ordinary reader with a high-bit byte after the uppercase
+# first byte of an optional extension signature.
+for algo in sha1 sha256
+do
+	test_expect_success PTHREADS,PERL_TEST_HELPERS \
+		"$algo index extension signatures use unsigned bytes" '
+		repo=high-bit-extension-$algo &&
+		git init --object-format="$algo" "$repo" &&
+		perl make-index.pl "$algo" high-bit-extension >"$repo/.git/witness" &&
+		GIT_INDEX_FILE="$PWD/$repo/.git/witness" \
+			git -C "$repo" -c core.fsmonitor=false \
+				-c core.untrackedCache=false -c index.threads=1 \
+				--no-optional-locks ls-files --stage >expect 2>serial.err &&
+		test_line_count = 1 expect &&
+		test_grep "^100644 .*alpha$" expect &&
+		test_grep "ignoring ZZZZ extension" serial.err &&
+		GIT_INDEX_FILE="$PWD/$repo/.git/witness" \
+			git -C "$repo" -c core.fsmonitor=false \
+				-c core.untrackedCache=false -c index.threads=2 \
+				--no-optional-locks ls-files --stage >actual 2>threaded.err &&
+		test_cmp expect actual &&
+		test_grep "ignoring ZZZZ extension" threaded.err &&
+		perl make-index.pl "$algo" high-bit-signature >"$repo/.git/witness" &&
+		GIT_INDEX_FILE="$PWD/$repo/.git/witness" \
+			git -C "$repo" -c core.fsmonitor=false \
+				-c core.untrackedCache=false -c index.threads=1 \
+				--no-optional-locks ls-files --stage >actual 2>signature.err &&
+		test_cmp expect actual &&
+		test_grep "ignoring .* extension" signature.err
+	'
+done
 
 test_done
