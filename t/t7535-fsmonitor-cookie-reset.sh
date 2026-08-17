@@ -15,15 +15,15 @@ test_expect_success 'a failed cookie permanently invalidates the old token' '
 	test_create_repo cookie-reset &&
 	GIT_TRACE2_EVENT="$PWD/cookie-daemon.trace" \
 		git -C cookie-reset fsmonitor--daemon start --start-timeout=10 &&
+	test-tool -C cookie-reset fsmonitor-client flush >before &&
+	nul_to_q <before >before.q &&
+	test_grep "^builtin:.*:0Q/Q$" before.q &&
+	old_token=$(sed "s/Q.*//" before.q) &&
 	mv cookie-reset/.git/fsmonitor--daemon/cookies \
 		cookie-reset/.git/fsmonitor--daemon/cookies.saved &&
 	test_when_finished "test ! -d cookie-reset/.git/fsmonitor--daemon/cookies.saved ||
 		mv cookie-reset/.git/fsmonitor--daemon/cookies.saved \
 		cookie-reset/.git/fsmonitor--daemon/cookies" &&
-	test-tool -C cookie-reset fsmonitor-client flush >before &&
-	nul_to_q <before >before.q &&
-	test_grep "^builtin:.*:0Q/Q$" before.q &&
-	old_token=$(sed "s/Q.*//" before.q) &&
 	test-tool -C cookie-reset fsmonitor-client query \
 		--token "$old_token" >failed &&
 	nul_to_q <failed >failed.q &&
