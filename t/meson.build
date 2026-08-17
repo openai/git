@@ -970,6 +970,7 @@ integration_tests = [
   't7533-status-scoped-stash.sh',
   't7534-status-scoped-readers.sh',
   't7535-fsmonitor-cookie-reset.sh',
+  't7536-fsmonitor-watch-limit-backoff.sh',
   't7600-merge.sh',
   't7601-merge-pull-config.sh',
   't7602-merge-octopus-many.sh',
