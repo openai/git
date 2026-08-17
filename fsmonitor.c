@@ -896,6 +896,35 @@ void fsmonitor_query_result_release(struct fsmonitor_query_result *result)
 	strbuf_release(&result->paths);
 }
 
+void fsmonitor_format_worktree_paths(
+	struct strbuf *paths, const char *path, size_t worktree_len,
+	int is_file, int is_directory)
+{
+	const char *relative = path + worktree_len;
+
+	strbuf_reset(paths);
+	if (!is_file && !is_directory)
+		return;
+
+	/* The root has no relative pathname; never read past its NUL. */
+	if (!*relative || (*relative == '/' && !relative[1])) {
+		strbuf_addstr(paths, FSMONITOR_PATH_GLOBAL_INVALIDATE);
+		strbuf_addch(paths, '\0');
+		return;
+	}
+
+	relative++;
+	if (is_file) {
+		strbuf_addstr(paths, relative);
+		strbuf_addch(paths, '\0');
+	}
+	if (is_directory) {
+		strbuf_addstr(paths, relative);
+		strbuf_addch(paths, '/');
+		strbuf_addch(paths, '\0');
+	}
+}
+
 static int fsmonitor_valid_worktree_path(const char *path, size_t len)
 {
 	struct strbuf copy = STRBUF_INIT;

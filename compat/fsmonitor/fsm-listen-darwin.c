@@ -24,7 +24,7 @@
 #endif
 
 #include "git-compat-util.h"
-#include "fsmonitor-ll.h"
+#include "fsmonitor.h"
 #include "fsm-listen.h"
 #include "fsmonitor--daemon.h"
 #include "fsmonitor-path-utils.h"
@@ -420,26 +420,19 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 			 * know how much to invalidate/refresh.
 			 */
 
-			if (event_flags[k] & (kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink)) {
-				const char *rel = path_k +
-					state->path_worktree_watch.len + 1;
-
+			fsmonitor_format_worktree_paths(
+				&tmp, path_k, state->path_worktree_watch.len,
+				!!(event_flags[k] &
+				   (kFSEventStreamEventFlagItemIsFile |
+				    kFSEventStreamEventFlagItemIsSymlink)),
+				!!(event_flags[k] &
+				   kFSEventStreamEventFlagItemIsDir));
+			for (const char *relative = tmp.buf;
+			     relative < tmp.buf + tmp.len;
+			     relative += strlen(relative) + 1) {
 				if (!batch)
 					batch = fsmonitor_batch__new();
-				my_add_path(batch, rel);
-			}
-
-			if (event_flags[k] & kFSEventStreamEventFlagItemIsDir) {
-				const char *rel = path_k +
-					state->path_worktree_watch.len + 1;
-
-				strbuf_reset(&tmp);
-				strbuf_addstr(&tmp, rel);
-				strbuf_addch(&tmp, '/');
-
-				if (!batch)
-					batch = fsmonitor_batch__new();
-				my_add_path(batch, tmp.buf);
+				my_add_path(batch, relative);
 			}
 
 			break;
