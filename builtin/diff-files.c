@@ -12,6 +12,7 @@
 #include "diff.h"
 #include "diff-merges.h"
 #include "commit.h"
+#include "fsmonitor.h"
 #include "preload-index.h"
 #include "revision.h"
 
@@ -27,6 +28,7 @@ int cmd_diff_files(int argc,
 {
 	struct rev_info rev;
 	int result;
+	int scoped_bootstrap;
 	unsigned options = 0;
 
 	show_usage_if_asked(argc, argv, diff_files_usage);
@@ -85,8 +87,14 @@ int cmd_diff_files(int argc,
 		diff_merges_set_dense_combined_if_unset(&rev);
 
 	prepare_diff_external_history(the_repository);
+	scoped_bootstrap =
+		diff_has_bounded_regular_pathspec(&rev.diffopt.pathspec);
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
 	if (repo_read_index_preload(the_repository, &rev.diffopt.pathspec, 0) < 0)
 		die_errno("repo_read_index_preload");
+	if (scoped_bootstrap)
+		fsmonitor_end_scoped_bootstrap(the_repository->index);
 	run_diff_files(&rev, options);
 	result = diff_result_code(&rev);
 	release_revisions(&rev);

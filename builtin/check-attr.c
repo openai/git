@@ -129,23 +129,6 @@ int cmd_check_attr(int argc,
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
 
-	if (!stdin_paths && !source) {
-		for (i = 0; i < argc && strcmp(argv[i], "--"); i++)
-			;
-		scoped_bootstrap = i < argc &&
-			argc - i - 1 > 0 && argc - i - 1 <= 64;
-	}
-	if (scoped_bootstrap)
-		fsmonitor_begin_scoped_bootstrap(the_repository->index);
-	if (repo_read_index(the_repository) < 0) {
-		die("invalid cache");
-	}
-	if (scoped_bootstrap)
-		fsmonitor_end_scoped_bootstrap(the_repository->index);
-
-	if (cached_attrs)
-		git_attr_set_direction(GIT_ATTR_INDEX);
-
 	doubledash = -1;
 	for (i = 0; doubledash < 0 && i < argc; i++) {
 		if (!strcmp(argv[i], "--"))
@@ -187,6 +170,18 @@ int cmd_check_attr(int argc,
 		if (filei >= argc)
 			error_with_usage("No file specified");
 	}
+
+	scoped_bootstrap = !stdin_paths && !source &&
+		argc - filei > 0 && argc - filei <= 64;
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
+	if (repo_read_index(the_repository) < 0)
+		die("invalid cache");
+	if (scoped_bootstrap)
+		fsmonitor_end_scoped_bootstrap(the_repository->index);
+
+	if (cached_attrs)
+		git_attr_set_direction(GIT_ATTR_INDEX);
 
 	check = attr_check_alloc();
 	if (!all_attrs) {

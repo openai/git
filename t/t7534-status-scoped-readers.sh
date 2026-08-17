@@ -105,6 +105,22 @@ assert_scoped_reader () {
 	test_cmp_bin "$gitdir/checkpoint.pristine" "$scoped_checkpoint"
 }
 
+assert_unscoped_reader () {
+	scoped_label=$1 &&
+	shift &&
+	cp "$gitdir/index" "$gitdir/$scoped_label.index" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+	GIT_TRACE2_EVENT="$gitdir/$scoped_label.trace" \
+		git -C "$worktree" "$@" \
+			>"$gitdir/$scoped_label.actual" &&
+	! test_trace2_data fsmonitor \
+		semantic/scoped-reader-stat-fallback 1 \
+		<"$gitdir/$scoped_label.trace" &&
+	test_cmp_bin "$gitdir/$scoped_label.index" "$gitdir/index" &&
+	test_cmp_bin "$gitdir/checkpoint.pristine" "$scoped_checkpoint"
+}
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
 	'bounded physical-index readers reject incomplete history without a manifest' '
 	test_when_finished "rm -rf scoped-readers scoped-readers-linked" &&
@@ -165,6 +181,24 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 			assert_scoped_reader worktree-default 1 \
 				diff --no-ext-diff --no-textconv -- tracked &&
 			test_must_be_empty "$gitdir/worktree-default.actual" &&
+			assert_scoped_reader plumbing-files-readonly 0 \
+				diff-files --no-ext-diff --no-textconv -- tracked &&
+			assert_scoped_reader plumbing-files-default 1 \
+				diff-files --no-ext-diff --no-textconv -- tracked &&
+			assert_scoped_reader plumbing-index-readonly 0 \
+				diff-index --no-ext-diff --no-textconv HEAD -- tracked &&
+			assert_scoped_reader plumbing-index-default 1 \
+				diff-index --no-ext-diff --no-textconv HEAD -- tracked &&
+			assert_scoped_reader plumbing-cached-readonly 0 \
+				diff-index --cached --name-only -z HEAD -- &&
+			assert_scoped_reader plumbing-cached-default 1 \
+				diff-index --cached --name-only -z HEAD -- &&
+			assert_unscoped_reader plumbing-files-root \
+				diff-files --no-ext-diff --no-textconv -- . &&
+			assert_unscoped_reader plumbing-index-root \
+				diff-index --no-ext-diff --no-textconv HEAD -- . &&
+			assert_unscoped_reader plumbing-files-wildcard \
+				diff-files --no-ext-diff --no-textconv -- "track*" &&
 			if test "$worktree" != "$PWD"
 			then
 				cp "$gitdir/index" "$gitdir/partial.saved" &&
@@ -189,12 +223,50 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 			test_cmp_bin "$gitdir/private.index" "$gitdir/index" &&
 			assert_scoped_reader attributes 0 \
 				check-attr -a -- tracked sibling &&
+			assert_scoped_reader implicit-all-attributes 0 \
+				check-attr -a tracked sibling &&
+			assert_scoped_reader named-attributes 0 \
+				check-attr text tracked sibling &&
+			assert_scoped_reader literal-pattern-attributes 0 \
+				check-attr text "tracked*" &&
+			assert_scoped_reader absent-path-attributes 0 \
+				check-attr text missing &&
 			assert_scoped_reader cached-attributes 0 \
 				check-attr --cached -a -- tracked &&
+			assert_scoped_reader cached-implicit-attributes 0 \
+				check-attr --cached text tracked &&
+			assert_unscoped_reader source-attributes \
+				check-attr --source=HEAD -a -- tracked &&
 			assert_scoped_reader index-stage-readonly 0 \
 				ls-files --stage -- tracked staged &&
 			assert_scoped_reader index-stage-default 1 \
 				ls-files --stage -- tracked staged &&
+			assert_scoped_reader index-stage-combined 0 \
+				ls-files -sz tracked staged &&
+			assert_scoped_reader index-stage-abbreviated 0 \
+				ls-files --stage --abbrev=12 tracked staged &&
+			assert_scoped_reader index-stage-literal 0 \
+				ls-files --stage -- ":(literal)tracked" &&
+			assert_scoped_reader index-stage-wildcard 0 \
+				ls-files --stage -- "track*" &&
+			assert_scoped_reader index-stage-root 0 \
+				ls-files --stage -- . &&
+			assert_scoped_reader index-cached 0 \
+				ls-files --cached -- tracked staged &&
+			assert_scoped_reader index-cached-all 0 \
+				ls-files --cached &&
+			assert_scoped_reader index-default-all 1 \
+				ls-files &&
+			rm "$worktree/staged" &&
+			assert_scoped_reader index-deleted-stage 0 \
+				ls-files --stage -- staged &&
+			test_write_lines staged >"$worktree/staged" &&
+			assert_unscoped_reader index-debug \
+				ls-files --debug -- tracked &&
+			assert_unscoped_reader index-format \
+				ls-files --format="%(path)" -- tracked &&
+			assert_unscoped_reader index-attribute-pathspec \
+				ls-files -- ":(attr:text)tracked" &&
 			GIT_OPTIONAL_LOCKS=0 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/fsmonitor-mode.trace" \

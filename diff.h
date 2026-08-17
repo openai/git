@@ -701,6 +701,7 @@ void diff_get_merge_base(const struct rev_info *revs, struct object_id *mb);
 /* update index stat data for content-checked entries */
 #define DIFF_UPDATE_INDEX_STAT 04
 void run_diff_files(struct rev_info *revs, unsigned int option);
+int diff_has_bounded_regular_pathspec(const struct pathspec *pathspec);
 
 #define DIFF_INDEX_CACHED 01
 #define DIFF_INDEX_MERGE_BASE 02
