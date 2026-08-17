@@ -14,6 +14,36 @@ struct clean_status_index_snapshot {
 	int fd;
 };
 
+/*
+ * An opt-in receipt for a canonical index write. Only the index writer may
+ * record it, after committing its lockfile and before running hooks. The
+ * caller must initialize and release it, even if no write was performed.
+ */
+struct clean_status_index_write_receipt {
+	struct clean_status_index_snapshot snapshot;
+	struct clean_status_identity source_identity;
+	const struct index_state *istate;
+	unsigned int recorded : 1;
+};
+
+#define CLEAN_STATUS_INDEX_WRITE_RECEIPT_INIT \
+	{ .snapshot = { .fd = -1 } }
+
+/* Writer-only lifecycle: prepare duplicates lock_fd; record fails closed. */
+int clean_status_index_prepare_write_receipt(
+	struct index_state *istate, int lock_fd,
+	struct clean_status_index_write_receipt *receipt);
+void clean_status_index_record_write_receipt(
+	struct index_state *istate,
+	struct clean_status_index_write_receipt *receipt);
+
+/* Consumes the receipt and returns whether the written source was adopted. */
+int clean_status_index_adopt_write_receipt(
+	struct index_state *istate,
+	struct clean_status_index_write_receipt *receipt);
+void clean_status_index_write_receipt_release(
+	struct clean_status_index_write_receipt *receipt);
+
 int clean_status_index_snapshot_open(
 	struct clean_status_index_snapshot *snapshot, const char *path,
 	const struct git_hash_algo *algo);

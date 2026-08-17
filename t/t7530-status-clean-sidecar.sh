@@ -2734,4 +2734,446 @@ test_expect_success PERL_TEST_HELPERS \
 	)
 '
 
+test_expect_success PERL_TEST_HELPERS \
+	'a rewritten skipHash index reissues its clean status sidecar' '
+	test_when_finished "rm -rf sidecar-skiphash-postwrite" &&
+	test_create_repo sidecar-skiphash-postwrite &&
+	(
+		cd sidecar-skiphash-postwrite &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime =-180 tracked &&
+		git -c core.fsmonitor=false update-index --refresh &&
+		git config index.version 4 &&
+		git config index.skipHash true &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		test_env GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		rawsz=$(test_oid rawsz) &&
+		dd if=/dev/zero of=.git/zero-trailer \
+			bs="$rawsz" count=1 2>/dev/null &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/issue &&
+		test_must_be_empty .git/issue &&
+		test_path_is_file .git/index.csts &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status >.git/expected &&
+		cp .git/index .git/index.before-noop &&
+		cp .git/index.csts .git/index.csts.before-noop &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/noop.trace" \
+			git status >.git/noop &&
+		test_cmp .git/expected .git/noop &&
+		test_trace2_data status clean-proof/hit 1 \
+			<.git/noop.trace &&
+		test_region ! index do_read_index .git/noop.trace &&
+		test_region ! index do_write_index .git/noop.trace &&
+		test_cmp_bin .git/index.before-noop .git/index &&
+		test_cmp_bin .git/index.csts.before-noop .git/index.csts &&
+
+		before_inode=$(/usr/bin/stat -f %i .git/index) &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --force-write-index &&
+		foreign_inode=$(/usr/bin/stat -f %i .git/index) &&
+		test "$before_inode" != "$foreign_inode" &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		test_cmp_bin .git/index.csts.before-noop .git/index.csts &&
+		cp .git/index .git/index.foreign &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/foreign.trace" \
+			git status >.git/foreign &&
+		test_cmp .git/expected .git/foreign &&
+		test_trace2_data status clean-proof/miss \
+			fast-index-mismatch <.git/foreign.trace &&
+		! test_trace2_data status clean-proof/hit 1 \
+			<.git/foreign.trace &&
+		test_region ! index do_write_index .git/foreign.trace &&
+		test_cmp_bin .git/index.foreign .git/index &&
+		test_cmp_bin .git/index.csts.before-noop .git/index.csts &&
+
+		test-tool chmtime =-90 tracked &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status >.git/expected &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/actual &&
+		test_cmp .git/expected .git/actual &&
+		test_trace2_data status clean-proof/miss \
+			fast-index-mismatch <.git/repair.trace &&
+		test_trace2_data fsmonitor apply_count 1 \
+			<.git/repair.trace &&
+		test_region index do_write_index .git/repair.trace &&
+		repaired_inode=$(/usr/bin/stat -f %i .git/index) &&
+		test "$repaired_inode" != "$foreign_inode" &&
+		! test_cmp_bin .git/index.foreign .git/index &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		test_trace2_data status clean-proof/sidecar 1 \
+			<.git/repair.trace &&
+		test_trace2_data status clean-proof/postwrite-reissued 1 \
+			<.git/repair.trace &&
+		! test_trace2_data status clean-proof/miss \
+			issue-pinned-inputs <.git/repair.trace &&
+
+		cp .git/index .git/index.before-follower &&
+		cp .git/index.csts .git/index.csts.before-follower &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/follower.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/follower &&
+		test_cmp .git/expected .git/follower &&
+		test_trace2_data status clean-proof/hit 1 \
+			<.git/follower.trace &&
+		test_region ! index do_read_index .git/follower.trace &&
+		test_region ! index do_write_index .git/follower.trace &&
+		test_cmp_bin .git/index.before-follower .git/index &&
+		test_cmp_bin .git/index.csts.before-follower .git/index.csts
+	)
+'
+
+test_expect_success PERL_TEST_HELPERS \
+	'index write receipts reject in-place and foreign hook mutations' '
+	test_when_finished "rm -rf sidecar-receipt-valid sidecar-receipt-same-inode sidecar-receipt-foreign-replace" &&
+	for mode in valid same-inode foreign-replace
+	do
+		repo=sidecar-receipt-$mode &&
+		test_create_repo "$repo" &&
+		(
+			cd "$repo" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			test_commit base tracked &&
+			test-tool chmtime =-180 tracked &&
+			git -c core.fsmonitor=false update-index --refresh &&
+			git config index.version 4 &&
+			git config index.skipHash true &&
+			git config core.autocrlf false &&
+			git config core.untrackedCache true &&
+			git config core.fsmonitor true &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git update-index --fsmonitor &&
+			test_env GIT_INDEX_FILE="$PWD/.git/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				bulk_status status --porcelain=v2 >.git/prime &&
+			test_must_be_empty .git/prime &&
+			test_grep FSCF .git/index &&
+			test_grep FSUC .git/index &&
+			test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				bulk_status status --porcelain=v2 >.git/issued &&
+			test_must_be_empty .git/issued &&
+			test_path_is_file .git/index.csts &&
+			cp .git/index.csts .git/sidecar.before &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git update-index --force-write-index &&
+			test_cmp_bin .git/sidecar.before .git/index.csts &&
+			rawsz=$(test_oid rawsz) &&
+			printf "%s\n" "$rawsz" >.git/receipt-rawsz &&
+			dd if=/dev/zero of=.git/zero-trailer \
+				bs="$rawsz" count=1 2>/dev/null &&
+			test-tool chmtime =-90 tracked &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -c core.fsmonitor=false \
+					-c core.untrackedCache=false \
+					-c core.trustctime=true \
+					-c core.checkStat=default \
+					status >.git/expected &&
+
+			if test "$mode" != valid
+			then
+				printf "%s\n" "$mode" >.git/receipt-mode &&
+				cat >.git/receipt-mutate.pl <<-\EOF &&
+				use strict;
+				use warnings;
+				my $path = shift;
+				open(my $index, "+<", $path) or die "open: $!";
+				binmode $index;
+				read($index, my $header, 12) == 12 or die "header";
+				substr($header, 0, 4) eq "DIRC" or die "magic";
+				unpack("N", substr($header, 8, 4)) or die "entries";
+				seek($index, 16, 0) or die "seek";
+				read($index, my $ctime, 4) == 4 or die "ctime";
+				seek($index, 16, 0) or die "rewind";
+				my $next = (unpack("N", $ctime) + 1) % 1000000000;
+				print {$index} pack("N", $next) or die "write";
+				close($index) or die "close";
+				EOF
+				write_script .git/hooks/post-index-change <<-\EOF
+				mode=$(cat .git/receipt-mode) &&
+				/usr/bin/stat -f %i .git/index >.git/hook-inode-before &&
+				cp .git/index .git/hook-index-before &&
+				rm -f "$0" &&
+				case "$mode" in
+				same-inode)
+					perl .git/receipt-mutate.pl .git/index
+					;;
+				foreign-replace)
+					cp .git/index .git/hook-replacement &&
+					mv .git/hook-replacement .git/index
+					;;
+				*)
+					exit 1
+					;;
+				esac &&
+				/usr/bin/stat -f %i .git/index >.git/hook-inode-after &&
+				tail -c "$(cat .git/receipt-rawsz)" .git/index \
+					>.git/hook-trailer
+				EOF
+			else
+				:
+			fi &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+				git -c core.preloadIndex=true \
+					-c core.preloadIndexBulk=true \
+					status >.git/actual &&
+			test_cmp .git/expected .git/actual &&
+			test_region index do_write_index .git/status.trace &&
+			test_trace2_data fsmonitor \
+				history/own-write-source-recorded 1 \
+				<.git/status.trace &&
+			tail -c "$rawsz" .git/index >.git/trailer &&
+			test_cmp_bin .git/zero-trailer .git/trailer &&
+
+			case "$mode" in
+			valid)
+				test_trace2_data fsmonitor \
+					history/own-write-source-adopted 1 \
+					<.git/status.trace &&
+				test_trace2_data status \
+					clean-proof/postwrite-reissued 1 \
+					<.git/status.trace
+				;;
+			same-inode|foreign-replace)
+				test_path_is_missing .git/hooks/post-index-change &&
+				test_cmp_bin .git/zero-trailer .git/hook-trailer &&
+				! test_trace2_data fsmonitor \
+					history/own-write-source-adopted 1 \
+					<.git/status.trace &&
+				! test_trace2_data status \
+					clean-proof/sidecar 1 \
+					<.git/status.trace &&
+				! test_trace2_data status \
+					clean-proof/postwrite-reissued 1 \
+					<.git/status.trace &&
+				test_cmp_bin .git/sidecar.before .git/index.csts &&
+				if test "$mode" = same-inode
+				then
+					test_cmp .git/hook-inode-before \
+						.git/hook-inode-after &&
+					! test_cmp_bin .git/hook-index-before .git/index
+				else
+					! test_cmp .git/hook-inode-before \
+						.git/hook-inode-after &&
+					test_cmp_bin .git/hook-index-before .git/index
+				fi
+				;;
+			esac &&
+			cp .git/index .git/follower-index &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/follower.trace" \
+				git -c core.preloadIndex=true \
+					-c core.preloadIndexBulk=true \
+					status >.git/follower &&
+			test_cmp .git/expected .git/follower &&
+			test_cmp_bin .git/follower-index .git/index &&
+			test_region ! index do_write_index .git/follower.trace &&
+			if test "$mode" = valid
+			then
+				test_trace2_data status clean-proof/hit 1 \
+					<.git/follower.trace
+			else
+				test_trace2_data status clean-proof/miss \
+					fast-index-mismatch <.git/follower.trace &&
+				! test_trace2_data status clean-proof/hit 1 \
+					<.git/follower.trace
+			fi
+		) || return 1
+	done
+'
+
+test_expect_success PERL_TEST_HELPERS \
+	'index write receipts reject unchanged and private indexes' '
+	test_when_finished "rm -rf sidecar-receipt-private" &&
+	test_create_repo sidecar-receipt-private &&
+	(
+		cd sidecar-receipt-private &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime =-180 tracked &&
+		git -c core.fsmonitor=false update-index --refresh &&
+		git config index.version 4 &&
+		git config index.skipHash true &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		test_env GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/issued &&
+		test_must_be_empty .git/issued &&
+		test_path_is_file .git/index.csts &&
+		cp .git/index .git/canonical.before &&
+		cp .git/index.csts .git/sidecar.before &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/noop.trace" \
+			git status >.git/noop &&
+		test_trace2_data status clean-proof/hit 1 \
+			<.git/noop.trace &&
+		! test_trace2_data fsmonitor \
+			history/own-write-source-recorded 1 <.git/noop.trace &&
+		! test_trace2_data fsmonitor \
+			history/own-write-source-adopted 1 <.git/noop.trace &&
+		test_cmp_bin .git/canonical.before .git/index &&
+		test_cmp_bin .git/sidecar.before .git/index.csts &&
+
+		cp .git/index .git/private.index &&
+		test-tool chmtime =-90 tracked &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status >.git/expected &&
+		GIT_INDEX_FILE="$PWD/.git/private.index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$PWD/.git/private.trace" \
+			git status >.git/private.actual &&
+		test_cmp .git/expected .git/private.actual &&
+		test_region index do_write_index .git/private.trace &&
+		! test_trace2_data fsmonitor \
+			history/own-write-source-recorded 1 <.git/private.trace &&
+		! test_trace2_data fsmonitor \
+			history/own-write-source-adopted 1 <.git/private.trace &&
+		test_cmp_bin .git/canonical.before .git/index &&
+		test_cmp_bin .git/sidecar.before .git/index.csts
+	)
+'
+
+test_expect_success PERL_TEST_HELPERS \
+	'a provider reset reissues an otherwise current skipHash sidecar' '
+	test_when_finished "rm -rf sidecar-receipt-provider-reset" &&
+	test_create_repo sidecar-receipt-provider-reset &&
+	(
+		cd sidecar-receipt-provider-reset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime =-180 tracked &&
+		git -c core.fsmonitor=false update-index --refresh &&
+		git config index.version 4 &&
+		git config index.skipHash true &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		test_env GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/issued &&
+		test_must_be_empty .git/issued &&
+		test_path_is_file .git/index.csts &&
+		rawsz=$(test_oid rawsz) &&
+		dd if=/dev/zero of=.git/zero-trailer \
+			bs="$rawsz" count=1 2>/dev/null &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status >.git/expected &&
+		cp .git/index .git/index.before &&
+		cp .git/index.csts .git/sidecar.before &&
+		before_inode=$(/usr/bin/stat -f %i .git/index) &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/hit.trace" \
+			git status >.git/hit &&
+		test_cmp .git/expected .git/hit &&
+		test_trace2_data status clean-proof/hit 1 <.git/hit.trace &&
+		test_region ! index do_read_index .git/hit.trace &&
+		test_region ! index do_write_index .git/hit.trace &&
+		test_cmp_bin .git/index.before .git/index &&
+		test_cmp_bin .git/sidecar.before .git/index.csts &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/reset.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/actual &&
+		test_cmp .git/expected .git/actual &&
+		test_trace2_data status clean-proof/miss \
+			fast-provider-changed <.git/reset.trace &&
+		test_trace2_data status clean-proof/provider-reset-carried 1 \
+			<.git/reset.trace &&
+		test_region index do_write_index .git/reset.trace &&
+		after_inode=$(/usr/bin/stat -f %i .git/index) &&
+		test "$before_inode" != "$after_inode" &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		test_trace2_data fsmonitor \
+			history/own-write-source-recorded 1 <.git/reset.trace &&
+		test_trace2_data fsmonitor \
+			history/own-write-source-adopted 1 <.git/reset.trace &&
+		test_trace2_data status clean-proof/sidecar 1 \
+			<.git/reset.trace &&
+		test_trace2_data status clean-proof/postwrite-reissued 1 \
+			<.git/reset.trace &&
+		! test_cmp_bin .git/sidecar.before .git/index.csts &&
+		cp .git/index .git/index.after &&
+		cp .git/index.csts .git/sidecar.after &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/follower.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/follower &&
+		test_cmp .git/expected .git/follower &&
+		test_trace2_data status clean-proof/hit 1 \
+			<.git/follower.trace &&
+		test_region ! index do_read_index .git/follower.trace &&
+		test_region ! index do_write_index .git/follower.trace &&
+		test_cmp_bin .git/index.after .git/index &&
+		test_cmp_bin .git/sidecar.after .git/index.csts
+	)
+'
+
 test_done
