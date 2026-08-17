@@ -6662,4 +6662,51 @@ test_expect_success LINUX_SCOPED_HISTORY,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORE
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'exhausted provider resets skip an unclosable final index refresh' '
+	test_when_finished "rm -rf builtin-closure-terminal-reset" &&
+	prepare_builtin_closure_repo builtin-closure-terminal-reset untracked &&
+	(
+		cd builtin-closure-terminal-reset &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_fsmonitor_full_proof .git/index paired &&
+		test_write_lines modified >tracked &&
+		test_write_lines "tracked -text" >.gitattributes &&
+		test_write_lines visible >visible &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				status --porcelain=v2 >.git/expected &&
+		test_grep "^1 \\.M .* tracked$" .git/expected &&
+		test_grep "^? \\.gitattributes$" .git/expected &&
+		test_grep "^? visible$" .git/expected &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TTTT \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expected .git/actual &&
+		test_trace2_data fsmonitor token_closure/trivial 1 \
+			<.git/status.trace >.git/trivial &&
+		test_line_count = 3 .git/trivial &&
+		test_trace2_data fsmonitor semantic/proof-epoch-captured 1 \
+			<.git/status.trace >.git/epochs &&
+		test_line_count = 3 .git/epochs &&
+		test_trace2_data status \
+			fsmonitor_token/terminal-rescan-skipped 1 \
+			<.git/status.trace &&
+		test_trace2_data fsmonitor token_closure/rejected 1 \
+			<.git/status.trace &&
+		! test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/status.trace &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep "^fsmonitor last update builtin:test:2$" \
+			.git/fsmonitor &&
+		! test_fsmonitor_full_proof .git/index paired \
+			2>.git/unbound-proof &&
+		test_grep "^unbound FSCF flags 9$" .git/unbound-proof
+	)
+'
+
 test_done
