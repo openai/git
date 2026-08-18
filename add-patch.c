@@ -4,6 +4,7 @@
 #include "git-compat-util.h"
 #include "add-patch.h"
 #include "advice.h"
+#include "clean-status.h"
 #include "commit.h"
 #include "config.h"
 #include "diff.h"
@@ -2080,6 +2081,7 @@ int run_add_p(struct repository *r, enum add_p_mode mode,
 		s.mode = &patch_mode_add;
 	s.revision = revision;
 
+	clean_status_prepare_main_index_history(r);
 	discard_index(r->index);
 	if (repo_read_index(r) < 0 ||
 	    (!s.mode->index_only &&
