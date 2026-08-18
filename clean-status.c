@@ -233,7 +233,7 @@ int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
 	    repo_has_replace_refs_uncached(istate->repo) ||
 	    !state->config_enforced || !state->current_config_valid ||
 	    !state->current_semantic_valid || !state->current_attr_valid ||
-	    !state->current_tracked_policy_valid || state->filter_configured ||
+	    !state->current_tracked_policy_valid ||
 	    state->external_history_restored || !state->disk_config_valid ||
 	    state->disk_config_invalid || !state->disk_config_raw.len ||
 	    !state->disk_semantic_valid || !state->disk_attr_valid ||
@@ -290,6 +290,7 @@ int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
 	state->config_revalidated = 0;
 	state->initial_coherent = 0;
 	state->config_mismatch = 1;
+	/* Replacements check their attributes; no current filter scope survives. */
 	state->filter_scope_valid = 0;
 	FREE_AND_NULL(state->config_revalidated_token);
 	state->backoff_token = xstrdup(istate->fsmonitor_last_update);
@@ -433,7 +434,8 @@ int clean_status_index_entry_is_semantically_safe(
 
 	if (!state ||
 	    (!suspended && !clean_status_revalidated_token_matches(istate)) ||
-	    (state->filter_configured && !state->filter_scope_valid) ||
+	    (!suspended && state->filter_configured &&
+	     !state->filter_scope_valid) ||
 	    istate->split_index ||
 	    istate->sparse_index || !entry)
 		return 0;
