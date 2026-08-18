@@ -2,6 +2,7 @@
 
 #include "git-compat-util.h"
 #include "add-interactive.h"
+#include "clean-status.h"
 #include "color.h"
 #include "diffcore.h"
 #include "gettext.h"
@@ -1123,6 +1124,7 @@ int run_add_i(struct repository *r, const struct pathspec *ps,
 		    _("staged"), _("unstaged"), _("path"));
 	opts.list_opts.header = header.buf;
 
+	clean_status_prepare_main_index_history(r);
 	discard_index(r->index);
 	if (repo_read_index(r) < 0 ||
 	    repo_refresh_and_write_index(r, REFRESH_QUIET, 0, 1,
