@@ -2120,6 +2120,16 @@ struct clean_status_commit_checkpoint {
 	unsigned sealed : 1;
 };
 
+static int commit_checkpoint_owner_matches(const struct stat *st)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	return st->st_uid == geteuid();
+#else
+	(void)st;
+	return 0;
+#endif
+}
+
 static int commit_checkpoint_source_matches(
 	const struct clean_status_commit_checkpoint *checkpoint,
 	struct lock_file *lock)
@@ -2225,7 +2235,7 @@ struct clean_status_commit_checkpoint *clean_status_capture_commit_checkpoint(
 	flags = fd < 0 ? -1 : fcntl(fd, F_GETFL);
 	if (flags < 0 || (flags & O_ACCMODE) != O_RDWR ||
 	    fstat(fd, &st) || !S_ISREG(st.st_mode) ||
-	    st.st_nlink != 1 || st.st_uid != geteuid())
+	    st.st_nlink != 1 || !commit_checkpoint_owner_matches(&st))
 		return NULL;
 
 	CALLOC_ARRAY(checkpoint, 1);
@@ -2247,7 +2257,8 @@ struct clean_status_commit_checkpoint *clean_status_capture_commit_checkpoint(
 
 	/* The first write replaces istate->oid, so pin its canonical source now. */
 	if (clean_status_index_snapshot_pin_proof_epoch(&checkpoint->source, istate) ||
-	    fstat(checkpoint->source.fd, &st) || st.st_uid != geteuid() ||
+	    fstat(checkpoint->source.fd, &st) ||
+	    !commit_checkpoint_owner_matches(&st) ||
 	    attr_source_snapshot_repository(istate->repo, &checkpoint->attrs))
 		goto fail;
 	attrs = attr_source_snapshot_fingerprint(checkpoint->attrs);
@@ -2293,7 +2304,8 @@ void clean_status_record_commit_checkpoint(
 	if (checkpoint->repo != istate->repo ||
 	    !clean_status_fsmonitor_backoff_suspended(istate) ||
 	    !commit_checkpoint_source_matches(checkpoint, lock) ||
-	    fstat(checkpoint->writer_fd, &st) || st.st_uid != geteuid() ||
+	    fstat(checkpoint->writer_fd, &st) ||
+	    !commit_checkpoint_owner_matches(&st) ||
 	    clean_status_identity_from_stat(&identity, &st) ||
 	    clean_status_index_snapshot_open_allow_null_checksum(
 		    &checkpoint->written, get_lock_file_path(lock),
@@ -2343,6 +2355,7 @@ int clean_status_prepare_commit_checkpoint_restore(
 	struct index_state *replacement, int fd)
 {
 	struct clean_status_state *state;
+	struct stat st;
 	unsigned char hash[GIT_MAX_RAWSZ];
 	const char *suffix;
 
@@ -2350,6 +2363,7 @@ int clean_status_prepare_commit_checkpoint_restore(
 	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock) ||
 	    current->repo != checkpoint->repo || current != current->repo->index ||
 	    current->resolve_undo ||
+	    fstat(fd, &st) || !commit_checkpoint_owner_matches(&st) ||
 	    clean_status_index_logical_digest(current, hash) ||
 	    memcmp(hash, checkpoint->logical_hash, current->repo->hash_algo->rawsz) ||
 	    read_index_entries_from_fd(replacement, fd) ||
