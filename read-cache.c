@@ -574,11 +574,20 @@ int ie_match_stat_with_content_check(struct index_state *istate,
 				     const struct cache_entry *ce,
 				     struct stat *st, unsigned int options)
 {
+	const struct stat_data empty = { 0 };
 	struct cache_entry *current;
 	int changed, pos;
 
+	/*
+	 * A suspended replacement persists its poisoned stat data, but not the
+	 * transient content-check flag. Recover that obligation only from an
+	 * authenticated suspended epoch; ordinary zero-stat entries keep their
+	 * stat-only matching behavior.
+	 */
 	if (S_ISGITLINK(ce->ce_mode) ||
-	    !(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED))
+	    (!(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED) &&
+	     (!clean_status_fsmonitor_backoff_suspended(istate) ||
+	      memcmp(&ce->ce_stat_data, &empty, sizeof(empty)))))
 		return ie_match_stat(istate, ce, st, options);
 
 	changed = ie_modified(istate, ce, st, options);

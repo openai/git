@@ -509,8 +509,9 @@ int has_racy_timestamp(struct index_state *istate);
 int ie_match_stat(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
 int ie_modified(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
 /*
- * Unlike ie_match_stat(), verify content for marked non-gitlinks. Ordinary
- * entries, including unmarked zero-stat entries, retain stat-only matching.
+ * Unlike ie_match_stat(), verify content for marked non-gitlinks and poisoned
+ * entries in an authenticated suspended fsmonitor epoch. Ordinary entries,
+ * including unmarked zero-stat entries, retain stat-only matching.
  */
 int ie_match_stat_with_content_check(struct index_state *,
 				     const struct cache_entry *,
