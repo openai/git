@@ -185,6 +185,9 @@ static void replace_index_entry(struct index_state *istate, int nr,
 		  istate->untracked->use_fsmonitor)) &&
 		S_ISREG(old->ce_mode) && S_ISREG(ce->ce_mode) &&
 		clean_status_index_entry_is_semantically_safe(istate, old, ce);
+	int suspended_replacement = preserve_untracked &&
+		clean_status_fsmonitor_backoff_suspended(istate) &&
+		!oideq(&old->oid, &ce->oid);
 
 	replace_index_entry_in_base(istate, old, ce);
 	remove_name_hash(istate, old);
@@ -192,9 +195,11 @@ static void replace_index_entry(struct index_state *istate, int nr,
 	ce->ce_flags &= ~CE_HASHED;
 	set_index_entry(istate, nr, ce);
 	ce->ce_flags |= CE_UPDATE_IN_BASE;
-	if (preserve_untracked)
+	if (preserve_untracked) {
 		ce->ce_flags &= ~CE_FSMONITOR_VALID;
-	else
+		if (suspended_replacement)
+			fsmonitor_invalidate_cache_entry(ce);
+	} else
 		mark_fsmonitor_invalid(istate, ce);
 	if (preserve_paired_history && preserve_untracked)
 		trace2_data_intmax("fsmonitor", istate->repo,
@@ -1592,6 +1597,8 @@ int repo_refresh_and_write_index(struct repository *repo,
 		return -1;
 	if (refresh_index(repo->index, refresh_flags, pathspec, seen, header_msg))
 		ret = 1;
+	if (fsm_settings__is_watch_limit_backoff(repo))
+		write_flags |= SKIP_IF_UNCHANGED;
 	if (0 <= fd && write_locked_index(repo->index, &lock_file, COMMIT_LOCK | write_flags))
 		ret = -1;
 	return ret;
@@ -3413,6 +3420,24 @@ enum write_extensions {
 static int fsmonitor_can_persist_untracked_revalidation(
 	const struct index_state *istate)
 {
+	const char *suffix, *pending;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
+	int same_token = istate->fsmonitor_last_update &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token);
+
+	if (suspended) {
+		if (alternate_index_output || getenv(DB_ENVIRONMENT) ||
+		    !fstat_is_reliable() ||
+		    repo_config_values(istate->repo)->apply_sparse_checkout ||
+		    repo_has_replace_refs_uncached(istate->repo))
+			return 0;
+		if (!same_token && istate->fsmonitor_untracked_token &&
+		    skip_prefix(istate->fsmonitor_last_update, "builtin:", &suffix) &&
+		    skip_prefix(istate->fsmonitor_untracked_token, "pending:", &pending))
+			same_token = !strcmp(suffix, pending);
+	}
 	return istate->untracked && istate->untracked->root &&
 		istate->untracked->root->valid &&
 		istate->untracked->fsmonitor_revalidation &&
@@ -3423,9 +3448,7 @@ static int fsmonitor_can_persist_untracked_revalidation(
 		starts_with(istate->fsmonitor_last_update, "builtin:") &&
 		istate->fsmonitor_last_update[strlen("builtin:")] &&
 		strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
-		istate->fsmonitor_untracked_token &&
-		!strcmp(istate->fsmonitor_last_update,
-			istate->fsmonitor_untracked_token) &&
+		same_token &&
 		!getenv(INDEX_ENVIRONMENT) &&
 		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
 		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
@@ -3437,7 +3460,8 @@ static int fsmonitor_can_persist_untracked_revalidation(
 		  (CE_ENTRY_ADDED | CE_ENTRY_REMOVED)) &&
 		istate->repo->config_values_private_.trust_ctime &&
 		istate->repo->config_values_private_.check_stat &&
-		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		(fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC ||
+		 suspended) &&
 		clean_status_fsmonitor_semantic_baseline_pending(istate);
 }
 
@@ -3802,6 +3826,11 @@ void set_alternate_index_output(const char *name)
 	alternate_index_output = name;
 }
 
+const char *get_alternate_index_output(void)
+{
+	return alternate_index_output;
+}
+
 static int commit_locked_index(struct lock_file *lk)
 {
 	if (alternate_index_output)
@@ -4031,6 +4060,14 @@ static int write_locked_index_with_receipt(
 		if (flags & COMMIT_LOCK)
 			rollback_lock_file(lock);
 		return 0;
+	}
+	if (fsm_settings__is_watch_limit_backoff(istate->repo)) {
+		/* An actual write may retain history, never a live clean bitmap. */
+		for (size_t i = 0; i < istate->cache_nr; i++)
+			istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
+		istate->fsmonitor_untracked_valid = 0;
+		if (istate->untracked)
+			istate->untracked->use_fsmonitor = 0;
 	}
 
 	if (istate->fsmonitor_last_update)

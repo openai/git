@@ -235,6 +235,99 @@ static int directory_attribute_source_matches(
 }
 #endif
 
+int clean_status_manifest_path_attributes_unchanged(
+	const struct index_state *istate, const char *name)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	const struct clean_status_state *state =
+		istate ? istate->clean_status : NULL;
+	const struct git_hash_algo *algo;
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	struct strbuf candidate = STRBUF_INIT;
+	const char *slash = name;
+	unsigned int namespace_unstable = 0;
+	size_t position = 0;
+	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	int safe = 0;
+
+	if (!istate || !istate->repo || !name || !*name ||
+	    !verify_path(name, 0) ||
+	    !clean_status_fsmonitor_backoff_suspended(istate) ||
+	    istate->split_index || istate->sparse_index != INDEX_EXPANDED ||
+	    istate->cache_nr > INT_MAX || !state ||
+	    !state->manifest.current_valid || !state->manifest.checked ||
+	    state->manifest.current_invalidated ||
+	    state->manifest.global_fallback ||
+	    (state->manifest.current_flags & required) != required)
+		return 0;
+	algo = istate->repo->hash_algo;
+	if (!algo || !attr_manifest_valid(state->manifest.current.buf,
+					state->manifest.current.len, algo) ||
+	    semantic_verify_root_init(istate->repo, &root))
+		goto done;
+	path = semantic_verify_path_new(root);
+	if (!path)
+		goto done;
+
+	/* The root source applies even to a path without any slash. */
+	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+	for (;;) {
+		struct attr_manifest_entry entry;
+		const struct attr_manifest_entry *historical = NULL;
+		int pos;
+
+		if (candidate.len > INT_MAX)
+			goto done;
+		if (!find_manifest_entry(&state->manifest.current,
+					 candidate.buf, algo, &entry))
+			historical = &entry;
+		/*
+		 * Attribute fallback can read stage #2 of an unmerged path.
+		 * The shared matcher accepts only stage #0, so do not mistake
+		 * an unmerged source for historical absence. The expanded-index
+		 * guard above makes this lookup non-mutating.
+		 */
+		pos = index_name_pos((struct index_state *)istate,
+				     candidate.buf, candidate.len);
+		if (pos < 0) {
+			unsigned int first = -(pos + 1);
+
+			if (first < istate->cache_nr &&
+			    !strcmp(istate->cache[first]->name, candidate.buf))
+				goto done;
+		}
+		if (!directory_attribute_source_matches(
+				(struct index_state *)istate, path, candidate.buf,
+				historical, position++))
+			goto done;
+		slash = strchr(slash, '/');
+		if (!slash)
+			break;
+		strbuf_reset(&candidate);
+		strbuf_add(&candidate, name, slash - name + 1);
+		strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+		slash++;
+	}
+
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	path = NULL;
+	safe = !namespace_unstable && semantic_verify_root_stable(root);
+
+done:
+	if (path)
+		semantic_verify_path_free(path, NULL, NULL);
+	semantic_verify_root_clear(root);
+	strbuf_release(&candidate);
+	return safe;
+#else
+	(void)istate;
+	(void)name;
+	return 0;
+#endif
+}
+
 int clean_status_manifest_directory_unchanged(
 	struct index_state *istate, const char *directory)
 {

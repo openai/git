@@ -2242,7 +2242,8 @@ int untracked_cache_preserve_for_revalidation(struct index_state *istate)
 		istate == istate->repo->index &&
 		!istate->split_index &&
 		istate->sparse_index == INDEX_EXPANDED &&
-		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		(fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC ||
+		 fsm_settings__is_watch_limit_backoff(istate->repo)) &&
 		(!getenv(GIT_WORK_TREE_ENVIRONMENT) ||
 		 ident_in_untracked(uc)) &&
 		skip_prefix(istate->fsmonitor_last_update,

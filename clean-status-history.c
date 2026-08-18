@@ -1911,6 +1911,8 @@ void clean_status_copy_fsmonitor_history(struct index_state *dst,
 	    src_state->disk_config_invalid || !src_state->disk_config_raw.len)
 		return;
 	dst_state = clean_status_get_state(dst);
+	dst_state->backoff_suspended = 0;
+	FREE_AND_NULL(dst_state->backoff_token);
 	FREE_AND_NULL(dst_state->disk_config_token);
 	strbuf_reset(&dst_state->disk_config_raw);
 	dst_state->disk_config_token =
