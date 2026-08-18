@@ -173,6 +173,10 @@ struct clean_status_commit_checkpoint *clean_status_capture_commit_checkpoint(
 void clean_status_record_commit_checkpoint(
 	struct clean_status_commit_checkpoint *checkpoint,
 	struct index_state *istate, struct lock_file *lock);
+/* Seal safe same-path interactive changes before running ordinary hooks. */
+int clean_status_advance_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint,
+	const struct index_state *current, struct lock_file *lock);
 int clean_status_commit_checkpoint_changed(
 	const struct clean_status_commit_checkpoint *checkpoint,
 	struct lock_file *lock);

@@ -2972,4 +2972,616 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	done
 '
 
+extract_backoff_interactive_apply_trace () {
+	perl - "$1" <<-\EOF
+	use strict;
+	use warnings;
+	open my $input, "<", $ARGV[0] or die "cannot read trace: $!\n";
+	my @lines = <$input>;
+	my @sids = map { /"sid":"([^"]+)"/ ? $1 : () }
+		grep { /"event":"cmd_name"/ && /"name":"apply"/ } @lines;
+	die "expected exactly one real apply child\n" unless @sids == 1;
+	print grep { /"sid":"\Q$sids[0]\E"/ } @lines;
+	EOF
+}
+
+assert_backoff_interactive_index_env () {
+	perl - "$1" "$2" <<-\EOF
+	use strict;
+	use warnings;
+	my ($trace, $expected) = @ARGV;
+	open my $input, "<", $trace or die "cannot read trace: $!\n";
+	my @matches = grep {
+		/"event":"def_param"/ && /"param":"GIT_INDEX_FILE"/ &&
+		/"value":"\Q$expected\E"/
+	} <$input>;
+	die "apply did not receive the expected selected index\n" unless @matches == 1;
+	EOF
+}
+
+check_backoff_interactive () (
+	prefix=$1 &&
+	operation=$2 &&
+	action=$3 &&
+	kind=$4 &&
+	common=$5 &&
+	case "$kind" in
+	main)
+		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
+			--no-optional-locks rev-parse --absolute-git-dir)
+		;;
+	linked)
+		other_gitdir=$common
+		;;
+	esac &&
+	cd "$prefix-$kind" &&
+	sane_unset GIT_INDEX_FILE GIT_TEST_PRELOAD_INDEX_BULK \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH &&
+	gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+		rev-parse --absolute-git-dir) &&
+	main_index="$gitdir/index" &&
+	checkpoint=$(cat "$gitdir/checkpoints") &&
+	evidence="$common/interactive-$operation-$action-$kind" &&
+	mkdir "$evidence" &&
+	cp "$main_index" "$evidence/main.seed" &&
+	cp "$checkpoint" "$evidence/checkpoint.before" &&
+	cp "$other_gitdir/index" "$evidence/other-index.before" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.before" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.before" &&
+	assert_backoff_full_proof "$evidence/main.seed" &&
+	case "$operation" in
+	commit-p-mode) chmod +x tracked ;;
+	commit-p-delete) rm tracked ;;
+	*) test_write_lines worktree-change >tracked ;;
+	esac &&
+	cp "$evidence/main.seed" "$evidence/oracle-main.index" &&
+	cp "$evidence/main.seed" "$evidence/oracle-selected.index" &&
+	case "$operation" in
+	quit-p | quit-i)
+		:
+		;;
+	add-p | commit-p)
+		backoff_commit_index "$evidence/oracle-main.index" add -- tracked &&
+		cp "$evidence/oracle-main.index" "$evidence/oracle-selected.index"
+		;;
+	commit-p-mode | commit-p-delete)
+		case "$operation" in
+		commit-p-mode)
+			backoff_commit_index "$evidence/oracle-main.index" \
+				update-index --chmod=+x tracked
+			;;
+		commit-p-delete)
+			backoff_commit_index "$evidence/oracle-main.index" \
+				update-index --force-remove tracked
+			;;
+		esac &&
+		cp "$evidence/oracle-main.index" "$evidence/oracle-selected.index"
+		;;
+	private-p)
+		backoff_commit_index "$evidence/oracle-selected.index" add -- tracked
+		;;
+	*)
+		return 1
+		;;
+	esac &&
+	for oracle in main selected
+	do
+		backoff_commit_index "$evidence/oracle-$oracle.index" write-tree \
+			>"$evidence/expected-$oracle.tree" &&
+		backoff_commit_entries "$evidence/oracle-$oracle.index" \
+			>"$evidence/expected-$oracle.entries" || return 1
+	done &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+		>"$evidence/head.before" &&
+	selected=$main_index &&
+	if test "$operation" = private-p
+	then
+		selected="$gitdir/index.alias-copy" &&
+		cp "$evidence/main.seed" "$selected" &&
+		perl "$common/rejected-index.pl" alias copy "$selected" "$main_index" \
+			>"$evidence/private.identity.before"
+	else
+		:
+	fi &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		test-tool fsmonitor-client record-watch-limit &&
+	test_path_is_file "$gitdir/fsmonitor--daemon.inotify-limit" &&
+	case "$operation" in
+	quit-p) answer=q && set -- add -p -- tracked ;;
+	quit-i) answer=q && set -- add -i -- tracked ;;
+	add-p | private-p) answer=y && set -- add -p -- tracked ;;
+	commit-p | commit-p-mode | commit-p-delete)
+		answer=y && set -- commit -p -qm "accepted tracked change" ;;
+	esac &&
+	test_write_lines "$answer" >"$evidence/input" &&
+	(
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=EEEEEEEEEEEEEEEE &&
+		GIT_TRACE2_EVENT="$evidence/interactive.trace" &&
+		GIT_TRACE2_ENV_VARS=GIT_INDEX_FILE &&
+		BACKOFF_HOOK_STYLE=all BACKOFF_HOOK_ACTION=$action &&
+		BACKOFF_HOOK_EVIDENCE=$evidence BACKOFF_HOOK_MAIN_INDEX=$main_index &&
+		BACKOFF_HOOK_IDENTITY_HELPER="$common/hook-index.pl" &&
+		BACKOFF_HOOK_REJECT_HELPER="$common/rejected-index.pl" &&
+		BACKOFF_HOOK_REFRESH_PATH=sibling &&
+		export GIT_TEST_FSMONITOR_INOTIFY_BACKOFF \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TRACE2_EVENT GIT_TRACE2_ENV_VARS \
+			BACKOFF_HOOK_STYLE BACKOFF_HOOK_ACTION BACKOFF_HOOK_EVIDENCE \
+			BACKOFF_HOOK_MAIN_INDEX BACKOFF_HOOK_IDENTITY_HELPER \
+			BACKOFF_HOOK_REJECT_HELPER BACKOFF_HOOK_REFRESH_PATH &&
+		if test "$operation" = private-p
+		then
+			GIT_INDEX_FILE=$selected && export GIT_INDEX_FILE
+		else
+			sane_unset GIT_INDEX_FILE
+		fi &&
+		git "$@" <"$evidence/input" >"$evidence/interactive.out" \
+			2>"$evidence/interactive.err"
+	) &&
+	# Snapshot the publication before any status or other Git command.
+	cp "$main_index" "$evidence/index.published" &&
+	cp "$selected" "$evidence/selected.published" &&
+	snapshot_backoff_index_identity "$main_index" \
+		>"$evidence/index.published.identity" &&
+	test_path_is_missing "$main_index.lock" &&
+	test_path_is_missing "$selected.lock" &&
+	case "$operation" in
+	quit-i) test_grep "What now" "$evidence/interactive.out" ;;
+	commit-p-mode) test_grep "Stage mode change" "$evidence/interactive.out" ;;
+	commit-p-delete) test_grep "Stage deletion" "$evidence/interactive.out" ;;
+	*) test_grep "Stage this hunk" "$evidence/interactive.out" ;;
+	esac &&
+	for view in main selected
+	do
+		case "$view" in
+		main) published="$evidence/index.published" ;;
+		selected) published="$evidence/selected.published" ;;
+		esac &&
+		cp "$published" "$evidence/actual-$view.index" &&
+		backoff_commit_index "$evidence/actual-$view.index" write-tree \
+			>"$evidence/actual-$view.tree" &&
+		backoff_commit_entries "$published" >"$evidence/actual-$view.entries" &&
+		test_cmp "$evidence/expected-$view.tree" "$evidence/actual-$view.tree" &&
+		test_cmp_bin "$evidence/expected-$view.entries" \
+			"$evidence/actual-$view.entries" || return 1
+	done &&
+	extract_backoff_root_trace "$evidence/interactive.trace" \
+		>"$evidence/interactive.root.trace" &&
+	test_trace2_data fsm_client settings/inotify-watch-limit-backoff 1 \
+		<"$evidence/interactive.root.trace" &&
+	! test_trace2_data fsmonitor token_closure/accepted 1 \
+		<"$evidence/interactive.trace" &&
+	case "$operation" in
+	quit-p | quit-i)
+		assert_backoff_full_proof "$evidence/index.published" &&
+		test_cmp "$evidence/main.identity.before" "$evidence/index.published.identity" &&
+		assert_backoff_history_unchanged "$gitdir" "$checkpoint" &&
+		assert_backoff_main_index_write "$evidence/interactive.trace" "$main_index" no &&
+		test_grep ! '"event":"child_start".*"apply","--cached"' \
+			"$evidence/interactive.trace"
+		;;
+	add-p | commit-p | commit-p-mode | commit-p-delete | private-p)
+		extract_backoff_interactive_apply_trace "$evidence/interactive.trace" \
+			>"$evidence/apply.trace" &&
+		test_grep '"event":"child_start".*"apply","--cached"' \
+			"$evidence/interactive.trace" &&
+		! test_trace2_data fsmonitor history/commit-backoff-advanced 1 \
+			<"$evidence/apply.trace" &&
+		! test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+			<"$evidence/apply.trace" &&
+		case "$operation" in
+		add-p)
+			assert_backoff_interactive_index_env "$evidence/apply.trace" "$main_index" &&
+			test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+				<"$evidence/apply.trace" &&
+			assert_backoff_pending_proof "$evidence/main.seed" "$evidence/index.published" &&
+			assert_backoff_main_index_write "$evidence/interactive.trace" "$main_index" yes
+			;;
+		commit-p)
+			# The child still uses an untrusted temporary index.  Only its
+			# owning commit may validate and advance the same-path epoch.
+			assert_backoff_interactive_index_env "$evidence/apply.trace" "$main_index.lock" &&
+			assert_backoff_rejected_index_trace "$evidence/apply.trace" &&
+			assert_backoff_pending_proof "$evidence/main.seed" "$evidence/index.published" &&
+			test_trace2_data fsmonitor history/commit-backoff-advanced 1 \
+				<"$evidence/interactive.root.trace" &&
+			test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+				<"$evidence/interactive.root.trace" &&
+			assert_backoff_main_index_write "$evidence/interactive.trace" "$main_index" yes
+			;;
+		commit-p-mode | commit-p-delete)
+			assert_backoff_interactive_index_env "$evidence/apply.trace" "$main_index.lock" &&
+			assert_backoff_rejected_index_trace "$evidence/apply.trace" &&
+			assert_backoff_commit_unbound "$evidence/index.published" \
+				"$evidence/transition-unbound" &&
+			! test_trace2_data fsmonitor history/commit-backoff-advanced 1 \
+				<"$evidence/interactive.root.trace" &&
+			! test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+				<"$evidence/interactive.root.trace" &&
+			assert_backoff_main_index_write "$evidence/interactive.trace" "$main_index" yes
+			;;
+		private-p)
+			assert_backoff_interactive_index_env "$evidence/apply.trace" "$selected" &&
+			assert_backoff_rejected_index_trace "$evidence/interactive.trace" &&
+			assert_backoff_commit_unbound "$evidence/selected.published" \
+				"$evidence/private-unbound" &&
+			test_cmp "$evidence/main.identity.before" "$evidence/index.published.identity" &&
+			assert_backoff_history_unchanged "$gitdir" "$checkpoint" &&
+			assert_backoff_main_index_write "$evidence/interactive.trace" "$main_index" no
+			;;
+		esac
+		;;
+	esac &&
+	case "$operation" in
+	commit-p | commit-p-mode | commit-p-delete)
+		git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^{tree} \
+			>"$evidence/committed.tree" &&
+		git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^ \
+			>"$evidence/committed.parent" &&
+		test_cmp "$evidence/expected-main.tree" "$evidence/committed.tree" &&
+		test_cmp "$evidence/head.before" "$evidence/committed.parent" &&
+		if test "$action" != none
+		then
+			test_grep "^success$" "$evidence/completed" &&
+			test_cmp_bin "$evidence/main.seed" "$evidence/main.in-hook.before" &&
+			test_cmp_bin "$evidence/main.seed" "$evidence/main.in-hook.after" &&
+			test_cmp "$evidence/main.identity.before" "$evidence/main.identity.hook-before" &&
+			test_cmp "$evidence/main.identity.before" "$evidence/main.identity.hook-after" &&
+			assert_backoff_commit_unbound "$evidence/selected.before" "$evidence/hook-before-unbound" &&
+			assert_backoff_commit_unbound "$evidence/selected.after" "$evidence/hook-after-unbound" &&
+			backoff_commit_entries "$evidence/selected.before" >"$evidence/hook-before.entries" &&
+			backoff_commit_entries "$evidence/selected.after" >"$evidence/hook-after.entries" &&
+			test_cmp_bin "$evidence/expected-main.entries" "$evidence/hook-before.entries" &&
+			test_cmp_bin "$evidence/expected-main.entries" "$evidence/hook-after.entries" &&
+			! test_trace2_data fsmonitor history/commit-backoff-advanced 1 <"$evidence/hook.trace" &&
+			! test_trace2_data fsmonitor history/commit-backoff-restored 1 <"$evidence/hook.trace" &&
+			if test "$action" = refresh
+			then
+				assert_backoff_rejected_index_trace "$evidence/hook.trace"
+			else
+				test_cmp_bin "$evidence/selected.before" "$evidence/selected.after"
+			fi
+		else
+			:
+		fi
+		;;
+	*)
+		git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+			>"$evidence/head.after" &&
+		test_cmp "$evidence/head.before" "$evidence/head.after" &&
+		! test_trace2_data fsmonitor history/commit-backoff-advanced 1 \
+			<"$evidence/interactive.trace" &&
+		! test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+			<"$evidence/interactive.trace"
+		;;
+	esac &&
+	test_cmp_bin "$evidence/checkpoint.before" "$checkpoint" &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-c core.preloadIndex=false -c core.preloadIndexBulk=false \
+		--no-optional-locks status --porcelain=v2 >"$evidence/status.expected" &&
+	case "$operation" in
+	commit-p | commit-p-mode | commit-p-delete)
+		test_must_be_empty "$evidence/status.expected"
+		;;
+	*) : ;;
+	esac &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=EEEEEEEEEEEEEEEE \
+	GIT_TRACE2_EVENT="$evidence/status.trace" \
+		git status --porcelain=v2 >"$evidence/status.actual" &&
+	test_cmp "$evidence/status.expected" "$evidence/status.actual" &&
+	test_cmp_bin "$evidence/index.published" "$main_index" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/index.after-status.identity" &&
+	test_cmp "$evidence/index.published.identity" "$evidence/index.after-status.identity" &&
+	assert_backoff_main_index_write "$evidence/status.trace" "$main_index" no &&
+	rm "$gitdir/fsmonitor--daemon.inotify-limit" &&
+	GIT_INDEX_FILE="$main_index" GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCCCCCC \
+	GIT_TEST_FSMONITOR_QUERY_PATH=// \
+	GIT_TRACE2_EVENT="$evidence/recovery.trace" \
+		git status --porcelain=v2 >"$evidence/recovery.actual" &&
+	test_cmp "$evidence/status.expected" "$evidence/recovery.actual" &&
+	test_trace2_data fsm_client query/trivial-response 1 <"$evidence/recovery.trace" &&
+	test_trace2_data fsmonitor token_closure/accepted 1 <"$evidence/recovery.trace" &&
+	assert_backoff_full_proof "$main_index" &&
+	cp "$main_index" "$evidence/index.recovered" &&
+	cp "$main_index" "$evidence/recovery-oracle.index" &&
+	backoff_commit_index "$evidence/recovery-oracle.index" write-tree \
+		>"$evidence/recovered.tree" &&
+	backoff_commit_entries "$evidence/index.recovered" >"$evidence/recovered.entries" &&
+	test_cmp "$evidence/expected-main.tree" "$evidence/recovered.tree" &&
+	test_cmp_bin "$evidence/expected-main.entries" "$evidence/recovered.entries" &&
+	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.after" &&
+	test_cmp "$evidence/other-index.identity.before" "$evidence/other-index.identity.after" &&
+	test_grep ! '"event":"child_start".*"fsmonitor--daemon"' \
+		"$evidence/interactive.trace" "$evidence/status.trace" "$evidence/recovery.trace"
+)
+
+setup_backoff_interactive_pair () {
+	setup_backoff_hook_pair "$1" &&
+	common=$(git -C "$1-main" -c core.fsmonitor=false \
+		--no-optional-locks rev-parse --absolute-git-dir) &&
+	write_backoff_hook_identity_helper "$common/hook-index.pl" &&
+	write_backoff_rejected_index_helper "$common/rejected-index.pl" &&
+	if test "$2" != none
+	then
+		install_backoff_successful_commit_hook "$1-main"
+	else
+		:
+	fi
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'quitting either interactive add entrypoint preserves the main proof' '
+	test_config_global interactive.singleKey false &&
+	test_config_global color.ui false &&
+	for operation in quit-p quit-i
+	do
+		prefix="watch-backoff-interactive-$operation" &&
+		setup_backoff_interactive_pair "$prefix" none &&
+		for kind in main linked
+		do
+			check_backoff_interactive "$prefix" "$operation" none "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'accepted interactive hunks retain only authenticated pending history' '
+	test_config_global interactive.singleKey false &&
+	test_config_global color.ui false &&
+	for mode in add-p commit-p-none commit-p-noop commit-p-refresh
+	do
+		case "$mode" in
+		add-p) operation=add-p action=none ;;
+		commit-p-*) operation=commit-p action=${mode#commit-p-} ;;
+		esac &&
+		prefix="watch-backoff-interactive-$mode" &&
+		setup_backoff_interactive_pair "$prefix" "$action" &&
+		for kind in main linked
+		do
+			check_backoff_interactive "$prefix" "$operation" "$action" "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'interactive patching cannot authenticate a copied private index' '
+	test_config_global interactive.singleKey false &&
+	test_config_global color.ui false &&
+	prefix=watch-backoff-interactive-private &&
+	setup_backoff_interactive_pair "$prefix" none &&
+	for kind in main linked
+	do
+		check_backoff_interactive "$prefix" private-p none "$kind" "$common" ||
+			return 1
+	done
+'
+
+test_expect_success FILEMODE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'interactive commit cannot advance history across mode or membership changes' '
+	test_config_global interactive.singleKey false &&
+	test_config_global color.ui false &&
+	for operation in commit-p-mode commit-p-delete
+	do
+		prefix="watch-backoff-interactive-$operation" &&
+		setup_backoff_interactive_pair "$prefix" none &&
+		for kind in main linked
+		do
+			check_backoff_interactive "$prefix" "$operation" none "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+check_backoff_manifest_attribute () {
+	perl - "$1" "$2" "$3" "$4" "$(test_oid rawsz)" <<-\EOF
+	use strict;
+	use warnings;
+	my ($file, $flags, $name, $hash, $rawsz) = @ARGV;
+	open my $input, "<", $file or die "cannot read index: $!\n";
+	binmode $input;
+	local $/;
+	my $index = <$input>;
+	my $offset = index($index, "FSCF");
+	die "missing FSCF extension\n" if $offset < 0;
+	my $size = unpack("N", substr($index, $offset + 4, 4));
+	my $proof = substr($index, $offset + 8, $size);
+	my ($version, $magic, $actual_flags, $token_len, $manifest_len) =
+		unpack("NNNNN", substr($proof, 0, 20));
+	die "invalid FSCF header\n" unless length($proof) == $size &&
+		($version == 1 || $version == 2) && $magic == 0x46534331 &&
+		$actual_flags == $flags;
+	my $start = 20 + $token_len + (3 + ($version == 2)) * $rawsz;
+	die "invalid manifest extent\n"
+		unless $start + $manifest_len + $rawsz == length($proof);
+	my $manifest = substr($proof, $start, $manifest_len);
+	my $count = unpack("N", substr($manifest, 0, 4));
+	my ($pos, $found) = (4, 0);
+	for (1 .. $count) {
+		my $len = unpack("N", substr($manifest, $pos, 4));
+		my $source = ord(substr($manifest, $pos + 4, 1));
+		my $digest = unpack("H*", substr($manifest, $pos + 8, $rawsz));
+		$pos += 8 + $rawsz;
+		my $path = substr($manifest, $pos, $len);
+		$pos += $len;
+		if ($path eq $name) {
+			die "wrong attribute source or content\n"
+				unless $source == 1 && $digest eq $hash;
+			$found++;
+		}
+	}
+	die "invalid or missing attribute manifest entry\n"
+		unless $pos == length($manifest) && $found == 1;
+	EOF
+}
+
+check_backoff_worktree_attributes_after_hook () (
+	scope=$1 &&
+	test_create_repo "watch-backoff-worktree-attrs-$scope" &&
+	cd "watch-backoff-worktree-attrs-$scope" &&
+	sane_unset GIT_INDEX_FILE GIT_TEST_PRELOAD_INDEX_BULK \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH &&
+	case "$scope" in
+	root) attrs=.gitattributes target=target visible=visible-untracked ;;
+	nested)
+		mkdir nested &&
+		attrs=nested/.gitattributes target=nested/target \
+			visible=nested/visible-untracked
+		;;
+	esac &&
+	gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+		rev-parse --absolute-git-dir) &&
+	main_index="$gitdir/index" &&
+	evidence="$gitdir/attribute-evidence" &&
+	mkdir "$evidence" &&
+	: >"$gitdir/empty-attributes" &&
+	: >"$gitdir/empty-excludes" &&
+	git config core.attributesFile "$gitdir/empty-attributes" &&
+	git config core.excludesFile "$gitdir/empty-excludes" &&
+	git config core.autocrlf false &&
+	git config core.safecrlf false &&
+	git config core.preloadIndex false &&
+	git config core.preloadIndexBulk false &&
+	git config index.version 2 &&
+	git config gc.auto 0 &&
+	git config maintenance.auto false &&
+	printf "%s\n" "target -text" >"$attrs" &&
+	printf "line\r\n" >"$target" &&
+	test_write_lines base >trigger &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		add -- "$attrs" "$target" trigger &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		commit -qm base &&
+	git config core.untrackedCache true &&
+	git config core.fsmonitor true &&
+	test-tool chmtime -120 "$attrs" "$target" trigger &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+		git update-index --refresh &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C git update-index --fsmonitor &&
+	GIT_INDEX_FILE="$main_index" \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+		git status --porcelain=v2 >"$evidence/prime" &&
+	test_must_be_empty "$evidence/prime" &&
+	cp "$main_index" "$evidence/index.seed" &&
+	assert_backoff_full_proof "$evidence/index.seed" &&
+	old_hash=$(test-tool "$test_hash_algo" <"$attrs") &&
+	check_backoff_manifest_attribute "$evidence/index.seed" 15 "$attrs" "$old_hash" &&
+	test_write_lines commit-change >trigger &&
+	cp "$main_index" "$evidence/oracle.index" &&
+	backoff_commit_index "$evidence/oracle.index" add -u &&
+	backoff_commit_index "$evidence/oracle.index" write-tree \
+		>"$evidence/expected.tree" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+		>"$evidence/parent" &&
+	test_hook pre-commit <<-\EOF &&
+	set -eu
+	test "$GIT_INDEX_FILE" = "$BACKOFF_ATTR_MAIN.lock"
+	cp "$BACKOFF_ATTR_MAIN" "$BACKOFF_ATTR_EVIDENCE/main.before"
+	cp "$GIT_INDEX_FILE" "$BACKOFF_ATTR_EVIDENCE/selected.before"
+	GIT_TRACE2_EVENT="$BACKOFF_ATTR_EVIDENCE/hook.trace" \
+		git add --refresh -- trigger
+	cp "$GIT_INDEX_FILE" "$BACKOFF_ATTR_EVIDENCE/selected.after-refresh"
+	printf "%s\n" "target text" >"$BACKOFF_ATTR_FILE"
+	cp "$GIT_INDEX_FILE" "$BACKOFF_ATTR_EVIDENCE/selected.after"
+	cp "$BACKOFF_ATTR_MAIN" "$BACKOFF_ATTR_EVIDENCE/main.after"
+	printf "%s\n" success >"$BACKOFF_ATTR_EVIDENCE/completed"
+	EOF
+	record_authenticated_backoff_marker &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=E \
+	GIT_TRACE2_EVENT="$evidence/commit.trace" \
+	BACKOFF_ATTR_MAIN="$main_index" BACKOFF_ATTR_FILE="$PWD/$attrs" \
+	BACKOFF_ATTR_EVIDENCE="$evidence" \
+		git commit -aqm "attribute-only successful hook" &&
+	# Observe publication before any status can repair its optional metadata.
+	cp "$main_index" "$evidence/index.published" &&
+	test_grep "^success$" "$evidence/completed" &&
+	test_cmp_bin "$evidence/index.seed" "$evidence/main.before" &&
+	test_cmp_bin "$evidence/index.seed" "$evidence/main.after" &&
+	test_cmp_bin "$evidence/selected.after-refresh" "$evidence/selected.after" &&
+	backoff_commit_entries "$evidence/selected.before" >"$evidence/entries.before" &&
+	backoff_commit_entries "$evidence/selected.after" >"$evidence/entries.after" &&
+	test_cmp_bin "$evidence/entries.before" "$evidence/entries.after" &&
+	assert_backoff_commit_unbound "$evidence/selected.after" "$evidence/private" &&
+	if assert_backoff_full_proof "$evidence/index.published" \
+		>"$evidence/published-full.out" 2>"$evidence/published-full.err"
+	then
+		echo "backoff publication granted current cleanliness" >&2 &&
+		return 1
+	fi &&
+	if test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+		<"$evidence/commit.trace"
+	then
+		check_backoff_manifest_attribute "$evidence/index.published" 9 \
+			"$attrs" "$old_hash"
+	else
+		:
+	fi &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^{tree} \
+		>"$evidence/committed.tree" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^ \
+		>"$evidence/committed.parent" &&
+	test_cmp "$evidence/expected.tree" "$evidence/committed.tree" &&
+	test_cmp "$evidence/parent" "$evidence/committed.parent" &&
+	test_write_lines visible >"$visible" &&
+	test-tool chmtime +120 "$target" &&
+	backoff_commit_index "$main_index" hash-object --path="$target" --stdin \
+		<"$target" >"$evidence/normalized.oid" &&
+	printf "line\n" >"$evidence/expected-normalized" &&
+	backoff_commit_index "$main_index" hash-object --no-filters --stdin \
+		<"$evidence/expected-normalized" >"$evidence/expected-normalized.oid" &&
+	test_cmp "$evidence/expected-normalized.oid" "$evidence/normalized.oid" &&
+	backoff_commit_index "$main_index" rev-parse ":$target" \
+		>"$evidence/indexed.oid" &&
+	! test_cmp "$evidence/indexed.oid" "$evidence/normalized.oid" &&
+	backoff_commit_index "$main_index" status --porcelain=v2 -z \
+		--untracked-files=all >"$evidence/status.expected" &&
+	tr "\000" "\n" <"$evidence/status.expected" >"$evidence/status.lines" &&
+	test_grep "^1 \\.M .* $attrs$" "$evidence/status.lines" &&
+	test_grep "^1 \\.M .* $target$" "$evidence/status.lines" &&
+	test_grep "^? $visible$" "$evidence/status.lines" &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=E \
+	GIT_TRACE2_EVENT="$evidence/backoff.trace" \
+		git status --porcelain=v2 -z --untracked-files=all \
+			>"$evidence/status.actual" &&
+	test_cmp_bin "$evidence/status.expected" "$evidence/status.actual" &&
+	rm .git/fsmonitor--daemon.inotify-limit &&
+	GIT_INDEX_FILE="$main_index" GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCCCCCC \
+	GIT_TEST_FSMONITOR_QUERY_PATH=// \
+	GIT_TRACE2_EVENT="$evidence/recovery.trace" \
+		git status --porcelain=v2 -z --untracked-files=all \
+			>"$evidence/recovery.actual" &&
+	test_cmp_bin "$evidence/status.expected" "$evidence/recovery.actual" &&
+	test_trace2_data fsm_client query/trivial-response 1 <"$evidence/recovery.trace" &&
+	test_trace2_data fsmonitor token_closure/accepted 1 <"$evidence/recovery.trace" &&
+	assert_backoff_full_proof "$main_index" &&
+	new_hash=$(test-tool "$test_hash_algo" <"$attrs") &&
+	test "$old_hash" != "$new_hash" &&
+	check_backoff_manifest_attribute "$main_index" 15 "$attrs" "$new_hash" &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+		git --no-optional-locks status --porcelain=v2 -z --untracked-files=all \
+			>"$evidence/warm.actual" &&
+	test_cmp_bin "$evidence/status.expected" "$evidence/warm.actual" &&
+	test_path_is_missing "$main_index.lock" &&
+	test_grep ! "\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+		"$evidence/commit.trace" "$evidence/hook.trace" \
+		"$evidence/backoff.trace" "$evidence/recovery.trace"
+)
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'historical commit recovery revalidates worktree attributes and untracked files' '
+	for scope in root nested
+	do
+		check_backoff_worktree_attributes_after_hook "$scope" || return 1
+	done
+'
+
 test_done
