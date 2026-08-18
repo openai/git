@@ -2,6 +2,10 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "abspath.h"
+#include "dir.h"
+#include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -808,6 +812,26 @@ struct tree *write_in_core_index_as_tree(struct repository *repo,
 }
 
 
+static int skip_backoff_cache_tree_write(struct index_state *istate,
+					const char *index_path)
+{
+	struct repository *repo = istate->repo;
+	char *main_index, *named, *canonical;
+	int skip;
+
+	if (getenv(INDEX_ENVIRONMENT) || get_alternate_index_output() ||
+	    !fsm_settings__is_watch_limit_backoff(repo))
+		return 0;
+	main_index = xstrfmt("%s/index", repo_get_git_dir(repo));
+	named = real_pathdup(index_path, 0);
+	canonical = real_pathdup(main_index, 0);
+	skip = named && canonical && !fspathcmp(named, canonical);
+	free(main_index);
+	free(named);
+	free(canonical);
+	return skip;
+}
+
 int write_index_as_tree(struct object_id *oid, struct index_state *index_state, const char *index_path, int flags, const char *prefix)
 {
 	int entries, was_valid;
@@ -829,7 +853,8 @@ int write_index_as_tree(struct object_id *oid, struct index_state *index_state, 
 
 	ret = write_index_as_tree_internal(oid, index_state, was_valid, flags,
 					   prefix);
-	if (!ret && !was_valid) {
+	if (!ret && !was_valid &&
+	    !skip_backoff_cache_tree_write(index_state, index_path)) {
 		write_locked_index(index_state, &lock_file, COMMIT_LOCK);
 		/* Not being able to write is fine -- we are only interested
 		 * in updating the cache-tree part, and if the next caller
