@@ -770,4 +770,361 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'unused global LFS preserves two mandatory backoff writes and recovery' '
+	test_config_global filter.lfs.clean "git-lfs clean -- %f" &&
+	test_config_global filter.lfs.smudge "git-lfs smudge -- %f" &&
+	test_config_global filter.lfs.process "git-lfs filter-process" &&
+	test_config_global filter.lfs.required true &&
+	setup_backoff_bound_proof watch-backoff-unused-lfs &&
+	(
+		cd watch-backoff-unused-lfs &&
+		checkpoint=$(cat .git/checkpoints) &&
+		record_authenticated_backoff_marker &&
+		test_write_lines staged-first >tracked &&
+		test_write_lines staged-second >sibling &&
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/first-add.trace" \
+			git add tracked &&
+		test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+			<.git/first-add.trace &&
+		assert_backoff_main_index_write \
+			.git/first-add.trace "$PWD/.git/index" yes &&
+		assert_backoff_pending_proof .git/index.before-backoff .git/index &&
+		test_cmp_bin .git/checkpoint.before-backoff "$checkpoint" &&
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/second-add.trace" \
+			git add sibling &&
+		test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+			<.git/second-add.trace &&
+		assert_backoff_main_index_write \
+			.git/second-add.trace "$PWD/.git/index" yes &&
+		assert_backoff_pending_proof .git/index.before-backoff .git/index &&
+		test_cmp_bin .git/checkpoint.before-backoff "$checkpoint" &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			show :tracked >.git/staged-tracked &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			show :sibling >.git/staged-sibling &&
+		test_cmp tracked .git/staged-tracked &&
+		test_cmp sibling .git/staged-sibling &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			--no-optional-locks status --porcelain=v2 >.git/expected &&
+		test_grep "^1 M\\. .* tracked$" .git/expected &&
+		test_grep "^1 M\\. .* sibling$" .git/expected &&
+		rm .git/fsmonitor--daemon.inotify-limit &&
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=// \
+		GIT_TRACE2_EVENT="$PWD/.git/recovery.trace" \
+			git status --porcelain=v2 >.git/recovery.actual &&
+		test_cmp .git/expected .git/recovery.actual &&
+		test_trace2_data fsmonitor token_closure/accepted 1 \
+			<.git/recovery.trace &&
+		assert_backoff_full_proof .git/index &&
+		cp .git/index .git/recovered.before-warm &&
+		# Scripted provider tokens restart in each Git invocation.
+		# Check read-only reuse, not optional publication of a new token.
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
+			git --no-optional-locks status --porcelain=v2 \
+				>.git/warm.actual &&
+		test_cmp .git/expected .git/warm.actual &&
+		test_trace2_data fsmonitor config/coherent 1 <.git/warm.trace &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/warm.trace &&
+		assert_backoff_main_index_write \
+			.git/warm.trace "$PWD/.git/index" no &&
+		test_cmp_bin .git/recovered.before-warm .git/index &&
+		test_grep ! \
+			"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+			.git/first-add.trace .git/second-add.trace .git/recovery.trace \
+			.git/warm.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'an activated clean filter converts content instead of retaining backoff proof' '
+	test_config_global filter.lfs.clean "sed s/raw/converted/" &&
+	test_config_global filter.lfs.smudge cat &&
+	test_unconfig --global filter.lfs.process &&
+	test_config_global filter.lfs.required true &&
+	setup_backoff_bound_proof watch-backoff-active-filter &&
+	(
+		cd watch-backoff-active-filter &&
+		record_authenticated_backoff_marker &&
+		test_write_lines "tracked filter=lfs" >.gitattributes &&
+		test_write_lines raw >tracked &&
+		test_write_lines converted >.git/converted.expected &&
+		cp .git/index .git/filtered.before &&
+		cp .git/index .git/filtered.oracle.index &&
+		GIT_INDEX_FILE="$PWD/.git/filtered.oracle.index" \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				add tracked &&
+		GIT_INDEX_FILE="$PWD/.git/filtered.oracle.index" \
+			git -c core.fsmonitor=false write-tree >.git/expected-tree &&
+		GIT_INDEX_FILE="$PWD/.git/filtered.oracle.index" \
+			git -c core.fsmonitor=false show :tracked >.git/oracle-content &&
+		test_cmp .git/converted.expected .git/oracle-content &&
+		test_cmp_bin .git/filtered.before .git/index &&
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/filtered-add.trace" \
+			git add tracked &&
+		assert_backoff_main_index_write \
+			.git/filtered-add.trace "$PWD/.git/index" yes &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			show :tracked >.git/filtered-content &&
+		test_cmp .git/converted.expected .git/filtered-content &&
+		cp .git/index .git/filtered.actual.index &&
+		GIT_INDEX_FILE="$PWD/.git/filtered.actual.index" \
+			git -c core.fsmonitor=false write-tree >.git/actual-tree &&
+		test_cmp .git/expected-tree .git/actual-tree &&
+		test_grep ! "pending:" .git/index &&
+		if assert_backoff_full_proof .git/index \
+			>.git/filtered-proof.out 2>.git/filtered-proof.err
+		then
+			return 1
+		else
+			:
+		fi &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			--no-optional-locks status --porcelain=v2 >.git/filtered.expected &&
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/filtered-status.trace" \
+			git status --porcelain=v2 >.git/filtered.actual &&
+		test_cmp .git/filtered.expected .git/filtered.actual &&
+		test_grep "^1 M\\. .* tracked$" .git/filtered.actual &&
+		test_grep "^? .gitattributes$" .git/filtered.actual &&
+		test_grep ! \
+			"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+			.git/filtered-add.trace .git/filtered-status.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'an activated required filter fails closed during backoff' '
+	test_config_global filter.lfs.clean false &&
+	test_config_global filter.lfs.smudge cat &&
+	test_unconfig --global filter.lfs.process &&
+	test_config_global filter.lfs.required true &&
+	setup_backoff_bound_proof watch-backoff-required-filter &&
+	(
+		cd watch-backoff-required-filter &&
+		record_authenticated_backoff_marker &&
+		cp .git/index .git/required.before &&
+		test_write_lines "tracked filter=lfs" >.git/info/attributes &&
+		test-tool chmtime +120 tracked &&
+		test_must_fail git -c core.fsmonitor=false \
+			-c core.untrackedCache=false --no-optional-locks \
+			diff -- tracked >.git/required.oracle.out \
+				2>.git/required.oracle.err &&
+		test_grep "clean filter .lfs. failed" .git/required.oracle.err &&
+		test_cmp_bin .git/required.before .git/index &&
+		test_must_fail env GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TRACE2_EVENT="$PWD/.git/required-status.trace" \
+			git status --porcelain=v2 >.git/required-status.out \
+				2>.git/required-status.err &&
+		test_grep "clean filter .lfs. failed" .git/required-status.err &&
+		test_cmp_bin .git/required.before .git/index &&
+		test_must_fail env GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TRACE2_EVENT="$PWD/.git/required-add.trace" \
+			git add tracked >.git/required-add.out \
+				2>.git/required-add.err &&
+		test_grep "clean filter .lfs. failed" .git/required-add.err &&
+		test_cmp_bin .git/required.before .git/index &&
+		assert_backoff_main_index_write \
+			.git/required-add.trace "$PWD/.git/index" no &&
+		test_grep ! \
+			"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+			.git/required-status.trace .git/required-add.trace
+	)
+'
+
+test_lazy_prereq STATUS_BULK_PRELOAD '
+	test_create_repo backoff-bulk-preload-prereq &&
+	(
+		cd backoff-bulk-preload-prereq &&
+		sane_unset GIT_TEST_PRELOAD_INDEX_BULK &&
+		test_write_lines tracked >tracked &&
+		test_write_lines sibling >sibling &&
+		git -c core.fsmonitor=false add tracked sibling &&
+		git -c core.fsmonitor=false commit -qm base &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TRACE2_EVENT="$PWD/.git/bulk.trace" \
+			git -c core.fsmonitor=false \
+				-c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_trace2_data index preload/bulk_result complete \
+			<.git/bulk.trace
+	)
+'
+
+configure_backoff_unused_lfs () {
+	test_config_global filter.lfs.clean "git-lfs clean -- %f" &&
+	test_config_global filter.lfs.smudge "git-lfs smudge -- %f" &&
+	test_config_global filter.lfs.process "git-lfs filter-process" &&
+	test_config_global filter.lfs.required true
+}
+
+extract_backoff_root_trace () {
+	perl - "$1" <<-\EOF
+	use strict;
+	use warnings;
+	open my $input, "<", $ARGV[0] or die "cannot read trace: $!\n";
+	my @lines = <$input>;
+	my ($root) = map { /"sid":"([^"]+)"/ ? $1 : () }
+		grep { /"event":"start"/ } @lines;
+	die "missing root Trace2 start\n" unless defined $root;
+	print grep { /"sid":"\Q$root\E"/ } @lines;
+	EOF
+}
+
+assert_backoff_no_bulk_scan () {
+	! test_trace2_data index preload/bulk_useful "[0-9][0-9]*" <"$1" &&
+	! test_trace2_data index preload/bulk_dirs "[0-9][0-9]*" <"$1" &&
+	! test_trace2_data index preload/bulk_entries "[0-9][0-9]*" <"$1"
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'unused global LFS preserves clean add refresh with preload controls' '
+	configure_backoff_unused_lfs &&
+	setup_backoff_bound_proof watch-backoff-unused-lfs-refresh &&
+	(
+		cd watch-backoff-unused-lfs-refresh &&
+		sane_unset GIT_TEST_PRELOAD_INDEX_BULK &&
+		checkpoint=$(cat .git/checkpoints) &&
+		record_authenticated_backoff_marker &&
+		for preload in false true
+		do
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TRACE2_EVENT="$PWD/.git/refresh-$preload.trace" \
+				git -c core.preloadIndex=$preload \
+					-c core.preloadIndexBulk=$preload \
+					add --refresh -- tracked \
+						>".git/refresh-$preload.actual" &&
+			test_must_be_empty ".git/refresh-$preload.actual" &&
+			test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+				<".git/refresh-$preload.trace" &&
+			assert_backoff_main_index_write \
+				".git/refresh-$preload.trace" "$PWD/.git/index" no &&
+			extract_backoff_root_trace ".git/refresh-$preload.trace" \
+				>".git/refresh-$preload.root.trace" &&
+			assert_backoff_no_bulk_scan \
+				".git/refresh-$preload.root.trace" &&
+			test_grep ! \
+				"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+				".git/refresh-$preload.trace" &&
+			assert_backoff_full_proof .git/index &&
+			assert_backoff_history_unchanged .git "$checkpoint" || return 1
+		done &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			--no-optional-locks status --porcelain=v2 \
+				>.git/refresh.oracle &&
+		test_must_be_empty .git/refresh.oracle
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'unused global LFS preserves dirty stash trees and reports bulk work' '
+	if test_have_prereq STATUS_BULK_PRELOAD
+	then
+		bulk_available=yes
+	else
+		bulk_available=no
+	fi &&
+	configure_backoff_unused_lfs &&
+	setup_backoff_bound_proof watch-backoff-unused-lfs-stash staged &&
+	(
+		cd watch-backoff-unused-lfs-stash &&
+		sane_unset GIT_TEST_PRELOAD_INDEX_BULK &&
+		checkpoint=$(cat .git/checkpoints) &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			test-tool dump-cache-tree >.git/cache-tree.before &&
+		test_grep "^invalid " .git/cache-tree.before &&
+		cp .git/index .git/expected-stash.index &&
+		GIT_INDEX_FILE="$PWD/.git/expected-stash.index" \
+			git -c core.fsmonitor=false write-tree \
+				>.git/expected-stash-tree &&
+		record_authenticated_backoff_marker &&
+		test_write_lines unstaged-worktree >tracked &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			--no-optional-locks status --porcelain=v2 \
+				>.git/stash.oracle &&
+		test_grep "^1 M\\. .* sibling$" .git/stash.oracle &&
+		test_grep "^1 \\.M .* tracked$" .git/stash.oracle &&
+		snapshot_backoff_index_identity .git/index \
+			>.git/stash.index.identity.before &&
+		for preload in false true
+		do
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_PRELOAD_INDEX=1 \
+			GIT_TRACE2_EVENT="$PWD/.git/stash-$preload.trace" \
+				git -c core.preloadIndex=$preload \
+					-c core.preloadIndexBulk=$preload \
+					stash create >".git/stash-$preload.oid" &&
+			test_file_not_empty ".git/stash-$preload.oid" &&
+			stash=$(cat ".git/stash-$preload.oid") &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse "$stash^2^{tree}" \
+					>".git/stash-$preload.index-tree" &&
+			test_cmp .git/expected-stash-tree \
+				".git/stash-$preload.index-tree" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse "$stash^{tree}" \
+					>".git/stash-$preload.worktree-tree" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				show "$stash:tracked" >".git/stash-$preload.worktree" &&
+			test_cmp tracked ".git/stash-$preload.worktree" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				show "$stash^2:sibling" >".git/stash-$preload.index" &&
+			test_cmp sibling ".git/stash-$preload.index" &&
+			test_must_fail git -c core.fsmonitor=false \
+				--no-optional-locks rev-parse --verify refs/stash \
+					>".git/stash-$preload.ref" \
+					2>".git/stash-$preload.ref.err" &&
+			test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+				<".git/stash-$preload.trace" &&
+			snapshot_backoff_index_identity .git/index \
+				>".git/stash-$preload.index.identity.after" &&
+			test_cmp .git/stash.index.identity.before \
+				".git/stash-$preload.index.identity.after" &&
+			extract_backoff_root_trace ".git/stash-$preload.trace" \
+				>".git/stash-$preload.root.trace" &&
+			if test "$preload" = true && test "$bulk_available" = yes
+			then
+				test_trace2_data index preload/bulk_cache_nr 2 \
+					<".git/stash-$preload.root.trace" &&
+				test_trace2_data index preload/bulk_useful 2 \
+					<".git/stash-$preload.root.trace" &&
+				test_trace2_data index preload/bulk_result complete \
+					<".git/stash-$preload.root.trace" &&
+				test_trace2_data index preload/bulk_dirs "[1-9][0-9]*" \
+					<".git/stash-$preload.root.trace" &&
+				test_trace2_data index preload/bulk_entries "[1-9][0-9]*" \
+					<".git/stash-$preload.root.trace"
+			elif test "$preload" = false
+			then
+				assert_backoff_no_bulk_scan \
+					".git/stash-$preload.root.trace"
+			else
+				:
+			fi &&
+			test_grep ! \
+				"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+				".git/stash-$preload.trace" &&
+			assert_backoff_full_proof .git/index &&
+			assert_backoff_history_unchanged .git "$checkpoint" &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 \
+					>".git/stash-$preload.after" &&
+			test_cmp .git/stash.oracle ".git/stash-$preload.after" || return 1
+		done &&
+		test_cmp .git/stash-false.worktree-tree \
+			.git/stash-true.worktree-tree
+	)
+'
+
 test_done
