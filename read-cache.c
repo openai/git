@@ -3353,7 +3353,8 @@ int has_racy_timestamp(struct index_state *istate)
 
 static int write_locked_index_with_receipt(
 	struct index_state *istate, struct lock_file *lock,
-	unsigned flags, struct clean_status_index_write_receipt *receipt);
+	unsigned flags, struct clean_status_index_write_receipt *receipt,
+	struct clean_status_commit_checkpoint *checkpoint);
 
 void repo_update_index_if_able_with_receipt(
 	struct repository *repo, struct lock_file *lockfile,
@@ -3365,7 +3366,7 @@ void repo_update_index_if_able_with_receipt(
 	     has_racy_timestamp(repo->index)) &&
 	    repo_verify_index(repo))
 		write_locked_index_with_receipt(repo->index, lockfile,
-					COMMIT_LOCK, receipt);
+					COMMIT_LOCK, receipt, NULL);
 	else
 		rollback_lock_file(lockfile);
 }
@@ -3846,7 +3847,8 @@ static int commit_locked_index(struct lock_file *lk)
 static int do_write_locked_index(
 	struct index_state *istate, struct lock_file *lock, unsigned flags,
 	enum write_extensions write_extensions,
-	struct clean_status_index_write_receipt *receipt)
+	struct clean_status_index_write_receipt *receipt,
+	struct clean_status_commit_checkpoint *checkpoint)
 {
 	int ret;
 	int was_full = istate->sparse_index == INDEX_EXPANDED;
@@ -3896,6 +3898,8 @@ static int do_write_locked_index(
 		else
 			clean_status_index_write_receipt_release(receipt);
 	}
+	if (!ret && checkpoint && !(flags & COMMIT_LOCK))
+		clean_status_record_commit_checkpoint(checkpoint, istate, lock);
 
 	run_hooks_l(the_repository, "post-index-change",
 		    istate->updated_workdir ? "1" : "0",
@@ -3913,7 +3917,7 @@ static int write_split_index(struct index_state *istate,
 	int ret;
 	prepare_to_write_split_index(istate);
 	ret = do_write_locked_index(istate, lock, flags, WRITE_ALL_EXTENSIONS,
-				    NULL);
+				    NULL, NULL);
 	finish_writing_split_index(istate);
 	return ret;
 }
@@ -4057,7 +4061,8 @@ static int too_many_not_shared_entries(struct index_state *istate)
 
 static int write_locked_index_with_receipt(
 	struct index_state *istate, struct lock_file *lock,
-	unsigned flags, struct clean_status_index_write_receipt *receipt)
+	unsigned flags, struct clean_status_index_write_receipt *receipt,
+	struct clean_status_commit_checkpoint *checkpoint)
 {
 	int new_shared_index, ret, test_split_index_env;
 	struct split_index *si = istate->split_index;
@@ -4090,7 +4095,7 @@ static int write_locked_index_with_receipt(
 	    (istate->cache_changed & ~EXTMASK)) {
 		ret = do_write_locked_index(istate, lock, flags,
 					    ~WRITE_SPLIT_INDEX_EXTENSION,
-					    receipt);
+					    receipt, checkpoint);
 		goto out;
 	}
 
@@ -4121,7 +4126,7 @@ static int write_locked_index_with_receipt(
 		if (!temp) {
 			ret = do_write_locked_index(istate, lock, flags,
 						    ~WRITE_SPLIT_INDEX_EXTENSION,
-						    receipt);
+						    receipt, checkpoint);
 			goto out;
 		}
 		ret = write_shared_index(istate, &temp, flags);
@@ -4154,7 +4159,99 @@ out:
 int write_locked_index(struct index_state *istate, struct lock_file *lock,
 		       unsigned flags)
 {
-	return write_locked_index_with_receipt(istate, lock, flags, NULL);
+	return write_locked_index_with_receipt(istate, lock, flags, NULL, NULL);
+}
+
+int write_locked_index_for_commit(
+	struct index_state *istate, struct lock_file *lock,
+	struct clean_status_commit_checkpoint **checkpoint)
+{
+	struct clean_status_commit_checkpoint *candidate;
+	int ret;
+
+	clean_status_release_commit_checkpoint(*checkpoint);
+	*checkpoint = NULL;
+	candidate = clean_status_capture_commit_checkpoint(istate, lock);
+	ret = write_locked_index_with_receipt(istate, lock, 0, NULL, candidate);
+	if (ret)
+		clean_status_release_commit_checkpoint(candidate);
+	else
+		*checkpoint = candidate;
+	return ret;
+}
+
+void restore_locked_index_for_commit(
+	struct index_state *istate, struct lock_file *lock,
+	const struct clean_status_commit_checkpoint *checkpoint)
+{
+	struct repository *repo = istate->repo;
+	struct index_state replacement = INDEX_STATE_INIT(repo);
+	struct clean_status_index_snapshot current = { .fd = -1 };
+	struct lock_file rewrite = LOCK_INIT;
+	struct strbuf cache_tree_data = STRBUF_INIT;
+	struct stat st;
+	char *destination = NULL;
+	const char *path;
+	int ret;
+
+	if (!clean_status_commit_checkpoint_changed(checkpoint, lock) ||
+	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock))
+		return;
+	path = get_lock_file_path(lock);
+	destination = get_locked_file_path(lock);
+	if (!clean_status_index_path_is_main(repo, destination) ||
+	    clean_status_index_snapshot_open_allow_null_checksum(
+		    &current, path, repo->hash_algo) ||
+	    fstat(current.fd, &st) || st.st_uid != geteuid() ||
+	    hold_lock_file_for_update(&rewrite, path, LOCK_NO_DEREF) < 0 ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &current, path, repo->hash_algo) ||
+	    !clean_status_prepare_commit_checkpoint_restore(
+		    checkpoint, lock, istate, &replacement, current.fd))
+		goto done;
+
+	/* The logical entries are equal, so the parent's cache tree is reusable. */
+	if (istate->cache_tree) {
+		cache_tree_write(&cache_tree_data, istate->cache_tree);
+		replacement.cache_tree = cache_tree_read(
+			cache_tree_data.buf, cache_tree_data.len);
+	}
+
+	/*
+	 * Only this parent owns the final canonical destination. A nested lock
+	 * preserves the hook's file on rejection or I/O failure, and avoids
+	 * reopening an untrusted pathname with O_TRUNC. The regular serializer
+	 * retains the post-hook stat data and performs its usual racy smudging.
+	 */
+	repo->index = &replacement;
+	if (!untracked_cache_preserve_for_revalidation(&replacement)) {
+		repo->index = istate;
+		goto done;
+	}
+	fill_fsmonitor_bitmap(&replacement);
+	trace2_region_enter_printf("index", "do_write_index", repo,
+				   "%s", get_lock_file_path(&rewrite));
+	ret = do_write_index(&replacement, rewrite.tempfile,
+			     ~WRITE_SPLIT_INDEX_EXTENSION, 0, destination);
+	trace2_region_leave_printf("index", "do_write_index", repo,
+				   "%s", get_lock_file_path(&rewrite));
+	repo->index = istate;
+	if (ret ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &current, path, repo->hash_algo) ||
+	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock) ||
+	    commit_lock_file(&rewrite))
+		goto done;
+
+	/* The original logical write already ran post-index-change. */
+	trace2_data_intmax("fsmonitor", repo,
+			   "history/commit-backoff-restored", 1);
+done:
+	rollback_lock_file(&rewrite);
+	clean_status_index_snapshot_release(&current);
+	strbuf_release(&cache_tree_data);
+	release_index(&replacement);
+	free(destination);
 }
 
 /*
