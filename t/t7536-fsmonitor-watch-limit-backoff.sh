@@ -2176,4 +2176,469 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	done
 '
 
+# A successful COMMIT_NORMAL publishes the lockfile handed to pre-commit.
+# The older hook tests abort before that publication.  Keep the immediate
+# on-disk result separate from any later status which could repair it.
+backoff_commit_index () (
+	selected_index=$1 &&
+	shift &&
+	sane_unset GIT_TEST_PRELOAD_INDEX_BULK \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH &&
+	GIT_INDEX_FILE="$selected_index" \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.preloadIndex=false -c core.preloadIndexBulk=false \
+			--no-optional-locks "$@"
+)
+
+backoff_commit_entries () {
+	# Include the stage, mode, object ID, name, and assume/skip-worktree flags.
+	backoff_commit_index "$1" ls-files --stage -v -z
+}
+
+assert_backoff_commit_unbound () {
+	test_grep ! "pending:" "$1" &&
+	if assert_backoff_full_proof "$1" >"$2.out" 2>"$2.err"
+	then
+		echo "unexpected complete proof in $1" >&2 &&
+		return 1
+	else
+		:
+	fi
+}
+
+install_backoff_successful_commit_hook () {
+	test_hook -C "$1" pre-commit <<-\EOF
+	set -eu
+	test -n "$GIT_INDEX_FILE"
+	evidence=$BACKOFF_HOOK_EVIDENCE
+	main=$BACKOFF_HOOK_MAIN_INDEX
+	helper=$BACKOFF_HOOK_IDENTITY_HELPER
+	reject=$BACKOFF_HOOK_REJECT_HELPER
+	printf "%s\n" "$GIT_INDEX_FILE" >"$evidence/index.env"
+	selected=$(perl "$reject" temporary "$BACKOFF_HOOK_STYLE" \
+		"$GIT_INDEX_FILE" "$main")
+	printf "%s\n" "$selected" >"$evidence/selected.path"
+	perl "$helper" identity "$main" >"$evidence/main.identity.hook-before"
+	cp "$main" "$evidence/main.in-hook.before"
+	cp "$selected" "$evidence/selected.before"
+	if test "$BACKOFF_HOOK_STYLE" = partial
+	then
+		perl "$reject" temporary all "$main.lock" "$main" \
+			>"$evidence/real-lock.path"
+		cp "$main.lock" "$evidence/real-lock.before"
+	fi
+	: >"$evidence/pre-mutation-refresh.trace"
+	case "$BACKOFF_HOOK_ACTION" in
+	noop | refresh)
+		:
+		;;
+	*)
+		GIT_TRACE2_EVENT="$evidence/pre-mutation-refresh.trace" \
+			git add --refresh -- sibling
+		cp "$selected" "$evidence/selected.after-refresh"
+		;;
+	esac
+	: >"$evidence/hook.trace"
+	GIT_TRACE2_EVENT="$evidence/hook.trace"
+	export GIT_TRACE2_EVENT
+	case "$BACKOFF_HOOK_ACTION" in
+	noop)
+		:
+		;;
+	refresh)
+		git add --refresh -- "$BACKOFF_HOOK_REFRESH_PATH"
+		;;
+	content)
+		printf "%s\n" hook-content >sibling
+		git add sibling
+		;;
+	add-new)
+		printf "%s\n" hook-added >created
+		git add created
+		;;
+	remove)
+		git rm sibling
+		;;
+	rename)
+		git mv sibling renamed
+		;;
+	mode)
+		git update-index --chmod=+x sibling
+		;;
+	assume-unchanged)
+		git update-index --assume-unchanged sibling
+		;;
+	info-attributes)
+		printf "%s\n" "sibling -text" >"$BACKOFF_HOOK_ATTRIBUTES"
+		git add --refresh -- sibling
+		;;
+	*)
+		exit 2
+		;;
+	esac
+	perl "$reject" temporary "$BACKOFF_HOOK_STYLE" \
+		"$GIT_INDEX_FILE" "$main" >"$evidence/selected.path.after"
+	cp "$selected" "$evidence/selected.after"
+	cp "$main" "$evidence/main.in-hook.after"
+	perl "$helper" identity "$main" >"$evidence/main.identity.hook-after"
+	if test "$BACKOFF_HOOK_STYLE" = partial
+	then
+		cp "$main.lock" "$evidence/real-lock.after"
+	fi
+	printf "%s\n" success >"$evidence/completed"
+	exit 0
+	EOF
+}
+
+setup_backoff_successful_commit_pair () {
+	setup_backoff_hook_pair "$1" &&
+	common=$(git -C "$1-main" -c core.fsmonitor=false \
+		--no-optional-locks rev-parse --absolute-git-dir) &&
+	write_backoff_hook_identity_helper "$common/hook-index.pl" &&
+	write_backoff_rejected_index_helper "$common/rejected-index.pl" &&
+	install_backoff_successful_commit_hook "$1-main"
+}
+
+make_backoff_successful_commit_oracles () (
+	style=$1 &&
+	action=$2 &&
+	evidence=$3 &&
+	cp "$evidence/main.seed" "$evidence/oracle-main.index" &&
+	backoff_commit_index "$evidence/oracle-main.index" add -u &&
+	case "$style" in
+	all)
+		cp "$evidence/oracle-main.index" "$evidence/oracle-commit.index"
+		;;
+	partial)
+		backoff_commit_index "$evidence/oracle-commit.index" read-tree HEAD &&
+		backoff_commit_index "$evidence/oracle-commit.index" add -- tracked
+		;;
+	esac &&
+	backoff_commit_entries "$evidence/oracle-commit.index" \
+		>"$evidence/expected-pre-hook.entries" &&
+	case "$action" in
+	noop | refresh | info-attributes)
+		:
+		;;
+	content | add-new)
+		case "$action" in
+		content) contents=hook-content target=sibling ;;
+		add-new) contents=hook-added target=created ;;
+		esac &&
+		test_write_lines "$contents" >"$evidence/expected-content" &&
+		oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
+			<"$evidence/expected-content") &&
+		backoff_commit_index "$evidence/oracle-commit.index" \
+			update-index --add --cacheinfo "100644,$oid,$target"
+		;;
+	remove)
+		backoff_commit_index "$evidence/oracle-commit.index" \
+			update-index --force-remove sibling
+		;;
+	rename)
+		oid=$(backoff_commit_index "$evidence/oracle-commit.index" \
+			rev-parse :sibling) &&
+		backoff_commit_index "$evidence/oracle-commit.index" \
+			update-index --force-remove sibling &&
+		backoff_commit_index "$evidence/oracle-commit.index" \
+			update-index --add --cacheinfo "100644,$oid,renamed"
+		;;
+	mode)
+		backoff_commit_index "$evidence/oracle-commit.index" \
+			update-index --chmod=+x sibling
+		;;
+	assume-unchanged)
+		backoff_commit_index "$evidence/oracle-commit.index" \
+			update-index --assume-unchanged sibling
+		;;
+	*)
+		return 1
+		;;
+	esac &&
+	backoff_commit_index "$evidence/oracle-commit.index" write-tree \
+		>"$evidence/expected-commit.tree" &&
+	backoff_commit_entries "$evidence/oracle-commit.index" \
+		>"$evidence/expected-commit.entries" &&
+	case "$action" in
+	noop | refresh | info-attributes)
+		test_cmp_bin "$evidence/expected-pre-hook.entries" \
+			"$evidence/expected-commit.entries"
+		;;
+	*)
+		! test_cmp_bin "$evidence/expected-pre-hook.entries" \
+			"$evidence/expected-commit.entries"
+		;;
+	esac &&
+	if test "$style" = all
+	then
+		cp "$evidence/oracle-commit.index" "$evidence/oracle-main.index"
+	else
+		:
+	fi &&
+	backoff_commit_index "$evidence/oracle-main.index" write-tree \
+		>"$evidence/expected-main.tree" &&
+	backoff_commit_entries "$evidence/oracle-main.index" \
+		>"$evidence/expected-main.entries" &&
+	if test "$style" = partial
+	then
+		! test_cmp "$evidence/expected-commit.tree" "$evidence/expected-main.tree"
+	else
+		test_cmp "$evidence/expected-commit.tree" "$evidence/expected-main.tree"
+	fi
+)
+
+check_backoff_successful_commit () (
+	prefix=$1 &&
+	style=$2 &&
+	action=$3 &&
+	kind=$4 &&
+	common=$5 &&
+	case "$kind" in
+	main)
+		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
+			--no-optional-locks rev-parse --absolute-git-dir)
+		;;
+	linked)
+		other_gitdir=$common
+		;;
+	esac &&
+	cd "$prefix-$kind" &&
+	sane_unset GIT_INDEX_FILE GIT_TEST_PRELOAD_INDEX_BULK \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH &&
+	gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+		rev-parse --absolute-git-dir) &&
+	main_index="$gitdir/index" &&
+	checkpoint=$(cat "$gitdir/checkpoints") &&
+	# Keep linked-worktree evidence in the common gitdir after its cleanup.
+	evidence="$common/successful-$style-$action-$kind" &&
+	mkdir "$evidence" &&
+	cp "$main_index" "$evidence/main.seed" &&
+	cp "$checkpoint" "$evidence/checkpoint.before" &&
+	cp "$other_gitdir/index" "$evidence/other-index.before" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.before" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.before" &&
+	assert_backoff_full_proof "$evidence/main.seed" &&
+	test_path_is_missing "$common/info/attributes" &&
+	test_write_lines worktree-change >tracked &&
+	make_backoff_successful_commit_oracles "$style" "$action" "$evidence" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+		>"$evidence/head.before" &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		test-tool fsmonitor-client record-watch-limit &&
+	test_path_is_file "$gitdir/fsmonitor--daemon.inotify-limit" &&
+	case "$style" in
+	all) refresh_path=sibling && set -- -a ;;
+	partial) refresh_path=tracked && set -- -- tracked ;;
+	esac &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TRACE2_EVENT="$evidence/commit.trace" \
+	BACKOFF_HOOK_STYLE="$style" BACKOFF_HOOK_ACTION="$action" \
+	BACKOFF_HOOK_EVIDENCE="$evidence" BACKOFF_HOOK_MAIN_INDEX="$main_index" \
+	BACKOFF_HOOK_IDENTITY_HELPER="$common/hook-index.pl" \
+	BACKOFF_HOOK_REJECT_HELPER="$common/rejected-index.pl" \
+	BACKOFF_HOOK_REFRESH_PATH="$refresh_path" \
+	BACKOFF_HOOK_ATTRIBUTES="$common/info/attributes" \
+		git commit -qm "successful $style $action hook" "$@" \
+			>"$evidence/commit.out" &&
+	# This must be the first observation after the successful commit.
+	cp "$main_index" "$evidence/index.published" &&
+	snapshot_backoff_index_identity "$main_index" \
+		>"$evidence/index.published.identity" &&
+	test_grep "^success$" "$evidence/completed" &&
+	test_cmp "$evidence/selected.path" "$evidence/selected.path.after" &&
+	test_cmp_bin "$evidence/main.seed" "$evidence/main.in-hook.before" &&
+	test_cmp_bin "$evidence/main.seed" "$evidence/main.in-hook.after" &&
+	test_cmp "$evidence/main.identity.before" "$evidence/main.identity.hook-before" &&
+	test_cmp "$evidence/main.identity.before" "$evidence/main.identity.hook-after" &&
+	! test_cmp "$evidence/main.identity.before" "$evidence/index.published.identity" &&
+	test_cmp_bin "$evidence/checkpoint.before" "$checkpoint" &&
+	test_path_is_missing "$main_index.lock" &&
+	selected=$(cat "$evidence/selected.path") &&
+	test_path_is_missing "$selected" &&
+	test_path_is_missing "$selected.lock" &&
+	find "$gitdir" -maxdepth 1 -name "next-index-*.lock" \
+		>"$evidence/remaining-temporary-indexes" &&
+	test_must_be_empty "$evidence/remaining-temporary-indexes" &&
+	backoff_commit_entries "$evidence/selected.before" \
+		>"$evidence/selected-before.entries" &&
+	backoff_commit_entries "$evidence/selected.after" \
+		>"$evidence/selected-after.entries" &&
+	backoff_commit_entries "$evidence/index.published" \
+		>"$evidence/published.entries" &&
+	test_cmp_bin "$evidence/expected-pre-hook.entries" \
+		"$evidence/selected-before.entries" &&
+	test_cmp_bin "$evidence/expected-commit.entries" \
+		"$evidence/selected-after.entries" &&
+	test_cmp_bin "$evidence/expected-main.entries" "$evidence/published.entries" &&
+	cp "$evidence/index.published" "$evidence/published-oracle.index" &&
+	backoff_commit_index "$evidence/published-oracle.index" write-tree \
+		>"$evidence/published.tree" &&
+	test_cmp "$evidence/expected-main.tree" "$evidence/published.tree" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^{tree} \
+		>"$evidence/committed.tree" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^ \
+		>"$evidence/committed.parent" &&
+	test_cmp "$evidence/expected-commit.tree" "$evidence/committed.tree" &&
+	test_cmp "$evidence/head.before" "$evidence/committed.parent" &&
+	extract_backoff_root_trace "$evidence/commit.trace" >"$evidence/commit.root.trace" &&
+	test_trace2_data fsm_client settings/inotify-watch-limit-backoff 1 \
+		<"$evidence/commit.root.trace" &&
+	! test_trace2_data fsmonitor token_closure/accepted 1 \
+		<"$evidence/commit.root.trace" &&
+	! test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+		<"$evidence/hook.trace" &&
+	case "$style:$action" in
+	all:noop | all:refresh)
+		assert_backoff_pending_proof "$evidence/main.seed" "$evidence/selected.before" &&
+		assert_backoff_pending_proof "$evidence/main.seed" "$evidence/index.published" &&
+		if test "$action" = refresh
+		then
+			assert_backoff_rejected_index_trace "$evidence/hook.trace" &&
+			assert_backoff_commit_unbound "$evidence/selected.after" \
+				"$evidence/selected-unbound" &&
+			test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+				<"$evidence/commit.root.trace"
+		else
+			test_cmp_bin "$evidence/selected.before" "$evidence/selected.after"
+		fi
+		;;
+	partial:*)
+		# The false commit index and real lockfile have different trees.
+		# Only the latter is published; no normal-commit repair may run.
+		test_cmp_bin "$evidence/real-lock.before" "$evidence/real-lock.after" &&
+		test_cmp_bin "$evidence/real-lock.after" "$evidence/index.published" &&
+		assert_backoff_commit_unbound "$evidence/selected.after" \
+			"$evidence/selected-unbound" &&
+		! test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+			<"$evidence/commit.root.trace" &&
+		if test "$action" = refresh
+		then
+			assert_backoff_rejected_index_trace "$evidence/hook.trace"
+		else
+			:
+		fi
+		;;
+	all:*)
+		assert_backoff_pending_proof "$evidence/main.seed" "$evidence/selected.before" &&
+		assert_backoff_rejected_index_trace "$evidence/pre-mutation-refresh.trace" &&
+		assert_backoff_commit_unbound "$evidence/selected.after-refresh" \
+			"$evidence/after-refresh-unbound" &&
+		# A real hook may serialize its own optional metadata.  The
+		# parent must publish those exact bytes, not strengthen them.
+		test_cmp_bin "$evidence/selected.after" "$evidence/index.published" &&
+		! test_trace2_data fsmonitor history/commit-backoff-restored 1 \
+			<"$evidence/commit.root.trace"
+		;;
+	esac &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-c core.preloadIndex=false -c core.preloadIndexBulk=false \
+		--no-optional-locks status --porcelain=v2 >"$evidence/status.expected" &&
+	if test "$style" = partial
+	then
+		test_grep "^1 M\\. .* sibling$" "$evidence/status.expected"
+	else
+		:
+	fi &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TRACE2_EVENT="$evidence/status.trace" \
+		git status --porcelain=v2 >"$evidence/status.actual" &&
+	test_cmp "$evidence/status.expected" "$evidence/status.actual" &&
+	test_cmp_bin "$evidence/index.published" "$main_index" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/index.after-status.identity" &&
+	test_cmp "$evidence/index.published.identity" "$evidence/index.after-status.identity" &&
+	assert_backoff_main_index_write "$evidence/status.trace" "$main_index" no &&
+	test_cmp_bin "$evidence/checkpoint.before" "$checkpoint" &&
+	# CE_VALID is itself a negative admission case.  Check its publication
+	# first, then return the fixture to an eligible shape for real recovery.
+	if test "$action" = assume-unchanged
+	then
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			update-index --no-assume-unchanged sibling &&
+		backoff_commit_index "$evidence/oracle-main.index" \
+			update-index --no-assume-unchanged sibling
+	else
+		:
+	fi &&
+	backoff_commit_entries "$evidence/oracle-main.index" \
+		>"$evidence/expected-recovery.entries" &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		-c core.preloadIndex=false -c core.preloadIndexBulk=false \
+		--no-optional-locks status --porcelain=v2 >"$evidence/recovery.expected" &&
+	rm "$gitdir/fsmonitor--daemon.inotify-limit" &&
+	GIT_INDEX_FILE="$main_index" GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCCCCCC \
+	GIT_TEST_FSMONITOR_QUERY_PATH=// \
+	GIT_TRACE2_EVENT="$evidence/recovery.trace" \
+		git status --porcelain=v2 >"$evidence/recovery.actual" &&
+	test_cmp "$evidence/recovery.expected" "$evidence/recovery.actual" &&
+	test_trace2_data fsm_client query/trivial-response 1 <"$evidence/recovery.trace" &&
+	test_trace2_data fsmonitor token_closure/accepted 1 <"$evidence/recovery.trace" &&
+	assert_backoff_full_proof "$main_index" &&
+	cp "$main_index" "$evidence/index.recovered" &&
+	cp "$main_index" "$evidence/recovered-oracle.index" &&
+	backoff_commit_index "$evidence/recovered-oracle.index" write-tree \
+		>"$evidence/recovered.tree" &&
+	backoff_commit_entries "$evidence/index.recovered" \
+		>"$evidence/recovered.entries" &&
+	test_cmp "$evidence/expected-main.tree" "$evidence/recovered.tree" &&
+	test_cmp_bin "$evidence/expected-recovery.entries" "$evidence/recovered.entries" &&
+	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.after" &&
+	test_cmp "$evidence/other-index.identity.before" "$evidence/other-index.identity.after" &&
+	test_path_is_missing "$main_index.lock" &&
+	test_grep ! "\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+		"$evidence/commit.trace" "$evidence/hook.trace" \
+		"$evidence/pre-mutation-refresh.trace" \
+		"$evidence/status.trace" "$evidence/recovery.trace"
+)
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'successful normal commit hooks publish authenticated pending history' '
+	sane_unset GIT_INDEX_FILE &&
+	for action in noop refresh
+	do
+		prefix="watch-backoff-successful-all-$action" &&
+		setup_backoff_successful_commit_pair "$prefix" &&
+		for kind in main linked
+		do
+			check_backoff_successful_commit "$prefix" all "$action" "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'successful partial commit hooks do not transplant the false index' '
+	sane_unset GIT_INDEX_FILE &&
+	for action in noop refresh
+	do
+		prefix="watch-backoff-successful-partial-$action" &&
+		setup_backoff_successful_commit_pair "$prefix" &&
+		for kind in main linked
+		do
+			check_backoff_successful_commit "$prefix" partial "$action" "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'successful normal hooks cannot reuse history across changed entries or attributes' '
+	sane_unset GIT_INDEX_FILE &&
+	for action in content add-new remove rename mode assume-unchanged info-attributes
+	do
+		for kind in main linked
+		do
+			# The semantic-input control changes common info/attributes;
+			# every arm starts from its own genuinely primed pair.
+			prefix="watch-backoff-successful-$action-$kind" &&
+			setup_backoff_successful_commit_pair "$prefix" &&
+			check_backoff_successful_commit "$prefix" all "$action" "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
 test_done
