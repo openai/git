@@ -25,6 +25,7 @@ void clean_status_set_config_digest(
 	struct repository *repo,
 	const struct clean_status_config_digest *digest);
 void clean_status_enable_external_history(struct repository *repo);
+void clean_status_prepare_main_index_history(struct repository *repo);
 int clean_status_external_history_enabled(const struct index_state *istate);
 void clean_status_enable_progress(struct repository *repo);
 struct clean_status_progress *clean_status_start_progress(
