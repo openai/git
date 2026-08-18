@@ -3172,7 +3172,9 @@ check_backoff_interactive () (
 			<"$evidence/apply.trace" &&
 		case "$operation" in
 		add-p)
-			assert_backoff_interactive_index_env "$evidence/apply.trace" "$main_index" &&
+			index_env=$(git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse --git-path index) &&
+			assert_backoff_interactive_index_env "$evidence/apply.trace" "$index_env" &&
 			test_trace2_data fsmonitor history/watch-limit-suspended 1 \
 				<"$evidence/apply.trace" &&
 			assert_backoff_pending_proof "$evidence/main.seed" "$evidence/index.published" &&
@@ -3479,7 +3481,7 @@ check_backoff_worktree_attributes_after_hook () (
 		>"$evidence/expected.tree" &&
 	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
 		>"$evidence/parent" &&
-	test_hook pre-commit <<-\EOF &&
+	write_script "$gitdir/hooks/pre-commit" <<-\EOF &&
 	set -eu
 	test "$GIT_INDEX_FILE" = "$BACKOFF_ATTR_MAIN.lock"
 	cp "$BACKOFF_ATTR_MAIN" "$BACKOFF_ATTR_EVIDENCE/main.before"
