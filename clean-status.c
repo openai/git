@@ -213,6 +213,7 @@ int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
 	const struct git_hash_algo *algo;
 	const struct untracked_cache *uc = istate->untracked;
 	const char *suffix, *pending;
+	char *main_index;
 	const uint32_t historical = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
 		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
 	int paired, suspended = 0;
@@ -223,7 +224,9 @@ int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
 	if (!state || !istate->repo || !istate->repo->worktree ||
 	    !fsm_settings__is_watch_limit_backoff(istate->repo) ||
 	    !fstat_is_reliable() || istate != istate->repo->index ||
-	    getenv(INDEX_ENVIRONMENT) || getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    !clean_status_index_path_is_main(istate->repo,
+					     istate->repo->index_file) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
 	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
 	    getenv(ALTERNATE_DB_ENVIRONMENT) || istate->split_index ||
 	    istate->sparse_index != INDEX_EXPANDED ||
@@ -278,8 +281,13 @@ int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
 		return 0;
 	if (clean_status_index_snapshot_pin_proof_epoch(&source, istate))
 		return 0;
-	if (!untracked_cache_preserve_for_revalidation(istate) ||
-	    !clean_status_index_snapshot_still_matches_proof_epoch(&source, istate))
+	main_index = xstrfmt("%s/index", repo_get_git_dir(istate->repo));
+	if (!clean_status_index_snapshot_still_matches_path(
+		    &source, main_index, algo) ||
+	    !untracked_cache_preserve_for_revalidation(istate) ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(&source, istate) ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &source, main_index, algo))
 		goto done;
 
 	/* Only historical path semantics survive. Nothing is currently clean. */
@@ -300,6 +308,7 @@ int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "history/watch-limit-suspended", 1);
 done:
+	free(main_index);
 	clean_status_index_snapshot_release(&source);
 	return suspended;
 }
