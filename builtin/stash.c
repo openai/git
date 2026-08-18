@@ -378,6 +378,9 @@ static int reset_tree(struct object_id *i_tree, int update, int reset,
 		clean_status_has_persistent_fsmonitor_semantic_history(
 			the_repository->index) &&
 		clean_status_revalidated_token_matches(the_repository->index);
+	opts.preserve_backoff_history = preserve_semantic_history &&
+		!update && !reset &&
+		clean_status_fsmonitor_backoff_suspended(the_repository->index);
 	opts.merge = 1;
 	opts.reset = reset ? UNPACK_RESET_PROTECT_UNTRACKED : 0;
 	opts.update = update;
@@ -769,6 +772,10 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	}
 
 	if (has_index) {
+		/* The preceding publication replaced a null-checksum source inode. */
+		if (is_null_oid(&the_repository->index->oid) &&
+		    clean_status_fsmonitor_backoff_suspended(the_repository->index))
+			discard_index(the_repository->index);
 		if (reset_tree(&index_tree, 0, 0, 1))
 			ret = -1;
 	} else {

@@ -4634,6 +4634,9 @@ static int checkout(struct merge_options *opt,
 	unpack_opts.preserve_semantic_history =
 		preserve_semantic_history &&
 		clean_status_revalidated_token_matches(opt->repo->index);
+	unpack_opts.preserve_backoff_history =
+		preserve_semantic_history &&
+		clean_status_fsmonitor_backoff_suspended(opt->repo->index);
 	unpack_opts.quiet = 0; /* FIXME: sequencer might want quiet? */
 	unpack_opts.verbose_update = (opt->verbosity > 2);
 	unpack_opts.fn = twoway_merge;
