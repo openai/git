@@ -1244,4 +1244,680 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	done
 '
 
+setup_backoff_hook_pair () {
+	test_create_repo "$1-main" &&
+	test_when_finished "git -C \"$1-main\" -c core.fsmonitor=false \
+		worktree remove --force \"../$1-linked\" >/dev/null 2>&1 || :" &&
+	(
+		cd "$1-main" &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git -c core.fsmonitor=false worktree add --detach "../$1-linked" HEAD &&
+		git config core.autocrlf false &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../$1-linked"
+		do
+			gitdir=$(git -C "$worktree" -c core.fsmonitor=false \
+				--no-optional-locks rev-parse --absolute-git-dir) &&
+			test_write_lines staged-before >"$worktree/sibling" &&
+			git -C "$worktree" -c core.fsmonitor=false add sibling &&
+			git -C "$worktree" -c core.fsmonitor=false write-tree \
+				>"$gitdir/hook.expected-index-tree" &&
+			test-tool chmtime -120 "$worktree/tracked" "$worktree/sibling" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" update-index --refresh &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 >"$gitdir/prime" &&
+			git -C "$worktree" -c core.fsmonitor=false \
+				-c core.untrackedCache=false --no-optional-locks \
+				status --porcelain=v2 >"$gitdir/prime.expect" &&
+			test_cmp "$gitdir/prime.expect" "$gitdir/prime" &&
+			test_grep "^1 M\\. .* sibling$" "$gitdir/prime" &&
+			assert_backoff_full_proof "$gitdir/index" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
+				git -C "$worktree" status --short >"$gitdir/checkpoint.status" &&
+			test_trace2_data fsmonitor history/external-stored 1 \
+				<"$gitdir/checkpoint.trace" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status >"$gitdir/sidecar.status" &&
+			find "$gitdir" -maxdepth 1 -type f -name "index.csh1.*" \
+				>"$gitdir/checkpoints" &&
+			test_line_count = 1 "$gitdir/checkpoints" &&
+			checkpoint=$(cat "$gitdir/checkpoints") &&
+			assert_backoff_full_proof "$gitdir/index" &&
+			cp "$gitdir/index" "$gitdir/index.before-backoff" &&
+			cp "$checkpoint" "$gitdir/checkpoint.before-backoff" &&
+			if test -f "$gitdir/index.csts"
+			then
+				cp "$gitdir/index.csts" "$gitdir/sidecar.before-backoff"
+			else
+				:
+			fi || return 1
+		done
+	)
+}
+
+assert_backoff_checkpoint_unchanged () {
+	test_cmp_bin "$1/checkpoint.before-backoff" "$2" &&
+	if test -f "$1/sidecar.before-backoff"
+	then
+		test_cmp_bin "$1/sidecar.before-backoff" "$1/index.csts"
+	else
+		test_path_is_missing "$1/index.csts"
+	fi
+}
+
+write_backoff_hook_identity_helper () {
+	cat >"$1" <<-\EOF
+	use strict;
+	use warnings;
+	use Cwd qw(abs_path getcwd);
+	use File::Spec;
+	use Fcntl qw(:mode);
+	my ($mode, $path, $main) = @ARGV;
+	my @selected = lstat($path) or die "cannot stat selected index: $!\n";
+	die "selected index is not a singly linked regular file\n"
+		unless S_ISREG($selected[2]) && $selected[3] == 1;
+	if ($mode eq "identity") {
+		print join(" ", @selected[0, 1, 2, 3, 4, 5, 7, 9, 10]), "\n";
+	} elsif ($mode eq "relative") {
+		print File::Spec->abs2rel(abs_path($path), getcwd()), "\n";
+	} elsif ($mode eq "canonical") {
+		my @authority = lstat($main) or die "cannot stat physical index: $!\n";
+		my $selected_path = abs_path($path);
+		my $physical_path = abs_path($main);
+		die "hook did not receive the physical canonical index\n" unless
+			defined($selected_path) && defined($physical_path) &&
+			$selected_path eq $physical_path &&
+			S_ISREG($authority[2]) && $authority[3] == 1 &&
+			$selected[0] == $authority[0] && $selected[1] == $authority[1];
+		print "$selected_path\n";
+	} else {
+		die "unknown hook index operation\n";
+	}
+	EOF
+}
+
+retain_backoff_linked_hook_evidence () {
+	archive="$1/retained-linked-hook-$5" &&
+	test_path_is_missing "$archive" &&
+	mkdir "$archive" &&
+	cp -R "$3" "$archive/hook" &&
+	cp "$2/hook.expected-index-tree" "$archive/expected-index-tree" &&
+	cp "$2/prime.expect" "$archive/expected-status" &&
+	test_cmp "$2/hook.expected-index-tree" "$archive/expected-index-tree" &&
+	test_cmp "$2/prime.expect" "$archive/expected-status" &&
+	test_write_lines "$2" "$3" "$4" >"$archive/source-paths" &&
+	cp "$2/index.before-backoff" "$archive/index.before" &&
+	cp "$2/index" "$archive/index.after" &&
+	snapshot_backoff_index_identity "$2/index" >"$archive/index.after.identity" &&
+	cp "$2/checkpoint.before-backoff" "$archive/checkpoint.before" &&
+	cp "$4" "$archive/checkpoint.after" &&
+	snapshot_backoff_index_identity "$4" >"$archive/checkpoint.after.identity" &&
+	if test -f "$2/sidecar.before-backoff"
+	then
+		cp "$2/sidecar.before-backoff" "$archive/sidecar.before" &&
+		test_cmp_bin "$2/sidecar.before-backoff" "$archive/sidecar.before"
+	else
+		test_write_lines absent >"$archive/sidecar.before.absent"
+	fi &&
+	if test -f "$2/index.csts"
+	then
+		cp "$2/index.csts" "$archive/sidecar.after" &&
+		test_cmp_bin "$2/index.csts" "$archive/sidecar.after"
+	else
+		test_write_lines absent >"$archive/sidecar.after.absent"
+	fi &&
+	test_cmp_bin "$2/index.before-backoff" "$archive/index.before" &&
+	test_cmp_bin "$2/index" "$archive/index.after" &&
+	test_cmp_bin "$2/checkpoint.before-backoff" "$archive/checkpoint.before" &&
+	test_cmp_bin "$4" "$archive/checkpoint.after"
+}
+install_backoff_canonical_hook () {
+	test_hook -C "$1" pre-commit <<-\EOF
+	set -eu
+	test -n "$GIT_INDEX_FILE"
+	evidence=$BACKOFF_HOOK_EVIDENCE
+	main=$BACKOFF_HOOK_MAIN_INDEX
+	helper=$BACKOFF_HOOK_IDENTITY_HELPER
+	printf "%s\n" "$GIT_INDEX_FILE" >"$evidence/index.env"
+	perl "$helper" canonical "$GIT_INDEX_FILE" "$main" \
+		>"$evidence/selected.path"
+	perl "$helper" identity "$main" >"$evidence/main.identity.before"
+	cp "$main" "$evidence/main.before"
+	cp "$GIT_INDEX_FILE" "$evidence/selected.before"
+	case "$BACKOFF_HOOK_ACTION" in
+	refresh)
+		GIT_TRACE2_EVENT="$evidence/refresh-emitted.trace" \
+			git add --refresh -- tracked
+		cp "$main" "$evidence/after-emitted"
+		perl "$helper" identity "$main" >"$evidence/identity-emitted"
+		absolute=$(dirname "$main")/./index
+		relative=./$(perl "$helper" relative "$main")
+		printf "%s\n" "$absolute" "$relative" >"$evidence/normalized.paths"
+		GIT_INDEX_FILE="$absolute" \
+		GIT_TRACE2_EVENT="$evidence/refresh-absolute.trace" \
+			git add --refresh -- tracked
+		cp "$main" "$evidence/after-absolute"
+		perl "$helper" identity "$main" >"$evidence/identity-absolute"
+		GIT_INDEX_FILE="$relative" \
+		GIT_TRACE2_EVENT="$evidence/refresh-relative.trace" \
+			git add --refresh -- tracked
+		cp "$main" "$evidence/after-relative"
+		perl "$helper" identity "$main" >"$evidence/identity-relative"
+		;;
+	stage)
+		printf "%s\n" hook-first >tracked
+		GIT_TRACE2_EVENT="$evidence/first-add.trace" git add tracked
+		cp "$main" "$evidence/after-first"
+		perl "$helper" identity "$main" >"$evidence/identity-first"
+		printf "%s\n" hook-second >sibling
+		GIT_TRACE2_EVENT="$evidence/second-add.trace" git add sibling
+		cp "$main" "$evidence/after-second"
+		perl "$helper" identity "$main" >"$evidence/identity-second"
+		test-tool dump-cache-tree >"$evidence/cache-tree.before-write-tree"
+		GIT_TRACE2_EVENT="$evidence/write-tree.trace" \
+			git write-tree >"$evidence/write-tree"
+		cp "$main" "$evidence/after-write-tree"
+		perl "$helper" identity "$main" >"$evidence/identity-write-tree"
+		;;
+	*)
+		exit 2
+		;;
+	esac
+	cp "$main" "$evidence/main.after"
+	perl "$helper" identity "$main" >"$evidence/main.identity.after"
+	printf "%s\n" complete >"$evidence/completed"
+	exit 1
+	EOF
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'canonical pre-commit refresh preserves primary and linked backoff proofs' '
+	sane_unset GIT_INDEX_FILE &&
+	setup_backoff_hook_pair watch-backoff-hook-refresh &&
+	common=$(git -C watch-backoff-hook-refresh-main -c core.fsmonitor=false \
+		--no-optional-locks rev-parse --absolute-git-dir) &&
+	write_backoff_hook_identity_helper "$common/hook-index.pl" &&
+	install_backoff_canonical_hook watch-backoff-hook-refresh-main &&
+	for kind in main linked
+	do
+		(
+			cd "watch-backoff-hook-refresh-$kind" &&
+			gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse --absolute-git-dir) &&
+			checkpoint=$(cat "$gitdir/checkpoints") &&
+			evidence="$gitdir/hook-refresh-evidence" &&
+			mkdir "$evidence" &&
+			main_index=$(perl "$common/hook-index.pl" canonical \
+				"$gitdir/index" "$gitdir/index") &&
+			printf "%s\n" "$main_index" >"$evidence/expected.path" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >"$evidence/head.before" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				for-each-ref --format="%(refname) %(objectname)" \
+					>"$evidence/refs.before" &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+				test-tool fsmonitor-client record-watch-limit &&
+			test_must_fail env GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+				GIT_TRACE2_EVENT="$evidence/commit.trace" \
+				BACKOFF_HOOK_ACTION=refresh BACKOFF_HOOK_EVIDENCE="$evidence" \
+				BACKOFF_HOOK_MAIN_INDEX="$main_index" \
+				BACKOFF_HOOK_IDENTITY_HELPER="$common/hook-index.pl" \
+				git commit -qm "canonical refresh hook" &&
+			test_grep "^complete$" "$evidence/completed" &&
+			test_file_not_empty "$evidence/index.env" &&
+			test_cmp "$evidence/expected.path" "$evidence/selected.path" &&
+			assert_backoff_full_proof "$evidence/selected.before" &&
+			for spelling in emitted absolute relative
+			do
+				test_cmp_bin "$evidence/selected.before" \
+					"$evidence/after-$spelling" &&
+				test_cmp "$evidence/main.identity.before" \
+					"$evidence/identity-$spelling" &&
+				assert_backoff_full_proof "$evidence/after-$spelling" &&
+				test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+					<"$evidence/refresh-$spelling.trace" &&
+				assert_backoff_main_index_write \
+					"$evidence/refresh-$spelling.trace" "$main_index" no ||
+					return 1
+			done &&
+			test_cmp "$evidence/main.identity.before" \
+				"$evidence/main.identity.after" &&
+			assert_backoff_history_unchanged "$gitdir" "$checkpoint" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >"$evidence/head.after" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				for-each-ref --format="%(refname) %(objectname)" \
+					>"$evidence/refs.after" &&
+			test_cmp "$evidence/head.before" "$evidence/head.after" &&
+			test_cmp "$evidence/refs.before" "$evidence/refs.after" &&
+			cp "$gitdir/index" "$evidence/tree.index" &&
+			GIT_INDEX_FILE="$evidence/tree.index" \
+				git -c core.fsmonitor=false write-tree >"$evidence/actual-tree" &&
+			test_cmp "$gitdir/hook.expected-index-tree" "$evidence/actual-tree" &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 >"$evidence/status.after" &&
+			test_cmp "$gitdir/prime.expect" "$evidence/status.after" &&
+			test_grep ! \
+				"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+				"$evidence/commit.trace" "$evidence"/refresh-*.trace &&
+			if test "$kind" = linked
+			then
+				retain_backoff_linked_hook_evidence \
+					"$common" "$gitdir" "$evidence" "$checkpoint" refresh
+			else
+				:
+			fi
+		) || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'canonical pre-commit staging retains pending history across repeated writes' '
+	sane_unset GIT_INDEX_FILE &&
+	setup_backoff_hook_pair watch-backoff-hook-stage &&
+	common=$(git -C watch-backoff-hook-stage-main -c core.fsmonitor=false \
+		--no-optional-locks rev-parse --absolute-git-dir) &&
+	write_backoff_hook_identity_helper "$common/hook-index.pl" &&
+	install_backoff_canonical_hook watch-backoff-hook-stage-main &&
+	for kind in main linked
+	do
+		(
+			cd "watch-backoff-hook-stage-$kind" &&
+			gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse --absolute-git-dir) &&
+			checkpoint=$(cat "$gitdir/checkpoints") &&
+			evidence="$gitdir/hook-stage-evidence" &&
+			mkdir "$evidence" &&
+			main_index=$(perl "$common/hook-index.pl" canonical \
+				"$gitdir/index" "$gitdir/index") &&
+			printf "%s\n" "$main_index" >"$evidence/expected.path" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >"$evidence/head.before" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				for-each-ref --format="%(refname) %(objectname)" \
+					>"$evidence/refs.before" &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+				test-tool fsmonitor-client record-watch-limit &&
+			test_must_fail env GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+				GIT_TRACE2_EVENT="$evidence/commit.trace" \
+				BACKOFF_HOOK_ACTION=stage BACKOFF_HOOK_EVIDENCE="$evidence" \
+				BACKOFF_HOOK_MAIN_INDEX="$main_index" \
+				BACKOFF_HOOK_IDENTITY_HELPER="$common/hook-index.pl" \
+				git commit -qm "canonical staging hook" &&
+			test_grep "^complete$" "$evidence/completed" &&
+			test_cmp "$evidence/expected.path" "$evidence/selected.path" &&
+			assert_backoff_full_proof "$evidence/selected.before" &&
+			for stage in first second
+			do
+				test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+					<"$evidence/$stage-add.trace" &&
+				assert_backoff_main_index_write \
+					"$evidence/$stage-add.trace" "$main_index" yes &&
+				assert_backoff_pending_proof "$evidence/selected.before" \
+					"$evidence/after-$stage" || return 1
+			done &&
+			test_grep "^invalid " "$evidence/cache-tree.before-write-tree" &&
+			! test_cmp_bin "$evidence/selected.before" "$evidence/after-first" &&
+			! test_cmp_bin "$evidence/after-first" "$evidence/after-second" &&
+			test_cmp_bin "$evidence/after-second" "$evidence/after-write-tree" &&
+			test_cmp "$evidence/identity-second" "$evidence/identity-write-tree" &&
+			test_cmp_bin "$evidence/after-write-tree" "$gitdir/index" &&
+			assert_backoff_pending_proof "$evidence/selected.before" "$gitdir/index" &&
+			assert_backoff_checkpoint_unchanged "$gitdir" "$checkpoint" &&
+			test_path_is_missing "$gitdir/index.lock" &&
+			cp "$evidence/selected.before" "$evidence/oracle.index" &&
+			GIT_INDEX_FILE="$evidence/oracle.index" \
+				git -c core.fsmonitor=false -c core.untrackedCache=false \
+					add tracked sibling &&
+			GIT_INDEX_FILE="$evidence/oracle.index" \
+				git -c core.fsmonitor=false write-tree >"$evidence/expected-tree" &&
+			test_cmp "$evidence/expected-tree" "$evidence/write-tree" &&
+			cp "$gitdir/index" "$evidence/actual.index" &&
+			GIT_INDEX_FILE="$evidence/actual.index" \
+				git -c core.fsmonitor=false write-tree >"$evidence/actual-tree" &&
+			test_cmp "$evidence/expected-tree" "$evidence/actual-tree" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				show :tracked >"$evidence/staged-tracked" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				show :sibling >"$evidence/staged-sibling" &&
+			test_cmp tracked "$evidence/staged-tracked" &&
+			test_cmp sibling "$evidence/staged-sibling" &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 >"$evidence/status.expected" &&
+			test_grep "^1 M\\. .* tracked$" "$evidence/status.expected" &&
+			test_grep "^1 M\\. .* sibling$" "$evidence/status.expected" &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TRACE2_EVENT="$evidence/status.trace" \
+				git status --porcelain=v2 >"$evidence/status.actual" &&
+			test_cmp "$evidence/status.expected" "$evidence/status.actual" &&
+			test_cmp_bin "$evidence/after-second" "$gitdir/index" &&
+			assert_backoff_checkpoint_unchanged "$gitdir" "$checkpoint" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >"$evidence/head.after" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				for-each-ref --format="%(refname) %(objectname)" \
+					>"$evidence/refs.after" &&
+			test_cmp "$evidence/head.before" "$evidence/head.after" &&
+			test_cmp "$evidence/refs.before" "$evidence/refs.after" &&
+			test_grep ! \
+				"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+				"$evidence/commit.trace" "$evidence/first-add.trace" \
+				"$evidence/second-add.trace" "$evidence/write-tree.trace" \
+				"$evidence/status.trace" &&
+			if test "$kind" = linked
+			then
+				retain_backoff_linked_hook_evidence \
+					"$common" "$gitdir" "$evidence" "$checkpoint" stage
+			else
+				:
+			fi
+		) || return 1
+	done
+'
+
+test_lazy_prereq HARDLINKS '
+	: >hardlink-a &&
+	ln hardlink-a hardlink-b
+'
+
+write_backoff_rejected_index_helper () {
+	cat >"$1" <<-\EOF
+	use strict;
+	use warnings;
+	use Cwd qw(abs_path);
+	use File::Basename qw(basename dirname);
+	use Fcntl qw(:mode);
+	my ($operation, $kind, $path, $main) = @ARGV;
+	my $dir = abs_path(dirname($main)) or die "cannot resolve gitdir\n";
+	my $physical = "$dir/index";
+	my @authority = lstat($main) or die "cannot stat physical index: $!\n";
+	my @selected = lstat($path) or die "cannot stat selected index: $!\n";
+	my $parent = abs_path(dirname($path)) or die "cannot resolve selected parent\n";
+	my $named = "$parent/" . basename($path);
+	die "invalid physical index authority\n" unless
+		S_ISREG($authority[2]) && $authority[4] == $> &&
+		abs_path($main) eq $physical;
+	die "selected path is not fixture-owned\n" unless
+		$selected[4] == $> && $parent eq $dir && $named ne $physical;
+	my $same = $selected[0] == $authority[0] &&
+		$selected[1] == $authority[1];
+	if ($operation eq "temporary") {
+		die "selected index is not an independent regular lockfile\n" unless
+			S_ISREG($selected[2]) && $selected[3] == 1 &&
+			$authority[3] == 1 && !$same &&
+			abs_path($path) eq $named;
+		die "unexpected commit -a index\n" if
+			$kind eq "all" && $named ne "$physical.lock";
+		die "unexpected partial-commit index\n" if
+			$kind eq "partial" &&
+			$named !~ /\A\Q$dir\E\/next-index-[0-9]+\.lock\z/;
+		die "unknown commit style\n" unless $kind eq "all" || $kind eq "partial";
+		print "$named\n";
+	} elsif ($operation eq "alias") {
+		die "unexpected owned alias name\n" unless
+			$named eq "$dir/index.alias-$kind";
+		if ($kind eq "copy") {
+			die "invalid copied-index control\n" unless
+				S_ISREG($selected[2]) && $selected[3] == 1 &&
+				$authority[3] == 1 && !$same;
+		} elsif ($kind eq "symlink") {
+			my @target = stat($path) or die "cannot stat alias target: $!\n";
+			die "invalid leaf-symlink control\n" unless
+				S_ISLNK($selected[2]) && $selected[3] == 1 &&
+				$authority[3] == 1 && readlink($path) eq "index" &&
+				$target[0] == $authority[0] && $target[1] == $authority[1];
+		} elsif ($kind eq "hardlink") {
+			die "invalid hardlink control\n" unless
+				S_ISREG($selected[2]) && $selected[3] == 2 &&
+				$authority[3] == 2 && $same;
+		} else {
+			die "unknown alias kind\n";
+		}
+		print join(" ", @selected[0, 1, 2, 3, 4, 5, 7, 9, 10]), "\n";
+	} else {
+		die "unknown rejected-index operation\n";
+	}
+	EOF
+}
+
+assert_backoff_rejected_index_trace () {
+	test_trace2_data fsm_client settings/inotify-watch-limit-backoff 1 <"$1" &&
+	! test_trace2_data fsmonitor history/watch-limit-suspended 1 <"$1" &&
+	! test_trace2_data fsmonitor token_closure/accepted 1 <"$1" &&
+	! test_trace2_data fsmonitor config/revalidated 1 <"$1" &&
+	! test_trace2_data fsmonitor config/tracked-epoch-valid 1 <"$1" &&
+	! test_trace2_data status clean-proof/hit 1 <"$1" &&
+	! test_trace2_data status clean-proof/sidecar 1 <"$1" &&
+	test_grep ! "\"event\":\"child_start\".*\"fsmonitor--daemon\"" "$1"
+}
+
+install_backoff_temporary_hook () {
+	test_hook -C "$1" pre-commit <<-\EOF
+	set -eu
+	test -n "$GIT_INDEX_FILE"
+	evidence=$BACKOFF_HOOK_EVIDENCE
+	main=$BACKOFF_HOOK_MAIN_INDEX
+	helper=$BACKOFF_HOOK_IDENTITY_HELPER
+	reject=$BACKOFF_HOOK_REJECT_HELPER
+	printf "%s\n" "$GIT_INDEX_FILE" >"$evidence/index.env"
+	selected=$(perl "$reject" temporary "$BACKOFF_HOOK_STYLE" \
+		"$GIT_INDEX_FILE" "$main")
+	printf "%s\n" "$selected" >"$evidence/selected.path"
+	perl "$helper" identity "$main" >"$evidence/main.identity.hook-before"
+	perl "$helper" identity "$selected" >"$evidence/selected.identity.original"
+	cp "$selected" "$evidence/selected.original"
+	cp "$selected" "$evidence/original-tree.index"
+	GIT_INDEX_FILE="$evidence/original-tree.index" \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			write-tree >"$evidence/original-tree"
+	cmp "$evidence/main.seed" "$main"
+	perl "$reject" temporary "$BACKOFF_HOOK_STYLE" \
+		"$GIT_INDEX_FILE" "$main" >"$evidence/selected.path.rechecked"
+	cmp "$evidence/selected.path" "$evidence/selected.path.rechecked"
+	# Deliberately inject the canonical proof into the genuine private index.
+	# Its naturally produced contents are retained separately above.
+	cp "$main" "$selected"
+	cp "$selected" "$evidence/selected.seeded"
+	GIT_TRACE2_EVENT="$evidence/refresh.trace" \
+		git add --refresh -- sibling
+	perl "$reject" temporary "$BACKOFF_HOOK_STYLE" \
+		"$GIT_INDEX_FILE" "$main" >"$evidence/selected.path.after"
+	cp "$selected" "$evidence/selected.after"
+	cp "$selected" "$evidence/after-tree.index"
+	GIT_INDEX_FILE="$evidence/after-tree.index" \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			write-tree >"$evidence/after-tree"
+	cp "$main" "$evidence/main.after-hook"
+	perl "$helper" identity "$main" >"$evidence/main.identity.hook-after"
+	printf "%s\n" complete >"$evidence/completed"
+	exit 1
+	EOF
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'commit temporary indexes and noncanonical aliases reject backoff authority' '
+	sane_unset GIT_INDEX_FILE &&
+	for style in all partial
+	do
+		setup_backoff_bound_proof "watch-backoff-hook-reject-$style" staged &&
+		write_backoff_hook_identity_helper \
+			"watch-backoff-hook-reject-$style/.git/hook-index.pl" &&
+		write_backoff_rejected_index_helper \
+			"watch-backoff-hook-reject-$style/.git/rejected-index.pl" &&
+		install_backoff_temporary_hook "watch-backoff-hook-reject-$style" &&
+		(
+			cd "watch-backoff-hook-reject-$style" &&
+			gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse --absolute-git-dir) &&
+			main_index="$gitdir/index" &&
+			checkpoint=$(cat .git/checkpoints) &&
+			evidence="$gitdir/hook-reject-evidence" &&
+			mkdir "$evidence" &&
+			test_write_lines worktree-change >tracked &&
+			cp "$main_index" "$evidence/main.seed" &&
+			assert_backoff_full_proof "$evidence/main.seed" &&
+			cp "$main_index" "$evidence/oracle-main.index" &&
+			GIT_INDEX_FILE="$evidence/oracle-main.index" \
+				git -c core.fsmonitor=false -c core.untrackedCache=false \
+					write-tree >"$evidence/expected-main-tree" &&
+			case "$style" in
+			all)
+				cp "$main_index" "$evidence/oracle-selected.index" &&
+				GIT_INDEX_FILE="$evidence/oracle-selected.index" \
+					git -c core.fsmonitor=false -c core.untrackedCache=false add -u &&
+				set -- -a
+				;;
+			partial)
+				GIT_INDEX_FILE="$evidence/oracle-selected.index" \
+					git -c core.fsmonitor=false -c core.untrackedCache=false read-tree HEAD &&
+				GIT_INDEX_FILE="$evidence/oracle-selected.index" \
+					git -c core.fsmonitor=false -c core.untrackedCache=false add -- tracked &&
+				set -- -- tracked
+				;;
+			esac &&
+			GIT_INDEX_FILE="$evidence/oracle-selected.index" \
+				git -c core.fsmonitor=false -c core.untrackedCache=false \
+					write-tree >"$evidence/expected-selected-tree" &&
+			! test_cmp "$evidence/expected-main-tree" "$evidence/expected-selected-tree" &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 >"$evidence/status.before" &&
+			test_grep "^1 \\.M .* tracked$" "$evidence/status.before" &&
+			test_grep "^1 M\\. .* sibling$" "$evidence/status.before" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >"$evidence/head.before" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				for-each-ref --format="%(refname) %(objectname)" >"$evidence/refs.before" &&
+			snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.before" &&
+			record_authenticated_backoff_marker &&
+			test_must_fail env GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+				GIT_TRACE2_EVENT="$evidence/commit.trace" \
+				BACKOFF_HOOK_STYLE="$style" BACKOFF_HOOK_EVIDENCE="$evidence" \
+				BACKOFF_HOOK_MAIN_INDEX="$main_index" \
+				BACKOFF_HOOK_IDENTITY_HELPER="$gitdir/hook-index.pl" \
+				BACKOFF_HOOK_REJECT_HELPER="$gitdir/rejected-index.pl" \
+				git commit -qm "temporary index hook" "$@" &&
+			test_grep "^complete$" "$evidence/completed" &&
+			test_cmp "$evidence/expected-selected-tree" "$evidence/original-tree" &&
+			test_cmp "$evidence/expected-main-tree" "$evidence/after-tree" &&
+			test_cmp_bin "$evidence/main.seed" "$evidence/selected.seeded" &&
+			assert_backoff_full_proof "$evidence/selected.seeded" &&
+			assert_backoff_rejected_index_trace "$evidence/refresh.trace" &&
+			test_region index do_write_index "$evidence/refresh.trace" &&
+			test_grep ! "pending:" "$evidence/selected.after" &&
+			if assert_backoff_full_proof "$evidence/selected.after" \
+				>"$evidence/rejected-proof.out" 2>"$evidence/rejected-proof.err"
+			then
+				return 1
+			else
+				:
+			fi &&
+			test_cmp "$evidence/selected.path" "$evidence/selected.path.after" &&
+			test_cmp_bin "$evidence/main.seed" "$evidence/main.after-hook" &&
+			test_cmp "$evidence/main.identity.before" "$evidence/main.identity.hook-before" &&
+			test_cmp "$evidence/main.identity.before" "$evidence/main.identity.hook-after" &&
+			snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after" &&
+			test_cmp "$evidence/main.identity.before" "$evidence/main.identity.after" &&
+			assert_backoff_full_proof "$main_index" &&
+			assert_backoff_history_unchanged .git "$checkpoint" &&
+			selected=$(cat "$evidence/selected.path") &&
+			test_path_is_missing "$selected" &&
+			test_path_is_missing "$selected.lock" &&
+			find "$gitdir" -maxdepth 1 -name "next-index-*.lock" \
+				>"$evidence/remaining-temporary-indexes" &&
+			test_must_be_empty "$evidence/remaining-temporary-indexes" &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 >"$evidence/status.after" &&
+			test_cmp "$evidence/status.before" "$evidence/status.after" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >"$evidence/head.after" &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				for-each-ref --format="%(refname) %(objectname)" >"$evidence/refs.after" &&
+			test_cmp "$evidence/head.before" "$evidence/head.after" &&
+			test_cmp "$evidence/refs.before" "$evidence/refs.after" &&
+			test_grep ! "\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+				"$evidence/commit.trace"
+		) || return 1
+	done &&
+	setup_backoff_bound_proof watch-backoff-index-aliases &&
+	test_when_finished "rm -f \
+		\"$PWD/watch-backoff-index-aliases/.git/index.alias-copy\" \
+		\"$PWD/watch-backoff-index-aliases/.git/index.alias-symlink\" \
+		\"$PWD/watch-backoff-index-aliases/.git/index.alias-hardlink\"" &&
+	(
+		cd watch-backoff-index-aliases &&
+		gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+			rev-parse --absolute-git-dir) &&
+		main_index="$gitdir/index" &&
+		checkpoint=$(cat .git/checkpoints) &&
+		evidence="$gitdir/alias-evidence" &&
+		mkdir "$evidence" &&
+		write_backoff_rejected_index_helper "$gitdir/rejected-index.pl" &&
+		test_write_lines changed >tracked &&
+		test_write_lines visible >visible &&
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			--no-optional-locks status --porcelain=v2 >"$evidence/status.expected" &&
+		test_grep "^1 \\.M .* tracked$" "$evidence/status.expected" &&
+		test_grep "^? visible$" "$evidence/status.expected" &&
+		record_authenticated_backoff_marker &&
+		for kind in copy symlink hardlink
+		do
+			case "$kind" in
+			copy) alias_prereq= ;;
+			symlink) alias_prereq=SYMLINKS ;;
+			hardlink) alias_prereq=HARDLINKS ;;
+			esac &&
+			if test -n "$alias_prereq" && ! test_have_prereq "$alias_prereq"
+			then
+				test_write_lines "$alias_prereq prerequisite unavailable" \
+					>"$evidence/$kind.skipped" &&
+				continue
+			fi &&
+			alias="$gitdir/index.alias-$kind" &&
+			test_path_is_missing "$alias" &&
+			snapshot_backoff_index_identity "$main_index" \
+				>"$evidence/$kind.main.before-setup" &&
+			case "$kind" in
+			copy) cp "$main_index" "$alias" ;;
+			symlink) ln -s index "$alias" ;;
+			hardlink) ln "$main_index" "$alias" ;;
+			esac &&
+			perl "$gitdir/rejected-index.pl" alias "$kind" "$alias" "$main_index" \
+				>"$evidence/$kind.selected.before" &&
+			snapshot_backoff_index_identity "$main_index" \
+				>"$evidence/$kind.main.after-setup" &&
+			cp "$alias" "$evidence/$kind.seeded" &&
+			test_cmp_bin .git/index.before-backoff "$evidence/$kind.seeded" &&
+			assert_backoff_full_proof "$evidence/$kind.seeded" &&
+			GIT_INDEX_FILE="$alias" GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TRACE2_EVENT="$evidence/$kind.trace" \
+				git --no-optional-locks status --porcelain=v2 \
+					>"$evidence/$kind.status" &&
+			test_cmp "$evidence/status.expected" "$evidence/$kind.status" &&
+			assert_backoff_rejected_index_trace "$evidence/$kind.trace" &&
+			test_region ! index do_write_index "$evidence/$kind.trace" &&
+			test_cmp_bin "$evidence/$kind.seeded" "$alias" &&
+			perl "$gitdir/rejected-index.pl" alias "$kind" "$alias" "$main_index" \
+				>"$evidence/$kind.selected.after" &&
+			test_cmp "$evidence/$kind.selected.before" "$evidence/$kind.selected.after" &&
+			snapshot_backoff_index_identity "$main_index" \
+				>"$evidence/$kind.main.after-probe" &&
+			test_cmp "$evidence/$kind.main.after-setup" "$evidence/$kind.main.after-probe" &&
+			assert_backoff_history_unchanged .git "$checkpoint" &&
+			rm "$alias" &&
+			test_path_is_missing "$alias" &&
+			snapshot_backoff_index_identity "$main_index" \
+				>"$evidence/$kind.main.after-cleanup" &&
+			assert_backoff_history_unchanged .git "$checkpoint" || return 1
+		done
+	)
+'
+
 test_done

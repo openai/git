@@ -1,8 +1,10 @@
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "clean-status.h"
 #include "clean-status-index.h"
 #include "clean-status-internal.h"
 #include "clean-status-sidecar.h"
+#include "dir.h"
 #include "environment.h"
 #include "hash-framing.h"
 #include "object.h"
@@ -15,6 +17,56 @@
 	(CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS)
 #define LOGICAL_INDEX_BENIGN_FLAGS \
 	(CE_UPTODATE | CE_HASHED | CE_FSMONITOR_VALID)
+
+static int index_path_matches_main(
+	const char *path, const char *canonical,
+	const struct clean_status_identity *main_identity)
+{
+	struct clean_status_identity identity;
+	struct stat st;
+	char *resolved;
+	int matches;
+
+	if (!path || !*path || lstat(path, &st) ||
+	    clean_status_identity_from_stat(&identity, &st) ||
+	    !clean_status_identity_equal(&identity, main_identity))
+		return 0;
+	resolved = real_pathdup(path, 0);
+	matches = resolved && !fspathcmp(resolved, canonical);
+	free(resolved);
+	return matches;
+}
+
+int clean_status_index_path_is_main(struct repository *repo, const char *path)
+{
+	struct clean_status_identity main_identity;
+	struct stat st;
+	const char *selected = getenv(INDEX_ENVIRONMENT);
+	char *main_index, *canonical = NULL;
+	int matches = 0;
+
+	if (!repo || !repo->initialized || !repo->gitdir || !*repo->gitdir ||
+	    !repo->index_file || !*repo->index_file || !path || !*path)
+		return 0;
+	/* repo_git_path("index") follows GIT_INDEX_FILE, including lockfiles. */
+	main_index = xstrfmt("%s/index", repo_get_git_dir(repo));
+	if (lstat(main_index, &st) ||
+	    clean_status_identity_from_stat(&main_identity, &st))
+		goto done;
+	canonical = real_pathdup(main_index, 0);
+	if (!canonical ||
+	    !index_path_matches_main(repo->index_file, canonical, &main_identity) ||
+	    !index_path_matches_main(path, canonical, &main_identity) ||
+	    (selected &&
+	     !index_path_matches_main(selected, canonical, &main_identity)) ||
+	    !index_path_matches_main(main_index, canonical, &main_identity))
+		goto done;
+	matches = 1;
+done:
+	free(canonical);
+	free(main_index);
+	return matches;
+}
 
 static int snapshot_read(
 	int fd, const struct stat *st, const struct git_hash_algo *algo,

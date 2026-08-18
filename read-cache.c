@@ -3418,7 +3418,7 @@ enum write_extensions {
 #define WRITE_ALL_EXTENSIONS ((enum write_extensions)-1)
 
 static int fsmonitor_can_persist_untracked_revalidation(
-	const struct index_state *istate)
+	const struct index_state *istate, const char *index_path)
 {
 	const char *suffix, *pending;
 	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
@@ -3428,7 +3428,9 @@ static int fsmonitor_can_persist_untracked_revalidation(
 			istate->fsmonitor_untracked_token);
 
 	if (suspended) {
-		if (alternate_index_output || getenv(DB_ENVIRONMENT) ||
+		if (alternate_index_output ||
+		    !clean_status_index_path_is_main(istate->repo, index_path) ||
+		    getenv(DB_ENVIRONMENT) ||
 		    !fstat_is_reliable() ||
 		    repo_config_values(istate->repo)->apply_sparse_checkout ||
 		    repo_has_replace_refs_uncached(istate->repo))
@@ -3449,7 +3451,7 @@ static int fsmonitor_can_persist_untracked_revalidation(
 		istate->fsmonitor_last_update[strlen("builtin:")] &&
 		strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
 		same_token &&
-		!getenv(INDEX_ENVIRONMENT) &&
+		(!getenv(INDEX_ENVIRONMENT) || suspended) &&
 		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
 		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
 		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
@@ -3470,10 +3472,12 @@ static int fsmonitor_can_persist_untracked_revalidation(
  * of a `struct lock_file`, we will therefore effectively perform
  * a 'close_lock_file_gently()`. Since that is an implementation
  * detail of lockfiles, callers of `do_write_index()` should not
- * rely on it.
+ * rely on it. The optional index_path names a lockfile's intended
+ * destination; suspended history may only be carried to the main index.
  */
 static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
-			  enum write_extensions write_extensions, unsigned flags)
+			  enum write_extensions write_extensions, unsigned flags,
+			  const char *index_path)
 {
 	uint64_t start = getnanotime();
 	struct hashfile *f;
@@ -3717,7 +3721,7 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	    istate->untracked &&
 	    istate->fsmonitor_last_update &&
 	    (istate->fsmonitor_untracked_valid ||
-	     fsmonitor_can_persist_untracked_revalidation(istate)) &&
+	     fsmonitor_can_persist_untracked_revalidation(istate, index_path)) &&
 	    !istate->fsmonitor_legacy_untracked_fallback) {
 		strbuf_reset(&sb);
 
@@ -3847,6 +3851,7 @@ static int do_write_locked_index(
 	int ret;
 	int was_full = istate->sparse_index == INDEX_EXPANDED;
 	int receipt_prepared = 0;
+	char *index_path = NULL;
 
 	if (receipt && (flags & COMMIT_LOCK) && !alternate_index_output &&
 	    !(write_extensions & WRITE_SPLIT_INDEX_EXTENSION))
@@ -3862,9 +3867,14 @@ static int do_write_locked_index(
 		return ret;
 	}
 
+	if (clean_status_fsmonitor_backoff_suspended(istate) &&
+	    !alternate_index_output)
+		index_path = get_locked_file_path(lock);
 	trace2_region_enter_printf("index", "do_write_index", istate->repo,
 				   "%s", get_lock_file_path(lock));
-	ret = do_write_index(istate, lock->tempfile, write_extensions, flags);
+	ret = do_write_index(istate, lock->tempfile, write_extensions, flags,
+			     index_path);
+	free(index_path);
 	trace2_region_leave_printf("index", "do_write_index", istate->repo,
 				   "%s", get_lock_file_path(lock));
 
@@ -3989,7 +3999,7 @@ static int write_shared_index(struct index_state *istate,
 
 	trace2_region_enter_printf("index", "shared/do_write_index",
 				   the_repository, "%s", get_tempfile_path(*temp));
-	ret = do_write_index(si->base, *temp, WRITE_NO_EXTENSION, flags);
+	ret = do_write_index(si->base, *temp, WRITE_NO_EXTENSION, flags, NULL);
 	trace2_region_leave_printf("index", "shared/do_write_index",
 				   the_repository, "%s", get_tempfile_path(*temp));
 
