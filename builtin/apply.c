@@ -60,7 +60,8 @@ int cmd_apply(int argc,
 	    !repo_config_values(the_repository)->apply_sparse_checkout &&
 	    the_repository->config_values_private_.trust_ctime &&
 	    the_repository->config_values_private_.check_stat &&
-	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+	    (fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC ||
+	     fsm_settings__is_watch_limit_backoff(the_repository)) &&
 	    !repo_has_replace_refs_uncached(the_repository) &&
 	    !clean_status_config_read_repository(the_repository,
 					       &clean_digest)) {

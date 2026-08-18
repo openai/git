@@ -1920,4 +1920,260 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	)
 '
 
+make_backoff_patch_series () (
+	shape=$1 &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+		>.git/patch-base.commit &&
+	parent=$(cat .git/patch-base.commit) &&
+	cp .git/index .git/patch-maker.index &&
+	for step in first second
+	do
+		case "$step" in
+		first) patch_target=tracked ;;
+		second) patch_target=sibling ;;
+		esac &&
+		test_write_lines "patched-$step" >".git/patch-$step.contents" &&
+		oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
+			<".git/patch-$step.contents") &&
+		GIT_INDEX_FILE="$PWD/.git/patch-maker.index" \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				update-index --cacheinfo "100644,$oid,$patch_target" &&
+		if test "$shape" = mixed
+		then
+			test_write_lines created >.git/patch-created.contents &&
+			oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
+				<.git/patch-created.contents) &&
+			GIT_INDEX_FILE="$PWD/.git/patch-maker.index" \
+				git -c core.fsmonitor=false -c core.untrackedCache=false \
+					update-index --add \
+					--cacheinfo "100644,$oid,zz-created"
+		else
+			:
+		fi &&
+		GIT_INDEX_FILE="$PWD/.git/patch-maker.index" \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				write-tree >".git/patch-$step.tree" &&
+		tree=$(cat ".git/patch-$step.tree") &&
+		commit=$(git -c core.fsmonitor=false -c commit.gpgSign=false \
+			commit-tree "$tree" -p "$parent" -m "backoff $step") &&
+		test_write_lines "$commit" >".git/patch-$step.commit" &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			diff-tree --binary --full-index --no-renames --no-commit-id -p \
+				"$parent" "$commit" -- >".git/patch-$step.diff" &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			format-patch -1 --stdout --no-signature --no-renames "$commit" \
+				>".git/patch-$step.mbox" &&
+		parent=$commit || return 1
+		test "$shape" != mixed || break
+	done &&
+	test_cmp_bin .git/index.before-backoff .git/index
+)
+
+assert_backoff_patch_tree () {
+	cp "$1" "$2.actual.index" &&
+	GIT_INDEX_FILE="$PWD/$2.actual.index" \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			write-tree >"$2.actual.tree" &&
+	test_cmp "$2.tree" "$2.actual.tree"
+}
+
+recover_backoff_patch_history () {
+	expected_status=$1 &&
+	expected_tree=$2 &&
+	rm .git/fsmonitor--daemon.inotify-limit &&
+	GIT_INDEX_FILE="$PWD/.git/index" \
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCCCCCC \
+	GIT_TEST_FSMONITOR_QUERY_PATH=// \
+	GIT_TRACE2_EVENT="$PWD/.git/patch-recovery.trace" \
+		git status --porcelain=v2 >.git/patch-recovery.actual &&
+	test_cmp "$expected_status" .git/patch-recovery.actual &&
+	test_trace2_data fsm_client query/trivial-response 1 \
+		<.git/patch-recovery.trace &&
+	test_trace2_data fsmonitor token_closure/accepted 1 \
+		<.git/patch-recovery.trace &&
+	assert_backoff_full_proof .git/index &&
+	cp .git/index .git/patch-recovered.index &&
+	cp .git/index .git/patch-recovered.oracle.index &&
+	GIT_INDEX_FILE="$PWD/.git/patch-recovered.oracle.index" \
+		git -c core.fsmonitor=false -c core.untrackedCache=false \
+			write-tree >.git/patch-recovered.tree &&
+	test_cmp "$expected_tree" .git/patch-recovered.tree &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+	GIT_TRACE2_EVENT="$PWD/.git/patch-warm.trace" \
+		git --no-optional-locks status --porcelain=v2 \
+			>.git/patch-warm.actual &&
+	test_cmp "$expected_status" .git/patch-warm.actual &&
+	test_trace2_data fsmonitor config/coherent 1 <.git/patch-warm.trace &&
+	! test_trace2_data fsmonitor semantic/manifest-scan-count \
+		"[1-9][0-9]*" <.git/patch-warm.trace &&
+	assert_backoff_main_index_write .git/patch-warm.trace \
+		"$PWD/.git/index" no &&
+	test_cmp_bin .git/patch-recovered.index .git/index &&
+	test_grep ! \
+		"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+		.git/patch-*.trace
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'apply and am retain pending backoff history across same-path patches' '
+	for operation in apply am
+	do
+		setup_backoff_bound_proof "watch-backoff-patch-$operation" &&
+		(
+			cd "watch-backoff-patch-$operation" &&
+			checkpoint=$(cat .git/checkpoints) &&
+			make_backoff_patch_series same-path &&
+			cp .git/patch-base.commit .git/patch-previous.commit &&
+			record_authenticated_backoff_marker &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/patch-noop.trace" \
+				git --no-optional-locks status --porcelain=v2 \
+					>.git/patch-noop.actual &&
+			test_cmp .git/prime.expect .git/patch-noop.actual &&
+			test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+				<.git/patch-noop.trace &&
+			assert_backoff_history_unchanged .git "$checkpoint" &&
+			test_write_lines visible >visible &&
+			for step in first second
+			do
+				case "$operation" in
+				apply) set -- git apply --index ".git/patch-$step.diff" ;;
+				am) set -- git am ".git/patch-$step.mbox" ;;
+				esac &&
+				GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+				GIT_TRACE2_EVENT="$PWD/.git/patch-$step.trace" \
+					"$@" >".git/patch-$step.out" &&
+				cp .git/index ".git/patch-after-$step.index" &&
+				snapshot_backoff_index_identity .git/index \
+					>".git/patch-after-$step.identity" &&
+				assert_backoff_pending_proof .git/index.before-backoff \
+					".git/patch-after-$step.index" &&
+				test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+					<".git/patch-$step.trace" &&
+				assert_backoff_main_index_write ".git/patch-$step.trace" \
+					"$PWD/.git/index" yes &&
+				assert_backoff_checkpoint_unchanged .git "$checkpoint" &&
+				assert_backoff_patch_tree ".git/patch-after-$step.index" \
+					".git/patch-$step" &&
+				git -c core.fsmonitor=false --no-optional-locks \
+					rev-parse HEAD >".git/patch-$step.head" &&
+				if test "$operation" = am
+				then
+					git -c core.fsmonitor=false --no-optional-locks \
+						rev-parse HEAD^ >".git/patch-$step.parent" &&
+					test_cmp .git/patch-previous.commit \
+						".git/patch-$step.parent" &&
+					git -c core.fsmonitor=false --no-optional-locks \
+						rev-parse HEAD^{tree} >".git/patch-$step.head-tree" &&
+					test_cmp ".git/patch-$step.tree" \
+						".git/patch-$step.head-tree" &&
+					cp ".git/patch-$step.head" .git/patch-previous.commit &&
+					test_path_is_missing .git/rebase-apply
+				else
+					test_cmp .git/patch-base.commit ".git/patch-$step.head"
+				fi || return 1
+			done &&
+			test_cmp .git/patch-first.contents tracked &&
+			test_cmp .git/patch-second.contents sibling &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 \
+					>.git/patch-status.expected &&
+			test_grep "^? visible$" .git/patch-status.expected &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/patch-status.trace" \
+				git --no-optional-locks status --porcelain=v2 \
+					>.git/patch-status.actual &&
+			test_cmp .git/patch-status.expected .git/patch-status.actual &&
+			test_cmp_bin .git/patch-after-second.index .git/index &&
+			assert_backoff_pending_proof .git/index.before-backoff .git/index &&
+			! test_trace2_data fsmonitor token_closure/accepted 1 \
+				<.git/patch-status.trace &&
+			recover_backoff_patch_history .git/patch-status.expected \
+				.git/patch-second.tree
+		) || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'a structural patch revokes backoff history for the complete apply or am batch' '
+	for operation in apply am
+	do
+		setup_backoff_bound_proof "watch-backoff-mixed-patch-$operation" &&
+		(
+			cd "watch-backoff-mixed-patch-$operation" &&
+			make_backoff_patch_series mixed &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				diff-tree --no-commit-id --name-status --no-renames \
+					"$(cat .git/patch-base.commit)" \
+					"$(cat .git/patch-first.commit)" \
+						>.git/patch-first.names &&
+			printf "M\ttracked\nA\tzz-created\n" >.git/patch-expected.names &&
+			test_cmp .git/patch-expected.names .git/patch-first.names &&
+			record_authenticated_backoff_marker &&
+			test_write_lines visible >visible &&
+			case "$operation" in
+			apply) set -- git apply --index .git/patch-first.diff ;;
+			am) set -- git am .git/patch-first.mbox ;;
+			esac &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/patch-first.trace" \
+				"$@" >.git/patch-first.out &&
+			cp .git/index .git/patch-after-first.index &&
+			snapshot_backoff_index_identity .git/index \
+				>.git/patch-after-first.identity &&
+			test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+				<.git/patch-first.trace &&
+			assert_backoff_main_index_write .git/patch-first.trace \
+				"$PWD/.git/index" yes &&
+			test_grep ! FSUC .git/patch-after-first.index &&
+			test_grep ! "pending:" .git/patch-after-first.index &&
+			if assert_backoff_full_proof .git/patch-after-first.index \
+				>.git/patch-proof.out 2>.git/patch-proof.err
+			then
+				return 1
+			else
+				:
+			fi &&
+			assert_backoff_patch_tree .git/patch-after-first.index \
+				.git/patch-first &&
+			test_cmp .git/patch-first.contents tracked &&
+			test_cmp .git/patch-created.contents zz-created &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				rev-parse HEAD >.git/patch-first.head &&
+			if test "$operation" = am
+			then
+				git -c core.fsmonitor=false --no-optional-locks \
+					rev-parse HEAD^ >.git/patch-first.parent &&
+				test_cmp .git/patch-base.commit .git/patch-first.parent &&
+				git -c core.fsmonitor=false --no-optional-locks \
+					rev-parse HEAD^{tree} >.git/patch-first.head-tree &&
+				test_cmp .git/patch-first.tree .git/patch-first.head-tree &&
+				test_path_is_missing .git/rebase-apply
+			else
+				test_cmp .git/patch-base.commit .git/patch-first.head
+			fi &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 \
+					>.git/patch-status.expected &&
+			test_grep "^? visible$" .git/patch-status.expected &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/patch-status.trace" \
+				git --no-optional-locks status --porcelain=v2 \
+					>.git/patch-status.actual &&
+			test_cmp .git/patch-status.expected .git/patch-status.actual &&
+			test_cmp_bin .git/patch-after-first.index .git/index &&
+			! test_trace2_data fsmonitor token_closure/accepted 1 \
+				<.git/patch-status.trace &&
+			recover_backoff_patch_history .git/patch-status.expected \
+				.git/patch-first.tree
+		) || return 1
+	done
+'
+
 test_done
