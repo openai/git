@@ -107,6 +107,14 @@ static int config_is_command_acceleration(const char *key,
 		 !strcmp(key, "core.preloadindexbulk"));
 }
 
+/* Clean proofs cache no output; the current status printer uses this choice. */
+static int config_is_command_relative_paths(const char *key,
+					    const struct config_context *ctx)
+{
+	return ctx && ctx->kvi && ctx->kvi->scope == CONFIG_SCOPE_COMMAND &&
+		!strcmp(key, "status.relativepaths");
+}
+
 static int config_is_command_empty_attributes(const char *key,
 					      const char *value,
 					      const struct config_context *ctx,
@@ -320,6 +328,7 @@ void clean_status_config_add(struct clean_status_config_digest *digest,
 	/* Independent attribute fingerprints guard empty source overrides. */
 	if (config_is_command_transport(key, ctx) ||
 	    config_is_command_acceleration(key, ctx) ||
+	    config_is_command_relative_paths(key, ctx) ||
 	    config_is_command_empty_attributes(key, value, ctx, digest) ||
 	    config_is_command_status_guard(key, value, ctx, digest))
 		return;

@@ -3304,4 +3304,153 @@ test_expect_success PERL_TEST_HELPERS \
 	)
 '
 
+sidecar_aba_capture () {
+	sidecar_aba_label=$1 &&
+	sidecar_aba_mode=$2 &&
+	shift 2 &&
+	case "$sidecar_aba_mode" in
+	clean)
+		sidecar_aba_locks=1 &&
+		sidecar_aba_sequence=CCCCCCCC
+		;;
+	dirty)
+		sidecar_aba_locks=0 &&
+		sidecar_aba_sequence=DDCCCCCCCC
+		;;
+	*) return 1 ;;
+	esac &&
+	GIT_OPTIONAL_LOCKS=$sidecar_aba_locks \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=$sidecar_aba_sequence \
+	GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+	GIT_TRACE2_EVENT_NESTING=100 \
+	GIT_TRACE2_EVENT="$PWD/.git/$sidecar_aba_label.trace" \
+		git "$@" >".git/$sidecar_aba_label.actual" &&
+	cp .git/index ".git/$sidecar_aba_label.index" &&
+	cp .git/index.csts ".git/$sidecar_aba_label.csts" &&
+	/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+		.git/index >".git/$sidecar_aba_label.index.stat" &&
+	/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+		.git/index.csts >".git/$sidecar_aba_label.csts.stat" &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT_NESTING=100 \
+	GIT_TRACE2_EVENT="$PWD/.git/$sidecar_aba_label.oracle.trace" \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			-c core.trustctime=true \
+			-c core.checkStat=default \
+			"$@" >".git/$sidecar_aba_label.expect" &&
+	cp .git/index ".git/$sidecar_aba_label.oracle.index" &&
+	cp .git/index.csts ".git/$sidecar_aba_label.oracle.csts" &&
+	/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+		.git/index >".git/$sidecar_aba_label.oracle.index.stat" &&
+	/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+		.git/index.csts >".git/$sidecar_aba_label.oracle.csts.stat"
+}
+
+test_expect_success PERL_TEST_HELPERS \
+	'a temporary status relativePaths setting preserves the original clean proof' '
+	test_create_repo sidecar-command-config-aba &&
+	(
+		cd sidecar-command-config-aba &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		mkdir subdir &&
+		test-tool chmtime =-180 tracked &&
+		git -c core.fsmonitor=false update-index --refresh &&
+		git config index.version 4 &&
+		git config index.skipHash true &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		test_must_fail git config --get status.relativePaths \
+			>.git/relativepaths.absent &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		test_env GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/issued &&
+		test_must_be_empty .git/issued &&
+		test_path_is_file .git/index.csts &&
+		rawsz=$(test_oid rawsz) &&
+		dd if=/dev/zero of=.git/zero-trailer \
+			bs="$rawsz" count=1 2>/dev/null &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		cp .git/config .git/config.before &&
+		cp .git/index .git/index.before &&
+		cp .git/index.csts .git/sidecar.before &&
+		/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+			.git/index >.git/index.before.stat &&
+		/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+			.git/index.csts >.git/sidecar.before.stat &&
+
+		# Retain every pair before testing the fast-path behavior.
+		sidecar_aba_capture a0 clean status &&
+		sidecar_aba_capture b clean -c status.relativePaths=false status &&
+		sidecar_aba_capture a1 clean status &&
+		sidecar_aba_capture subdir clean \
+			-C subdir -c status.relativePaths=false status &&
+		test_write_lines changed >tracked &&
+		sidecar_aba_capture dirty-relative dirty -C subdir status &&
+		sidecar_aba_capture dirty-root dirty \
+			-C subdir -c status.relativePaths=false status &&
+
+		for sidecar_aba_label in a0 b a1 subdir dirty-relative dirty-root
+		do
+			test_cmp ".git/$sidecar_aba_label.expect" \
+				".git/$sidecar_aba_label.actual" &&
+			test_cmp_bin .git/index.before \
+				".git/$sidecar_aba_label.index" &&
+			test_cmp .git/index.before.stat \
+				".git/$sidecar_aba_label.index.stat" &&
+			test_cmp_bin ".git/$sidecar_aba_label.index" \
+				".git/$sidecar_aba_label.oracle.index" &&
+			test_cmp ".git/$sidecar_aba_label.index.stat" \
+				".git/$sidecar_aba_label.oracle.index.stat" &&
+			test_cmp_bin .git/sidecar.before \
+				".git/$sidecar_aba_label.csts" &&
+			test_cmp .git/sidecar.before.stat \
+				".git/$sidecar_aba_label.csts.stat" &&
+			test_cmp_bin ".git/$sidecar_aba_label.csts" \
+				".git/$sidecar_aba_label.oracle.csts" &&
+			test_cmp ".git/$sidecar_aba_label.csts.stat" \
+				".git/$sidecar_aba_label.oracle.csts.stat" &&
+			test_region ! index do_write_index \
+				".git/$sidecar_aba_label.trace" &&
+			test_region ! index do_write_index \
+				".git/$sidecar_aba_label.oracle.trace" ||
+				exit 1
+		done &&
+		for sidecar_aba_label in a0 b a1 subdir
+		do
+			test_trace2_data status clean-proof/hit 1 \
+				<".git/$sidecar_aba_label.trace" &&
+			test_region ! index do_read_index \
+				".git/$sidecar_aba_label.trace" &&
+			! test_trace2_data status clean-proof/sidecar 1 \
+				<".git/$sidecar_aba_label.trace" ||
+				exit 1
+		done &&
+		for sidecar_aba_label in dirty-relative dirty-root
+		do
+			test_trace2_data status clean-proof/miss fast-provider-changed \
+				<".git/$sidecar_aba_label.trace" &&
+			! test_trace2_data status clean-proof/hit 1 \
+				<".git/$sidecar_aba_label.trace" ||
+				exit 1
+		done &&
+		test_grep "modified:   \.\./tracked$" .git/dirty-relative.actual &&
+		test_grep "modified:   tracked$" .git/dirty-root.actual &&
+		test_grep ! "modified:   \.\./tracked$" .git/dirty-root.actual &&
+		test_cmp_bin .git/config.before .git/config &&
+		test_cmp_bin .git/index.before .git/index &&
+		test_cmp_bin .git/sidecar.before .git/index.csts
+	)
+'
+
 test_done
