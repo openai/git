@@ -39,6 +39,32 @@ void clean_status_enable_external_history(struct repository *repo)
 	external_history_repo = repo;
 }
 
+void clean_status_prepare_main_index_history(struct repository *repo)
+{
+	struct clean_status_config_digest digest;
+
+	/*
+	 * Attach the command's configuration before its first index read. This
+	 * does not grant a proof: the reader must still authenticate the on-disk
+	 * epoch, and each writer must validate its own logical changes.
+	 */
+	if (!repo || !repo->worktree ||
+	    !clean_status_index_path_is_main(repo, repo->index_file) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) || !fstat_is_reliable() ||
+	    repo_config_values(repo)->apply_sparse_checkout ||
+	    !repo->config_values_private_.trust_ctime ||
+	    !repo->config_values_private_.check_stat ||
+	    (fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC &&
+	     !fsm_settings__is_watch_limit_backoff(repo)) ||
+	    repo_has_replace_refs_uncached(repo) ||
+	    clean_status_config_read_repository(repo, &digest))
+		return;
+	clean_status_enable_external_history(repo);
+	clean_status_set_config_digest(repo, &digest);
+}
+
 int clean_status_external_history_enabled(const struct index_state *istate)
 {
 	return istate && istate->repo == external_history_repo;

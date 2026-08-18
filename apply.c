@@ -14,6 +14,7 @@
 #include "abspath.h"
 #include "base85.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "config.h"
 #include "odb.h"
 #include "delta.h"
@@ -4454,7 +4455,9 @@ static int patch_preserves_clean_history(struct apply_state *state,
 	if (!state->update_index || state->ita_only || state->threeway ||
 	    state->apply_with_reject || state->fake_ancestor ||
 	    state->index_file || !fstat_is_reliable() ||
-	    getenv(INDEX_ENVIRONMENT) ||
+	    (getenv(INDEX_ENVIRONMENT) &&
+	     !clean_status_index_path_is_main(istate->repo,
+					      istate->repo->index_file)) ||
 	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
 	    getenv(GIT_COMMON_DIR_ENVIRONMENT) ||
 	    getenv(DB_ENVIRONMENT) || getenv(ALTERNATE_DB_ENVIRONMENT) ||
