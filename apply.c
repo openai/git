@@ -4448,6 +4448,7 @@ static int patch_preserves_clean_history(struct apply_state *state,
 {
 	struct index_state *istate = state->repo->index;
 	const struct cache_entry *old;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
 	int pos;
 
 	if (!state->update_index || state->ita_only || state->threeway ||
@@ -4462,7 +4463,8 @@ static int patch_preserves_clean_history(struct apply_state *state,
 	    repo_config_values(istate->repo)->apply_sparse_checkout ||
 	    !istate->repo->config_values_private_.trust_ctime ||
 	    !istate->repo->config_values_private_.check_stat ||
-	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC ||
+	    (fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC &&
+	     !suspended) ||
 	    repo_has_replace_refs_uncached(istate->repo) ||
 	    patch->is_new > 0 || patch->is_delete > 0 || patch->is_copy ||
 	    patch->is_rename || patch->conflicted_threeway ||
@@ -4472,19 +4474,28 @@ static int patch_preserves_clean_history(struct apply_state *state,
 	    create_ce_mode(patch->old_mode) !=
 		create_ce_mode(patch->new_mode) ||
 	    !clean_status_external_history_enabled(istate) ||
-	    !clean_status_has_persistent_fsmonitor_semantic_history(istate) ||
-	    !clean_status_revalidated_token_matches(istate) ||
-	    !istate->fsmonitor_token_valid ||
-	    !istate->fsmonitor_untracked_valid ||
-	    !istate->fsmonitor_untracked_extension_seen ||
-	    istate->fsmonitor_untracked_extension_invalid ||
-	    !istate->fsmonitor_last_update ||
-	    !istate->fsmonitor_untracked_token ||
-	    strcmp(istate->fsmonitor_last_update,
-		   istate->fsmonitor_untracked_token) ||
-	    !istate->untracked || !istate->untracked->use_fsmonitor ||
+	    !istate->untracked ||
 	    !istate->untracked->root)
 		return 0;
+	if (suspended) {
+		/* Keep only the authenticated historical boundary during backoff. */
+		if (!clean_status_fsmonitor_semantic_baseline_pending(istate) ||
+		    !istate->untracked->root->valid ||
+		    !istate->untracked->fsmonitor_revalidation)
+			return 0;
+	} else if (!clean_status_has_persistent_fsmonitor_semantic_history(istate) ||
+		   !clean_status_revalidated_token_matches(istate) ||
+		   !istate->fsmonitor_token_valid ||
+		   !istate->fsmonitor_untracked_valid ||
+		   !istate->fsmonitor_untracked_extension_seen ||
+		   istate->fsmonitor_untracked_extension_invalid ||
+		   !istate->fsmonitor_last_update ||
+		   !istate->fsmonitor_untracked_token ||
+		   strcmp(istate->fsmonitor_last_update,
+			  istate->fsmonitor_untracked_token) ||
+		   !istate->untracked->use_fsmonitor) {
+		return 0;
+	}
 
 	pos = index_name_pos(istate, patch->old_name,
 			     strlen(patch->old_name));
