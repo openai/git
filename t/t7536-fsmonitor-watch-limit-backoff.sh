@@ -1127,4 +1127,121 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'backoff membership changes invalidate proof and recover correct trees' '
+	for operation in add-new remove rename
+	do
+		setup_backoff_bound_proof "watch-backoff-structural-$operation" &&
+		(
+			cd "watch-backoff-structural-$operation" &&
+			record_authenticated_backoff_marker &&
+			cp .git/index .git/structural.oracle.index &&
+			case "$operation" in
+			add-new)
+				test_write_lines added-content >created &&
+				GIT_INDEX_FILE="$PWD/.git/structural.oracle.index" \
+					git -c core.fsmonitor=false \
+						-c core.untrackedCache=false add created &&
+				printf "A\\tcreated\\n" >.git/expected-names &&
+				set -- git add created
+				;;
+			remove)
+				GIT_INDEX_FILE="$PWD/.git/structural.oracle.index" \
+					git -c core.fsmonitor=false \
+						-c core.untrackedCache=false rm --cached tracked \
+							>.git/oracle-remove.out &&
+				printf "D\\ttracked\\n" >.git/expected-names &&
+				set -- git rm tracked
+				;;
+			rename)
+				tracked_oid=$(git -c core.fsmonitor=false \
+					--no-optional-locks rev-parse :tracked) &&
+				GIT_INDEX_FILE="$PWD/.git/structural.oracle.index" \
+					git -c core.fsmonitor=false \
+						update-index --force-remove tracked &&
+				GIT_INDEX_FILE="$PWD/.git/structural.oracle.index" \
+					git -c core.fsmonitor=false update-index --add \
+						--cacheinfo "100644,$tracked_oid,renamed" &&
+				printf "A\\trenamed\\nD\\ttracked\\n" >.git/expected-names &&
+				set -- git mv tracked renamed
+				;;
+			esac &&
+			GIT_INDEX_FILE="$PWD/.git/structural.oracle.index" \
+				git -c core.fsmonitor=false write-tree \
+					>.git/expected-tree &&
+			test_cmp_bin .git/index.before-backoff .git/index &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TRACE2_EVENT="$PWD/.git/structural.trace" \
+				"$@" >.git/structural.out &&
+			assert_backoff_main_index_write \
+				.git/structural.trace "$PWD/.git/index" yes &&
+			git -c core.fsmonitor=false --no-optional-locks \
+				diff --cached --name-status --no-renames \
+					>.git/actual-names &&
+			test_cmp .git/expected-names .git/actual-names &&
+			cp .git/index .git/structural.actual.index &&
+			GIT_INDEX_FILE="$PWD/.git/structural.actual.index" \
+				git -c core.fsmonitor=false write-tree \
+					>.git/actual-tree &&
+			test_cmp .git/expected-tree .git/actual-tree &&
+			test_grep ! "pending:" .git/index &&
+			if assert_backoff_full_proof .git/index \
+				>.git/structural-proof.out 2>.git/structural-proof.err
+			then
+				return 1
+			else
+				:
+			fi &&
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+				--no-optional-locks status --porcelain=v2 \
+					>.git/expected &&
+			test_file_not_empty .git/expected &&
+			cp .git/index .git/structural.before-status &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TRACE2_EVENT="$PWD/.git/backoff-status.trace" \
+				git status --porcelain=v2 >.git/backoff.actual &&
+			test_cmp .git/expected .git/backoff.actual &&
+			assert_backoff_main_index_write \
+				.git/backoff-status.trace "$PWD/.git/index" no &&
+			test_cmp_bin .git/structural.before-status .git/index &&
+			rm .git/fsmonitor--daemon.inotify-limit &&
+			GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=TCCCCCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=// \
+			GIT_TRACE2_EVENT="$PWD/.git/recovery.trace" \
+				git status --porcelain=v2 >.git/recovery.actual &&
+			test_cmp .git/expected .git/recovery.actual &&
+			test_trace2_data fsm_client query/trivial-response 1 \
+				<.git/recovery.trace &&
+			test_trace2_data fsmonitor token_closure/accepted 1 \
+				<.git/recovery.trace &&
+			assert_backoff_main_index_write \
+				.git/recovery.trace "$PWD/.git/index" yes &&
+			assert_backoff_full_proof .git/index &&
+			cp .git/index .git/recovered.before-warm &&
+			cp .git/index .git/recovered.oracle.index &&
+			GIT_INDEX_FILE="$PWD/.git/recovered.oracle.index" \
+				git -c core.fsmonitor=false write-tree \
+					>.git/recovered-tree &&
+			test_cmp .git/expected-tree .git/recovered-tree &&
+			# Scripted tokens restart; qualify read-only warm reuse.
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/warm.trace" \
+				git --no-optional-locks status --porcelain=v2 \
+					>.git/warm.actual &&
+			test_cmp .git/expected .git/warm.actual &&
+			test_trace2_data fsmonitor config/coherent 1 <.git/warm.trace &&
+			! test_trace2_data fsmonitor semantic/manifest-scan-count \
+				"[1-9][0-9]*" <.git/warm.trace &&
+			assert_backoff_main_index_write \
+				.git/warm.trace "$PWD/.git/index" no &&
+			test_cmp_bin .git/recovered.before-warm .git/index &&
+			test_grep ! \
+				"\"event\":\"child_start\".*\"fsmonitor--daemon\"" \
+				.git/structural.trace .git/backoff-status.trace \
+				.git/recovery.trace .git/warm.trace
+		) || return 1
+	done
+'
+
 test_done
