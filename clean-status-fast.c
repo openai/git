@@ -240,6 +240,7 @@ int clean_status_try_sidecar(
 	}
 	if (memcmp(config->hash, record.sidecar.proof.config_hash,
 		   repo->hash_algo->rawsz)) {
+		*repository_inputs_changed = 1;
 		trace_miss(repo, "fast-config-changed");
 		goto done;
 	}

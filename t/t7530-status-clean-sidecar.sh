@@ -3194,4 +3194,114 @@ test_expect_success PERL_TEST_HELPERS \
 	)
 '
 
+test_expect_success PERL_TEST_HELPERS \
+	'a plain clean status reissues a proof after nonsemantic config changes' '
+	test_create_repo sidecar-config-reissue &&
+	(
+		cd sidecar-config-reissue &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base tracked &&
+		test-tool chmtime =-180 tracked &&
+		git -c core.fsmonitor=false update-index --refresh &&
+		git config index.version 4 &&
+		git config index.skipHash true &&
+		git config core.autocrlf false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git update-index --fsmonitor &&
+		test_env GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index &&
+		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			bulk_status status --porcelain=v2 >.git/issued &&
+		test_must_be_empty .git/issued &&
+		test_path_is_file .git/index.csts &&
+		rawsz=$(test_oid rawsz) &&
+		dd if=/dev/zero of=.git/zero-trailer \
+			bs="$rawsz" count=1 2>/dev/null &&
+		tail -c "$rawsz" .git/index >.git/trailer &&
+		test_cmp_bin .git/zero-trailer .git/trailer &&
+		cp .git/index .git/index.before &&
+		cp .git/index.csts .git/sidecar.before &&
+		before_inode=$(/usr/bin/stat -f %i .git/index) &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/baseline.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/baseline &&
+		test_trace2_data status clean-proof/hit 1 \
+			<.git/baseline.trace &&
+		test_region ! index do_read_index .git/baseline.trace &&
+		test_region ! index do_write_index .git/baseline.trace &&
+		test_cmp_bin .git/index.before .git/index &&
+		test_cmp_bin .git/sidecar.before .git/index.csts &&
+		test "$before_inode" = "$(/usr/bin/stat -f %i .git/index)" &&
+
+		git config status.relativePaths false &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false \
+				-c core.untrackedCache=false \
+				-c core.trustctime=true \
+				-c core.checkStat=default \
+				status >.git/expected &&
+		test_cmp .git/baseline .git/expected &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/readonly.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/readonly &&
+		test_cmp .git/expected .git/readonly &&
+		test_trace2_data status clean-proof/miss \
+			fast-config-changed <.git/readonly.trace &&
+		! test_trace2_data status clean-proof/sidecar 1 \
+			<.git/readonly.trace &&
+		test_region ! index do_write_index .git/readonly.trace &&
+		test_cmp_bin .git/index.before .git/index &&
+		test_cmp_bin .git/sidecar.before .git/index.csts &&
+		test "$before_inode" = "$(/usr/bin/stat -f %i .git/index)" &&
+
+		GIT_OPTIONAL_LOCKS=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/reissue.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/actual &&
+		cp .git/index .git/index.after &&
+		cp .git/index.csts .git/sidecar.after &&
+		after_inode=$(/usr/bin/stat -f %i .git/index) &&
+		test_cmp .git/expected .git/actual &&
+		test_trace2_data status clean-proof/miss \
+			fast-config-changed <.git/reissue.trace &&
+		test_trace2_data status clean-proof/sidecar 1 \
+			<.git/reissue.trace &&
+		! test_trace2_data status clean-proof/provider-reset-carried 1 \
+			<.git/reissue.trace &&
+		test_region ! index do_write_index .git/reissue.trace &&
+		test_cmp_bin .git/index.before .git/index.after &&
+		test "$before_inode" = "$after_inode" &&
+		! test_cmp_bin .git/sidecar.before .git/sidecar.after &&
+
+		GIT_OPTIONAL_LOCKS=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/follower.trace" \
+			git -c core.preloadIndex=true \
+				-c core.preloadIndexBulk=true \
+				status >.git/follower &&
+		test_cmp .git/expected .git/follower &&
+		test_trace2_data status clean-proof/hit 1 \
+			<.git/follower.trace &&
+		test_region ! index do_read_index .git/follower.trace &&
+		test_region ! index do_write_index .git/follower.trace &&
+		test_cmp_bin .git/index.after .git/index &&
+		test_cmp_bin .git/sidecar.after .git/index.csts &&
+		test "$after_inode" = "$(/usr/bin/stat -f %i .git/index)"
+	)
+'
+
 test_done
