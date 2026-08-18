@@ -1939,6 +1939,8 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 		BUG("o->internal.dir is for internal use only");
 	if (o->internal.pl)
 		BUG("o->internal.pl is for internal use only");
+	if (o->internal.backoff_transfer)
+		BUG("o->internal.backoff_transfer is for internal use only");
 	if (o->df_conflict_entry)
 		BUG("o->df_conflict_entry is an output only field");
 
@@ -1951,6 +1953,10 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 		if (o->dst_index)
 			ensure_full_index(o->dst_index);
 	}
+	if (o->preserve_backoff_history &&
+	    o->src_index == o->dst_index && !o->prefix && !o->dry_run)
+		o->internal.backoff_transfer =
+			clean_status_capture_backoff_transfer(o->src_index);
 
 	if (o->reset == UNPACK_RESET_OVERWRITE_UNTRACKED &&
 	    o->preserve_ignored)
@@ -2131,6 +2137,10 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 						o->src_index, &o->internal.result);
 		}
 		move_index_extensions(&o->internal.result, o->src_index);
+		if (!ret && o->internal.backoff_transfer)
+			clean_status_transfer_backoff_history(
+				o->internal.backoff_transfer,
+				&o->internal.result, o->src_index);
 		if (!ret && o->preserve_semantic_history && history_transferred &&
 		    !new_indexed_directory &&
 		    !o->src_index->sparse_index &&
@@ -2189,6 +2199,8 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 	o->src_index = NULL;
 
 done:
+	clean_status_release_backoff_transfer(o->internal.backoff_transfer);
+	o->internal.backoff_transfer = NULL;
 	if (free_pattern_list)
 		clear_pattern_list(&pl);
 	if (o->internal.dir) {
@@ -2388,6 +2400,9 @@ static void invalidate_ce_path(const struct cache_entry *ce,
 {
 	if (!ce)
 		return;
+	/* Once rooted, even a later identical result cannot revive history. */
+	clean_status_release_backoff_transfer(o->internal.backoff_transfer);
+	o->internal.backoff_transfer = NULL;
 	cache_tree_invalidate_path(o->src_index, ce->name);
 	untracked_cache_invalidate_path(o->src_index, ce->name, 1);
 }
@@ -2399,6 +2414,16 @@ static void invalidate_replaced_ce_path(const struct cache_entry *old,
 	const unsigned int unsafe_flags = CE_SKIP_WORKTREE |
 		CE_NEW_SKIP_WORKTREE | CE_INTENT_TO_ADD | CE_CONFLICTED;
 	const char *basename;
+
+	if (o->internal.backoff_transfer &&
+	    clean_status_backoff_transfer_entry_is_safe(
+		    o->internal.backoff_transfer, old, new)) {
+		/* Pending lists are candidates, not a live targeted-event cache. */
+		cache_tree_invalidate_path(o->src_index, old->name);
+		return;
+	}
+	clean_status_release_backoff_transfer(o->internal.backoff_transfer);
+	o->internal.backoff_transfer = NULL;
 
 	if (!o->preserve_semantic_history ||
 	    o->src_index->sparse_index || o->src_index->split_index ||
@@ -2743,6 +2768,9 @@ static int merged_entry(const struct cache_entry *ce,
 			}
 			/* Migrate old flags over */
 			update |= old->ce_flags & (CE_SKIP_WORKTREE | CE_NEW_SKIP_WORKTREE);
+			/* do_add_entry() publishes this tree entry at stage zero. */
+			if (o->internal.backoff_transfer)
+				merge->ce_flags &= ~CE_STAGEMASK;
 			invalidate_replaced_ce_path(old, merge, o);
 		}
 
