@@ -2257,7 +2257,7 @@ install_backoff_successful_commit_hook () {
 		git add created
 		;;
 	remove)
-		git rm sibling
+		git rm -f sibling
 		;;
 	rename)
 		git mv sibling renamed
