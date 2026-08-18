@@ -3908,6 +3908,11 @@ setup_backoff_stash_apply_pair () {
 		git config core.preloadIndex false &&
 		git config core.untrackedCache true &&
 		git config core.fsmonitor true &&
+		case "${2-default}" in
+		default) : ;;
+		skip-hash) git config index.skipHash true ;;
+		*) return 1 ;;
+		esac &&
 		for worktree in "$PWD" "$PWD/../$1-linked"
 		do
 			gitdir=$(git -C "$worktree" -c core.fsmonitor=false \
@@ -3922,6 +3927,12 @@ setup_backoff_stash_apply_pair () {
 				git -C "$worktree" status --porcelain=v2 >"$gitdir/prime" &&
 			test_must_be_empty "$gitdir/prime" &&
 			assert_backoff_full_proof "$gitdir/index" &&
+			if test "${2-default}" = skip-hash
+			then
+				test "$(test_trailing_hash "$gitdir/index")" = "$(test_oid zero)"
+			else
+				:
+			fi &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
 				git -C "$worktree" status --short >"$gitdir/checkpoint.status" &&
@@ -3954,27 +3965,104 @@ install_backoff_stash_apply_capture () {
 	set -eu
 	test -n "${BACKOFF_STASH_CAPTURE-}" || exit 0
 	first=$BACKOFF_STASH_CAPTURE/first-write
-	if test -d "$first"
+	if test "${BACKOFF_STASH_CAPTURE_ALL-0}" = 1
 	then
-		exit 0
+		number=1
+		while test -d "$BACKOFF_STASH_CAPTURE/writes/$(printf "%03d" "$number")"
+		do
+			number=$((number + 1))
+		done
+		test "$number" -le 32
+		write=$BACKOFF_STASH_CAPTURE/writes/$(printf "%03d" "$number")
+	else
+		test ! -d "$first" || exit 0
+		write=$first
 	fi
-	mkdir "$first"
+	mkdir "$write"
 	test "${GIT_INDEX_FILE-}" = "$BACKOFF_STASH_INDEX_ENV"
 	perl "$BACKOFF_STASH_IDENTITY" identity "$BACKOFF_STASH_MAIN" \
-		>"$first/main.identity"
+		>"$write/main.identity"
 	perl "$BACKOFF_STASH_IDENTITY" identity "$BACKOFF_STASH_SELECTED" \
-		>"$first/selected.identity"
-	cp "$BACKOFF_STASH_MAIN" "$first/main.index"
-	cp "$BACKOFF_STASH_SELECTED" "$first/selected.index"
-	printf "%s\n" "${GIT_INDEX_FILE-}" >"$first/index.env"
-	printf "%s\n" "$@" >"$first/hook.args"
-	cp "$GIT_TRACE2_EVENT" "$first/trace"
-	printf "%s\n" complete >"$first/completed"
+		>"$write/selected.identity"
+	cp "$BACKOFF_STASH_MAIN" "$write/main.index"
+	cp "$BACKOFF_STASH_SELECTED" "$write/selected.index"
+	printf "%s\n" "${GIT_INDEX_FILE-}" >"$write/index.env"
+	printf "%s\n" "$@" >"$write/hook.args"
+	cp "$GIT_TRACE2_EVENT" "$write/trace"
+	printf "%s\n" complete >"$write/completed"
+	if test "$write" != "$first" && test ! -d "$first"
+	then
+		cp -R "$write" "$first"
+	fi
+	if test -n "${BACKOFF_STASH_ATTRIBUTE_PATH-}" &&
+	   test ! -e "$BACKOFF_STASH_CAPTURE/attributes.changed"
+	then
+		# Change semantics only after the genuine initial publication.
+		test ! -e "$BACKOFF_STASH_ATTRIBUTE_PATH"
+		cp "$BACKOFF_STASH_ATTRIBUTE_CONTENTS" "$BACKOFF_STASH_ATTRIBUTE_PATH"
+		printf "%s\n" changed >"$BACKOFF_STASH_CAPTURE/attributes.changed"
+	fi
 	EOF
 }
 
+check_backoff_stash_apply_publications () (
+	evidence=$1 && seed=$2 && selected=$3 && style=$4 && shape=$5 &&
+	test_path_is_dir "$evidence/writes/001" &&
+	extract_backoff_root_trace "$evidence/stash.trace" >"$evidence/stash.root.trace" &&
+	if test "$style" = alternate || test "$shape" != safe
+	then
+		! test_trace2_data fsmonitor history/backoff-transferred 1 \
+			<"$evidence/stash.trace" &&
+		assert_backoff_commit_unbound "$evidence/selected.published" \
+			"$evidence/final-rejected-proof"
+	else
+		assert_backoff_pending_proof "$seed" "$evidence/selected.published" &&
+		test_trace2_data fsmonitor history/backoff-transferred 1 \
+			<"$evidence/stash.root.trace"
+	fi &&
+	merge_seen=no &&
+	for write in "$evidence"/writes/[0-9][0-9][0-9]
+	do
+		test_grep "^complete$" "$write/completed" &&
+		test_cmp "$evidence/expected-index.env" "$write/index.env" &&
+		assert_backoff_main_index_write "$write/trace" "$selected" yes &&
+		if test "$style" = alternate
+		then
+			test_cmp_bin "$evidence/index.pending" "$write/main.index" &&
+			test_cmp "$evidence/main.identity.before" "$write/main.identity"
+		elif test "$shape" = safe
+		then
+			assert_backoff_pending_proof "$seed" "$write/selected.index" &&
+			extract_backoff_root_trace "$write/trace" >"$write/root.trace" &&
+			if test_trace2_data fsmonitor history/backoff-transferred 1 \
+				<"$write/root.trace"
+			then
+				# The first root transfer precedes the clean-merge write.
+				# Later reset writes must preserve the same logical result.
+				backoff_scoped_index_tree "$write/selected.index" "$write/oracle" &&
+				backoff_commit_entries "$write/selected.index" >"$write/entries" &&
+				test_cmp "$evidence/donor.tree" "$write/oracle.tree" &&
+				test_cmp_bin "$evidence/donor.entries" "$write/entries" &&
+				merge_seen=yes
+			else
+				:
+			fi
+		else
+			:
+		fi || return 1
+	done &&
+	if test "$style" != alternate && test "$shape" = safe
+	then
+		test "$merge_seen" = yes
+	else
+		:
+	fi
+)
+
 check_backoff_stash_apply () (
 	prefix=$1 && style=$2 && operation=$3 && kind=$4 && common=$5 &&
+	shape=${6-safe} &&
+	case "$shape" in safe | add | mode | attributes) : ;; *) return 1 ;; esac &&
 	case "$kind" in
 	main)
 		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
@@ -3986,12 +4074,14 @@ check_backoff_stash_apply () (
 	sane_unset GIT_INDEX_FILE GIT_TEST_PRELOAD_INDEX_BULK \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH \
 		BACKOFF_STASH_CAPTURE BACKOFF_STASH_MAIN BACKOFF_STASH_SELECTED \
-		BACKOFF_STASH_INDEX_ENV BACKOFF_STASH_IDENTITY &&
+		BACKOFF_STASH_INDEX_ENV BACKOFF_STASH_IDENTITY BACKOFF_STASH_CAPTURE_ALL \
+		BACKOFF_STASH_ATTRIBUTE_PATH BACKOFF_STASH_ATTRIBUTE_CONTENTS &&
 	gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
 		rev-parse --absolute-git-dir) &&
 	main_index="$gitdir/index" &&
-	evidence="$common/stash-$operation-$style-$kind" &&
+	evidence="$common/stash-$operation-$style-$kind-$shape" &&
 	mkdir "$evidence" &&
+	mkdir "$evidence/writes" &&
 	cp "$main_index" "$evidence/index.seed" &&
 	cp "$other_gitdir/index" "$evidence/other-index.before" &&
 	snapshot_backoff_index_identity "$other_gitdir/index" \
@@ -4014,19 +4104,46 @@ check_backoff_stash_apply () (
 	test_cmp "$common/patch-first.tree" "$evidence/head.tree" &&
 	git -c core.fsmonitor=false --no-optional-locks \
 		for-each-ref --format="%(objectname)" refs/stash >"$evidence/stash.prior" &&
+	cp "$evidence/index.pending" "$evidence/donor-oracle.index" &&
+	oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
+		<"$common/patch-second.contents") &&
+	case "$shape" in mode) mode=100755 ;; *) mode=100644 ;; esac &&
+	backoff_commit_index "$evidence/donor-oracle.index" \
+		update-index --cacheinfo "$mode,$oid,sibling" &&
+	if test "$shape" = add
+	then
+		test_write_lines created-by-stash >"$evidence/created.contents" &&
+		oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
+			<"$evidence/created.contents") &&
+		backoff_commit_index "$evidence/donor-oracle.index" \
+			update-index --add --cacheinfo "100644,$oid,zz-created"
+	else
+		:
+	fi &&
+	backoff_commit_index "$evidence/donor-oracle.index" write-tree \
+		>"$evidence/expected-donor.tree" &&
 	donor="$TRASH_DIRECTORY/$prefix-$kind-donor" &&
 	git -c core.fsmonitor=false -c core.untrackedCache=false \
 		worktree add --detach "$donor" "$(cat "$evidence/head.before")" &&
 	cp "$common/patch-second.contents" "$donor/sibling" &&
-	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false add sibling &&
+	case "$shape" in
+	add)
+		cp "$evidence/created.contents" "$donor/zz-created" &&
+		set -- sibling zz-created
+		;;
+	mode) chmod +x "$donor/sibling" && set -- sibling ;;
+	*) set -- sibling ;;
+	esac &&
+	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false \
+		-c core.filemode=true add "$@" &&
 	git -C "$donor" -c core.fsmonitor=false write-tree >"$evidence/donor.tree" &&
-	test_cmp "$common/patch-second.tree" "$evidence/donor.tree" &&
+	test_cmp "$evidence/expected-donor.tree" "$evidence/donor.tree" &&
 	donor_gitdir=$(git -C "$donor" -c core.fsmonitor=false \
 		--no-optional-locks rev-parse --absolute-git-dir) &&
 	cp "$donor_gitdir/index" "$evidence/donor.index" &&
 	backoff_commit_entries "$evidence/donor.index" >"$evidence/donor.entries" &&
 	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false \
-		stash push --quiet -- sibling &&
+		-c core.filemode=true stash push --quiet -- "$@" &&
 	git -c core.fsmonitor=false --no-optional-locks rev-parse refs/stash >"$evidence/stash.created" &&
 	stash=$(cat "$evidence/stash.created") &&
 	git -c core.fsmonitor=false --no-optional-locks rev-parse "$stash^1" >"$evidence/stash.parent" &&
@@ -4040,6 +4157,14 @@ check_backoff_stash_apply () (
 	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after-donor" &&
 	test_cmp "$evidence/main.identity.before" "$evidence/main.identity.after-donor" &&
 	test_write_lines visible >visible &&
+	test_path_is_missing zz-created &&
+	if test "$shape" = attributes
+	then
+		test_path_is_missing "$common/info/attributes" &&
+		test_write_lines "sibling -text" >"$evidence/attributes.expected"
+	else
+		:
+	fi &&
 	selected=$main_index && selected_env= &&
 	case "$style" in
 	implicit) : ;;
@@ -4060,11 +4185,19 @@ check_backoff_stash_apply () (
 		GIT_TRACE2_ENV_VARS=GIT_INDEX_FILE &&
 		BACKOFF_STASH_CAPTURE=$evidence BACKOFF_STASH_MAIN=$main_index &&
 		BACKOFF_STASH_SELECTED=$selected BACKOFF_STASH_INDEX_ENV=$selected_env &&
-		BACKOFF_STASH_IDENTITY="$common/hook-index.pl" &&
+		BACKOFF_STASH_IDENTITY="$common/hook-index.pl" BACKOFF_STASH_CAPTURE_ALL=1 &&
 		export GIT_TEST_FSMONITOR_INOTIFY_BACKOFF \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TRACE2_EVENT GIT_TRACE2_ENV_VARS \
 			BACKOFF_STASH_CAPTURE BACKOFF_STASH_MAIN BACKOFF_STASH_SELECTED \
-			BACKOFF_STASH_INDEX_ENV BACKOFF_STASH_IDENTITY &&
+			BACKOFF_STASH_INDEX_ENV BACKOFF_STASH_IDENTITY BACKOFF_STASH_CAPTURE_ALL &&
+		if test "$shape" = attributes
+		then
+			BACKOFF_STASH_ATTRIBUTE_PATH="$common/info/attributes" &&
+			BACKOFF_STASH_ATTRIBUTE_CONTENTS="$evidence/attributes.expected" &&
+			export BACKOFF_STASH_ATTRIBUTE_PATH BACKOFF_STASH_ATTRIBUTE_CONTENTS
+		else
+			:
+		fi &&
 		if test "$style" = implicit
 		then
 			sane_unset GIT_INDEX_FILE
@@ -4073,7 +4206,7 @@ check_backoff_stash_apply () (
 		fi &&
 		git stash "$operation" --index >"$evidence/stash.out" 2>"$evidence/stash.err"
 	) &&
-	# Later merge/reset writes may revoke metadata. Capture before any repair.
+	# Retain the final merge/reset publication before any repairing command.
 	cp "$main_index" "$evidence/main.published" &&
 	cp "$selected" "$evidence/selected.published" &&
 	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after" &&
@@ -4099,6 +4232,8 @@ check_backoff_stash_apply () (
 		test_trace2_data fsmonitor history/watch-limit-suspended 1 <"$evidence/first.root.trace" &&
 		expected_main="$evidence/donor.tree"
 	fi &&
+	check_backoff_stash_apply_publications "$evidence" "$evidence/index.seed" \
+		"$selected" "$style" "$shape" &&
 	backoff_scoped_index_tree "$evidence/main.published" "$evidence/main-final" &&
 	backoff_scoped_index_tree "$evidence/selected.published" "$evidence/selected-final" &&
 	backoff_commit_entries "$evidence/selected.published" >"$evidence/selected-final.entries" &&
@@ -4109,6 +4244,17 @@ check_backoff_stash_apply () (
 	test_cmp "$evidence/head.before" "$evidence/head.after" &&
 	test_cmp "$common/patch-first.contents" tracked &&
 	test_cmp "$common/patch-second.contents" sibling &&
+	case "$shape" in
+	add) test_cmp "$evidence/created.contents" zz-created ;;
+	mode) test -x sibling ;;
+	attributes)
+		test_grep "^changed$" "$evidence/attributes.changed" &&
+		test_cmp "$evidence/attributes.expected" "$common/info/attributes" &&
+		# Reestablish the original semantic source before honest recovery.
+		rm "$common/info/attributes"
+		;;
+	*) : ;;
+	esac &&
 	test_grep "^visible$" visible &&
 	git -c core.fsmonitor=false --no-optional-locks \
 		for-each-ref --format="%(objectname)" refs/stash >"$evidence/stash.after" &&
@@ -4161,6 +4307,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 			return 1
 	done
 '
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
 	'staged-only stash preserves history only when there is no selection' '
 	for action in empty accept
@@ -4187,6 +4334,54 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	do
 		check_backoff_stash_staged "$prefix" private-empty "$kind" "$common" ||
 			return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'stash apply cannot transfer history across membership or attribute changes' '
+	for shape in add attributes
+	do
+		prefix="watch-backoff-stash-transfer-$shape" &&
+		setup_backoff_stash_apply_pair "$prefix" &&
+		for kind in main linked
+		do
+			check_backoff_stash_apply "$prefix" canonical apply "$kind" "$common" "$shape" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success FILEMODE,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'stash apply cannot transfer history across a mode change' '
+	prefix=watch-backoff-stash-transfer-mode &&
+	setup_backoff_stash_apply_pair "$prefix" &&
+	for kind in main linked
+	do
+		check_backoff_stash_apply "$prefix" canonical apply "$kind" "$common" mode ||
+			return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'skip-hash stash apply preserves pending history across every publication' '
+	for style in implicit canonical
+	do
+		prefix="watch-backoff-stash-skip-hash-$style" &&
+		setup_backoff_stash_apply_pair "$prefix" skip-hash &&
+		test_write_lines "$(test_oid zero)" >"$common/skip-hash.expect" &&
+		for kind in main linked
+		do
+			check_backoff_stash_apply "$prefix" "$style" apply "$kind" "$common" &&
+			evidence="$common/stash-apply-$style-$kind-safe" &&
+			for index in "$evidence/index.seed" "$evidence/index.pending" \
+				"$evidence/selected.published" "$evidence/index.recovered" \
+				"$evidence"/writes/[0-9][0-9][0-9]/selected.index
+			do
+				test_trailing_hash "$index" >"$index.trailing-hash" &&
+				test_cmp "$common/skip-hash.expect" "$index.trailing-hash" ||
+					return 1
+			done || return 1
+		done || return 1
 	done
 '
 
