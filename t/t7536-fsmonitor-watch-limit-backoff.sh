@@ -3586,4 +3586,486 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	done
 '
 
+assert_backoff_stash_patch_history () {
+	assert_backoff_full_proof "$1" &&
+	if assert_backoff_full_proof "$2" >"$3.out" 2>"$3.err"
+	then
+		# A retained FULL proof must still name the original provider token.
+		perl - "$1" "$2" <<-\EOF
+		use strict;
+		use warnings;
+		my @tokens;
+		for my $path (@ARGV) {
+			open my $input, "<", $path or die "cannot read index: $!\n";
+			binmode $input;
+			local $/;
+			my $index = <$input>;
+			my $offset = index($index, "FSMN");
+			die "missing FSMN\n" if $offset < 0;
+			my $start = $offset + 12;
+			my $end = index($index, "\0", $start);
+			die "invalid FSMN token\n" if $end < 0;
+			push @tokens, substr($index, $start, $end - $start);
+		}
+		die "stash advanced a suspended provider token\n"
+			unless $tokens[0] eq $tokens[1];
+		EOF
+	else
+		assert_backoff_pending_proof "$1" "$2"
+	fi
+}
+
+check_backoff_stash_patch () (
+	prefix=$1 && action=$2 && kind=$3 && common=$4 &&
+	case "$kind" in
+	main)
+		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
+			--no-optional-locks rev-parse --absolute-git-dir)
+		;;
+	linked) other_gitdir=$common ;;
+	esac &&
+	cd "$prefix-$kind" &&
+	sane_unset GIT_INDEX_FILE GIT_TEST_PRELOAD_INDEX_BULK \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH &&
+	gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+		rev-parse --absolute-git-dir) &&
+	main_index="$gitdir/index" &&
+	checkpoint=$(cat "$gitdir/checkpoints") &&
+	evidence="$common/stash-patch-$action-$kind" &&
+	mkdir "$evidence" &&
+	cp "$main_index" "$evidence/index.seed" &&
+	cp "$other_gitdir/index" "$evidence/other-index.before" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.before" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.before" &&
+	assert_backoff_full_proof "$evidence/index.seed" &&
+	backoff_scoped_index_tree "$evidence/index.seed" "$evidence/expected-main" &&
+	backoff_commit_entries "$evidence/index.seed" >"$evidence/expected.entries" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+		>"$evidence/head.before" &&
+	git -c core.fsmonitor=false --no-optional-locks \
+		for-each-ref --format="%(refname) %(objectname)" >"$evidence/refs.before" &&
+	git -c core.fsmonitor=false show HEAD:tracked >"$evidence/head-tracked" &&
+	test_write_lines stash-selected >tracked &&
+	cp tracked "$evidence/worktree-tracked.before" &&
+	cp sibling "$evidence/sibling.before" &&
+	test_write_lines untracked-visible >visible &&
+	cp visible "$evidence/visible.before" &&
+	backoff_commit_index "$main_index" status --porcelain=v2 >"$evidence/status.before" &&
+	selected=$main_index &&
+	case "$action" in
+	accept)
+		cp "$evidence/index.seed" "$evidence/worktree-oracle.index" &&
+		backoff_commit_index "$evidence/worktree-oracle.index" read-tree HEAD &&
+		oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
+			<"$evidence/worktree-tracked.before") &&
+		backoff_commit_index "$evidence/worktree-oracle.index" \
+			update-index --cacheinfo "100644,$oid,tracked" &&
+		backoff_commit_index "$evidence/worktree-oracle.index" write-tree \
+			>"$evidence/expected-stash-worktree.tree" &&
+		answer=y
+		;;
+	private-quit)
+		selected="$gitdir/index.alias-copy" &&
+		cp "$evidence/index.seed" "$selected" &&
+		perl "$common/rejected-index.pl" alias copy "$selected" "$main_index" \
+			>"$evidence/private.identity.before" &&
+		answer=q
+		;;
+	quit) answer=q ;;
+	*) return 1 ;;
+	esac &&
+	test_cmp_bin "$evidence/index.seed" "$main_index" &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		test-tool fsmonitor-client record-watch-limit &&
+	test_path_is_file "$gitdir/fsmonitor--daemon.inotify-limit" &&
+	test_write_lines "$answer" >"$evidence/input" &&
+	(
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=EEEEEEEEEEEEEEEE &&
+		GIT_TRACE2_EVENT="$evidence/stash.trace" &&
+		GIT_TRACE2_ENV_VARS=GIT_INDEX_FILE &&
+		export GIT_TEST_FSMONITOR_INOTIFY_BACKOFF \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TRACE2_EVENT GIT_TRACE2_ENV_VARS &&
+		if test "$action" = private-quit
+		then
+			GIT_INDEX_FILE=$selected && export GIT_INDEX_FILE
+		else
+			sane_unset GIT_INDEX_FILE
+		fi &&
+		if test "$action" = accept
+		then
+			git stash push -p -- tracked
+		else
+			test_expect_code 1 git stash push -p -- tracked
+		fi <"$evidence/input" >"$evidence/stash.out" 2>"$evidence/stash.err"
+	) &&
+	# Retain the publication before any status or other Git command.
+	cp "$main_index" "$evidence/index.published" &&
+	cp "$selected" "$evidence/selected.published" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after" &&
+	test_grep "Stash this hunk" "$evidence/stash.out" &&
+	test_path_is_missing "$main_index.lock" &&
+	test_path_is_missing "$selected.lock" &&
+	backoff_scoped_index_tree "$evidence/index.published" "$evidence/published" &&
+	backoff_commit_entries "$evidence/index.published" >"$evidence/published.entries" &&
+	backoff_commit_entries "$evidence/selected.published" >"$evidence/selected.entries" &&
+	test_cmp "$evidence/expected-main.tree" "$evidence/published.tree" &&
+	test_cmp_bin "$evidence/expected.entries" "$evidence/published.entries" &&
+	test_cmp_bin "$evidence/expected.entries" "$evidence/selected.entries" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
+		>"$evidence/head.after" &&
+	test_cmp "$evidence/head.before" "$evidence/head.after" &&
+	test_cmp "$evidence/sibling.before" sibling &&
+	test_cmp "$evidence/visible.before" visible &&
+	extract_backoff_root_trace "$evidence/stash.trace" >"$evidence/stash.root.trace" &&
+	! test_trace2_data fsmonitor token_closure/accepted 1 <"$evidence/stash.trace" &&
+	case "$action" in
+	quit | private-quit)
+		test_grep "^No changes selected$" "$evidence/stash.err" &&
+		git -c core.fsmonitor=false --no-optional-locks \
+			for-each-ref --format="%(refname) %(objectname)" >"$evidence/refs.after" &&
+		test_cmp "$evidence/refs.before" "$evidence/refs.after" &&
+		test_cmp "$evidence/worktree-tracked.before" tracked &&
+		backoff_commit_index "$main_index" status --porcelain=v2 >"$evidence/status.after" &&
+		test_cmp "$evidence/status.before" "$evidence/status.after"
+		;;
+	accept)
+		git -c core.fsmonitor=false --no-optional-locks rev-parse stash^{tree} \
+			>"$evidence/stash-worktree.tree" &&
+		git -c core.fsmonitor=false --no-optional-locks rev-parse stash^2^{tree} \
+			>"$evidence/stash-index.tree" &&
+		git -c core.fsmonitor=false --no-optional-locks rev-parse stash^1 \
+			>"$evidence/stash-parent" &&
+		test_cmp "$evidence/expected-stash-worktree.tree" "$evidence/stash-worktree.tree" &&
+		test_cmp "$evidence/expected-main.tree" "$evidence/stash-index.tree" &&
+		test_cmp "$evidence/head.before" "$evidence/stash-parent" &&
+		test_cmp "$evidence/head-tracked" tracked
+		;;
+	esac &&
+	if test "$action" = private-quit
+	then
+		assert_backoff_rejected_index_trace "$evidence/stash.root.trace" &&
+		test_cmp_bin "$evidence/index.seed" "$evidence/index.published" &&
+		test_cmp "$evidence/main.identity.before" "$evidence/main.identity.after" &&
+		# An untouched copied proof is not an authenticated private proof.
+		if cmp "$evidence/index.seed" "$evidence/selected.published"
+		then
+			:
+		else
+			assert_backoff_commit_unbound "$evidence/selected.published" \
+				"$evidence/private-proof"
+		fi
+	else
+		assert_backoff_stash_patch_history "$evidence/index.seed" \
+			"$evidence/index.published" "$evidence/published-proof" &&
+		test_trace2_data fsmonitor history/watch-limit-suspended 1 \
+			<"$evidence/stash.root.trace"
+	fi &&
+	assert_backoff_checkpoint_unchanged "$gitdir" "$checkpoint" &&
+	test_cmp_bin "$evidence/index.published" "$main_index" &&
+	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.after" &&
+	test_cmp "$evidence/other-index.identity.before" "$evidence/other-index.identity.after" &&
+	test_grep ! '"event":"child_start".*"fsmonitor--daemon"' "$evidence/stash.trace" &&
+	backoff_scoped_recover "$gitdir" "$evidence" "$evidence/expected-main.tree" &&
+	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index"
+)
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'patch stash preserves suspended history before and after selection' '
+	test_config_global interactive.singleKey false &&
+	test_config_global color.ui false &&
+	for action in quit accept
+	do
+		prefix="watch-backoff-stash-patch-$action" &&
+		setup_backoff_interactive_pair "$prefix" none &&
+		for kind in main linked
+		do
+			check_backoff_stash_patch "$prefix" "$action" "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'patch stash cannot authenticate a copied private index' '
+	test_config_global interactive.singleKey false &&
+	test_config_global color.ui false &&
+	prefix=watch-backoff-stash-patch-private &&
+	setup_backoff_interactive_pair "$prefix" none &&
+	for kind in main linked
+	do
+		check_backoff_stash_patch "$prefix" private-quit "$kind" "$common" ||
+			return 1
+	done
+'
+
+setup_backoff_stash_apply_pair () {
+	test_create_repo "$1-main" &&
+	test_when_finished "git -C \"$1-main\" -c core.fsmonitor=false \
+		worktree remove --force \"../$1-linked\" >/dev/null 2>&1 || :" &&
+	(
+		cd "$1-main" &&
+		test_commit base tracked &&
+		test_commit sibling sibling &&
+		git -c core.fsmonitor=false worktree add --detach "../$1-linked" HEAD &&
+		git config core.autocrlf false &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		for worktree in "$PWD" "$PWD/../$1-linked"
+		do
+			gitdir=$(git -C "$worktree" -c core.fsmonitor=false \
+				--no-optional-locks rev-parse --absolute-git-dir) &&
+			test-tool chmtime -120 "$worktree/tracked" "$worktree/sibling" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" update-index --refresh &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 >"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			assert_backoff_full_proof "$gitdir/index" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
+				git -C "$worktree" status --short >"$gitdir/checkpoint.status" &&
+			test_trace2_data fsmonitor history/external-stored 1 <"$gitdir/checkpoint.trace" &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status >"$gitdir/sidecar.status" &&
+			find "$gitdir" -maxdepth 1 -type f -name "index.csh1.*" >"$gitdir/checkpoints" &&
+			test_line_count = 1 "$gitdir/checkpoints" &&
+			checkpoint=$(cat "$gitdir/checkpoints") &&
+			cp "$gitdir/index" "$gitdir/index.before-backoff" &&
+			cp "$checkpoint" "$gitdir/checkpoint.before-backoff" &&
+			if test -f "$gitdir/index.csts"
+			then
+				cp "$gitdir/index.csts" "$gitdir/sidecar.before-backoff"
+			else
+				:
+			fi || return 1
+		done &&
+		make_backoff_patch_series same-path
+	) &&
+	common=$(git -C "$1-main" -c core.fsmonitor=false \
+		--no-optional-locks rev-parse --absolute-git-dir) &&
+	write_backoff_hook_identity_helper "$common/hook-index.pl" &&
+	write_backoff_rejected_index_helper "$common/rejected-index.pl" &&
+	install_backoff_stash_apply_capture "$1-main"
+}
+
+install_backoff_stash_apply_capture () {
+	test_hook -C "$1" post-index-change <<-\EOF
+	set -eu
+	test -n "${BACKOFF_STASH_CAPTURE-}" || exit 0
+	first=$BACKOFF_STASH_CAPTURE/first-write
+	if test -d "$first"
+	then
+		exit 0
+	fi
+	mkdir "$first"
+	test "${GIT_INDEX_FILE-}" = "$BACKOFF_STASH_INDEX_ENV"
+	perl "$BACKOFF_STASH_IDENTITY" identity "$BACKOFF_STASH_MAIN" \
+		>"$first/main.identity"
+	perl "$BACKOFF_STASH_IDENTITY" identity "$BACKOFF_STASH_SELECTED" \
+		>"$first/selected.identity"
+	cp "$BACKOFF_STASH_MAIN" "$first/main.index"
+	cp "$BACKOFF_STASH_SELECTED" "$first/selected.index"
+	printf "%s\n" "${GIT_INDEX_FILE-}" >"$first/index.env"
+	printf "%s\n" "$@" >"$first/hook.args"
+	cp "$GIT_TRACE2_EVENT" "$first/trace"
+	printf "%s\n" complete >"$first/completed"
+	EOF
+}
+
+check_backoff_stash_apply () (
+	prefix=$1 && style=$2 && operation=$3 && kind=$4 && common=$5 &&
+	case "$kind" in
+	main)
+		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
+			--no-optional-locks rev-parse --absolute-git-dir)
+		;;
+	linked) other_gitdir=$common ;;
+	esac &&
+	cd "$prefix-$kind" &&
+	sane_unset GIT_INDEX_FILE GIT_TEST_PRELOAD_INDEX_BULK \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TEST_FSMONITOR_QUERY_PATH \
+		BACKOFF_STASH_CAPTURE BACKOFF_STASH_MAIN BACKOFF_STASH_SELECTED \
+		BACKOFF_STASH_INDEX_ENV BACKOFF_STASH_IDENTITY &&
+	gitdir=$(git -c core.fsmonitor=false --no-optional-locks \
+		rev-parse --absolute-git-dir) &&
+	main_index="$gitdir/index" &&
+	evidence="$common/stash-$operation-$style-$kind" &&
+	mkdir "$evidence" &&
+	cp "$main_index" "$evidence/index.seed" &&
+	cp "$other_gitdir/index" "$evidence/other-index.before" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" \
+		>"$evidence/other-index.identity.before" &&
+	assert_backoff_full_proof "$evidence/index.seed" &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+		test-tool fsmonitor-client record-watch-limit &&
+	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+	GIT_TRACE2_EVENT="$evidence/am.trace" \
+		git am -q "$common/patch-first.mbox" >"$evidence/am.out" &&
+	cp "$main_index" "$evidence/index.pending" &&
+	assert_backoff_pending_proof "$evidence/index.seed" "$evidence/index.pending" &&
+	backoff_scoped_index_tree "$evidence/index.pending" "$evidence/before" &&
+	test_cmp "$common/patch-first.tree" "$evidence/before.tree" &&
+	backoff_commit_entries "$evidence/index.pending" >"$evidence/before.entries" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.before" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD >"$evidence/head.before" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^{tree} >"$evidence/head.tree" &&
+	test_cmp "$common/patch-first.tree" "$evidence/head.tree" &&
+	git -c core.fsmonitor=false --no-optional-locks \
+		for-each-ref --format="%(objectname)" refs/stash >"$evidence/stash.prior" &&
+	donor="$TRASH_DIRECTORY/$prefix-$kind-donor" &&
+	git -c core.fsmonitor=false -c core.untrackedCache=false \
+		worktree add --detach "$donor" "$(cat "$evidence/head.before")" &&
+	cp "$common/patch-second.contents" "$donor/sibling" &&
+	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false add sibling &&
+	git -C "$donor" -c core.fsmonitor=false write-tree >"$evidence/donor.tree" &&
+	test_cmp "$common/patch-second.tree" "$evidence/donor.tree" &&
+	donor_gitdir=$(git -C "$donor" -c core.fsmonitor=false \
+		--no-optional-locks rev-parse --absolute-git-dir) &&
+	cp "$donor_gitdir/index" "$evidence/donor.index" &&
+	backoff_commit_entries "$evidence/donor.index" >"$evidence/donor.entries" &&
+	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false \
+		stash push --quiet -- sibling &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse refs/stash >"$evidence/stash.created" &&
+	stash=$(cat "$evidence/stash.created") &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse "$stash^1" >"$evidence/stash.parent" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse "$stash^{tree}" >"$evidence/stash.tree" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse "$stash^2^{tree}" >"$evidence/stash-index.tree" &&
+	test_cmp "$evidence/head.before" "$evidence/stash.parent" &&
+	test_cmp "$evidence/donor.tree" "$evidence/stash.tree" &&
+	test_cmp "$evidence/donor.tree" "$evidence/stash-index.tree" &&
+	git -c core.fsmonitor=false worktree remove --force "$donor" &&
+	test_cmp_bin "$evidence/index.pending" "$main_index" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after-donor" &&
+	test_cmp "$evidence/main.identity.before" "$evidence/main.identity.after-donor" &&
+	test_write_lines visible >visible &&
+	selected=$main_index && selected_env= &&
+	case "$style" in
+	implicit) : ;;
+	canonical) selected_env=$main_index ;;
+	alternate)
+		selected="$gitdir/index.alias-copy" && selected_env=$selected &&
+		cp "$evidence/index.pending" "$selected" &&
+		perl "$common/rejected-index.pl" alias copy "$selected" "$main_index" \
+			>"$evidence/private.identity.before"
+		;;
+	*) return 1 ;;
+	esac &&
+	test_write_lines "$selected_env" >"$evidence/expected-index.env" &&
+	(
+		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=EEEEEEEEEEEEEEEE &&
+		GIT_TRACE2_EVENT="$evidence/stash.trace" &&
+		GIT_TRACE2_ENV_VARS=GIT_INDEX_FILE &&
+		BACKOFF_STASH_CAPTURE=$evidence BACKOFF_STASH_MAIN=$main_index &&
+		BACKOFF_STASH_SELECTED=$selected BACKOFF_STASH_INDEX_ENV=$selected_env &&
+		BACKOFF_STASH_IDENTITY="$common/hook-index.pl" &&
+		export GIT_TEST_FSMONITOR_INOTIFY_BACKOFF \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TRACE2_EVENT GIT_TRACE2_ENV_VARS \
+			BACKOFF_STASH_CAPTURE BACKOFF_STASH_MAIN BACKOFF_STASH_SELECTED \
+			BACKOFF_STASH_INDEX_ENV BACKOFF_STASH_IDENTITY &&
+		if test "$style" = implicit
+		then
+			sane_unset GIT_INDEX_FILE
+		else
+			GIT_INDEX_FILE=$selected && export GIT_INDEX_FILE
+		fi &&
+		git stash "$operation" --index >"$evidence/stash.out" 2>"$evidence/stash.err"
+	) &&
+	# Later merge/reset writes may revoke metadata. Capture before any repair.
+	cp "$main_index" "$evidence/main.published" &&
+	cp "$selected" "$evidence/selected.published" &&
+	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after" &&
+	first="$evidence/first-write" &&
+	test_grep "^complete$" "$first/completed" &&
+	test_cmp "$evidence/expected-index.env" "$first/index.env" &&
+	backoff_scoped_index_tree "$first/selected.index" "$evidence/first" &&
+	backoff_commit_entries "$first/selected.index" >"$evidence/first.entries" &&
+	test_cmp "$evidence/before.tree" "$evidence/first.tree" &&
+	test_cmp_bin "$evidence/before.entries" "$evidence/first.entries" &&
+	assert_backoff_main_index_write "$first/trace" "$selected" yes &&
+	extract_backoff_root_trace "$first/trace" >"$evidence/first.root.trace" &&
+	if test "$style" = alternate
+	then
+		assert_backoff_commit_unbound "$first/selected.index" "$evidence/private-first-proof" &&
+		assert_backoff_rejected_index_trace "$evidence/first.root.trace" &&
+		test_cmp_bin "$evidence/index.pending" "$first/main.index" &&
+		test_cmp_bin "$evidence/index.pending" "$evidence/main.published" &&
+		test_cmp "$evidence/main.identity.before" "$evidence/main.identity.after" &&
+		expected_main="$evidence/before.tree"
+	else
+		assert_backoff_pending_proof "$evidence/index.seed" "$first/selected.index" &&
+		test_trace2_data fsmonitor history/watch-limit-suspended 1 <"$evidence/first.root.trace" &&
+		expected_main="$evidence/donor.tree"
+	fi &&
+	backoff_scoped_index_tree "$evidence/main.published" "$evidence/main-final" &&
+	backoff_scoped_index_tree "$evidence/selected.published" "$evidence/selected-final" &&
+	backoff_commit_entries "$evidence/selected.published" >"$evidence/selected-final.entries" &&
+	test_cmp "$expected_main" "$evidence/main-final.tree" &&
+	test_cmp "$evidence/donor.tree" "$evidence/selected-final.tree" &&
+	test_cmp_bin "$evidence/donor.entries" "$evidence/selected-final.entries" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD >"$evidence/head.after" &&
+	test_cmp "$evidence/head.before" "$evidence/head.after" &&
+	test_cmp "$common/patch-first.contents" tracked &&
+	test_cmp "$common/patch-second.contents" sibling &&
+	test_grep "^visible$" visible &&
+	git -c core.fsmonitor=false --no-optional-locks \
+		for-each-ref --format="%(objectname)" refs/stash >"$evidence/stash.after" &&
+	if test "$operation" = apply
+	then
+		test_cmp "$evidence/stash.created" "$evidence/stash.after"
+	else
+		test_cmp "$evidence/stash.prior" "$evidence/stash.after"
+	fi &&
+	test_cmp_bin "$evidence/main.published" "$main_index" &&
+	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index" &&
+	snapshot_backoff_index_identity "$other_gitdir/index" >"$evidence/other-index.identity.after" &&
+	test_cmp "$evidence/other-index.identity.before" "$evidence/other-index.identity.after" &&
+	test_grep ! '"event":"child_start".*"fsmonitor--daemon"' "$evidence/am.trace" "$evidence/stash.trace" &&
+	backoff_scoped_recover "$gitdir" "$evidence" "$expected_main" &&
+	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index" &&
+	if test "$style" = alternate
+	then
+		test_cmp_bin "$evidence/selected.published" "$selected"
+	else
+		:
+	fi
+)
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'canonical and implicit stash apply preserve the initial backoff refresh' '
+	for style in implicit canonical
+	do
+		prefix="watch-backoff-stash-apply-$style" &&
+		setup_backoff_stash_apply_pair "$prefix" &&
+		for kind in main linked
+		do
+			check_backoff_stash_apply "$prefix" "$style" apply "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'stash pop shares canonical admission and private stash apply stays rejected' '
+	for mode in canonical-pop alternate-apply
+	do
+		case "$mode" in
+		canonical-pop) style=canonical operation=pop ;;
+		alternate-apply) style=alternate operation=apply ;;
+		esac &&
+		prefix="watch-backoff-stash-$mode" &&
+		setup_backoff_stash_apply_pair "$prefix" &&
+		check_backoff_stash_apply "$prefix" "$style" "$operation" main "$common" ||
+			return 1
+	done
+'
 test_done

@@ -682,11 +682,7 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	struct tree *head, *merge, *merge_base;
 	struct lock_file lock = LOCK_INIT;
 
-	if (!getenv(INDEX_ENVIRONMENT)) {
-		clean_status_enable_external_history(the_repository);
-		clean_status_set_config_digest(the_repository,
-					       &stash_clean_digest);
-	}
+	clean_status_prepare_main_index_history(the_repository);
 
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET, 0, 0,
@@ -1753,18 +1749,12 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	}
 
 	/*
-	 * Keep authenticated history bound while inspecting the worktree.
-	 * Whole-worktree changes still invalidate their proof below. A scoped
-	 * regular-file replacement keeps it only when each writer proves that
-	 * its provider, semantic inputs, and untracked cache remain paired.
+	 * Even a cancelled patch selection can refresh the real index. Attach
+	 * authenticated history before that first read, independently of the
+	 * eventual stash operation. Whole-worktree changes still invalidate
+	 * their proof below, and each writer must validate its own changes.
 	 */
-	if (preserve_clean_history) {
-		clean_status_enable_external_history(the_repository);
-		clean_status_set_config_digest(the_repository,
-					       &stash_clean_digest);
-	} else if (ps->nr && !include_untracked && !patch_mode &&
-		   !only_staged && keep_index != 1)
-		clean_status_prepare_main_index_history(the_repository);
+	clean_status_prepare_main_index_history(the_repository);
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
