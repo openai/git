@@ -2469,7 +2469,8 @@ int cmd_am(int argc,
 	git_committer_info(IDENT_STRICT);
 
 	if (fstat_is_reliable() && !getenv(INDEX_ENVIRONMENT) &&
-	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+	    (fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC ||
+	     fsm_settings__is_watch_limit_backoff(the_repository)) &&
 	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
 		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository, &clean_digest);
