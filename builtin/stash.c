@@ -1724,7 +1724,6 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 {
 	int ret = 0;
 	int preserve_clean_history = !ps->nr && !include_untracked;
-	int preserve_scoped_history = 0;
 	struct lock_file index_lock = LOCK_INIT;
 	struct stash_info info = STASH_INFO_INIT;
 	struct strbuf patch = STRBUF_INIT;
@@ -1753,30 +1752,19 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		goto done;
 	}
 
-	preserve_scoped_history = ps->nr && !include_untracked &&
-		!patch_mode && !only_staged && keep_index != 1 &&
-		!getenv(INDEX_ENVIRONMENT) &&
-		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
-		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
-		!getenv(DB_ENVIRONMENT) &&
-		!getenv(ALTERNATE_DB_ENVIRONMENT) && fstat_is_reliable() &&
-		!repo_config_values(the_repository)->apply_sparse_checkout &&
-		the_repository->config_values_private_.trust_ctime &&
-		the_repository->config_values_private_.check_stat &&
-		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
-		!repo_has_replace_refs_uncached(the_repository);
-
 	/*
 	 * Keep authenticated history bound while inspecting the worktree.
 	 * Whole-worktree changes still invalidate their proof below. A scoped
 	 * regular-file replacement keeps it only when each writer proves that
 	 * its provider, semantic inputs, and untracked cache remain paired.
 	 */
-	if (preserve_clean_history || preserve_scoped_history) {
+	if (preserve_clean_history) {
 		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository,
 					       &stash_clean_digest);
-	}
+	} else if (ps->nr && !include_untracked && !patch_mode &&
+		   !only_staged && keep_index != 1)
+		clean_status_prepare_main_index_history(the_repository);
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
