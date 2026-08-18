@@ -4189,7 +4189,6 @@ void restore_locked_index_for_commit(
 	struct clean_status_index_snapshot current = { .fd = -1 };
 	struct lock_file rewrite = LOCK_INIT;
 	struct strbuf cache_tree_data = STRBUF_INIT;
-	struct stat st;
 	char *destination = NULL;
 	const char *path;
 	int ret;
@@ -4202,7 +4201,6 @@ void restore_locked_index_for_commit(
 	if (!clean_status_index_path_is_main(repo, destination) ||
 	    clean_status_index_snapshot_open_allow_null_checksum(
 		    &current, path, repo->hash_algo) ||
-	    fstat(current.fd, &st) || st.st_uid != geteuid() ||
 	    hold_lock_file_for_update(&rewrite, path, LOCK_NO_DEREF) < 0 ||
 	    !clean_status_index_snapshot_still_matches_path(
 		    &current, path, repo->hash_algo) ||
