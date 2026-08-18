@@ -450,7 +450,10 @@ static const char *prepare_index(const char **argv, const char *prefix,
 
 		refresh_cache_or_die(refresh_flags);
 
-		if (write_locked_index(the_repository->index, &index_lock, 0))
+		if (is_status ?
+		    write_locked_index(the_repository->index, &index_lock, 0) :
+		    write_locked_index_for_commit(the_repository->index, &index_lock,
+					  &commit_checkpoint))
 			die(_("unable to create temporary index"));
 
 		old_repo_index_file = the_repository->index_file;
@@ -479,6 +482,10 @@ static const char *prepare_index(const char **argv, const char *prefix,
 				die(_("unable to update temporary index"));
 		} else
 			warning(_("Failed to update main cache tree"));
+		if (!is_status &&
+		    !clean_status_advance_commit_checkpoint(
+			    commit_checkpoint, the_repository->index, &index_lock))
+			release_commit_checkpoint();
 
 		commit_style = COMMIT_NORMAL;
 		ret = get_lock_file_path(&index_lock);
