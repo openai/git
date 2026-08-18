@@ -165,6 +165,72 @@ void test_exclude_source_proof__cleanup(void)
 	FREE_AND_NULL(trash);
 }
 
+static void check_empty_source(const struct git_hash_algo *algo)
+{
+	struct repository test_repo = { .hash_algo = algo };
+	struct index_state test_istate = { .repo = &test_repo };
+	struct exclude_source_proof *proof;
+	struct exclude_source_capture *capture;
+	struct object_id empty, missing, nonempty;
+	struct stat st;
+	char *source = make_path(algo->name);
+	int fd;
+
+	write_file_buf(source, "", 0);
+	proof = exclude_source_proof_create(&test_istate, NULL, open_parent, 0);
+	capture = exclude_source_capture_begin(proof, source, 0);
+	cl_assert(capture != NULL);
+	fd = exclude_source_capture_open(capture);
+	cl_must_pass(fd);
+	cl_must_pass(fstat(fd, &st));
+	cl_assert(S_ISREG(st.st_mode) && !st.st_size);
+	/* The pattern reader represents a present empty source as NULL/0. */
+	exclude_source_capture_record(capture, fd, &st, NULL, 0);
+	exclude_source_capture_release(capture);
+	cl_must_pass(close(fd));
+	cl_assert(exclude_source_proof_validate(proof));
+	cl_must_pass(exclude_source_proof_digest(proof, algo, &empty));
+
+	cl_must_pass(unlink(source));
+	cl_assert(!exclude_source_proof_validate(proof));
+	exclude_source_proof_release(proof);
+	proof = exclude_source_proof_create(&test_istate, NULL, open_parent, 0);
+	record_absence(proof, source);
+	cl_assert(exclude_source_proof_validate(proof));
+	cl_must_pass(exclude_source_proof_digest(proof, algo, &missing));
+	cl_assert(!oideq(&empty, &missing));
+
+	write_file_buf(source, "content", 7);
+	cl_assert(!exclude_source_proof_validate(proof));
+	exclude_source_proof_release(proof);
+	proof = exclude_source_proof_create(&test_istate, NULL, open_parent, 0);
+	record_file(proof, source);
+	cl_assert(exclude_source_proof_validate(proof));
+	cl_must_pass(exclude_source_proof_digest(proof, algo, &nonempty));
+	cl_assert(!oideq(&empty, &nonempty));
+	cl_assert(!oideq(&missing, &nonempty));
+	exclude_source_proof_release(proof);
+
+	proof = exclude_source_proof_create(&test_istate, NULL, open_parent, 0);
+	capture = exclude_source_capture_begin(proof, source, 0);
+	cl_assert(capture != NULL);
+	fd = exclude_source_capture_open(capture);
+	cl_must_pass(fd);
+	cl_must_pass(fstat(fd, &st));
+	exclude_source_capture_record(capture, fd, &st, NULL, 7);
+	cl_assert(!exclude_source_proof_validate(proof));
+	cl_must_pass(close(fd));
+	exclude_source_capture_release(capture);
+	exclude_source_proof_release(proof);
+	free(source);
+}
+
+void test_exclude_source_proof__distinguishes_empty_missing_and_nonempty_sources(void)
+{
+	check_empty_source(&hash_algos[GIT_HASH_SHA1]);
+	check_empty_source(&hash_algos[GIT_HASH_SHA256]);
+}
+
 void test_exclude_source_proof__accepts_same_content_replacement(void)
 {
 	struct exclude_source_proof *proof = new_proof();
@@ -778,6 +844,7 @@ void test_exclude_source_proof__captures_fifo_without_blocking(void)
 
 EMPTY_TEST(test_exclude_source_proof__initialize)
 EMPTY_TEST(test_exclude_source_proof__cleanup)
+SKIP_TEST(test_exclude_source_proof__distinguishes_empty_missing_and_nonempty_sources)
 SKIP_TEST(test_exclude_source_proof__accepts_same_content_replacement)
 SKIP_TEST(test_exclude_source_proof__accepts_sibling_churn_during_regular_capture)
 SKIP_TEST(test_exclude_source_proof__accepts_sibling_churn_during_regular_validation)
