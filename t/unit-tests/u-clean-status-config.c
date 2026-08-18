@@ -187,6 +187,178 @@ void test_clean_status_config__command_preload_config_does_not_change_proof(void
 	}
 }
 
+void test_clean_status_config__only_command_relative_paths_is_normalized(void)
+{
+	static const char key[] = "status.relativepaths";
+	static const char *const values[] = { NULL, "", "true", "false" };
+	static const enum config_scope retained_scopes[] = {
+		CONFIG_SCOPE_SYSTEM,
+		CONFIG_SCOPE_GLOBAL,
+		CONFIG_SCOPE_LOCAL,
+		CONFIG_SCOPE_WORKTREE,
+		CONFIG_SCOPE_SUBMODULE,
+		CONFIG_SCOPE_UNKNOWN,
+	};
+	static const char *const retained_keys[] = {
+		"status.showuntrackedfiles", "status.relativepaths.extra",
+		"core.filemode", "core.autocrlf",
+	};
+	static const char *const retained_values[] = {
+		"all", "false", "true", "true",
+	};
+	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+	struct config_context missing = CONFIG_CONTEXT_INIT;
+
+	for (size_t a = 0; a < ARRAY_SIZE(algorithms); a++) {
+		const struct git_hash_algo *algo = &hash_algos[algorithms[a]];
+		struct clean_status_config_digest baseline, persistent, digest;
+
+		clean_status_config_init(&baseline, algo);
+		clean_status_config_final(&baseline);
+		kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+		kvi.filename = NULL;
+		for (size_t value = 0; value < ARRAY_SIZE(values); value++) {
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, key,
+						values[value], &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(hasheq(digest.hash, baseline.hash, algo));
+			cl_assert(hasheq(digest.semantic_hash,
+					 baseline.semantic_hash, algo));
+			cl_assert(hasheq(digest.tracked_policy_hash,
+					 baseline.tracked_policy_hash, algo));
+			cl_assert(!digest.filter_configured);
+			cl_assert(!digest.semantic_config_explicit);
+
+			for (size_t scope = 0;
+			     scope < ARRAY_SIZE(retained_scopes); scope++) {
+				kvi.scope = retained_scopes[scope];
+				clean_status_config_init(&digest, algo);
+				clean_status_config_add(&digest, key,
+							values[value], &ctx);
+				clean_status_config_final(&digest);
+				cl_assert(!hasheq(digest.hash,
+						  baseline.hash, algo));
+				cl_assert(hasheq(digest.semantic_hash,
+						 baseline.semantic_hash, algo));
+				cl_assert(hasheq(digest.tracked_policy_hash,
+						 baseline.tracked_policy_hash, algo));
+			}
+
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, key,
+						values[value], &missing);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, key,
+						values[value], NULL);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+		}
+
+		/* Included files retain their command-line include's scope. */
+		kvi.scope = CONFIG_SCOPE_COMMAND;
+		kvi.origin_type = CONFIG_ORIGIN_FILE;
+		kvi.filename = "/command-config";
+		clean_status_config_init(&digest, algo);
+		clean_status_config_add(&digest, key, "false", &ctx);
+		clean_status_config_final(&digest);
+		cl_assert(hasheq(digest.hash, baseline.hash, algo));
+
+		/* Omitting an override must not omit its persistent source. */
+		kvi.scope = CONFIG_SCOPE_LOCAL;
+		kvi.filename = "/local-config";
+		clean_status_config_init(&persistent, algo);
+		clean_status_config_add(&persistent, key, "true", &ctx);
+		clean_status_config_final(&persistent);
+		cl_assert(!hasheq(persistent.hash, baseline.hash, algo));
+		clean_status_config_init(&digest, algo);
+		clean_status_config_add(&digest, key, "true", &ctx);
+		kvi.scope = CONFIG_SCOPE_COMMAND;
+		kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+		kvi.filename = NULL;
+		clean_status_config_add(&digest, key, "false", &ctx);
+		clean_status_config_final(&digest);
+		cl_assert(hasheq(digest.hash, persistent.hash, algo));
+		cl_assert(hasheq(digest.semantic_hash,
+				 persistent.semantic_hash, algo));
+		cl_assert(hasheq(digest.tracked_policy_hash,
+				 persistent.tracked_policy_hash, algo));
+
+		for (size_t i = 0; i < ARRAY_SIZE(retained_keys); i++) {
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, retained_keys[i],
+						retained_values[i], &ctx);
+			clean_status_config_final(&digest);
+			cl_assert(!hasheq(digest.hash, baseline.hash, algo));
+			if (!strcmp(retained_keys[i], "core.filemode"))
+				cl_assert(!hasheq(
+					digest.tracked_policy_hash,
+					baseline.tracked_policy_hash, algo));
+			if (!strcmp(retained_keys[i], "core.autocrlf"))
+				cl_assert(!hasheq(digest.semantic_hash,
+						 baseline.semantic_hash, algo));
+		}
+	}
+}
+
+void test_clean_status_config__relative_paths_does_not_join_filter_parts(void)
+{
+	static const char *const keys[] = {
+		"filter.demo.clean", "filter.demo.smudge",
+		"filter.demo.process", "filter.demo.required",
+	};
+	static const char *const values[] = { "", "", "", "false" };
+	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
+	struct key_value_info kvi = KVI_INIT;
+	struct config_context ctx = { .kvi = &kvi };
+
+	for (size_t a = 0; a < ARRAY_SIZE(algorithms); a++) {
+		const struct git_hash_algo *algo = &hash_algos[algorithms[a]];
+		struct clean_status_config_digest baseline, digest;
+
+		kvi.scope = CONFIG_SCOPE_LOCAL;
+		kvi.origin_type = CONFIG_ORIGIN_FILE;
+		kvi.filename = "/local-config";
+		clean_status_config_init(&baseline, algo);
+		clean_status_config_add(&baseline, keys[0], "configured", &ctx);
+		clean_status_config_final(&baseline);
+		for (unsigned separated = 0; separated < 2; separated++) {
+			kvi.scope = CONFIG_SCOPE_LOCAL;
+			kvi.origin_type = CONFIG_ORIGIN_FILE;
+			kvi.filename = "/local-config";
+			clean_status_config_init(&digest, algo);
+			clean_status_config_add(&digest, keys[0], "configured", &ctx);
+			kvi.scope = CONFIG_SCOPE_COMMAND;
+			kvi.origin_type = CONFIG_ORIGIN_CMDLINE;
+			kvi.filename = NULL;
+			for (size_t part = 0; part < ARRAY_SIZE(keys); part++) {
+				if (separated && part == 2)
+					clean_status_config_add(&digest,
+						"status.relativepaths",
+						"false", &ctx);
+				clean_status_config_add(&digest, keys[part],
+							values[part], &ctx);
+			}
+			clean_status_config_final(&digest);
+			cl_assert_equal_i(hasheq(digest.hash, baseline.hash, algo),
+					  !separated);
+			cl_assert_equal_i(
+				hasheq(digest.semantic_hash,
+				       baseline.semantic_hash, algo),
+				!separated);
+			cl_assert(hasheq(digest.tracked_policy_hash,
+					 baseline.tracked_policy_hash, algo));
+			cl_assert_equal_i(digest.normalized_filter_disable,
+					  !separated);
+		}
+	}
+}
+
 void test_clean_status_config__only_complete_disabled_filters_are_normalized(void)
 {
 	static const char *const keys[] = {
