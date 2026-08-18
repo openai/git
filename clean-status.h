@@ -10,6 +10,7 @@ struct clean_status_progress;
 struct clean_status_proof_epoch;
 struct clean_status_index_snapshot;
 struct clean_status_commit_checkpoint;
+struct clean_status_backoff_transfer;
 struct lock_file;
 struct repository;
 struct stat;
@@ -161,6 +162,23 @@ int clean_status_transfer_current_proof_if_same_index(
 	struct index_state *dst, const struct index_state *src);
 int clean_status_transfer_current_proof_if_semantically_same_index(
 	struct index_state *dst, const struct index_state *src);
+
+/*
+ * A canonical main-index source may lend suspended historical state to an
+ * in-process replacement. The caller must abandon the capture on any unsafe
+ * mutation, move the original extensions, and transfer before discarding src.
+ * This never grants a current tracked or untracked proof.
+ */
+struct clean_status_backoff_transfer *clean_status_capture_backoff_transfer(
+	struct index_state *src);
+int clean_status_backoff_transfer_entry_is_safe(
+	const struct clean_status_backoff_transfer *transfer,
+	const struct cache_entry *old, const struct cache_entry *new_entry);
+int clean_status_transfer_backoff_history(
+	struct clean_status_backoff_transfer *transfer,
+	struct index_state *dst, struct index_state *src);
+void clean_status_release_backoff_transfer(
+	struct clean_status_backoff_transfer *transfer);
 
 /*
  * Historical-only state for a parent-owned, uncommitted main-index write.
