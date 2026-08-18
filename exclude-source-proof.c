@@ -364,8 +364,11 @@ void exclude_source_capture_record(
 		proof->invalid = 1;
 		return;
 	}
-	hash_object_file(proof->istate->repo->hash_algo, buf, size,
-			 OBJ_BLOB, &oid);
+	if (!size)
+		oidcpy(&oid, proof->istate->repo->hash_algo->empty_blob);
+	else
+		hash_object_file(proof->istate->repo->hash_algo, buf, size,
+				 OBJ_BLOB, &oid);
 	record_observation(capture, 1, size, &oid);
 }
 
