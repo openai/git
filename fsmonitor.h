@@ -2,6 +2,7 @@
 #define FSMONITOR_H
 
 #include "fsmonitor-ll.h"
+#include "clean-status.h"
 #include "dir.h"
 #include "fsmonitor-settings.h"
 #include "object.h"
@@ -122,8 +123,11 @@ static inline void mark_fsmonitor_valid(struct index_state *istate, struct cache
 static inline void mark_fsmonitor_invalid(struct index_state *istate, struct cache_entry *ce)
 {
 	enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(istate->repo);
+	int backoff = fsm_settings__is_watch_limit_backoff(istate->repo);
 
-	if (fsm_mode > FSMONITOR_MODE_DISABLED) {
+	if (fsm_mode > FSMONITOR_MODE_DISABLED || backoff) {
+		if (backoff)
+			clean_status_invalidate_current_proof(istate);
 		ce->ce_flags &= ~CE_FSMONITOR_VALID;
 		untracked_cache_invalidate_path(istate, ce->name, 1);
 		trace_printf_key(&trace_fsmonitor, "mark_fsmonitor_invalid '%s'", ce->name);

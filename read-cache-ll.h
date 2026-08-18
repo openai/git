@@ -552,6 +552,7 @@ struct cache_entry *refresh_cache_entry(struct index_state *, struct cache_entry
 void refresh_index_entry_stat(struct index_state *, int, struct stat *);
 
 void set_alternate_index_output(const char *);
+const char *get_alternate_index_output(void);
 
 extern int verify_index_checksum;
 extern int verify_ce_order;

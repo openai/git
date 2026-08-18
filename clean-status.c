@@ -2,12 +2,16 @@
 #include "attr-fingerprint.h"
 #include "attr-manifest.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "clean-status-internal.h"
 #include "convert.h"
 #include "dir.h"
+#include "environment.h"
 #include "fsmonitor-clean-proof.h"
+#include "fsmonitor-settings.h"
 #include "progress.h"
 #include "read-cache-ll.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "semantic-verify-internal.h"
 #include "worktree-attr-source.h"
@@ -172,7 +176,7 @@ int clean_status_revalidated_token_matches(const struct index_state *istate)
 {
 	const struct clean_status_state *state = istate->clean_status;
 
-	return state && state->config_revalidated &&
+	return state && !state->backoff_token && state->config_revalidated &&
 		state->config_revalidated_token &&
 		istate->fsmonitor_last_update &&
 		!strcmp(state->config_revalidated_token,
@@ -188,6 +192,115 @@ void clean_status_invalidate_current_proof(struct index_state *istate)
 	istate->clean_status->initial_coherent = 0;
 	istate->clean_status->filter_scope_valid = 0;
 	istate->clean_status->semantic_baseline_pending = 0;
+	istate->clean_status->backoff_suspended = 0;
+}
+
+int clean_status_fsmonitor_backoff_suspended(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->backoff_suspended && state->backoff_token &&
+		istate->fsmonitor_token_valid && istate->fsmonitor_last_update &&
+		!strcmp(state->backoff_token, istate->fsmonitor_last_update) &&
+		fsm_settings__is_watch_limit_backoff(istate->repo);
+}
+
+int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
+{
+	struct clean_status_state *state = istate->clean_status;
+	struct clean_status_index_snapshot source = { .fd = -1 };
+	const struct git_hash_algo *algo;
+	const struct untracked_cache *uc = istate->untracked;
+	const char *suffix, *pending;
+	const uint32_t historical = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	int paired, suspended = 0;
+
+	/* Never revive an epoch which an earlier mutation has invalidated. */
+	if (state && state->backoff_token)
+		return clean_status_fsmonitor_backoff_suspended(istate);
+	if (!state || !istate->repo || !istate->repo->worktree ||
+	    !fsm_settings__is_watch_limit_backoff(istate->repo) ||
+	    !fstat_is_reliable() || istate != istate->repo->index ||
+	    getenv(INDEX_ENVIRONMENT) || getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    repo_config_values(istate->repo)->apply_sparse_checkout ||
+	    !istate->repo->config_values_private_.trust_ctime ||
+	    !istate->repo->config_values_private_.check_stat ||
+	    repo_has_replace_refs_uncached(istate->repo) ||
+	    !state->config_enforced || !state->current_config_valid ||
+	    !state->current_semantic_valid || !state->current_attr_valid ||
+	    !state->current_tracked_policy_valid || state->filter_configured ||
+	    state->external_history_restored || !state->disk_config_valid ||
+	    state->disk_config_invalid || !state->disk_config_raw.len ||
+	    !state->disk_semantic_valid || !state->disk_attr_valid ||
+	    !state->disk_tracked_policy_valid || !state->manifest.disk_valid ||
+	    !istate->fsmonitor_extension_seen || !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_last_update ||
+	    !skip_prefix(istate->fsmonitor_last_update, "builtin:", &suffix) ||
+	    !*suffix || !strcmp(suffix, "fake") ||
+	    !state->disk_config_token ||
+	    strcmp(state->disk_config_token, istate->fsmonitor_last_update) ||
+	    istate->fsmonitor_last_update_pending ||
+	    istate->fsmonitor_pending_token_from_provider ||
+	    istate->fsmonitor_legacy_untracked_fallback ||
+	    !uc || !uc->root || !uc->root->valid ||
+	    uc->fsmonitor_dirty_paths.len ||
+	    !istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_extension_invalid ||
+	    !istate->fsmonitor_untracked_token)
+		return 0;
+	algo = istate->repo->hash_algo;
+	if (memcmp(state->disk_config_hash, state->current_config_hash,
+		   algo->rawsz) ||
+	    memcmp(state->disk_semantic_hash, state->current_semantic_hash,
+		   algo->rawsz) ||
+	    memcmp(state->disk_attr_hash, state->current_attr_hash, algo->rawsz) ||
+	    memcmp(state->disk_tracked_policy_hash,
+		   state->current_tracked_policy_hash, algo->rawsz))
+		return 0;
+
+	paired = state->manifest.disk_flags == FSMONITOR_CLEAN_PROOF_ALL &&
+		clean_status_has_current_full_fsmonitor_proof(istate) &&
+		!memcmp(state->manifest.disk_hash, state->manifest.current_hash,
+			algo->rawsz) &&
+		istate->fsmonitor_untracked_valid && uc->root->valid_recursive &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token);
+	if (!paired &&
+	    !(state->manifest.disk_flags == historical &&
+	      !istate->fsmonitor_untracked_valid && uc->fsmonitor_revalidation &&
+	      skip_prefix(istate->fsmonitor_untracked_token, "pending:", &pending) &&
+	      !strcmp(suffix, pending)))
+		return 0;
+	if (clean_status_index_snapshot_pin_proof_epoch(&source, istate))
+		return 0;
+	if (!untracked_cache_preserve_for_revalidation(istate) ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(&source, istate))
+		goto done;
+
+	/* Only historical path semantics survive. Nothing is currently clean. */
+	clean_status_manifest_adopt_disk(&state->manifest);
+	state->manifest.current_flags = historical;
+	clean_status_clear_authenticated_new_directories(istate);
+	state->authenticated_bootstrap_manifest = 0;
+	state->config_revalidated = 0;
+	state->initial_coherent = 0;
+	state->config_mismatch = 1;
+	state->filter_scope_valid = 0;
+	FREE_AND_NULL(state->config_revalidated_token);
+	state->backoff_token = xstrdup(istate->fsmonitor_last_update);
+	state->backoff_suspended = 1;
+	state->semantic_baseline_pending = 1;
+	suspended = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/watch-limit-suspended", 1);
+done:
+	clean_status_index_snapshot_release(&source);
+	return suspended;
 }
 
 static int path_has_no_new_attribute_sources(
@@ -316,9 +429,10 @@ int clean_status_index_entry_is_semantically_safe(
 	const struct cache_entry *entry = old ? old : new_entry;
 	struct conv_attrs attrs;
 	const char *base;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
 
-	if (!state || !state->config_revalidated ||
-	    !clean_status_revalidated_token_matches(istate) ||
+	if (!state ||
+	    (!suspended && !clean_status_revalidated_token_matches(istate)) ||
 	    (state->filter_configured && !state->filter_scope_valid) ||
 	    istate->split_index ||
 	    istate->sparse_index || !entry)
@@ -338,6 +452,11 @@ int clean_status_index_entry_is_semantically_safe(
 	base = base ? base + 1 : entry->name;
 	if (!fspathcmp(base, ".gitattributes") ||
 	    !fspathcmp(base, ".gitignore"))
+		return 0;
+	if (suspended &&
+	    (!old || !new_entry || !S_ISREG(old->ce_mode) ||
+	     !S_ISREG(new_entry->ce_mode) ||
+	     !clean_status_manifest_path_attributes_unchanged(istate, entry->name)))
 		return 0;
 	if (state->filter_configured) {
 		convert_attrs((struct index_state *)istate, &attrs, entry->name);
@@ -679,6 +798,8 @@ void clean_status_mark_fsmonitor_config_valid(struct index_state *istate,
 	state->config_mismatch = 0;
 	state->strong_mismatch = 0;
 	state->semantic_baseline_pending = 0;
+	state->backoff_suspended = 0;
+	FREE_AND_NULL(state->backoff_token);
 	state->manifest.current_flags = FSMONITOR_CLEAN_PROOF_ALL;
 	state->config_revalidated = state->current_semantic_valid &&
 		state->current_attr_valid && state->manifest.current_valid;
@@ -701,6 +822,7 @@ void clean_status_release(struct index_state *istate)
 	strbuf_release(&istate->clean_status->authenticated_new_directories);
 	free(istate->clean_status->disk_config_token);
 	free(istate->clean_status->config_revalidated_token);
+	free(istate->clean_status->backoff_token);
 	free(istate->clean_status->authenticated_new_directories_token);
 	FREE_AND_NULL(istate->clean_status);
 }

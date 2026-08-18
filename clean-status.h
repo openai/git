@@ -64,6 +64,9 @@ int clean_status_try_preserve_tracked_config_epoch(
 	struct index_state *istate);
 int clean_status_revalidated_token_matches(
 	const struct index_state *istate);
+int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate);
+int clean_status_fsmonitor_backoff_suspended(
+	const struct index_state *istate);
 
 int clean_status_has_persistent_fsmonitor_semantic_history(
 	const struct index_state *istate);
