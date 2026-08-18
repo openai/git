@@ -330,7 +330,8 @@ static void refresh_index_quietly(void)
 	int fd;
 	int refreshed;
 
-	if (!use_optional_locks())
+	if (!use_optional_locks() ||
+	    fsm_settings__is_watch_limit_backoff(the_repository))
 		return;
 
 	can_close_token = can_close_diff_fsmonitor_token(istate);

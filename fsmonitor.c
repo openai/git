@@ -1930,7 +1930,8 @@ void fsmonitor_reject_pending_token(struct index_state *istate)
 
 void fsmonitor_mark_untracked_cache_valid(struct index_state *istate)
 {
-	if (istate->fsmonitor_last_update_pending ||
+	if (fsm_settings__is_watch_limit_backoff(istate->repo) ||
+	    istate->fsmonitor_last_update_pending ||
 	    !istate->fsmonitor_token_valid ||
 	    !istate->fsmonitor_last_update || !istate->untracked ||
 	    istate->fsmonitor_untracked_valid)
@@ -2020,6 +2021,27 @@ void tweak_fsmonitor(struct index_state *istate)
 	unsigned int i;
 	int fsmonitor_enabled = (fsm_settings__get_mode(istate->repo)
 				 > FSMONITOR_MODE_DISABLED);
+
+	if (fsm_settings__is_watch_limit_backoff(istate->repo)) {
+		int suspended = clean_status_suspend_fsmonitor_for_backoff(istate);
+
+		/* Historical tokens never make a live entry clean while disabled. */
+		for (i = 0; i < istate->cache_nr; i++)
+			istate->cache[i]->ce_flags &=
+				~(CE_FSMONITOR_VALID | CE_UPTODATE);
+		ewah_free(istate->fsmonitor_dirty);
+		istate->fsmonitor_dirty = NULL;
+		if (!suspended) {
+			remove_fsmonitor(istate);
+			return;
+		}
+		istate->fsmonitor_untracked_valid = 0;
+		istate->fsmonitor_untracked_revalidation_authenticated = 0;
+		FREE_AND_NULL(istate->fsmonitor_last_update_pending);
+		istate->fsmonitor_pending_token_from_provider = 0;
+		istate->untracked->use_fsmonitor = 0;
+		return;
+	}
 
 	if (istate->fsmonitor_dirty) {
 		if (fsmonitor_enabled) {
