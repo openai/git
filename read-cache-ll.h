@@ -32,6 +32,7 @@ struct cache_entry {
 };
 
 struct clean_status_index_write_receipt;
+struct clean_status_commit_checkpoint;
 struct clean_status_proof_epoch;
 struct preload_bulk_stat_update;
 
@@ -360,6 +361,14 @@ int is_index_unborn(struct index_state *);
  * is written (and the lock is rolled back if `COMMIT_LOCK` is given).
  */
 int write_locked_index(struct index_state *, struct lock_file *lock, unsigned flags);
+
+/* Commit's close-only main-index write and optional historical-only repair. */
+int write_locked_index_for_commit(
+	struct index_state *, struct lock_file *,
+	struct clean_status_commit_checkpoint **);
+void restore_locked_index_for_commit(
+	struct index_state *, struct lock_file *,
+	const struct clean_status_commit_checkpoint *);
 
 /*
  * Like repo_update_index_if_able(), with an optional receipt for the canonical

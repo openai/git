@@ -9,6 +9,7 @@ struct attr_source_snapshot;
 struct clean_status_progress;
 struct clean_status_proof_epoch;
 struct clean_status_index_snapshot;
+struct clean_status_commit_checkpoint;
 struct lock_file;
 struct repository;
 struct stat;
@@ -159,6 +160,30 @@ int clean_status_transfer_current_proof_if_same_index(
 	struct index_state *dst, const struct index_state *src);
 int clean_status_transfer_current_proof_if_semantically_same_index(
 	struct index_state *dst, const struct index_state *src);
+
+/*
+ * Historical-only state for a parent-owned, uncommitted main-index write.
+ * Capture before the first write; record its closed output before hooks.
+ * The caller releases the checkpoint and any replacement index state. The
+ * entries-only restore reader borrows fd and grants no current clean proof.
+ */
+struct clean_status_commit_checkpoint *clean_status_capture_commit_checkpoint(
+	struct index_state *istate, struct lock_file *lock);
+void clean_status_record_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint,
+	struct index_state *istate, struct lock_file *lock);
+int clean_status_commit_checkpoint_changed(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock);
+int clean_status_commit_checkpoint_still_valid(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock);
+int clean_status_prepare_commit_checkpoint_restore(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock, const struct index_state *current,
+	struct index_state *replacement, int fd);
+void clean_status_release_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint);
 
 void clean_status_release(struct index_state *istate);
 

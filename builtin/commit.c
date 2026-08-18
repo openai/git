@@ -118,6 +118,7 @@ static const char *color_status_slots[] = {
 static const char *use_message_buffer;
 static struct lock_file index_lock; /* real index */
 static struct lock_file false_lock; /* used only for partial commits */
+static struct clean_status_commit_checkpoint *commit_checkpoint;
 static enum {
 	COMMIT_AS_IS = 1,
 	COMMIT_NORMAL,
@@ -250,6 +251,12 @@ static void status_init_config_with_clean_digest(
 	s->hints = advice_enabled(ADVICE_STATUS_HINTS); /* must come after repo_config() */
 }
 
+static void release_commit_checkpoint(void)
+{
+	clean_status_release_commit_checkpoint(commit_checkpoint);
+	commit_checkpoint = NULL;
+}
+
 static void rollback_index_files(void)
 {
 	switch (commit_style) {
@@ -263,6 +270,7 @@ static void rollback_index_files(void)
 		rollback_lock_file(&false_lock);
 		break;
 	}
+	release_commit_checkpoint();
 }
 
 static int commit_index_files(void)
@@ -273,6 +281,8 @@ static int commit_index_files(void)
 	case COMMIT_AS_IS:
 		break; /* nothing to do */
 	case COMMIT_NORMAL:
+		restore_locked_index_for_commit(the_repository->index,
+						&index_lock, commit_checkpoint);
 		err = commit_lock_file(&index_lock);
 		break;
 	case COMMIT_PARTIAL:
@@ -280,6 +290,7 @@ static int commit_index_files(void)
 		rollback_lock_file(&false_lock);
 		break;
 	}
+	release_commit_checkpoint();
 
 	return err;
 }
@@ -502,7 +513,10 @@ static const char *prepare_index(const char **argv, const char *prefix,
 
 		refresh_cache_or_die(refresh_flags);
 		cache_tree_update(the_repository->index, WRITE_TREE_SILENT);
-		if (write_locked_index(the_repository->index, &index_lock, 0))
+		if (is_status ?
+		    write_locked_index(the_repository->index, &index_lock, 0) :
+		    write_locked_index_for_commit(the_repository->index, &index_lock,
+					  &commit_checkpoint))
 			die(_("unable to write new index file"));
 		commit_style = COMMIT_NORMAL;
 		ret = get_lock_file_path(&index_lock);
@@ -2583,6 +2597,7 @@ int cmd_commit(int argc,
 			    NULL, NULL, NULL, NULL);
 
 cleanup:
+	release_commit_checkpoint();
 	wt_status_collect_free_buffers(&s);
 	free_commit_extra_headers(extra);
 	commit_list_free(parents);
