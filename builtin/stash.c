@@ -727,6 +727,15 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 		}
 	}
 
+	/* The distinct-index path already reread after reset_head(). */
+	if (!has_index && is_null_oid(&the_repository->index->oid) &&
+	    clean_status_fsmonitor_backoff_suspended(the_repository->index)) {
+		/* The initial refresh may have replaced our source inode. */
+		discard_index(the_repository->index);
+		if (repo_read_index(the_repository) < 0)
+			return error(_("could not read index"));
+	}
+
 	init_ui_merge_options(&o, the_repository);
 
 	o.branch1 = label_ours ? label_ours : "Updated upstream";

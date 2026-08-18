@@ -3910,6 +3910,7 @@ setup_backoff_stash_apply_pair () {
 		git config core.fsmonitor true &&
 		case "${2-default}" in
 		default) : ;;
+		with-hash) git config index.skipHash false ;;
 		skip-hash) git config index.skipHash true ;;
 		*) return 1 ;;
 		esac &&
@@ -3927,12 +3928,15 @@ setup_backoff_stash_apply_pair () {
 				git -C "$worktree" status --porcelain=v2 >"$gitdir/prime" &&
 			test_must_be_empty "$gitdir/prime" &&
 			assert_backoff_full_proof "$gitdir/index" &&
-			if test "${2-default}" = skip-hash
-			then
+			case "${2-default}" in
+			skip-hash)
 				test "$(test_trailing_hash "$gitdir/index")" = "$(test_oid zero)"
-			else
-				:
-			fi &&
+				;;
+			with-hash)
+				test "$(test_trailing_hash "$gitdir/index")" != "$(test_oid zero)"
+				;;
+			*) : ;;
+			esac &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
 				git -C "$worktree" status --short >"$gitdir/checkpoint.status" &&
@@ -4007,6 +4011,7 @@ install_backoff_stash_apply_capture () {
 
 check_backoff_stash_apply_publications () (
 	evidence=$1 && seed=$2 && selected=$3 && style=$4 && shape=$5 &&
+	donor_stage=${6-staged} &&
 	test_path_is_dir "$evidence/writes/001" &&
 	extract_backoff_root_trace "$evidence/stash.trace" >"$evidence/stash.root.trace" &&
 	if test "$style" = alternate || test "$shape" != safe
@@ -4020,7 +4025,7 @@ check_backoff_stash_apply_publications () (
 		test_trace2_data fsmonitor history/backoff-transferred 1 \
 			<"$evidence/stash.root.trace"
 	fi &&
-	merge_seen=no &&
+	merge_seen=no && reset_seen=no &&
 	for write in "$evidence"/writes/[0-9][0-9][0-9]
 	do
 		test_grep "^complete$" "$write/completed" &&
@@ -4037,13 +4042,28 @@ check_backoff_stash_apply_publications () (
 			if test_trace2_data fsmonitor history/backoff-transferred 1 \
 				<"$write/root.trace"
 			then
-				# The first root transfer precedes the clean-merge write.
-				# Later reset writes must preserve the same logical result.
+				# The first transfer publishes the clean merge.  A stash
+				# without a distinct staged snapshot then unstages it.
 				backoff_scoped_index_tree "$write/selected.index" "$write/oracle" &&
 				backoff_commit_entries "$write/selected.index" >"$write/entries" &&
-				test_cmp "$evidence/donor.tree" "$write/oracle.tree" &&
-				test_cmp_bin "$evidence/donor.entries" "$write/entries" &&
-				merge_seen=yes
+				if test "$merge_seen" = no ||
+				   test "$(cat "$write/oracle.tree")" = "$(cat "$evidence/donor.tree")"
+				then
+					test "$reset_seen" = no &&
+					test_cmp "$evidence/donor.tree" "$write/oracle.tree" &&
+					test_cmp_bin "$evidence/donor.entries" "$write/entries" &&
+					merge_seen=yes
+				else
+					test_cmp "$evidence/expected-selected.tree" "$write/oracle.tree" &&
+					test_cmp_bin "$evidence/expected-selected.entries" "$write/entries" &&
+					reset_seen=yes
+				fi
+			elif test "$donor_stage" = unstaged
+			then
+				backoff_scoped_index_tree "$write/selected.index" "$write/oracle" &&
+				backoff_commit_entries "$write/selected.index" >"$write/entries" &&
+				test_cmp "$evidence/before.tree" "$write/oracle.tree" &&
+				test_cmp_bin "$evidence/before.entries" "$write/entries"
 			else
 				:
 			fi
@@ -4061,8 +4081,18 @@ check_backoff_stash_apply_publications () (
 
 check_backoff_stash_apply () (
 	prefix=$1 && style=$2 && operation=$3 && kind=$4 && common=$5 &&
-	shape=${6-safe} &&
+	shape=${6-safe} && selection=${7-index} && donor_stage=${8-staged} &&
 	case "$shape" in safe | add | mode | attributes) : ;; *) return 1 ;; esac &&
+	case "$selection:$donor_stage" in
+	index:staged | index:unstaged | default:unstaged) : ;;
+	*) return 1 ;;
+	esac &&
+	if test "$shape" != safe
+	then
+		test "$selection:$donor_stage" = index:staged
+	else
+		:
+	fi &&
 	case "$kind" in
 	main)
 		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
@@ -4080,6 +4110,12 @@ check_backoff_stash_apply () (
 		rev-parse --absolute-git-dir) &&
 	main_index="$gitdir/index" &&
 	evidence="$common/stash-$operation-$style-$kind-$shape" &&
+	if test "$selection:$donor_stage" != index:staged
+	then
+		evidence="$evidence-$selection-$donor_stage"
+	else
+		:
+	fi &&
 	mkdir "$evidence" &&
 	mkdir "$evidence/writes" &&
 	cp "$main_index" "$evidence/index.seed" &&
@@ -4134,14 +4170,35 @@ check_backoff_stash_apply () (
 	mode) chmod +x "$donor/sibling" && set -- sibling ;;
 	*) set -- sibling ;;
 	esac &&
-	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false \
-		-c core.filemode=true add "$@" &&
-	git -C "$donor" -c core.fsmonitor=false write-tree >"$evidence/donor.tree" &&
-	test_cmp "$evidence/expected-donor.tree" "$evidence/donor.tree" &&
 	donor_gitdir=$(git -C "$donor" -c core.fsmonitor=false \
 		--no-optional-locks rev-parse --absolute-git-dir) &&
-	cp "$donor_gitdir/index" "$evidence/donor.index" &&
+	if test "$donor_stage" = staged
+	then
+		git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.filemode=true add "$@" &&
+		git -C "$donor" -c core.fsmonitor=false write-tree >"$evidence/donor.tree" &&
+		cp "$donor_gitdir/index" "$evidence/donor.index" &&
+		expected_stash_index="$evidence/donor.tree"
+	else
+		# Leave the real donor index at HEAD.  The independently built
+		# content oracle describes only its unstaged worktree change.
+		git -C "$donor" -c core.fsmonitor=false write-tree >"$evidence/donor-index.tree" &&
+		test_cmp "$evidence/head.tree" "$evidence/donor-index.tree" &&
+		cp "$evidence/donor-oracle.index" "$evidence/donor.index" &&
+		backoff_commit_index "$evidence/donor.index" write-tree >"$evidence/donor.tree" &&
+		expected_stash_index="$evidence/head.tree"
+	fi &&
+	test_cmp "$evidence/expected-donor.tree" "$evidence/donor.tree" &&
 	backoff_commit_entries "$evidence/donor.index" >"$evidence/donor.entries" &&
+	if test "$selection:$donor_stage" = index:staged
+	then
+		cp "$evidence/donor.tree" "$evidence/expected-selected.tree" &&
+		cp "$evidence/donor.entries" "$evidence/expected-selected.entries"
+	else
+		cp "$evidence/before.tree" "$evidence/expected-selected.tree" &&
+		cp "$evidence/before.entries" "$evidence/expected-selected.entries" &&
+		! test_cmp "$evidence/donor.tree" "$evidence/expected-selected.tree"
+	fi &&
 	git -C "$donor" -c core.fsmonitor=false -c core.untrackedCache=false \
 		-c core.filemode=true stash push --quiet -- "$@" &&
 	git -c core.fsmonitor=false --no-optional-locks rev-parse refs/stash >"$evidence/stash.created" &&
@@ -4151,7 +4208,7 @@ check_backoff_stash_apply () (
 	git -c core.fsmonitor=false --no-optional-locks rev-parse "$stash^2^{tree}" >"$evidence/stash-index.tree" &&
 	test_cmp "$evidence/head.before" "$evidence/stash.parent" &&
 	test_cmp "$evidence/donor.tree" "$evidence/stash.tree" &&
-	test_cmp "$evidence/donor.tree" "$evidence/stash-index.tree" &&
+	test_cmp "$expected_stash_index" "$evidence/stash-index.tree" &&
 	git -c core.fsmonitor=false worktree remove --force "$donor" &&
 	test_cmp_bin "$evidence/index.pending" "$main_index" &&
 	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after-donor" &&
@@ -4204,7 +4261,11 @@ check_backoff_stash_apply () (
 		else
 			GIT_INDEX_FILE=$selected && export GIT_INDEX_FILE
 		fi &&
-		git stash "$operation" --index >"$evidence/stash.out" 2>"$evidence/stash.err"
+		case "$selection" in
+		index) set -- --index ;;
+		default) set -- ;;
+		esac &&
+		git stash "$operation" "$@" >"$evidence/stash.out" 2>"$evidence/stash.err"
 	) &&
 	# Retain the final merge/reset publication before any repairing command.
 	cp "$main_index" "$evidence/main.published" &&
@@ -4230,16 +4291,16 @@ check_backoff_stash_apply () (
 	else
 		assert_backoff_pending_proof "$evidence/index.seed" "$first/selected.index" &&
 		test_trace2_data fsmonitor history/watch-limit-suspended 1 <"$evidence/first.root.trace" &&
-		expected_main="$evidence/donor.tree"
+		expected_main="$evidence/expected-selected.tree"
 	fi &&
 	check_backoff_stash_apply_publications "$evidence" "$evidence/index.seed" \
-		"$selected" "$style" "$shape" &&
+		"$selected" "$style" "$shape" "$donor_stage" &&
 	backoff_scoped_index_tree "$evidence/main.published" "$evidence/main-final" &&
 	backoff_scoped_index_tree "$evidence/selected.published" "$evidence/selected-final" &&
 	backoff_commit_entries "$evidence/selected.published" >"$evidence/selected-final.entries" &&
 	test_cmp "$expected_main" "$evidence/main-final.tree" &&
-	test_cmp "$evidence/donor.tree" "$evidence/selected-final.tree" &&
-	test_cmp_bin "$evidence/donor.entries" "$evidence/selected-final.entries" &&
+	test_cmp "$evidence/expected-selected.tree" "$evidence/selected-final.tree" &&
+	test_cmp_bin "$evidence/expected-selected.entries" "$evidence/selected-final.entries" &&
 	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD >"$evidence/head.after" &&
 	test_cmp "$evidence/head.before" "$evidence/head.after" &&
 	test_cmp "$common/patch-first.contents" tracked &&
@@ -4381,6 +4442,80 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 				test_cmp "$common/skip-hash.expect" "$index.trailing-hash" ||
 					return 1
 			done || return 1
+		done || return 1
+	done
+'
+
+# Exercise the !has_index branch with a real stash whose index tree is HEAD.
+# Its clean merge temporarily stages the donor tree before unstaging it again.
+check_backoff_stash_apply_trailers () (
+	evidence=$1 && hash_mode=$2 &&
+	for index in "$evidence/index.seed" "$evidence/index.pending" \
+		"$evidence/main.published" "$evidence/selected.published" \
+		"$evidence/index.recovered" \
+		"$evidence"/writes/[0-9][0-9][0-9]/main.index \
+		"$evidence"/writes/[0-9][0-9][0-9]/selected.index
+	do
+		actual=$(test_trailing_hash "$index") &&
+		case "$hash_mode" in
+		skip-hash) test "$actual" = "$(test_oid zero)" ;;
+		with-hash) test "$actual" != "$(test_oid zero)" ;;
+		*) return 1 ;;
+		esac || return 1
+	done
+)
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'default and unstaged-index stash restores preserve skip-hash history' '
+	for mode in implicit-default-apply canonical-default-pop \
+		implicit-index-apply canonical-index-pop
+	do
+		case "$mode" in
+		implicit-default-apply) style=implicit selection=default operation=apply ;;
+		canonical-default-pop) style=canonical selection=default operation=pop ;;
+		implicit-index-apply) style=implicit selection=index operation=apply ;;
+		canonical-index-pop) style=canonical selection=index operation=pop ;;
+		esac &&
+		prefix="watch-backoff-stash-unstaged-$mode" &&
+		setup_backoff_stash_apply_pair "$prefix" skip-hash &&
+		for kind in main linked
+		do
+			check_backoff_stash_apply "$prefix" "$style" "$operation" \
+				"$kind" "$common" safe "$selection" unstaged &&
+			evidence="$common/stash-$operation-$style-$kind-safe-$selection-unstaged" &&
+			check_backoff_stash_apply_trailers "$evidence" skip-hash ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'default stash history transfer retains hashed and private-index controls' '
+	for mode in hashed-apply hashed-pop private-default private-index
+	do
+		case "$mode" in
+		hashed-apply)
+			hash_mode=with-hash style=implicit selection=default operation=apply
+			;;
+		hashed-pop)
+			hash_mode=with-hash style=canonical selection=default operation=pop
+			;;
+		private-default)
+			hash_mode=skip-hash style=alternate selection=default operation=apply
+			;;
+		private-index)
+			hash_mode=skip-hash style=alternate selection=index operation=apply
+			;;
+		esac &&
+		prefix="watch-backoff-stash-unstaged-$mode" &&
+		setup_backoff_stash_apply_pair "$prefix" "$hash_mode" &&
+		for kind in main linked
+		do
+			check_backoff_stash_apply "$prefix" "$style" "$operation" \
+				"$kind" "$common" safe "$selection" unstaged &&
+			evidence="$common/stash-$operation-$style-$kind-safe-$selection-unstaged" &&
+			check_backoff_stash_apply_trailers "$evidence" "$hash_mode" ||
+				return 1
 		done || return 1
 	done
 '
