@@ -2,9 +2,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
-#include "abspath.h"
-#include "dir.h"
-#include "environment.h"
+#include "clean-status-index.h"
 #include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hex.h"
@@ -816,20 +814,10 @@ static int skip_backoff_cache_tree_write(struct index_state *istate,
 					const char *index_path)
 {
 	struct repository *repo = istate->repo;
-	char *main_index, *named, *canonical;
-	int skip;
 
-	if (getenv(INDEX_ENVIRONMENT) || get_alternate_index_output() ||
-	    !fsm_settings__is_watch_limit_backoff(repo))
-		return 0;
-	main_index = xstrfmt("%s/index", repo_get_git_dir(repo));
-	named = real_pathdup(index_path, 0);
-	canonical = real_pathdup(main_index, 0);
-	skip = named && canonical && !fspathcmp(named, canonical);
-	free(main_index);
-	free(named);
-	free(canonical);
-	return skip;
+	return !get_alternate_index_output() &&
+		fsm_settings__is_watch_limit_backoff(repo) &&
+		clean_status_index_path_is_main(repo, index_path);
 }
 
 int write_index_as_tree(struct object_id *oid, struct index_state *index_state, const char *index_path, int flags, const char *prefix)

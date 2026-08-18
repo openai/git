@@ -5,6 +5,14 @@
 #include "hash.h"
 
 struct index_state;
+struct repository;
+
+/*
+ * Check the physical worktree-specific main index, including any selected
+ * GIT_INDEX_FILE. Accept normalized names, but not leaf symlinks, hardlinks,
+ * private indexes, or lockfiles. This grants no clean-proof authority.
+ */
+int clean_status_index_path_is_main(struct repository *repo, const char *path);
 
 struct clean_status_index_snapshot {
 	struct clean_status_identity identity;
