@@ -1245,6 +1245,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 '
 
 setup_backoff_hook_pair () {
+	case "${2-staged}" in
+	staged | clean) : ;;
+	*) return 1 ;;
+	esac &&
 	test_create_repo "$1-main" &&
 	test_when_finished "git -C \"$1-main\" -c core.fsmonitor=false \
 		worktree remove --force \"../$1-linked\" >/dev/null 2>&1 || :" &&
@@ -1261,8 +1265,13 @@ setup_backoff_hook_pair () {
 		do
 			gitdir=$(git -C "$worktree" -c core.fsmonitor=false \
 				--no-optional-locks rev-parse --absolute-git-dir) &&
-			test_write_lines staged-before >"$worktree/sibling" &&
-			git -C "$worktree" -c core.fsmonitor=false add sibling &&
+			if test "${2-staged}" = staged
+			then
+				test_write_lines staged-before >"$worktree/sibling" &&
+				git -C "$worktree" -c core.fsmonitor=false add sibling
+			else
+				:
+			fi &&
 			git -C "$worktree" -c core.fsmonitor=false write-tree \
 				>"$gitdir/hook.expected-index-tree" &&
 			test-tool chmtime -120 "$worktree/tracked" "$worktree/sibling" &&
@@ -1277,7 +1286,12 @@ setup_backoff_hook_pair () {
 				-c core.untrackedCache=false --no-optional-locks \
 				status --porcelain=v2 >"$gitdir/prime.expect" &&
 			test_cmp "$gitdir/prime.expect" "$gitdir/prime" &&
-			test_grep "^1 M\\. .* sibling$" "$gitdir/prime" &&
+			if test "${2-staged}" = clean
+			then
+				test_must_be_empty "$gitdir/prime"
+			else
+				test_grep "^1 M\\. .* sibling$" "$gitdir/prime"
+			fi &&
 			assert_backoff_full_proof "$gitdir/index" &&
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			GIT_TRACE2_EVENT="$gitdir/checkpoint.trace" \
@@ -3303,7 +3317,7 @@ check_backoff_interactive () (
 )
 
 setup_backoff_interactive_pair () {
-	setup_backoff_hook_pair "$1" &&
+	setup_backoff_hook_pair "$1" "${3-staged}" &&
 	common=$(git -C "$1-main" -c core.fsmonitor=false \
 		--no-optional-locks rev-parse --absolute-git-dir) &&
 	write_backoff_hook_identity_helper "$common/hook-index.pl" &&
@@ -3615,8 +3629,14 @@ assert_backoff_stash_patch_history () {
 	fi
 }
 
-check_backoff_stash_patch () (
+check_backoff_stash_selection () (
 	prefix=$1 && action=$2 && kind=$3 && common=$4 &&
+	scope=$5 && operation=$6 &&
+	case "$operation:$action" in
+	patch:quit | patch:accept | patch:private-quit | \
+	staged:empty | staged:accept | staged:private-empty) : ;;
+	*) return 1 ;;
+	esac &&
 	case "$kind" in
 	main)
 		other_gitdir=$(git -C "$prefix-linked" -c core.fsmonitor=false \
@@ -3631,7 +3651,7 @@ check_backoff_stash_patch () (
 		rev-parse --absolute-git-dir) &&
 	main_index="$gitdir/index" &&
 	checkpoint=$(cat "$gitdir/checkpoints") &&
-	evidence="$common/stash-patch-$action-$kind" &&
+	evidence="$common/stash-$operation-$scope-$action-$kind" &&
 	mkdir "$evidence" &&
 	cp "$main_index" "$evidence/index.seed" &&
 	cp "$other_gitdir/index" "$evidence/other-index.before" &&
@@ -3640,12 +3660,16 @@ check_backoff_stash_patch () (
 		>"$evidence/other-index.identity.before" &&
 	assert_backoff_full_proof "$evidence/index.seed" &&
 	backoff_scoped_index_tree "$evidence/index.seed" "$evidence/expected-main" &&
+	cp "$evidence/expected-main.tree" "$evidence/expected-stash-index.tree" &&
 	backoff_commit_entries "$evidence/index.seed" >"$evidence/expected.entries" &&
 	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
 		>"$evidence/head.before" &&
+	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD^{tree} \
+		>"$evidence/head.tree" &&
 	git -c core.fsmonitor=false --no-optional-locks \
 		for-each-ref --format="%(refname) %(objectname)" >"$evidence/refs.before" &&
 	git -c core.fsmonitor=false show HEAD:tracked >"$evidence/head-tracked" &&
+	git -c core.fsmonitor=false show HEAD:sibling >"$evidence/head-sibling" &&
 	test_write_lines stash-selected >tracked &&
 	cp tracked "$evidence/worktree-tracked.before" &&
 	cp sibling "$evidence/sibling.before" &&
@@ -3653,8 +3677,8 @@ check_backoff_stash_patch () (
 	cp visible "$evidence/visible.before" &&
 	backoff_commit_index "$main_index" status --porcelain=v2 >"$evidence/status.before" &&
 	selected=$main_index &&
-	case "$action" in
-	accept)
+	case "$operation:$action" in
+	patch:accept)
 		cp "$evidence/index.seed" "$evidence/worktree-oracle.index" &&
 		backoff_commit_index "$evidence/worktree-oracle.index" read-tree HEAD &&
 		oid=$(git -c core.fsmonitor=false hash-object -w --stdin \
@@ -3662,24 +3686,55 @@ check_backoff_stash_patch () (
 		backoff_commit_index "$evidence/worktree-oracle.index" \
 			update-index --cacheinfo "100644,$oid,tracked" &&
 		backoff_commit_index "$evidence/worktree-oracle.index" write-tree \
-			>"$evidence/expected-stash-worktree.tree" &&
-		answer=y
+			>"$evidence/expected-stash-worktree.tree"
 		;;
-	private-quit)
+	staged:accept)
+		# Only sibling is staged. The stash records that original index,
+		# while the final index returns to HEAD and tracked stays dirty.
+		test "$(cat "$evidence/expected-stash-index.tree")" != \
+			"$(cat "$evidence/head.tree")" &&
+		cp "$evidence/expected-stash-index.tree" \
+			"$evidence/expected-stash-worktree.tree" &&
+		backoff_commit_index "$evidence/expected-main.index" read-tree HEAD &&
+		backoff_commit_index "$evidence/expected-main.index" write-tree \
+			>"$evidence/expected-main.tree" &&
+		backoff_commit_entries "$evidence/expected-main.index" \
+			>"$evidence/expected.entries"
+		;;
+	staged:empty | staged:private-empty)
+		# Establish the absence of staged changes independently of stash.
+		test_cmp "$evidence/head.tree" "$evidence/expected-main.tree"
+		;;
+	*) : ;;
+	esac &&
+	case "$action" in
+	private-*)
 		selected="$gitdir/index.alias-copy" &&
 		cp "$evidence/index.seed" "$selected" &&
 		perl "$common/rejected-index.pl" alias copy "$selected" "$main_index" \
-			>"$evidence/private.identity.before" &&
-		answer=q
+			>"$evidence/private.identity.before"
 		;;
-	quit) answer=q ;;
+	*) : ;;
+	esac &&
+	case "$operation:$scope" in
+	patch:scoped) set -- git stash push -p -- tracked ;;
+	patch:unscoped) set -- git stash -p ;;
+	staged:unscoped) set -- git stash --staged ;;
 	*) return 1 ;;
+	esac &&
+	case "$operation:$scope:$action" in
+	patch:unscoped:accept)
+		# sibling sorts first: reject its staged hunk, then select tracked.
+		test_write_lines n y >"$evidence/input"
+		;;
+	patch:*:accept) test_write_lines y >"$evidence/input" ;;
+	patch:*) test_write_lines q >"$evidence/input" ;;
+	staged:*) >"$evidence/input" ;;
 	esac &&
 	test_cmp_bin "$evidence/index.seed" "$main_index" &&
 	GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 \
 		test-tool fsmonitor-client record-watch-limit &&
 	test_path_is_file "$gitdir/fsmonitor--daemon.inotify-limit" &&
-	test_write_lines "$answer" >"$evidence/input" &&
 	(
 		GIT_TEST_FSMONITOR_INOTIFY_BACKOFF=1 &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=EEEEEEEEEEEEEEEE &&
@@ -3687,24 +3742,27 @@ check_backoff_stash_patch () (
 		GIT_TRACE2_ENV_VARS=GIT_INDEX_FILE &&
 		export GIT_TEST_FSMONITOR_INOTIFY_BACKOFF \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE GIT_TRACE2_EVENT GIT_TRACE2_ENV_VARS &&
-		if test "$action" = private-quit
-		then
-			GIT_INDEX_FILE=$selected && export GIT_INDEX_FILE
-		else
-			sane_unset GIT_INDEX_FILE
-		fi &&
+		case "$action" in
+		private-*) GIT_INDEX_FILE=$selected && export GIT_INDEX_FILE ;;
+		*) sane_unset GIT_INDEX_FILE ;;
+		esac &&
 		if test "$action" = accept
 		then
-			git stash push -p -- tracked
+			"$@"
 		else
-			test_expect_code 1 git stash push -p -- tracked
+			test_expect_code 1 "$@"
 		fi <"$evidence/input" >"$evidence/stash.out" 2>"$evidence/stash.err"
 	) &&
 	# Retain the publication before any status or other Git command.
 	cp "$main_index" "$evidence/index.published" &&
 	cp "$selected" "$evidence/selected.published" &&
 	snapshot_backoff_index_identity "$main_index" >"$evidence/main.identity.after" &&
-	test_grep "Stash this hunk" "$evidence/stash.out" &&
+	if test "$operation" = patch
+	then
+		test_grep "Stash this hunk" "$evidence/stash.out"
+	else
+		test_grep ! "Stash this hunk" "$evidence/stash.out"
+	fi &&
 	test_path_is_missing "$main_index.lock" &&
 	test_path_is_missing "$selected.lock" &&
 	backoff_scoped_index_tree "$evidence/index.published" "$evidence/published" &&
@@ -3716,17 +3774,22 @@ check_backoff_stash_patch () (
 	git -c core.fsmonitor=false --no-optional-locks rev-parse HEAD \
 		>"$evidence/head.after" &&
 	test_cmp "$evidence/head.before" "$evidence/head.after" &&
-	test_cmp "$evidence/sibling.before" sibling &&
 	test_cmp "$evidence/visible.before" visible &&
 	extract_backoff_root_trace "$evidence/stash.trace" >"$evidence/stash.root.trace" &&
 	! test_trace2_data fsmonitor token_closure/accepted 1 <"$evidence/stash.trace" &&
 	case "$action" in
-	quit | private-quit)
-		test_grep "^No changes selected$" "$evidence/stash.err" &&
+	quit | private-quit | empty | private-empty)
+		if test "$operation" = patch
+		then
+			test_grep "^No changes selected$" "$evidence/stash.err"
+		else
+			test_grep "^No staged changes$" "$evidence/stash.err"
+		fi &&
 		git -c core.fsmonitor=false --no-optional-locks \
 			for-each-ref --format="%(refname) %(objectname)" >"$evidence/refs.after" &&
 		test_cmp "$evidence/refs.before" "$evidence/refs.after" &&
 		test_cmp "$evidence/worktree-tracked.before" tracked &&
+		test_cmp "$evidence/sibling.before" sibling &&
 		backoff_commit_index "$main_index" status --porcelain=v2 >"$evidence/status.after" &&
 		test_cmp "$evidence/status.before" "$evidence/status.after"
 		;;
@@ -3738,13 +3801,20 @@ check_backoff_stash_patch () (
 		git -c core.fsmonitor=false --no-optional-locks rev-parse stash^1 \
 			>"$evidence/stash-parent" &&
 		test_cmp "$evidence/expected-stash-worktree.tree" "$evidence/stash-worktree.tree" &&
-		test_cmp "$evidence/expected-main.tree" "$evidence/stash-index.tree" &&
+		test_cmp "$evidence/expected-stash-index.tree" "$evidence/stash-index.tree" &&
 		test_cmp "$evidence/head.before" "$evidence/stash-parent" &&
-		test_cmp "$evidence/head-tracked" tracked
+		if test "$operation" = patch
+		then
+			test_cmp "$evidence/head-tracked" tracked &&
+			test_cmp "$evidence/sibling.before" sibling
+		else
+			test_cmp "$evidence/worktree-tracked.before" tracked &&
+			test_cmp "$evidence/head-sibling" sibling
+		fi
 		;;
 	esac &&
-	if test "$action" = private-quit
-	then
+	case "$action" in
+	private-*)
 		assert_backoff_rejected_index_trace "$evidence/stash.root.trace" &&
 		test_cmp_bin "$evidence/index.seed" "$evidence/index.published" &&
 		test_cmp "$evidence/main.identity.before" "$evidence/main.identity.after" &&
@@ -3756,12 +3826,21 @@ check_backoff_stash_patch () (
 			assert_backoff_commit_unbound "$evidence/selected.published" \
 				"$evidence/private-proof"
 		fi
-	else
-		assert_backoff_stash_patch_history "$evidence/index.seed" \
-			"$evidence/index.published" "$evidence/published-proof" &&
+		;;
+	*)
+		if test "$scope:$action" = unscoped:accept
+		then
+			# A real whole-worktree mutation must invalidate current proof.
+			# Historical FSCF/FSMN may remain, but FSUC may not.
+			test_grep ! FSUC "$evidence/index.published"
+		else
+			assert_backoff_stash_patch_history "$evidence/index.seed" \
+				"$evidence/index.published" "$evidence/published-proof"
+		fi &&
 		test_trace2_data fsmonitor history/watch-limit-suspended 1 \
 			<"$evidence/stash.root.trace"
-	fi &&
+		;;
+	esac &&
 	assert_backoff_checkpoint_unchanged "$gitdir" "$checkpoint" &&
 	test_cmp_bin "$evidence/index.published" "$main_index" &&
 	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index" &&
@@ -3773,18 +3852,29 @@ check_backoff_stash_patch () (
 	test_cmp_bin "$evidence/other-index.before" "$other_gitdir/index"
 )
 
+check_backoff_stash_patch () {
+	check_backoff_stash_selection "$1" "$2" "$3" "$4" "$5" patch
+}
+
+check_backoff_stash_staged () {
+	check_backoff_stash_selection "$1" "$2" "$3" "$4" unscoped staged
+}
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
-	'patch stash preserves suspended history before and after selection' '
+	'patch stash preserves suspended history until selection succeeds' '
 	test_config_global interactive.singleKey false &&
 	test_config_global color.ui false &&
-	for action in quit accept
+	for scope in scoped unscoped
 	do
-		prefix="watch-backoff-stash-patch-$action" &&
-		setup_backoff_interactive_pair "$prefix" none &&
-		for kind in main linked
+		for action in quit accept
 		do
-			check_backoff_stash_patch "$prefix" "$action" "$kind" "$common" ||
-				return 1
+			prefix="watch-backoff-stash-patch-$scope-$action" &&
+			setup_backoff_interactive_pair "$prefix" none &&
+			for kind in main linked
+			do
+				check_backoff_stash_patch "$prefix" "$action" "$kind" "$common" "$scope" ||
+					return 1
+			done || return 1
 		done || return 1
 	done
 '
@@ -3793,12 +3883,15 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	'patch stash cannot authenticate a copied private index' '
 	test_config_global interactive.singleKey false &&
 	test_config_global color.ui false &&
-	prefix=watch-backoff-stash-patch-private &&
-	setup_backoff_interactive_pair "$prefix" none &&
-	for kind in main linked
+	for scope in scoped unscoped
 	do
-		check_backoff_stash_patch "$prefix" private-quit "$kind" "$common" ||
-			return 1
+		prefix="watch-backoff-stash-patch-$scope-private" &&
+		setup_backoff_interactive_pair "$prefix" none &&
+		for kind in main linked
+		do
+			check_backoff_stash_patch "$prefix" private-quit "$kind" "$common" "$scope" ||
+				return 1
+		done || return 1
 	done
 '
 
@@ -4068,4 +4161,33 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 			return 1
 	done
 '
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'staged-only stash preserves history only when there is no selection' '
+	for action in empty accept
+	do
+		case "$action" in
+		empty) seed=clean ;;
+		accept) seed=staged ;;
+		esac &&
+		prefix="watch-backoff-stash-staged-$action" &&
+		setup_backoff_interactive_pair "$prefix" none "$seed" &&
+		for kind in main linked
+		do
+			check_backoff_stash_staged "$prefix" "$action" "$kind" "$common" ||
+				return 1
+		done || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'an empty staged-only stash cannot authenticate a copied private index' '
+	prefix=watch-backoff-stash-staged-private &&
+	setup_backoff_interactive_pair "$prefix" none clean &&
+	for kind in main linked
+	do
+		check_backoff_stash_staged "$prefix" private-empty "$kind" "$common" ||
+			return 1
+	done
+'
+
 test_done
