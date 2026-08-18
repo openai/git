@@ -2116,8 +2116,11 @@ struct clean_status_commit_checkpoint {
 	unsigned char semantic_hash[GIT_MAX_RAWSZ];
 	unsigned char tracked_policy_hash[GIT_MAX_RAWSZ];
 	unsigned char logical_hash[GIT_MAX_RAWSZ];
+	uint64_t written_dev;
+	uint64_t written_ino;
 	int writer_fd;
 	unsigned sealed : 1;
+	unsigned needs_restore : 1;
 };
 
 static int commit_checkpoint_owner_matches(const struct stat *st)
@@ -2320,6 +2323,8 @@ void clean_status_record_commit_checkpoint(
 		    &checkpoint->written, get_lock_file_path(lock),
 		    istate->repo->hash_algo))
 		goto done;
+	checkpoint->written_dev = st.st_dev;
+	checkpoint->written_ino = st.st_ino;
 	checkpoint->sealed = 1;
 done:
 	close(checkpoint->writer_fd);
@@ -2336,9 +2341,10 @@ int clean_status_commit_checkpoint_changed(
 	return checkpoint && checkpoint->sealed && lock &&
 		checkpoint->lock == lock &&
 		is_lock_file_locked(lock) &&
-		!clean_status_index_snapshot_still_matches_path(
+		(checkpoint->needs_restore ||
+		 !clean_status_index_snapshot_still_matches_path(
 			&checkpoint->written, get_lock_file_path(lock),
-			checkpoint->repo->hash_algo);
+			checkpoint->repo->hash_algo));
 }
 
 int clean_status_commit_checkpoint_still_valid(
@@ -2349,27 +2355,12 @@ int clean_status_commit_checkpoint_still_valid(
 		commit_checkpoint_source_matches(checkpoint, lock);
 }
 
-int clean_status_prepare_commit_checkpoint_restore(
+static int attach_commit_checkpoint_history(
 	const struct clean_status_commit_checkpoint *checkpoint,
-	struct lock_file *lock, const struct index_state *current,
-	struct index_state *replacement, int fd)
+	struct index_state *replacement)
 {
 	struct clean_status_state *state;
-	struct stat st;
-	unsigned char hash[GIT_MAX_RAWSZ];
 	const char *suffix;
-
-	if (!current || !replacement ||
-	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock) ||
-	    current->repo != checkpoint->repo || current != current->repo->index ||
-	    current->resolve_undo ||
-	    fstat(fd, &st) || !commit_checkpoint_owner_matches(&st) ||
-	    clean_status_index_logical_digest(current, hash) ||
-	    memcmp(hash, checkpoint->logical_hash, current->repo->hash_algo->rawsz) ||
-	    read_index_entries_from_fd(replacement, fd) ||
-	    clean_status_index_logical_digest(replacement, hash) ||
-	    memcmp(hash, checkpoint->logical_hash, current->repo->hash_algo->rawsz))
-		return 0;
 
 	replacement->untracked = read_untracked_extension(
 		checkpoint->untracked.buf, checkpoint->untracked.len);
@@ -2402,4 +2393,145 @@ int clean_status_prepare_commit_checkpoint_restore(
 		replacement->cache[i]->ce_flags &=
 			~(CE_FSMONITOR_VALID | CE_UPTODATE);
 	return 1;
+}
+
+static int read_commit_checkpoint_written(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct index_state *written)
+{
+	struct stat before, after;
+	unsigned char hash[GIT_MAX_RAWSZ];
+
+	/*
+	 * The child may have replaced the name, leaving this owned descriptor
+	 * unlinked. Its original inode and sealed logical contents still bind
+	 * the baseline; neither the old pathname nor unlink's ctime is authority.
+	 */
+	return checkpoint->written.fd >= 0 &&
+		!fstat(checkpoint->written.fd, &before) &&
+		S_ISREG(before.st_mode) && before.st_nlink <= 1 &&
+		commit_checkpoint_owner_matches(&before) &&
+		(uint64_t)before.st_dev == checkpoint->written_dev &&
+		(uint64_t)before.st_ino == checkpoint->written_ino &&
+		!read_index_entries_from_fd(written, checkpoint->written.fd) &&
+		written->version == checkpoint->written.version &&
+		written->cache_nr == checkpoint->written.cache_nr &&
+		oideq(&written->oid, &checkpoint->written.checksum) &&
+		!clean_status_index_logical_digest(written, hash) &&
+		!memcmp(hash, checkpoint->logical_hash,
+			checkpoint->repo->hash_algo->rawsz) &&
+		!fstat(checkpoint->written.fd, &after) &&
+		path_namespace_stat_equal(&before, &after);
+}
+
+int clean_status_advance_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint,
+	const struct index_state *current, struct lock_file *lock)
+{
+	struct index_state before = INDEX_STATE_INIT(NULL);
+	struct index_state after = INDEX_STATE_INIT(NULL);
+	struct clean_status_index_snapshot selected = { .fd = -1 };
+	const struct clean_status_state *state;
+	const struct git_hash_algo *algo;
+	struct stat st;
+	unsigned char current_hash[GIT_MAX_RAWSZ];
+	unsigned char selected_hash[GIT_MAX_RAWSZ];
+	const unsigned int persistent_flags =
+		CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS;
+	const uint32_t historical = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	int advanced = 0;
+
+	if (!current || !checkpoint || checkpoint->needs_restore ||
+	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock) ||
+	    current->repo != checkpoint->repo || current != current->repo->index ||
+	    current->resolve_undo)
+		return 0;
+	algo = current->repo->hash_algo;
+	before.repo = after.repo = current->repo;
+	if (!read_commit_checkpoint_written(checkpoint, &before) ||
+	    clean_status_index_snapshot_open_allow_null_checksum(
+		    &selected, get_lock_file_path(lock), algo) ||
+	    fstat(selected.fd, &st) || !commit_checkpoint_owner_matches(&st) ||
+	    read_index_entries_from_fd(&after, selected.fd) ||
+	    after.version != selected.version ||
+	    after.cache_nr != selected.cache_nr ||
+	    !oideq(&after.oid, &selected.checksum) ||
+	    clean_status_index_logical_digest(&after, selected_hash) ||
+	    clean_status_index_logical_digest(current, current_hash) ||
+	    memcmp(current_hash, selected_hash, algo->rawsz) ||
+	    before.cache_nr != after.cache_nr ||
+	    !attach_commit_checkpoint_history(checkpoint, &before))
+		goto done;
+
+	/* The old manifest is a historical path witness, never a current proof. */
+	state = before.clean_status;
+	if (state->manifest.current_flags != historical ||
+	    !state->disk_semantic_valid || !state->disk_tracked_policy_valid ||
+	    !state->disk_attr_valid ||
+	    memcmp(state->disk_config_hash, checkpoint->config_hash, algo->rawsz) ||
+	    memcmp(state->disk_semantic_hash, checkpoint->semantic_hash,
+		   algo->rawsz) ||
+	    memcmp(state->disk_tracked_policy_hash,
+		   checkpoint->tracked_policy_hash, algo->rawsz) ||
+	    memcmp(state->disk_attr_hash, state->current_attr_hash, algo->rawsz))
+		goto done;
+	for (size_t i = 0; i < before.cache_nr; i++) {
+		const struct cache_entry *old = before.cache[i];
+		const struct cache_entry *new_entry = after.cache[i];
+
+		if (ce_namelen(old) != ce_namelen(new_entry) ||
+		    memcmp(old->name, new_entry->name, ce_namelen(old)) ||
+		    old->ce_mode != new_entry->ce_mode ||
+		    ((old->ce_flags ^ new_entry->ce_flags) & persistent_flags) ||
+		    (!oideq(&old->oid, &new_entry->oid) &&
+		     (!S_ISREG(old->ce_mode) || !S_ISREG(new_entry->ce_mode) ||
+		      !clean_status_index_entry_is_semantically_safe(
+			      &before, old, new_entry))))
+			goto done;
+	}
+	if (!clean_status_index_snapshot_still_matches_path(
+		    &selected, get_lock_file_path(lock), algo) ||
+	    !commit_checkpoint_source_matches(checkpoint, lock))
+		goto done;
+
+	/* Subsequent hooks must leave these selected logical entries unchanged. */
+	clean_status_index_snapshot_release(&checkpoint->written);
+	checkpoint->written = selected;
+	selected.fd = -1;
+	checkpoint->written_dev = st.st_dev;
+	checkpoint->written_ino = st.st_ino;
+	memcpy(checkpoint->logical_hash, selected_hash, algo->rawsz);
+	checkpoint->needs_restore = 1;
+	advanced = 1;
+	trace2_data_intmax("fsmonitor", current->repo,
+			   "history/commit-backoff-advanced", 1);
+done:
+	clean_status_index_snapshot_release(&selected);
+	release_index(&before);
+	release_index(&after);
+	return advanced;
+}
+
+int clean_status_prepare_commit_checkpoint_restore(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock, const struct index_state *current,
+	struct index_state *replacement, int fd)
+{
+	struct stat st;
+	unsigned char hash[GIT_MAX_RAWSZ];
+
+	if (!current || !replacement ||
+	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock) ||
+	    current->repo != checkpoint->repo || current != current->repo->index ||
+	    current->resolve_undo ||
+	    fstat(fd, &st) || !commit_checkpoint_owner_matches(&st) ||
+	    clean_status_index_logical_digest(current, hash) ||
+	    memcmp(hash, checkpoint->logical_hash, current->repo->hash_algo->rawsz) ||
+	    read_index_entries_from_fd(replacement, fd) ||
+	    clean_status_index_logical_digest(replacement, hash) ||
+	    memcmp(hash, checkpoint->logical_hash, current->repo->hash_algo->rawsz))
+		return 0;
+
+	return attach_commit_checkpoint_history(checkpoint, replacement);
 }
