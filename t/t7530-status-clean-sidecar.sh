@@ -3304,6 +3304,43 @@ test_expect_success PERL_TEST_HELPERS \
 	)
 '
 
+sidecar_aba_setup () {
+	sidecar_aba_path=$1 &&
+	sane_unset GIT_TEST_SPLIT_INDEX &&
+	test_commit base "$sidecar_aba_path" &&
+	test-tool chmtime =-180 "$sidecar_aba_path" &&
+	git -c core.fsmonitor=false update-index --refresh &&
+	git config index.version 4 &&
+	git config index.skipHash true &&
+	git config core.autocrlf false &&
+	git config core.untrackedCache true &&
+	git config core.fsmonitor true &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		git update-index --fsmonitor &&
+	test_env GIT_INDEX_FILE="$PWD/.git/index" \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		bulk_status status --porcelain=v2 >.git/prime &&
+	test_must_be_empty .git/prime &&
+	test_grep FSCF .git/index &&
+	test_grep FSUC .git/index &&
+	test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		bulk_status status --porcelain=v2 >.git/issued &&
+	test_must_be_empty .git/issued &&
+	test_path_is_file .git/index.csts &&
+	rawsz=$(test_oid rawsz) &&
+	dd if=/dev/zero of=.git/zero-trailer \
+		bs="$rawsz" count=1 2>/dev/null &&
+	tail -c "$rawsz" .git/index >.git/trailer &&
+	test_cmp_bin .git/zero-trailer .git/trailer &&
+	cp .git/config .git/config.before &&
+	cp .git/index .git/index.before &&
+	cp .git/index.csts .git/sidecar.before &&
+	/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+		.git/index >.git/index.before.stat &&
+	/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
+		.git/index.csts >.git/sidecar.before.stat
+}
+
 sidecar_aba_capture () {
 	sidecar_aba_label=$1 &&
 	sidecar_aba_mode=$2 &&
@@ -3311,6 +3348,10 @@ sidecar_aba_capture () {
 	case "$sidecar_aba_mode" in
 	clean)
 		sidecar_aba_locks=1 &&
+		sidecar_aba_sequence=CCCCCCCC
+		;;
+	readonly)
+		sidecar_aba_locks=0 &&
 		sidecar_aba_sequence=CCCCCCCC
 		;;
 	dirty)
@@ -3321,7 +3362,7 @@ sidecar_aba_capture () {
 	esac &&
 	GIT_OPTIONAL_LOCKS=$sidecar_aba_locks \
 	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=$sidecar_aba_sequence \
-	GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+	GIT_TEST_FSMONITOR_QUERY_PATH="$sidecar_aba_path" \
 	GIT_TRACE2_EVENT_NESTING=100 \
 	GIT_TRACE2_EVENT="$PWD/.git/$sidecar_aba_label.trace" \
 		git "$@" >".git/$sidecar_aba_label.actual" &&
@@ -3347,52 +3388,58 @@ sidecar_aba_capture () {
 		.git/index.csts >".git/$sidecar_aba_label.oracle.csts.stat"
 }
 
+sidecar_aba_assert_unchanged () {
+	for sidecar_aba_label in "$@"
+	do
+		test_cmp ".git/$sidecar_aba_label.expect" \
+			".git/$sidecar_aba_label.actual" &&
+		test_cmp_bin .git/index.before \
+			".git/$sidecar_aba_label.index" &&
+		test_cmp .git/index.before.stat \
+			".git/$sidecar_aba_label.index.stat" &&
+		test_cmp_bin ".git/$sidecar_aba_label.index" \
+			".git/$sidecar_aba_label.oracle.index" &&
+		test_cmp ".git/$sidecar_aba_label.index.stat" \
+			".git/$sidecar_aba_label.oracle.index.stat" &&
+		test_cmp_bin .git/sidecar.before \
+			".git/$sidecar_aba_label.csts" &&
+		test_cmp .git/sidecar.before.stat \
+			".git/$sidecar_aba_label.csts.stat" &&
+		test_cmp_bin ".git/$sidecar_aba_label.csts" \
+			".git/$sidecar_aba_label.oracle.csts" &&
+		test_cmp ".git/$sidecar_aba_label.csts.stat" \
+			".git/$sidecar_aba_label.oracle.csts.stat" &&
+		test_region ! index do_write_index \
+			".git/$sidecar_aba_label.trace" &&
+		test_region ! index do_write_index \
+			".git/$sidecar_aba_label.oracle.trace" ||
+			return 1
+	done
+}
+
 test_expect_success PERL_TEST_HELPERS \
-	'a temporary status relativePaths setting preserves the original clean proof' '
+	'temporary status presentation settings preserve the original clean proof' '
 	test_create_repo sidecar-command-config-aba &&
 	(
 		cd sidecar-command-config-aba &&
-		sane_unset GIT_TEST_SPLIT_INDEX &&
-		test_commit base tracked &&
 		mkdir subdir &&
-		test-tool chmtime =-180 tracked &&
-		git -c core.fsmonitor=false update-index --refresh &&
-		git config index.version 4 &&
-		git config index.skipHash true &&
-		git config core.autocrlf false &&
-		git config core.untrackedCache true &&
-		git config core.fsmonitor true &&
+		git config color.status.branch red &&
+		sidecar_aba_setup tracked &&
 		test_must_fail git config --get status.relativePaths \
 			>.git/relativepaths.absent &&
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			git update-index --fsmonitor &&
-		test_env GIT_INDEX_FILE="$PWD/.git/index" \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			bulk_status status --porcelain=v2 >.git/prime &&
-		test_must_be_empty .git/prime &&
-		test_grep FSCF .git/index &&
-		test_grep FSUC .git/index &&
-		test_env GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-			bulk_status status --porcelain=v2 >.git/issued &&
-		test_must_be_empty .git/issued &&
-		test_path_is_file .git/index.csts &&
-		rawsz=$(test_oid rawsz) &&
-		dd if=/dev/zero of=.git/zero-trailer \
-			bs="$rawsz" count=1 2>/dev/null &&
-		tail -c "$rawsz" .git/index >.git/trailer &&
-		test_cmp_bin .git/zero-trailer .git/trailer &&
-		cp .git/config .git/config.before &&
-		cp .git/index .git/index.before &&
-		cp .git/index.csts .git/sidecar.before &&
-		/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
-			.git/index >.git/index.before.stat &&
-		/usr/bin/stat -f "%d %i %l %z %p %u %g %m %c %B" \
-			.git/index.csts >.git/sidecar.before.stat &&
+		test_must_fail git config --get color.ui >.git/color.absent &&
+		test_must_fail git config --get core.quotePath >.git/quotepath.absent &&
 
 		# Retain every pair before testing the fast-path behavior.
 		sidecar_aba_capture a0 clean status &&
 		sidecar_aba_capture b clean -c status.relativePaths=false status &&
 		sidecar_aba_capture a1 clean status &&
+		sidecar_aba_capture color-off clean -c color.ui=false status &&
+		sidecar_aba_capture color-a clean status &&
+		sidecar_aba_capture quote-off clean -c core.quotePath=false status &&
+		sidecar_aba_capture quote-a clean status &&
+		sidecar_aba_capture color-on clean -c color.ui=always status &&
+		sidecar_aba_capture color-final-a clean status &&
 		sidecar_aba_capture subdir clean \
 			-C subdir -c status.relativePaths=false status &&
 		test_write_lines changed >tracked &&
@@ -3400,33 +3447,11 @@ test_expect_success PERL_TEST_HELPERS \
 		sidecar_aba_capture dirty-root dirty \
 			-C subdir -c status.relativePaths=false status &&
 
-		for sidecar_aba_label in a0 b a1 subdir dirty-relative dirty-root
-		do
-			test_cmp ".git/$sidecar_aba_label.expect" \
-				".git/$sidecar_aba_label.actual" &&
-			test_cmp_bin .git/index.before \
-				".git/$sidecar_aba_label.index" &&
-			test_cmp .git/index.before.stat \
-				".git/$sidecar_aba_label.index.stat" &&
-			test_cmp_bin ".git/$sidecar_aba_label.index" \
-				".git/$sidecar_aba_label.oracle.index" &&
-			test_cmp ".git/$sidecar_aba_label.index.stat" \
-				".git/$sidecar_aba_label.oracle.index.stat" &&
-			test_cmp_bin .git/sidecar.before \
-				".git/$sidecar_aba_label.csts" &&
-			test_cmp .git/sidecar.before.stat \
-				".git/$sidecar_aba_label.csts.stat" &&
-			test_cmp_bin ".git/$sidecar_aba_label.csts" \
-				".git/$sidecar_aba_label.oracle.csts" &&
-			test_cmp ".git/$sidecar_aba_label.csts.stat" \
-				".git/$sidecar_aba_label.oracle.csts.stat" &&
-			test_region ! index do_write_index \
-				".git/$sidecar_aba_label.trace" &&
-			test_region ! index do_write_index \
-				".git/$sidecar_aba_label.oracle.trace" ||
-				exit 1
-		done &&
-		for sidecar_aba_label in a0 b a1 subdir
+		sidecar_aba_assert_unchanged \
+			a0 b a1 color-off color-a quote-off quote-a \
+			color-on color-final-a subdir dirty-relative dirty-root &&
+		for sidecar_aba_label in a0 b a1 color-off color-a \
+			quote-off quote-a color-on color-final-a subdir
 		do
 			test_trace2_data status clean-proof/hit 1 \
 				<".git/$sidecar_aba_label.trace" &&
@@ -3436,6 +3461,12 @@ test_expect_success PERL_TEST_HELPERS \
 				<".git/$sidecar_aba_label.trace" ||
 				exit 1
 		done &&
+		test_decode_color <.git/color-on.actual >.git/color-on.decoded &&
+		test_grep "^On branch <RED>.*<RESET>$" .git/color-on.decoded &&
+		test_decode_color <.git/color-off.actual >.git/color-off.decoded &&
+		test_grep ! "<RED>" .git/color-off.decoded &&
+		test_cmp .git/a0.actual .git/color-off.actual &&
+		! test_cmp_bin .git/color-off.actual .git/color-on.actual &&
 		for sidecar_aba_label in dirty-relative dirty-root
 		do
 			test_trace2_data status clean-proof/miss fast-provider-changed \
@@ -3450,6 +3481,69 @@ test_expect_success PERL_TEST_HELPERS \
 		test_cmp_bin .git/config.before .git/config &&
 		test_cmp_bin .git/index.before .git/index &&
 		test_cmp_bin .git/sidecar.before .git/index.csts
+	)
+'
+
+test_expect_success PERL_TEST_HELPERS \
+	'the current quotePath setting still controls dirty status output' '
+	test_create_repo sidecar-command-quotepath &&
+	(
+		cd sidecar-command-quotepath &&
+		quoted_path=$(printf "tracked-\303\270") &&
+		sidecar_aba_setup "$quoted_path" &&
+		test_write_lines changed >"$quoted_path" &&
+		sidecar_aba_capture quoted dirty -c core.quotePath=true status &&
+		sidecar_aba_capture unquoted dirty -c core.quotePath=false status &&
+		sidecar_aba_assert_unchanged quoted unquoted &&
+		for sidecar_aba_label in quoted unquoted
+		do
+			test_trace2_data status clean-proof/miss fast-provider-changed \
+				<".git/$sidecar_aba_label.trace" &&
+			! test_trace2_data status clean-proof/hit 1 \
+				<".git/$sidecar_aba_label.trace" ||
+				exit 1
+		done &&
+		test_grep -F "modified:   \"tracked-\\303\\270\"" .git/quoted.actual &&
+		test_grep -F "modified:   $quoted_path" .git/unquoted.actual &&
+		! test_cmp_bin .git/quoted.actual .git/unquoted.actual &&
+		test_cmp_bin .git/config.before .git/config
+	)
+'
+
+test_expect_success PERL_TEST_HELPERS \
+	'presentation config normalization does not suppress parse errors or persistent changes' '
+	test_create_repo sidecar-presentation-config &&
+	(
+		cd sidecar-presentation-config &&
+		sidecar_aba_setup tracked &&
+		for key in color.ui core.quotePath
+		do
+			GIT_OPTIONAL_LOCKS=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$PWD/.git/$key.invalid.trace" \
+				test_must_fail git -c "$key=invalid" status \
+				>".git/$key.invalid.out" 2>".git/$key.invalid.err" &&
+			test_must_be_empty ".git/$key.invalid.out" &&
+			test_grep "bad boolean config value" ".git/$key.invalid.err" &&
+			test_region ! index do_read_index ".git/$key.invalid.trace" &&
+			test_region ! index do_write_index ".git/$key.invalid.trace" &&
+			test_cmp_bin .git/index.before .git/index &&
+			test_cmp_bin .git/sidecar.before .git/index.csts ||
+				exit 1
+		done &&
+		for key in color.ui core.quotePath
+		do
+			git config "$key" false &&
+			sidecar_aba_capture "$key" readonly status &&
+			sidecar_aba_assert_unchanged "$key" &&
+			test_trace2_data status clean-proof/miss fast-config-changed \
+				<".git/$key.trace" &&
+			! test_trace2_data status clean-proof/sidecar 1 \
+				<".git/$key.trace" &&
+			cp .git/config.before .git/config ||
+				exit 1
+		done &&
+		test_cmp_bin .git/config.before .git/config
 	)
 '
 
