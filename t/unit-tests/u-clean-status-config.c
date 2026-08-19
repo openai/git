@@ -187,10 +187,11 @@ void test_clean_status_config__command_preload_config_does_not_change_proof(void
 	}
 }
 
-void test_clean_status_config__only_command_relative_paths_is_normalized(void)
+static void check_command_presentation_key(const char *key)
 {
-	static const char key[] = "status.relativepaths";
-	static const char *const values[] = { NULL, "", "true", "false" };
+	static const char *const values[] = {
+		NULL, "", "true", "false", "auto", "always", "never",
+	};
 	static const enum config_scope retained_scopes[] = {
 		CONFIG_SCOPE_SYSTEM,
 		CONFIG_SCOPE_GLOBAL,
@@ -201,10 +202,11 @@ void test_clean_status_config__only_command_relative_paths_is_normalized(void)
 	};
 	static const char *const retained_keys[] = {
 		"status.showuntrackedfiles", "status.relativepaths.extra",
+		"color.ui.extra", "color.status", "core.quotepath.extra",
 		"core.filemode", "core.autocrlf",
 	};
 	static const char *const retained_values[] = {
-		"all", "false", "true", "true",
+		"all", "false", "false", "always", "false", "true", "true",
 	};
 	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
 	struct key_value_info kvi = KVI_INIT;
@@ -306,13 +308,26 @@ void test_clean_status_config__only_command_relative_paths_is_normalized(void)
 	}
 }
 
-void test_clean_status_config__relative_paths_does_not_join_filter_parts(void)
+void test_clean_status_config__only_command_presentation_is_normalized(void)
+{
+	static const char *const keys[] = {
+		"status.relativepaths", "color.ui", "core.quotepath",
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(keys); i++)
+		check_command_presentation_key(keys[i]);
+}
+
+void test_clean_status_config__presentation_does_not_join_filter_parts(void)
 {
 	static const char *const keys[] = {
 		"filter.demo.clean", "filter.demo.smudge",
 		"filter.demo.process", "filter.demo.required",
 	};
 	static const char *const values[] = { "", "", "", "false" };
+	static const char *const separators[] = {
+		NULL, "status.relativepaths", "color.ui", "core.quotepath",
+	};
 	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
 	struct key_value_info kvi = KVI_INIT;
 	struct config_context ctx = { .kvi = &kvi };
@@ -327,7 +342,9 @@ void test_clean_status_config__relative_paths_does_not_join_filter_parts(void)
 		clean_status_config_init(&baseline, algo);
 		clean_status_config_add(&baseline, keys[0], "configured", &ctx);
 		clean_status_config_final(&baseline);
-		for (unsigned separated = 0; separated < 2; separated++) {
+		for (size_t i = 0; i < ARRAY_SIZE(separators); i++) {
+			int separated = !!separators[i];
+
 			kvi.scope = CONFIG_SCOPE_LOCAL;
 			kvi.origin_type = CONFIG_ORIGIN_FILE;
 			kvi.filename = "/local-config";
@@ -339,7 +356,7 @@ void test_clean_status_config__relative_paths_does_not_join_filter_parts(void)
 			for (size_t part = 0; part < ARRAY_SIZE(keys); part++) {
 				if (separated && part == 2)
 					clean_status_config_add(&digest,
-						"status.relativepaths",
+						separators[i],
 						"false", &ctx);
 				clean_status_config_add(&digest, keys[part],
 							values[part], &ctx);
