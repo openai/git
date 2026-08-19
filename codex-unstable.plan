@@ -15,6 +15,6 @@
 [branch "tb/codex/fsmonitor-hardlink-inodes-unstable"]
 	remote = .
 	source-ref = refs/heads/tb/codex/fsmonitor-hardlink-inodes-unstable
-	source-tip = 5f2a52ecb8c0510c3ae225baae4c8b7d75f3228a
+	source-tip = 88fab89c5ecd0a6f75a77616ebada157396dd475
 	source-base = cbf6ae4e9b3c705182b1e2573cee19aae7d4b877
 	merge = refs/heads/tb/codex/status-preview-unstable
