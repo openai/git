@@ -3518,7 +3518,7 @@ test_expect_success PERL_TEST_HELPERS \
 		sidecar_aba_setup tracked &&
 		for key in color.ui core.quotePath
 		do
-			GIT_OPTIONAL_LOCKS=1 \
+			test_env GIT_OPTIONAL_LOCKS=1 \
 			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			GIT_TRACE2_EVENT="$PWD/.git/$key.invalid.trace" \
 				test_must_fail git -c "$key=invalid" status \
