@@ -94,6 +94,16 @@ A value of 0 will give some reasonable default. If unset, it defaults to 1.
 For submodules, this setting can be overridden using the `submodule.fetchJobs`
 config setting.
 
+`fetch.packfileUriJobs`::
+	Specifies the maximum number of packfile URI downloads and indexers
+	to run at once. The default is 1, which preserves advertised URI
+	order.
++
+Values greater than 1 are used only when the server advertises and the
+client requests the `no-ref-delta` promise. Each URI pack is then checked
+with `index-pack --no-ref-delta` before it is accepted.
+Responses with one URI retain the serial path.
+
 `fetch.writeCommitGraph`::
 	Set to true to write a commit-graph after every `git fetch` command
 	that downloads a pack-file from a remote. Using the `--split` option,
