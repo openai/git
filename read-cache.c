@@ -17,6 +17,7 @@
 #include "lockfile.h"
 #include "cache-tree.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "refs.h"
 #include "dir.h"
 #include "object-file.h"
@@ -26,13 +27,16 @@
 #include "tree.h"
 #include "commit.h"
 #include "environment.h"
+#include "ewah/ewok.h"
 #include "gettext.h"
 #include "mem-pool.h"
 #include "name-hash.h"
 #include "object-name.h"
 #include "path.h"
+#include "path-namespace.h"
 #include "preload-index.h"
 #include "read-cache.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "resolve-undo.h"
 #include "revision.h"
@@ -66,7 +70,7 @@
  * is outside the range, to cause the reader to abort.
  */
 
-#define CACHE_EXT(s) ( (s[0]<<24)|(s[1]<<16)|(s[2]<<8)|(s[3]) )
+#define CACHE_EXT(s) get_be32(s)
 #define CACHE_EXT_TREE 0x54524545	/* "TREE" */
 #define CACHE_EXT_RESOLVE_UNDO 0x52455543 /* "REUC" */
 #define CACHE_EXT_LINK 0x6c696e6b	  /* "link" */
@@ -143,9 +147,47 @@ static void set_index_entry(struct index_state *istate, int nr, struct cache_ent
 	add_name_hash(istate, ce);
 }
 
-static void replace_index_entry(struct index_state *istate, int nr, struct cache_entry *ce)
+static void replace_index_entry(struct index_state *istate, int nr,
+				struct cache_entry *ce, int options)
 {
 	struct cache_entry *old = istate->cache[nr];
+	int preserve_paired_history =
+		(options & ADD_CACHE_PRESERVE_CLEAN_HISTORY) &&
+		fstat_is_reliable() && istate == istate->repo->index &&
+		!alternate_index_output && !getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(DB_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		!istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		!repo_config_values(istate->repo)->apply_sparse_checkout &&
+		istate->repo->config_values_private_.trust_ctime &&
+		istate->repo->config_values_private_.check_stat &&
+		fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC &&
+		!repo_has_replace_refs_uncached(istate->repo) &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_untracked_valid &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		istate->fsmonitor_last_update &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token) &&
+		clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		clean_status_revalidated_token_matches(istate);
+	/* Keep invalid nodes invalid; write_one_dir() expires pending events. */
+	int preserve_untracked = istate->untracked &&
+		istate->untracked->root &&
+		((istate->untracked->fsmonitor_revalidation &&
+		  istate->untracked->root->valid) ||
+		 (preserve_paired_history &&
+		  istate->untracked->use_fsmonitor)) &&
+		S_ISREG(old->ce_mode) && S_ISREG(ce->ce_mode) &&
+		clean_status_index_entry_is_semantically_safe(istate, old, ce);
+	int suspended_replacement = preserve_untracked &&
+		clean_status_fsmonitor_backoff_suspended(istate) &&
+		!oideq(&old->oid, &ce->oid);
 
 	replace_index_entry_in_base(istate, old, ce);
 	remove_name_hash(istate, old);
@@ -153,7 +195,15 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
 	ce->ce_flags &= ~CE_HASHED;
 	set_index_entry(istate, nr, ce);
 	ce->ce_flags |= CE_UPDATE_IN_BASE;
-	mark_fsmonitor_invalid(istate, ce);
+	if (preserve_untracked) {
+		ce->ce_flags &= ~CE_FSMONITOR_VALID;
+		if (suspended_replacement)
+			fsmonitor_invalidate_cache_entry(ce);
+	} else
+		mark_fsmonitor_invalid(istate, ce);
+	if (preserve_paired_history && preserve_untracked)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "apply/untracked-replacement-preserved", 1);
 	istate->cache_changed |= CE_ENTRY_CHANGED;
 }
 
@@ -228,7 +278,7 @@ void refresh_index_entry_stat(struct index_state *istate, int nr,
 			      struct stat *st)
 {
 	replace_index_entry(istate, nr, make_refreshed_cache_entry(
-		istate, istate->cache[nr], st, 1));
+		istate, istate->cache[nr], st, 1), 0);
 }
 
 static unsigned int st_mode_from_ce(const struct cache_entry *ce)
@@ -524,11 +574,20 @@ int ie_match_stat_with_content_check(struct index_state *istate,
 				     const struct cache_entry *ce,
 				     struct stat *st, unsigned int options)
 {
+	const struct stat_data empty = { 0 };
 	struct cache_entry *current;
 	int changed, pos;
 
+	/*
+	 * A suspended replacement persists its poisoned stat data, but not the
+	 * transient content-check flag. Recover that obligation only from an
+	 * authenticated suspended epoch; ordinary zero-stat entries keep their
+	 * stat-only matching behavior.
+	 */
 	if (S_ISGITLINK(ce->ce_mode) ||
-	    !(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED))
+	    (!(ce->ce_flags & CE_CONTENT_CHECK_REQUIRED) &&
+	     (!clean_status_fsmonitor_backoff_suspended(istate) ||
+	      memcmp(&ce->ce_stat_data, &empty, sizeof(empty)))))
 		return ie_match_stat(istate, ce, st, options);
 
 	changed = ie_modified(istate, ce, st, options);
@@ -1343,7 +1402,7 @@ static int add_index_entry_with_check(struct index_state *istate, struct cache_e
 	/* existing match? Just replace it. */
 	if (pos >= 0) {
 		if (!new_only)
-			replace_index_entry(istate, pos, ce);
+			replace_index_entry(istate, pos, ce, option);
 		return 0;
 	}
 	pos = -pos-1;
@@ -1547,6 +1606,8 @@ int repo_refresh_and_write_index(struct repository *repo,
 		return -1;
 	if (refresh_index(repo->index, refresh_flags, pathspec, seen, header_msg))
 		ret = 1;
+	if (fsm_settings__is_watch_limit_backoff(repo))
+		write_flags |= SKIP_IF_UNCHANGED;
 	if (0 <= fd && write_locked_index(repo->index, &lock_file, COMMIT_LOCK | write_flags))
 		ret = -1;
 	return ret;
@@ -1700,7 +1761,7 @@ int refresh_index(struct index_state *istate, unsigned int flags,
 				 clean_status_fsmonitor_semantic_baseline_pending(
 					 istate));
 
-			replace_index_entry(istate, i, new_entry);
+			replace_index_entry(istate, i, new_entry, 0);
 			if (fsmonitor_valid)
 				mark_fsmonitor_valid(istate,
 						     istate->cache[i]);
@@ -1785,14 +1846,10 @@ struct ondisk_cache_entry {
 	char name[FLEX_ARRAY];
 };
 
-/* These are only used for v3 or lower */
+/* Index v2/v3 entries are padded to a multiple of eight bytes. */
 #define align_padding_size(size, len) ((size + (len) + 8) & ~7) - (size + len)
-#define align_flex_name(STRUCT,len) ((offsetof(struct STRUCT,data) + (len) + 8) & ~7)
-#define ondisk_cache_entry_size(len) align_flex_name(ondisk_cache_entry,len)
 #define ondisk_data_size(flags, len) (the_hash_algo->rawsz + \
 				     ((flags & CE_EXTENDED) ? 2 : 1) * sizeof(uint16_t) + len)
-#define ondisk_data_size_max(len) (ondisk_data_size(CE_EXTENDED, len))
-#define ondisk_ce_size(ce) (ondisk_cache_entry_size(ondisk_data_size((ce)->ce_flags, ce_namelen(ce))))
 
 /* Allow fsck to force verification of the index checksum. */
 int verify_index_checksum;
@@ -1875,30 +1932,76 @@ static int read_index_extension(struct index_state *istate,
 	return 0;
 }
 
+enum index_entry_decode_error {
+	INDEX_ENTRY_DECODE_OK,
+	INDEX_ENTRY_DECODE_CORRUPT,
+	INDEX_ENTRY_DECODE_FLAGS,
+	INDEX_ENTRY_DECODE_NAME,
+};
+
+enum index_entry_decode_flags {
+	INDEX_ENTRY_ALLOW_NAME_RESTART = 1 << 0,
+	INDEX_ENTRY_VERIFY_FORMAT = 1 << 1,
+};
+
+struct decoded_index_entry {
+	struct cache_entry *ce;
+	size_t size;
+	unsigned int bad_flags;
+};
+
+static int decode_index_entry_varint(const unsigned char **cursor,
+				     const unsigned char *end,
+				     uint64_t *result)
+{
+	const unsigned char *p = *cursor;
+	unsigned char c;
+	uint64_t value;
+
+	if (p == end)
+		return -1;
+	c = *p++;
+	value = c & 127;
+	while (c & 128) {
+		value++;
+		if (!value || MSB(value, 7) || p == end)
+			return -1;
+		c = *p++;
+		value = (value << 7) + (c & 127);
+	}
+	*cursor = p;
+	*result = value;
+	return 0;
+}
+
 /*
- * Parses the contents of the cache entry contained within the 'ondisk' buffer
- * into a new incore 'cache_entry'.
+ * Decode one entry without reading beyond available bytes or reporting a
+ * fatal error. The main-index reader supplies its usual fatal wrapper below;
+ * optional index witnesses use the same decoder and treat errors as misses.
  *
- * Note that 'char *ondisk' may not be aligned to a 4-byte address interval in
- * index v4, so we cannot cast it to 'struct ondisk_cache_entry *' and access
- * its members. Instead, we use the byte offsets of members within the struct to
- * identify where 'get_be16()', 'get_be32()', and 'oidread()' (which can all
- * read from an unaligned memory buffer) should read from the 'ondisk' buffer
- * into the corresponding incore 'cache_entry' members.
+ * A v4 IEOT block starts with a complete name, but its strip count still
+ * describes the preceding block's last name. Preserve the main reader's
+ * treatment of a missing previous_ce as a name restart. The optional reader
+ * starts at the first entry and also requests the stricter format checks.
+ *
+ * V4 entries need not be aligned. Load fixed fields by their byte offsets,
+ * using get_be16(), get_be32(), and oidread() rather than a struct cast.
  */
-static struct cache_entry *create_from_disk(struct mem_pool *ce_mem_pool,
-					    unsigned int version,
-					    const char *ondisk,
-					    unsigned long *ent_size,
-					    const struct cache_entry *previous_ce)
+static enum index_entry_decode_error decode_index_entry(
+	struct mem_pool *ce_mem_pool, const struct git_hash_algo *algo,
+	unsigned int version, const char *ondisk, size_t available,
+	const struct cache_entry *previous_ce, unsigned int options,
+	struct decoded_index_entry *decoded)
 {
 	struct cache_entry *ce;
-	size_t len;
-	const char *name;
-	const unsigned hashsz = the_hash_algo->rawsz;
-	const char *flagsp = ondisk + offsetof(struct ondisk_cache_entry, data) + hashsz;
+	size_t len, suffix_len, consumed;
+	size_t fixed_size = offsetof(struct ondisk_cache_entry, data) +
+		algo->rawsz + sizeof(uint16_t);
+	const char *name, *end = ondisk + available;
+	const char *flagsp;
 	unsigned int flags;
 	size_t copy_len = 0;
+	int verify_format = options & INDEX_ENTRY_VERIFY_FORMAT;
 	/*
 	 * Adjacent cache entries tend to share the leading paths, so it makes
 	 * sense to only store the differences in later entries.  In the v4
@@ -1908,42 +2011,85 @@ static struct cache_entry *create_from_disk(struct mem_pool *ce_mem_pool,
 	 */
 	int expand_name_field = version == 4;
 
+	memset(decoded, 0, sizeof(*decoded));
+	if (available < fixed_size)
+		return INDEX_ENTRY_DECODE_CORRUPT;
+	flagsp = ondisk + fixed_size - sizeof(uint16_t);
+
 	/* On-disk flags are just 16 bits */
 	flags = get_be16(flagsp);
 	len = flags & CE_NAMEMASK;
 
 	if (flags & CE_EXTENDED) {
-		int extended_flags;
-		extended_flags = get_be16(flagsp + sizeof(uint16_t)) << 16;
+		unsigned int extended_flags;
+
+		if (available - fixed_size < sizeof(uint16_t))
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		extended_flags =
+			(unsigned int)get_be16(flagsp + sizeof(uint16_t)) << 16;
 		/* We do not yet understand any bit out of CE_EXTENDED_FLAGS */
-		if (extended_flags & ~CE_EXTENDED_FLAGS)
-			die(_("unknown index entry format 0x%08x"), extended_flags);
+		if (extended_flags & ~CE_EXTENDED_FLAGS) {
+			decoded->bad_flags = extended_flags;
+			return INDEX_ENTRY_DECODE_FLAGS;
+		}
 		flags |= extended_flags;
-		name = (const char *)(flagsp + 2 * sizeof(uint16_t));
+		fixed_size += sizeof(uint16_t);
 	}
-	else
-		name = (const char *)(flagsp + sizeof(uint16_t));
+	name = ondisk + fixed_size;
 
 	if (expand_name_field) {
 		const unsigned char *cp = (const unsigned char *)name;
-		uint64_t strip_len, previous_len;
+		uint64_t strip_len;
 
-		/* If we're at the beginning of a block, ignore the previous name */
-		strip_len = decode_varint(&cp);
+		if (decode_index_entry_varint(
+			    &cp, (const unsigned char *)end, &strip_len))
+			return INDEX_ENTRY_DECODE_CORRUPT;
 		if (previous_ce) {
-			previous_len = previous_ce->ce_namelen;
-			if (previous_len < strip_len)
-				die(_("malformed name field in the index, near path '%s'"),
-					previous_ce->name);
-			copy_len = previous_len - strip_len;
-		}
+			if (previous_ce->ce_namelen < strip_len)
+				return INDEX_ENTRY_DECODE_NAME;
+			copy_len = previous_ce->ce_namelen - strip_len;
+		} else if (strip_len &&
+			   !(options & INDEX_ENTRY_ALLOW_NAME_RESTART))
+			return INDEX_ENTRY_DECODE_NAME;
 		name = (const char *)cp;
 	}
 
 	if (len == CE_NAMEMASK) {
-		len = strlen(name);
-		if (expand_name_field)
-			len += copy_len;
+		const char *nul = memchr(name, '\0', end - name);
+
+		if (!nul || copy_len > INT_MAX ||
+		    (size_t)(nul - name) > INT_MAX - copy_len)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		suffix_len = nul - name;
+		len = copy_len + suffix_len;
+		if (verify_format && len < CE_NAMEMASK)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+	} else {
+		if (len < copy_len)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		suffix_len = len - copy_len;
+		if (suffix_len >= (size_t)(end - name) || name[suffix_len] ||
+		    (verify_format && memchr(name, '\0', suffix_len)))
+			return INDEX_ENTRY_DECODE_CORRUPT;
+	}
+	if (len > INT_MAX ||
+	    len > SIZE_MAX - offsetof(struct cache_entry, name) - 1)
+		return INDEX_ENTRY_DECODE_CORRUPT;
+
+	consumed = (name - ondisk) + suffix_len + 1;
+	if (!expand_name_field) {
+		size_t padded;
+
+		if (consumed > SIZE_MAX - 7)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		padded = (consumed + 7) & ~(size_t)7;
+		if (padded > available)
+			return INDEX_ENTRY_DECODE_CORRUPT;
+		if (verify_format)
+			for (size_t i = consumed; i < padded; i++)
+				if (ondisk[i])
+					return INDEX_ENTRY_DECODE_CORRUPT;
+		consumed = padded;
 	}
 
 	ce = mem_pool__ce_alloc(ce_mem_pool, len);
@@ -1974,18 +2120,189 @@ static struct cache_entry *create_from_disk(struct mem_pool *ce_mem_pool,
 	ce->ce_namelen = len;
 	ce->index = 0;
 	oidread(&ce->oid, (const unsigned char *)ondisk + offsetof(struct ondisk_cache_entry, data),
-		the_repository->hash_algo);
+		algo);
 
-	if (expand_name_field) {
-		if (copy_len)
-			memcpy(ce->name, previous_ce->name, copy_len);
-		memcpy(ce->name + copy_len, name, len + 1 - copy_len);
-		*ent_size = (name - ((char *)ondisk)) + len + 1 - copy_len;
-	} else {
-		memcpy(ce->name, name, len + 1);
-		*ent_size = ondisk_ce_size(ce);
+	if (copy_len)
+		memcpy(ce->name, previous_ce->name, copy_len);
+	memcpy(ce->name + copy_len, name, suffix_len + 1);
+	decoded->ce = ce;
+	decoded->size = consumed;
+	return INDEX_ENTRY_DECODE_OK;
+}
+
+static struct cache_entry *create_from_disk(
+	struct mem_pool *ce_mem_pool, unsigned int version,
+	const char *ondisk, size_t available, unsigned long *ent_size,
+	const struct cache_entry *previous_ce)
+{
+	struct decoded_index_entry decoded;
+	enum index_entry_decode_error err = decode_index_entry(
+		ce_mem_pool, the_hash_algo, version, ondisk, available,
+		previous_ce, INDEX_ENTRY_ALLOW_NAME_RESTART, &decoded);
+
+	if (err == INDEX_ENTRY_DECODE_FLAGS)
+		die(_("unknown index entry format 0x%08x"), decoded.bad_flags);
+	if (err == INDEX_ENTRY_DECODE_NAME && previous_ce)
+		die(_("malformed name field in the index, near path '%s'"),
+		    previous_ce->name);
+	if (err || decoded.size > ULONG_MAX)
+		die(_("index file corrupt"));
+	*ent_size = decoded.size;
+	return decoded.ce;
+}
+
+/* Format-level checks only: a witness must not consult worktree config. */
+static int index_witness_entry_is_valid(
+	const struct cache_entry *ce, unsigned int version,
+	const struct cache_entry *previous)
+{
+	const char *component = ce->name;
+
+	switch (ce->ce_mode) {
+	case 0100644:
+	case 0100755:
+	case 0120000:
+	case 0160000:
+		break;
+	default:
+		return 0;
 	}
-	return ce;
+	if (!ce_namelen(ce) ||
+	    (version == 2 && (ce->ce_flags & CE_EXTENDED)))
+		return 0;
+	for (;;) {
+		const char *slash = strchr(component, '/');
+		size_t len = slash ? (size_t)(slash - component) :
+			strlen(component);
+
+		if (!len || (len == 1 && component[0] == '.') ||
+		    (len == 2 && !memcmp(component, "..", 2)) ||
+		    (len == 4 && component[0] == '.' &&
+		     (component[1] == 'g' || component[1] == 'G') &&
+		     (component[2] == 'i' || component[2] == 'I') &&
+		     (component[3] == 't' || component[3] == 'T')))
+			return 0;
+		if (!slash)
+			break;
+		component = slash + 1;
+	}
+	if (previous) {
+		int cmp = strcmp(previous->name, ce->name);
+
+		if (cmp > 0 ||
+		    (!cmp && (!ce_stage(previous) ||
+			      ce_stage(previous) >= ce_stage(ce))))
+			return 0;
+	}
+	return 1;
+}
+
+int read_index_entries_from_fd(struct index_state *istate, int fd)
+{
+	struct index_state parsed = INDEX_STATE_INIT(istate->repo);
+	const struct git_hash_algo *algo;
+	struct stat before, after;
+	unsigned char header[sizeof(struct cache_header)];
+	char *data = NULL;
+	size_t size, end, offset, minimum_entry_size;
+	uint32_t nr;
+	int ret = -1;
+
+	if (!istate->repo || !istate->repo->hash_algo || fd < 0 ||
+	    istate->initialized || istate->cache || istate->cache_nr ||
+	    istate->ce_mem_pool)
+		return -1;
+	algo = istate->repo->hash_algo;
+	trace2_region_enter("index", "read_index_entries", istate->repo);
+	if (fstat(fd, &before) || !S_ISREG(before.st_mode) ||
+	    before.st_size < 0 ||
+	    (uintmax_t)before.st_size > SIZE_MAX ||
+	    (uintmax_t)before.st_size >
+		(uintmax_t)maximum_signed_value_of_type(ssize_t))
+		goto done;
+	size = (size_t)before.st_size;
+	if (size < sizeof(header) + algo->rawsz ||
+	    (size_t)pread_in_full(fd, header, sizeof(header), 0) !=
+		sizeof(header) || memcmp(header, "DIRC", 4))
+		goto done;
+	parsed.version = get_be32(header + 4);
+	if (parsed.version < INDEX_FORMAT_LB ||
+	    parsed.version > INDEX_FORMAT_UB)
+		goto done;
+	end = size - algo->rawsz;
+	nr = get_be32(header + 8);
+	offset = sizeof(header);
+	minimum_entry_size = offsetof(struct ondisk_cache_entry, data) +
+		algo->rawsz + sizeof(uint16_t) + 1 + (parsed.version == 4);
+	if (nr > INT_MAX || nr > (end - offset) / minimum_entry_size ||
+	    unsigned_mult_overflows((size_t)nr, sizeof(*parsed.cache)))
+		goto done;
+	/* A concurrent truncate must be a short read, not an mmap SIGBUS. */
+	data = malloc(size);
+	if (!data || (size_t)pread_in_full(fd, data, size, 0) != size ||
+	    memcmp(data, header, sizeof(header)))
+		goto done;
+	oidread(&parsed.oid, (const unsigned char *)data + end, algo);
+	if (!is_null_oid(&parsed.oid) &&
+	    !hashfile_checksum_valid(algo, (const unsigned char *)data, size))
+		goto done;
+	if (nr) {
+		parsed.cache = calloc(nr, sizeof(*parsed.cache));
+		if (!parsed.cache)
+			goto done;
+		parsed.ce_mem_pool = malloc(sizeof(*parsed.ce_mem_pool));
+		if (!parsed.ce_mem_pool)
+			goto done;
+		mem_pool_init(parsed.ce_mem_pool, 0);
+	}
+	parsed.cache_alloc = nr;
+	parsed.initialized = 1;
+	parsed.timestamp.sec = before.st_mtime;
+	parsed.timestamp.nsec = ST_MTIME_NSEC(before);
+	while (parsed.cache_nr < nr) {
+		struct decoded_index_entry decoded;
+		const struct cache_entry *previous = parsed.cache_nr ?
+			parsed.cache[parsed.cache_nr - 1] : NULL;
+
+		if (decode_index_entry(parsed.ce_mem_pool, algo, parsed.version,
+				       data + offset, end - offset, previous,
+				       INDEX_ENTRY_VERIFY_FORMAT, &decoded) ||
+		    !index_witness_entry_is_valid(decoded.ce, parsed.version,
+						  previous))
+			goto done;
+		parsed.cache[parsed.cache_nr++] = decoded.ce;
+		offset += decoded.size;
+	}
+	while (offset < end) {
+		const char *ext = data + offset;
+		uint32_t ext_size;
+
+		if (end - offset < 8)
+			goto done;
+		ext_size = get_be32(ext + 4);
+		if (ext_size > end - offset - 8 ||
+		    ext[0] < 'A' || ext[0] > 'Z' ||
+		    !memcmp(ext, "REUC", 4))
+			goto done;
+		/* Optional acceleration extensions are deliberately not installed. */
+		offset += 8;
+		offset += ext_size;
+	}
+	if (fstat(fd, &after) || !path_namespace_stat_equal(&before, &after))
+		goto done;
+
+	trace2_data_intmax("index", istate->repo, "read/entries-only",
+			   parsed.cache_nr);
+	release_index(istate);
+	*istate = parsed;
+	index_state_init(&parsed, istate->repo);
+	ret = 0;
+
+done:
+	free(data);
+	release_index(&parsed);
+	trace2_region_leave("index", "read_index_entries", istate->repo);
+	return ret;
 }
 
 static void check_ce_order(struct index_state *istate)
@@ -2259,20 +2576,32 @@ join_tree:
  */
 static unsigned long load_cache_entry_block(struct index_state *istate,
 			struct mem_pool *ce_mem_pool, int offset, int nr, const char *mmap,
-			unsigned long start_offset, const struct cache_entry *previous_ce)
+			size_t mmap_size, unsigned long start_offset,
+			const struct cache_entry *previous_ce)
 {
 	int i;
 	unsigned long src_offset = start_offset;
+	size_t end;
+
+	if (mmap_size < the_hash_algo->rawsz || offset < 0 || nr < 0 ||
+	    nr > INT_MAX - offset || (unsigned int)offset > istate->cache_nr ||
+	    (unsigned int)nr > istate->cache_nr - offset)
+		die(_("index file corrupt"));
+	end = mmap_size - the_hash_algo->rawsz;
 
 	for (i = offset; i < offset + nr; i++) {
 		struct cache_entry *ce;
 		unsigned long consumed;
 
+		if (src_offset > end)
+			die(_("index file corrupt"));
 		ce = create_from_disk(ce_mem_pool, istate->version,
-				      mmap + src_offset,
+				      mmap + src_offset, end - src_offset,
 				      &consumed, previous_ce);
 		set_index_entry(istate, i, ce);
 
+		if (consumed > ULONG_MAX - src_offset)
+			die(_("index file corrupt"));
 		src_offset += consumed;
 		previous_ce = ce;
 	}
@@ -2294,7 +2623,8 @@ static unsigned long load_all_cache_entries(struct index_state *istate,
 	}
 
 	consumed = load_cache_entry_block(istate, istate->ce_mem_pool,
-					0, istate->cache_nr, mmap, src_offset, NULL);
+					0, istate->cache_nr, mmap, mmap_size,
+					src_offset, NULL);
 	return consumed;
 }
 
@@ -2314,6 +2644,7 @@ struct load_cache_entries_thread_data
 	struct mem_pool *ce_mem_pool;
 	int offset;
 	const char *mmap;
+	size_t mmap_size;
 	struct index_entry_offset_table *ieot;
 	int ieot_start;		/* starting index into the ieot array */
 	int ieot_blocks;	/* count of ieot entries to process */
@@ -2332,7 +2663,8 @@ static void *load_cache_entries_thread(void *_data)
 	/* iterate across all ieot blocks assigned to this thread */
 	for (i = p->ieot_start; i < p->ieot_start + p->ieot_blocks; i++) {
 		p->consumed += load_cache_entry_block(p->istate, p->ce_mem_pool,
-			p->offset, p->ieot->entries[i].nr, p->mmap, p->ieot->entries[i].offset, NULL);
+			p->offset, p->ieot->entries[i].nr, p->mmap,
+			p->mmap_size, p->ieot->entries[i].offset, NULL);
 		p->offset += p->ieot->entries[i].nr;
 	}
 	return NULL;
@@ -2369,6 +2701,7 @@ static unsigned long load_cache_entries_threaded(struct index_state *istate, con
 		p->istate = istate;
 		p->offset = offset;
 		p->mmap = mmap;
+		p->mmap_size = mmap_size;
 		p->ieot = ieot;
 		p->ieot_start = ieot_start;
 		p->ieot_blocks = ieot_blocks;
@@ -2424,8 +2757,9 @@ static void set_new_index_sparsity(struct index_state *istate)
 		istate->sparse_index = 1;
 }
 
-/* remember to discard_cache() before reading a different cache! */
-int do_read_index(struct index_state *istate, const char *path, int must_exist)
+/* A nonnegative source_fd is owned by this reader. */
+static int do_read_index_1(struct index_state *istate, const char *path,
+			   int must_exist, int source_fd)
 {
 	int fd;
 	struct stat st;
@@ -2439,12 +2773,15 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	struct index_entry_offset_table *ieot = NULL;
 
 	clean_status_attach_config(istate);
-	if (istate->initialized)
+	if (istate->initialized) {
+		if (source_fd >= 0)
+			close(source_fd);
 		return istate->cache_nr;
+	}
 
 	istate->timestamp.sec = 0;
 	istate->timestamp.nsec = 0;
-	fd = git_open_cloexec(path, O_RDONLY);
+	fd = source_fd >= 0 ? source_fd : git_open_cloexec(path, O_RDONLY);
 	if (fd < 0) {
 		if (!must_exist && errno == ENOENT) {
 			set_new_index_sparsity(istate);
@@ -2583,6 +2920,24 @@ unmap:
 	die(_("index file corrupt"));
 }
 
+/* remember to discard_cache() before reading a different cache! */
+int do_read_index(struct index_state *istate, const char *path, int must_exist)
+{
+	return do_read_index_1(istate, path, must_exist, -1);
+}
+
+int do_read_index_from_fd(struct index_state *istate, int fd,
+			  const char *path)
+{
+	if (fd < 0)
+		return -1;
+	if (istate->initialized) {
+		close(fd);
+		return -1;
+	}
+	return do_read_index_1(istate, path, 1, fd);
+}
+
 /*
  * Signal that the shared index is used by updating its mtime.
  *
@@ -2690,6 +3045,8 @@ void release_index(struct index_state *istate)
 	free(istate->fsmonitor_last_update);
 	free(istate->fsmonitor_last_update_pending);
 	free(istate->fsmonitor_untracked_token);
+	ewah_free(istate->fsmonitor_dirty);
+	istate->fsmonitor_dirty = NULL;
 	clean_status_release(istate);
 	free(istate->preload_bulk_tracked_state);
 	free(istate->preload_bulk_stat_updates);
@@ -3003,15 +3360,30 @@ int has_racy_timestamp(struct index_state *istate)
 	return 0;
 }
 
-void repo_update_index_if_able(struct repository *repo,
-			       struct lock_file *lockfile)
+static int write_locked_index_with_receipt(
+	struct index_state *istate, struct lock_file *lock,
+	unsigned flags, struct clean_status_index_write_receipt *receipt,
+	struct clean_status_commit_checkpoint *checkpoint);
+
+void repo_update_index_if_able_with_receipt(
+	struct repository *repo, struct lock_file *lockfile,
+	struct clean_status_index_write_receipt *receipt)
 {
+	if (receipt)
+		clean_status_index_write_receipt_release(receipt);
 	if ((repo->index->cache_changed ||
 	     has_racy_timestamp(repo->index)) &&
 	    repo_verify_index(repo))
-		write_locked_index(repo->index, lockfile, COMMIT_LOCK);
+		write_locked_index_with_receipt(repo->index, lockfile,
+					COMMIT_LOCK, receipt, NULL);
 	else
 		rollback_lock_file(lockfile);
+}
+
+void repo_update_index_if_able(struct repository *repo,
+			       struct lock_file *lockfile)
+{
+	repo_update_index_if_able_with_receipt(repo, lockfile, NULL);
 }
 
 static int record_eoie(void)
@@ -3055,15 +3427,67 @@ enum write_extensions {
 };
 #define WRITE_ALL_EXTENSIONS ((enum write_extensions)-1)
 
+static int fsmonitor_can_persist_untracked_revalidation(
+	const struct index_state *istate, const char *index_path)
+{
+	const char *suffix, *pending;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
+	int same_token = istate->fsmonitor_last_update &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token);
+
+	if (suspended) {
+		if (alternate_index_output ||
+		    !clean_status_index_path_is_main(istate->repo, index_path) ||
+		    getenv(DB_ENVIRONMENT) ||
+		    !fstat_is_reliable() ||
+		    repo_config_values(istate->repo)->apply_sparse_checkout ||
+		    repo_has_replace_refs_uncached(istate->repo))
+			return 0;
+		if (!same_token && istate->fsmonitor_untracked_token &&
+		    skip_prefix(istate->fsmonitor_last_update, "builtin:", &suffix) &&
+		    skip_prefix(istate->fsmonitor_untracked_token, "pending:", &pending))
+			same_token = !strcmp(suffix, pending);
+	}
+	return istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid &&
+		istate->untracked->fsmonitor_revalidation &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		istate->fsmonitor_last_update &&
+		starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		istate->fsmonitor_last_update[strlen("builtin:")] &&
+		strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
+		same_token &&
+		(!getenv(INDEX_ENVIRONMENT) || suspended) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		istate == istate->repo->index &&
+		!istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		!(istate->cache_changed &
+		  (CE_ENTRY_ADDED | CE_ENTRY_REMOVED)) &&
+		istate->repo->config_values_private_.trust_ctime &&
+		istate->repo->config_values_private_.check_stat &&
+		(fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC ||
+		 suspended) &&
+		clean_status_fsmonitor_semantic_baseline_pending(istate);
+}
+
 /*
  * On success, `tempfile` is closed. If it is the temporary file
  * of a `struct lock_file`, we will therefore effectively perform
  * a 'close_lock_file_gently()`. Since that is an implementation
  * detail of lockfiles, callers of `do_write_index()` should not
- * rely on it.
+ * rely on it. The optional index_path names a lockfile's intended
+ * destination; suspended history may only be carried to the main index.
  */
 static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
-			  enum write_extensions write_extensions, unsigned flags)
+			  enum write_extensions write_extensions, unsigned flags,
+			  const char *index_path)
 {
 	uint64_t start = getnanotime();
 	struct hashfile *f;
@@ -3306,7 +3730,8 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	if (write_extensions & WRITE_FSMONITOR_EXTENSION &&
 	    istate->untracked &&
 	    istate->fsmonitor_last_update &&
-	    istate->fsmonitor_untracked_valid &&
+	    (istate->fsmonitor_untracked_valid ||
+	     fsmonitor_can_persist_untracked_revalidation(istate, index_path)) &&
 	    !istate->fsmonitor_legacy_untracked_fallback) {
 		strbuf_reset(&sb);
 
@@ -3319,6 +3744,21 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 			ret = -1;
 			goto out;
 		}
+	} else if ((write_extensions & WRITE_FSMONITOR_EXTENSION) &&
+		   (write_extensions & WRITE_UNTRACKED_CACHE_EXTENSION) &&
+		   istate == istate->repo->index &&
+		   !alternate_index_output &&
+		   !istate->split_index &&
+		   !getenv(INDEX_ENVIRONMENT) &&
+		   istate->untracked &&
+		   istate->fsmonitor_last_update &&
+		   starts_with(istate->fsmonitor_last_update, "builtin:") &&
+		   istate->fsmonitor_last_update[strlen("builtin:")] &&
+		   strcmp(istate->fsmonitor_last_update, "builtin:fake") &&
+		   !istate->fsmonitor_legacy_untracked_fallback &&
+		   fsm_settings__get_mode(istate->repo) == FSMONITOR_MODE_IPC) {
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   "untracked/proof-missing", 1);
 	}
 	if (write_extensions & WRITE_FSCF_EXTENSION &&
 	    !istate->fsmonitor_legacy_untracked_fallback &&
@@ -3400,6 +3840,11 @@ void set_alternate_index_output(const char *name)
 	alternate_index_output = name;
 }
 
+const char *get_alternate_index_output(void)
+{
+	return alternate_index_output;
+}
+
 static int commit_locked_index(struct lock_file *lk)
 {
 	if (alternate_index_output)
@@ -3408,36 +3853,62 @@ static int commit_locked_index(struct lock_file *lk)
 		return commit_lock_file(lk);
 }
 
-static int do_write_locked_index(struct index_state *istate,
-				 struct lock_file *lock,
-				 unsigned flags,
-				 enum write_extensions write_extensions)
+static int do_write_locked_index(
+	struct index_state *istate, struct lock_file *lock, unsigned flags,
+	enum write_extensions write_extensions,
+	struct clean_status_index_write_receipt *receipt,
+	struct clean_status_commit_checkpoint *checkpoint)
 {
 	int ret;
 	int was_full = istate->sparse_index == INDEX_EXPANDED;
+	int receipt_prepared = 0;
+	char *index_path = NULL;
+
+	if (receipt && (flags & COMMIT_LOCK) && !alternate_index_output &&
+	    !(write_extensions & WRITE_SPLIT_INDEX_EXTENSION))
+		receipt_prepared = !clean_status_index_prepare_write_receipt(
+			istate, get_lock_file_fd(lock), receipt);
 
 	ret = convert_to_sparse(istate, 0);
 
 	if (ret) {
+		if (receipt_prepared)
+			clean_status_index_write_receipt_release(receipt);
 		warning(_("failed to convert to a sparse-index"));
 		return ret;
 	}
 
+	if (clean_status_fsmonitor_backoff_suspended(istate) &&
+	    !alternate_index_output)
+		index_path = get_locked_file_path(lock);
 	trace2_region_enter_printf("index", "do_write_index", istate->repo,
 				   "%s", get_lock_file_path(lock));
-	ret = do_write_index(istate, lock->tempfile, write_extensions, flags);
+	ret = do_write_index(istate, lock->tempfile, write_extensions, flags,
+			     index_path);
+	free(index_path);
 	trace2_region_leave_printf("index", "do_write_index", istate->repo,
 				   "%s", get_lock_file_path(lock));
 
 	if (was_full)
 		ensure_full_index(istate);
 
-	if (ret)
+	if (ret) {
+		if (receipt_prepared)
+			clean_status_index_write_receipt_release(receipt);
 		return ret;
+	}
 	if (flags & COMMIT_LOCK)
 		ret = commit_locked_index(lock);
 	else
 		ret = close_lock_file_gently(lock);
+	if (receipt_prepared) {
+		if (!ret)
+			clean_status_index_record_write_receipt(istate, receipt);
+		else
+			clean_status_index_write_receipt_release(receipt);
+	}
+	if (!ret && checkpoint && !(flags & COMMIT_LOCK))
+		clean_status_record_commit_checkpoint(checkpoint, istate, lock);
 
 	run_hooks_l(the_repository, "post-index-change",
 		    istate->updated_workdir ? "1" : "0",
@@ -3454,7 +3925,8 @@ static int write_split_index(struct index_state *istate,
 {
 	int ret;
 	prepare_to_write_split_index(istate);
-	ret = do_write_locked_index(istate, lock, flags, WRITE_ALL_EXTENSIONS);
+	ret = do_write_locked_index(istate, lock, flags, WRITE_ALL_EXTENSIONS,
+				    NULL, NULL);
 	finish_writing_split_index(istate);
 	return ret;
 }
@@ -3540,7 +4012,7 @@ static int write_shared_index(struct index_state *istate,
 
 	trace2_region_enter_printf("index", "shared/do_write_index",
 				   the_repository, "%s", get_tempfile_path(*temp));
-	ret = do_write_index(si->base, *temp, WRITE_NO_EXTENSION, flags);
+	ret = do_write_index(si->base, *temp, WRITE_NO_EXTENSION, flags, NULL);
 	trace2_region_leave_printf("index", "shared/do_write_index",
 				   the_repository, "%s", get_tempfile_path(*temp));
 
@@ -3596,8 +4068,10 @@ static int too_many_not_shared_entries(struct index_state *istate)
 	return (int64_t)istate->cache_nr * max_split < (int64_t)not_shared * 100;
 }
 
-int write_locked_index(struct index_state *istate, struct lock_file *lock,
-		       unsigned flags)
+static int write_locked_index_with_receipt(
+	struct index_state *istate, struct lock_file *lock,
+	unsigned flags, struct clean_status_index_write_receipt *receipt,
+	struct clean_status_commit_checkpoint *checkpoint)
 {
 	int new_shared_index, ret, test_split_index_env;
 	struct split_index *si = istate->split_index;
@@ -3611,6 +4085,14 @@ int write_locked_index(struct index_state *istate, struct lock_file *lock,
 			rollback_lock_file(lock);
 		return 0;
 	}
+	if (fsm_settings__is_watch_limit_backoff(istate->repo)) {
+		/* An actual write may retain history, never a live clean bitmap. */
+		for (size_t i = 0; i < istate->cache_nr; i++)
+			istate->cache[i]->ce_flags &= ~CE_FSMONITOR_VALID;
+		istate->fsmonitor_untracked_valid = 0;
+		if (istate->untracked)
+			istate->untracked->use_fsmonitor = 0;
+	}
 
 	if (istate->fsmonitor_last_update)
 		fill_fsmonitor_bitmap(istate);
@@ -3621,7 +4103,8 @@ int write_locked_index(struct index_state *istate, struct lock_file *lock,
 	    alternate_index_output ||
 	    (istate->cache_changed & ~EXTMASK)) {
 		ret = do_write_locked_index(istate, lock, flags,
-					    ~WRITE_SPLIT_INDEX_EXTENSION);
+					    ~WRITE_SPLIT_INDEX_EXTENSION,
+					    receipt, checkpoint);
 		goto out;
 	}
 
@@ -3651,7 +4134,8 @@ int write_locked_index(struct index_state *istate, struct lock_file *lock,
 		free(path);
 		if (!temp) {
 			ret = do_write_locked_index(istate, lock, flags,
-						    ~WRITE_SPLIT_INDEX_EXTENSION);
+						    ~WRITE_SPLIT_INDEX_EXTENSION,
+						    receipt, checkpoint);
 			goto out;
 		}
 		ret = write_shared_index(istate, &temp, flags);
@@ -3679,6 +4163,102 @@ out:
 	if (flags & COMMIT_LOCK)
 		rollback_lock_file(lock);
 	return ret;
+}
+
+int write_locked_index(struct index_state *istate, struct lock_file *lock,
+		       unsigned flags)
+{
+	return write_locked_index_with_receipt(istate, lock, flags, NULL, NULL);
+}
+
+int write_locked_index_for_commit(
+	struct index_state *istate, struct lock_file *lock,
+	struct clean_status_commit_checkpoint **checkpoint)
+{
+	struct clean_status_commit_checkpoint *candidate;
+	int ret;
+
+	clean_status_release_commit_checkpoint(*checkpoint);
+	*checkpoint = NULL;
+	candidate = clean_status_capture_commit_checkpoint(istate, lock);
+	ret = write_locked_index_with_receipt(istate, lock, 0, NULL, candidate);
+	if (ret)
+		clean_status_release_commit_checkpoint(candidate);
+	else
+		*checkpoint = candidate;
+	return ret;
+}
+
+void restore_locked_index_for_commit(
+	struct index_state *istate, struct lock_file *lock,
+	const struct clean_status_commit_checkpoint *checkpoint)
+{
+	struct repository *repo = istate->repo;
+	struct index_state replacement = INDEX_STATE_INIT(repo);
+	struct clean_status_index_snapshot current = { .fd = -1 };
+	struct lock_file rewrite = LOCK_INIT;
+	struct strbuf cache_tree_data = STRBUF_INIT;
+	char *destination = NULL;
+	const char *path;
+	int ret;
+
+	if (!clean_status_commit_checkpoint_changed(checkpoint, lock) ||
+	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock))
+		return;
+	path = get_lock_file_path(lock);
+	destination = get_locked_file_path(lock);
+	if (!clean_status_index_path_is_main(repo, destination) ||
+	    clean_status_index_snapshot_open_allow_null_checksum(
+		    &current, path, repo->hash_algo) ||
+	    hold_lock_file_for_update(&rewrite, path, LOCK_NO_DEREF) < 0 ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &current, path, repo->hash_algo) ||
+	    !clean_status_prepare_commit_checkpoint_restore(
+		    checkpoint, lock, istate, &replacement, current.fd))
+		goto done;
+
+	/* The logical entries are equal, so the parent's cache tree is reusable. */
+	if (istate->cache_tree) {
+		cache_tree_write(&cache_tree_data, istate->cache_tree);
+		replacement.cache_tree = cache_tree_read(
+			cache_tree_data.buf, cache_tree_data.len);
+	}
+
+	/*
+	 * Only this parent owns the final canonical destination. A nested lock
+	 * preserves the hook's file on rejection or I/O failure, and avoids
+	 * reopening an untrusted pathname with O_TRUNC. The regular serializer
+	 * retains the post-hook stat data and performs its usual racy smudging.
+	 */
+	repo->index = &replacement;
+	if (!untracked_cache_preserve_for_revalidation(&replacement)) {
+		repo->index = istate;
+		goto done;
+	}
+	fill_fsmonitor_bitmap(&replacement);
+	trace2_region_enter_printf("index", "do_write_index", repo,
+				   "%s", get_lock_file_path(&rewrite));
+	ret = do_write_index(&replacement, rewrite.tempfile,
+			     ~WRITE_SPLIT_INDEX_EXTENSION, 0, destination);
+	trace2_region_leave_printf("index", "do_write_index", repo,
+				   "%s", get_lock_file_path(&rewrite));
+	repo->index = istate;
+	if (ret ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &current, path, repo->hash_algo) ||
+	    !clean_status_commit_checkpoint_still_valid(checkpoint, lock) ||
+	    commit_lock_file(&rewrite))
+		goto done;
+
+	/* The original logical write already ran post-index-change. */
+	trace2_data_intmax("fsmonitor", repo,
+			   "history/commit-backoff-restored", 1);
+done:
+	rollback_lock_file(&rewrite);
+	clean_status_index_snapshot_release(&current);
+	strbuf_release(&cache_tree_data);
+	release_index(&replacement);
+	free(destination);
 }
 
 /*

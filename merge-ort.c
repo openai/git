@@ -24,6 +24,7 @@
 #include "advice.h"
 #include "attr.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "commit.h"
 #include "commit-reach.h"
 #include "config.h"
@@ -4603,7 +4604,8 @@ cleanup:
 
 static int checkout(struct merge_options *opt,
 		    struct tree *prev,
-		    struct tree *next)
+		    struct tree *next,
+		    int preserve_semantic_history)
 {
 	/* Switch the index/working copy from old to new */
 	int ret;
@@ -4629,6 +4631,12 @@ static int checkout(struct merge_options *opt,
 	/* 2-way merge to the new branch */
 	unpack_opts.update = 1;
 	unpack_opts.merge = 1;
+	unpack_opts.preserve_semantic_history =
+		preserve_semantic_history &&
+		clean_status_revalidated_token_matches(opt->repo->index);
+	unpack_opts.preserve_backoff_history =
+		preserve_semantic_history &&
+		clean_status_fsmonitor_backoff_suspended(opt->repo->index);
 	unpack_opts.quiet = 0; /* FIXME: sequencer might want quiet? */
 	unpack_opts.verbose_update = (opt->verbosity > 2);
 	unpack_opts.fn = twoway_merge;
@@ -4933,7 +4941,7 @@ void merge_switch_to_result(struct merge_options *opt,
 	assert(opt->priv == NULL);
 	if (result->clean >= 0 && update_worktree_and_index) {
 		trace2_region_enter("merge", "checkout", opt->repo);
-		if (checkout(opt, head, result->tree)) {
+		if (checkout(opt, head, result->tree, result->clean > 0)) {
 			/* failure to function */
 			result->clean = -1;
 			merge_finalize(opt, result);

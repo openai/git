@@ -5,6 +5,7 @@
 #include "config.h"
 #include "environment.h"
 #include "hash-framing.h"
+#include "parse.h"
 #include "path-namespace.h"
 #include "read-cache-ll.h"
 #include "repository.h"
@@ -13,6 +14,29 @@
 
 #define CLEAN_STATUS_FILTER_PROOF_DOMAIN \
 	"clean-status-configured-filter-scope-v1"
+
+#define CLEAN_STATUS_FILTER_CLEAN (1U << 0)
+#define CLEAN_STATUS_FILTER_SMUDGE (1U << 1)
+#define CLEAN_STATUS_FILTER_PROCESS (1U << 2)
+#define CLEAN_STATUS_FILTER_REQUIRED (1U << 3)
+#define CLEAN_STATUS_FILTER_COMPLETE \
+	(CLEAN_STATUS_FILTER_CLEAN | CLEAN_STATUS_FILTER_SMUDGE | \
+	 CLEAN_STATUS_FILTER_PROCESS | CLEAN_STATUS_FILTER_REQUIRED)
+
+struct clean_status_pending_filter_entry {
+	char *key;
+	char *value;
+	char *filename;
+	enum config_scope scope;
+	enum config_origin_type origin_type;
+};
+
+struct clean_status_pending_filter {
+	char *driver;
+	struct clean_status_pending_filter_entry entries[4];
+	unsigned nr;
+	unsigned mask;
+};
 
 void clean_status_config_init(struct clean_status_config_digest *digest,
 			      const struct git_hash_algo *algo)
@@ -83,6 +107,16 @@ static int config_is_command_acceleration(const char *key,
 		 !strcmp(key, "core.preloadindexbulk"));
 }
 
+/* Clean proofs cache no output; the status printer uses these choices. */
+static int config_is_command_presentation(const char *key,
+					  const struct config_context *ctx)
+{
+	return ctx && ctx->kvi && ctx->kvi->scope == CONFIG_SCOPE_COMMAND &&
+		(!strcmp(key, "status.relativepaths") ||
+		 !strcmp(key, "color.ui") ||
+		 !strcmp(key, "core.quotepath"));
+}
+
 static int config_is_command_empty_attributes(const char *key,
 					      const char *value,
 					      const struct config_context *ctx,
@@ -93,6 +127,76 @@ static int config_is_command_empty_attributes(const char *key,
 		(!strcmp(key, "core.attributesfile") ||
 		 (!strcmp(key, "attr.tree") &&
 		  !digest->attribute_tree_configured));
+}
+
+static int config_is_command_status_guard(
+	const char *key, const char *value,
+	const struct config_context *ctx,
+	struct clean_status_config_digest *digest)
+{
+	int command = ctx && ctx->kvi &&
+		ctx->kvi->scope == CONFIG_SCOPE_COMMAND;
+
+	if (!strcmp(key, "core.fsmonitor")) {
+		int boolean = git_parse_maybe_bool(value);
+		int redundant = command && boolean >= 0 &&
+			digest->fsmonitor_value_seen &&
+			digest->fsmonitor_value_boolean &&
+			!!boolean == !!digest->fsmonitor_value_enabled;
+
+		digest->fsmonitor_value_seen = 1;
+		digest->fsmonitor_value_boolean = boolean >= 0;
+		digest->fsmonitor_value_enabled = boolean > 0;
+		return redundant;
+	}
+	if (!strcmp(key, "submodule.recurse")) {
+		int boolean = git_parse_maybe_bool(value);
+		int known_scope = ctx && ctx->kvi &&
+			ctx->kvi->scope > CONFIG_SCOPE_UNKNOWN &&
+			ctx->kvi->scope <= CONFIG_SCOPE_COMMAND;
+		int redundant = command && !boolean &&
+			(!digest->submodule_recurse_seen ||
+			 digest->submodule_recurse_known_false);
+
+		/* Recursion defaults to off; retain every effective change. */
+		digest->submodule_recurse_seen = 1;
+		digest->submodule_recurse_known_false =
+			known_scope && !boolean;
+		return redundant;
+	}
+
+	return command && value &&
+		((!strcmp(key, "safe.barerepository") &&
+		  !strcmp(value, "explicit")) ||
+		 (!strcmp(key, "core.hookspath") &&
+		  !strcmp(value, "/dev/null")) ||
+		 (!strcmp(key, "hook.post-index-change.enabled") &&
+		  !strcmp(value, "false")));
+}
+
+static unsigned config_command_disabled_filter_part(
+	const char *key, const char *value,
+	const struct config_context *ctx,
+	const char **driver, size_t *driver_len)
+{
+	const char *subkey;
+
+	if (!ctx || !ctx->kvi || ctx->kvi->scope != CONFIG_SCOPE_COMMAND ||
+	    !value || parse_config_key(key, "filter", driver, driver_len,
+				       &subkey) || !*driver || !*driver_len)
+		return 0;
+	if (!strcmp(subkey, "required"))
+		return git_parse_maybe_bool(value) == 0 ?
+			CLEAN_STATUS_FILTER_REQUIRED : 0;
+	if (*value)
+		return 0;
+	if (!strcmp(subkey, "clean"))
+		return CLEAN_STATUS_FILTER_CLEAN;
+	if (!strcmp(subkey, "smudge"))
+		return CLEAN_STATUS_FILTER_SMUDGE;
+	if (!strcmp(subkey, "process"))
+		return CLEAN_STATUS_FILTER_PROCESS;
+	return 0;
 }
 
 static int config_is_tracked_policy(const char *key)
@@ -112,22 +216,14 @@ static int config_is_tracked_policy(const char *key)
 		!strcmp(key, "core.attributesfile");
 }
 
-void clean_status_config_add(struct clean_status_config_digest *digest,
-			     const char *key, const char *value,
-			     const struct config_context *ctx)
+static void hash_retained_config_entry(
+	struct clean_status_config_digest *digest,
+	const char *key, const char *value,
+	const struct config_context *ctx)
 {
 	const char *suffix;
 	int semantic;
 
-	if (!digest->initialized || digest->finalized)
-		BUG("invalid clean-status config digest state");
-	if (!strcmp(key, "attr.tree") && value && *value)
-		digest->attribute_tree_configured = 1;
-	/* Independent attribute fingerprints guard empty source overrides. */
-	if (config_is_command_transport(key, ctx) ||
-	    config_is_command_acceleration(key, ctx) ||
-	    config_is_command_empty_attributes(key, value, ctx, digest))
-		return;
 	hash_config_entry(&digest->ctx, key, value, ctx);
 	if (config_is_tracked_policy(key))
 		hash_effective_config_entry(&digest->tracked_policy_ctx,
@@ -147,10 +243,105 @@ void clean_status_config_add(struct clean_status_config_digest *digest,
 	}
 }
 
+static void flush_pending_filter(struct clean_status_config_digest *digest)
+{
+	struct clean_status_pending_filter *pending = digest->pending_filter;
+
+	if (!pending)
+		return;
+	/* Remember command overrides omitted from the authenticated digest. */
+	if (pending->mask == CLEAN_STATUS_FILTER_COMPLETE)
+		digest->normalized_filter_disable = 1;
+	for (unsigned i = 0; i < pending->nr; i++) {
+		struct clean_status_pending_filter_entry *entry =
+			&pending->entries[i];
+
+		if (pending->mask != CLEAN_STATUS_FILTER_COMPLETE) {
+			struct key_value_info kvi = KVI_INIT;
+			struct config_context ctx = { .kvi = &kvi };
+
+			kvi.scope = entry->scope;
+			kvi.origin_type = entry->origin_type;
+			kvi.filename = entry->filename;
+			hash_retained_config_entry(digest, entry->key,
+						   entry->value, &ctx);
+		}
+		free(entry->key);
+		free(entry->value);
+		free(entry->filename);
+	}
+	free(pending->driver);
+	free(pending);
+	digest->pending_filter = NULL;
+}
+
+static void queue_disabled_filter_part(
+	struct clean_status_config_digest *digest,
+	const char *key, const char *value,
+	const struct config_context *ctx,
+	const char *driver, size_t driver_len, unsigned part)
+{
+	struct clean_status_pending_filter *pending = digest->pending_filter;
+	struct clean_status_pending_filter_entry *entry;
+
+	if (pending &&
+	    (strlen(pending->driver) != driver_len ||
+	     memcmp(pending->driver, driver, driver_len) ||
+	     (pending->mask & part))) {
+		flush_pending_filter(digest);
+		pending = NULL;
+	}
+	if (!pending) {
+		CALLOC_ARRAY(pending, 1);
+		pending->driver = xstrndup(driver, driver_len);
+		digest->pending_filter = pending;
+	}
+	entry = &pending->entries[pending->nr++];
+	entry->key = xstrdup(key);
+	entry->value = xstrdup(value);
+	entry->filename = xstrdup_or_null(ctx->kvi->filename);
+	entry->scope = ctx->kvi->scope;
+	entry->origin_type = ctx->kvi->origin_type;
+	pending->mask |= part;
+	if (pending->mask == CLEAN_STATUS_FILTER_COMPLETE)
+		flush_pending_filter(digest);
+}
+
+void clean_status_config_add(struct clean_status_config_digest *digest,
+			     const char *key, const char *value,
+			     const struct config_context *ctx)
+{
+	const char *driver = NULL;
+	size_t driver_len = 0;
+	unsigned filter_part;
+
+	if (!digest->initialized || digest->finalized)
+		BUG("invalid clean-status config digest state");
+	filter_part = config_command_disabled_filter_part(
+		key, value, ctx, &driver, &driver_len);
+	if (filter_part) {
+		queue_disabled_filter_part(digest, key, value, ctx,
+					  driver, driver_len, filter_part);
+		return;
+	}
+	flush_pending_filter(digest);
+	if (!strcmp(key, "attr.tree") && value && *value)
+		digest->attribute_tree_configured = 1;
+	/* Independent attribute fingerprints guard empty source overrides. */
+	if (config_is_command_transport(key, ctx) ||
+	    config_is_command_acceleration(key, ctx) ||
+	    config_is_command_presentation(key, ctx) ||
+	    config_is_command_empty_attributes(key, value, ctx, digest) ||
+	    config_is_command_status_guard(key, value, ctx, digest))
+		return;
+	hash_retained_config_entry(digest, key, value, ctx);
+}
+
 void clean_status_config_final(struct clean_status_config_digest *digest)
 {
 	if (!digest->initialized || digest->finalized)
 		BUG("invalid clean-status config digest state");
+	flush_pending_filter(digest);
 	if (digest->filter_configured) {
 		/*
 		 * Leave repositories without configured clean filters in their
@@ -217,7 +408,7 @@ static int config_epoch_command_is_safe(
 {
 	return starts_with(key, "advice.") ||
 		!strcmp(key, "user.name") || !strcmp(key, "user.email") ||
-		!strcmp(key, "core.preloadindexbulk") ||
+		config_is_command_acceleration(key, ctx) ||
 		config_is_command_transport(key, ctx);
 }
 

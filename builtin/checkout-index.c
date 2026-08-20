@@ -12,6 +12,7 @@
 #include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hook.h"
 #include "lockfile.h"
@@ -277,13 +278,8 @@ int cmd_checkout_index(int argc,
 	prepare_repo_settings(repo);
 	repo->settings.command_requires_full_index = 0;
 
-	if (repo_read_index(repo) < 0) {
-		die("invalid cache");
-	}
-
 	argc = parse_options(argc, argv, prefix, builtin_checkout_index_options,
 			builtin_checkout_index_usage, 0);
-	state.istate = repo->index;
 	state.force = force;
 	state.quiet = quiet;
 	state.not_new = not_new;
@@ -297,6 +293,15 @@ int cmd_checkout_index(int argc,
 	if (!to_tempfile && checkout_stage == CHECKOUT_ALL)
 		die(_("options '%s' and '%s' cannot be used together"),
 		    "--stage=all", "--no-temp");
+
+	if (index_opt && !state.base_dir_len && !to_tempfile &&
+	    !checkout_stage && !getenv(INDEX_ENVIRONMENT) &&
+	    fstat_is_reliable() &&
+	    fsm_settings__get_mode(repo) == FSMONITOR_MODE_IPC)
+		clean_status_enable_external_history(repo);
+	if (repo_read_index(repo) < 0)
+		die("invalid cache");
+	state.istate = repo->index;
 
 	/*
 	 * when --prefix is specified we do not want to update cache.

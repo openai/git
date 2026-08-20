@@ -1,5 +1,6 @@
 #define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "clean-status.h"
 #include "gettext.h"
 #include "hash.h"
 #include "apply.h"
@@ -42,6 +43,11 @@ int cmd_apply(int argc,
 
 	if (check_apply_state(&state, force_apply))
 		exit(128);
+
+	if (state.apply && state.check_index && !state.threeway &&
+	    !state.apply_with_reject && !state.ita_only &&
+	    !state.fake_ancestor && !state.index_file)
+		clean_status_prepare_main_index_history(the_repository);
 
 	ret = apply_all_patches(&state, argc, argv, options);
 

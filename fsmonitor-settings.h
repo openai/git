@@ -30,6 +30,7 @@ void fsm_settings__set_incompatible(struct repository *r,
 				    enum fsmonitor_reason reason);
 
 enum fsmonitor_mode fsm_settings__get_mode(struct repository *r);
+int fsm_settings__is_watch_limit_backoff(struct repository *r);
 const char *fsm_settings__get_hook_path(struct repository *r);
 
 enum fsmonitor_reason fsm_settings__get_reason(struct repository *r);

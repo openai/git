@@ -31,6 +31,8 @@ struct cache_entry {
 	char name[FLEX_ARRAY]; /* more */
 };
 
+struct clean_status_index_write_receipt;
+struct clean_status_commit_checkpoint;
 struct clean_status_proof_epoch;
 struct preload_bulk_stat_update;
 
@@ -194,10 +196,13 @@ struct index_state {
 		 fsmonitor_untracked_must_persist : 1,
 		 fsmonitor_untracked_extension_seen : 1,
 		 fsmonitor_untracked_extension_invalid : 1,
+		 fsmonitor_untracked_revalidation_authenticated : 1,
 		 fsmonitor_legacy_untracked_adopted : 1,
 		 fsmonitor_legacy_untracked_fallback : 1,
 		 fsmonitor_pending_token_from_provider : 1,
 		 preload_untracked_complete : 1,
+		 /* Read-only status request; never serialized. */
+		 preload_bulk_recovery_requested : 1,
 		 preload_bulk_provider_pending : 1,
 		 preload_bulk_excludes_digest_pending : 1,
 		 preload_bulk_excludes_digest_valid : 1;
@@ -314,6 +319,20 @@ void prefetch_cache_entries(const struct index_state *istate,
 struct lock_file;
 int do_read_index(struct index_state *istate, const char *path,
 		  int must_exist); /* for testting only! */
+/* Takes ownership of fd, including when the state is already initialized. */
+int do_read_index_from_fd(struct index_state *istate, int fd,
+			  const char *path);
+/*
+ * Read only the entries of a full index into a fresh index_state. Optional
+ * extensions are ignored; split/sparse indexes, resolve-undo, malformed data,
+ * and unknown mandatory extensions are rejected. Nonzero checksums are always
+ * verified. A zero skipHash trailer requires separate authentication by the
+ * caller before using these entries as a proof.
+ *
+ * The caller owns fd. Its offset is unchanged, and failure leaves istate
+ * unchanged. Return 0 on success or -1 for a missing/unsupported witness.
+ */
+int read_index_entries_from_fd(struct index_state *istate, int fd);
 int read_index_from(struct index_state *, const char *path,
 		    const char *gitdir);
 int is_index_unborn(struct index_state *);
@@ -342,6 +361,23 @@ int is_index_unborn(struct index_state *);
  * is written (and the lock is rolled back if `COMMIT_LOCK` is given).
  */
 int write_locked_index(struct index_state *, struct lock_file *lock, unsigned flags);
+
+/* Commit's close-only main-index write and optional historical-only repair. */
+int write_locked_index_for_commit(
+	struct index_state *, struct lock_file *,
+	struct clean_status_commit_checkpoint **);
+void restore_locked_index_for_commit(
+	struct index_state *, struct lock_file *,
+	const struct clean_status_commit_checkpoint *);
+
+/*
+ * Like repo_update_index_if_able(), with an optional receipt for the canonical
+ * file actually written. The receipt must be initialized by the caller and
+ * remains empty if the write is skipped, fails, or is not eligible.
+ */
+void repo_update_index_if_able_with_receipt(
+	struct repository *repo, struct lock_file *lock,
+	struct clean_status_index_write_receipt *receipt);
 
 void discard_index(struct index_state *);
 void move_index_extensions(struct index_state *dst, struct index_state *src);
@@ -420,6 +456,7 @@ static inline int index_pos_to_insert_pos(uintmax_t pos)
 #define ADD_CACHE_NEW_ONLY 16		/* Do not replace existing ones */
 #define ADD_CACHE_KEEP_CACHE_TREE 32	/* Do not invalidate cache-tree */
 #define ADD_CACHE_RENORMALIZE 64        /* Pass along HASH_RENORMALIZE */
+#define ADD_CACHE_PRESERVE_CLEAN_HISTORY 128 /* Preserve safe replacements */
 int add_index_entry(struct index_state *, struct cache_entry *ce, int option);
 void rename_index_entry_at(struct index_state *, int pos, const char *new_name);
 
@@ -470,8 +507,9 @@ int has_racy_timestamp(struct index_state *istate);
 int ie_match_stat(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
 int ie_modified(struct index_state *, const struct cache_entry *, struct stat *, unsigned int);
 /*
- * Unlike ie_match_stat(), verify content for marked non-gitlinks. Ordinary
- * entries, including unmarked zero-stat entries, retain stat-only matching.
+ * Unlike ie_match_stat(), verify content for marked non-gitlinks and poisoned
+ * entries in an authenticated suspended fsmonitor epoch. Ordinary entries,
+ * including unmarked zero-stat entries, retain stat-only matching.
  */
 int ie_match_stat_with_content_check(struct index_state *,
 				     const struct cache_entry *,
@@ -524,6 +562,7 @@ struct cache_entry *refresh_cache_entry(struct index_state *, struct cache_entry
 void refresh_index_entry_stat(struct index_state *, int, struct stat *);
 
 void set_alternate_index_output(const char *);
+const char *get_alternate_index_output(void);
 
 extern int verify_index_checksum;
 extern int verify_ce_order;

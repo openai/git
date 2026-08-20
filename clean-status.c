@@ -2,12 +2,16 @@
 #include "attr-fingerprint.h"
 #include "attr-manifest.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "clean-status-internal.h"
 #include "convert.h"
 #include "dir.h"
+#include "environment.h"
 #include "fsmonitor-clean-proof.h"
+#include "fsmonitor-settings.h"
 #include "progress.h"
 #include "read-cache-ll.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "semantic-verify-internal.h"
 #include "worktree-attr-source.h"
@@ -35,6 +39,32 @@ void clean_status_enable_external_history(struct repository *repo)
 	external_history_repo = repo;
 }
 
+void clean_status_prepare_main_index_history(struct repository *repo)
+{
+	struct clean_status_config_digest digest;
+
+	/*
+	 * Attach the command's configuration before its first index read. This
+	 * does not grant a proof: the reader must still authenticate the on-disk
+	 * epoch, and each writer must validate its own logical changes.
+	 */
+	if (!repo || !repo->worktree ||
+	    !clean_status_index_path_is_main(repo, repo->index_file) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) || !fstat_is_reliable() ||
+	    repo_config_values(repo)->apply_sparse_checkout ||
+	    !repo->config_values_private_.trust_ctime ||
+	    !repo->config_values_private_.check_stat ||
+	    (fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC &&
+	     !fsm_settings__is_watch_limit_backoff(repo)) ||
+	    repo_has_replace_refs_uncached(repo) ||
+	    clean_status_config_read_repository(repo, &digest))
+		return;
+	clean_status_enable_external_history(repo);
+	clean_status_set_config_digest(repo, &digest);
+}
+
 int clean_status_external_history_enabled(const struct index_state *istate)
 {
 	return istate && istate->repo == external_history_repo;
@@ -53,7 +83,7 @@ struct clean_status_progress *clean_status_start_progress(
 	if (repo != progress_repo)
 		return NULL;
 	CALLOC_ARRAY(progress, 1);
-	if (pthread_mutex_init(&progress->mutex, NULL))
+	if (HAVE_THREADS && pthread_mutex_init(&progress->mutex, NULL))
 		BUG("could not initialize clean status progress mutex");
 	progress->display = start_delayed_progress(repo, title, total);
 	return progress;
@@ -172,7 +202,7 @@ int clean_status_revalidated_token_matches(const struct index_state *istate)
 {
 	const struct clean_status_state *state = istate->clean_status;
 
-	return state && state->config_revalidated &&
+	return state && !state->backoff_token && state->config_revalidated &&
 		state->config_revalidated_token &&
 		istate->fsmonitor_last_update &&
 		!strcmp(state->config_revalidated_token,
@@ -188,6 +218,125 @@ void clean_status_invalidate_current_proof(struct index_state *istate)
 	istate->clean_status->initial_coherent = 0;
 	istate->clean_status->filter_scope_valid = 0;
 	istate->clean_status->semantic_baseline_pending = 0;
+	istate->clean_status->backoff_suspended = 0;
+}
+
+int clean_status_fsmonitor_backoff_suspended(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->backoff_suspended && state->backoff_token &&
+		istate->fsmonitor_token_valid && istate->fsmonitor_last_update &&
+		!strcmp(state->backoff_token, istate->fsmonitor_last_update) &&
+		fsm_settings__is_watch_limit_backoff(istate->repo);
+}
+
+int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate)
+{
+	struct clean_status_state *state = istate->clean_status;
+	struct clean_status_index_snapshot source = { .fd = -1 };
+	const struct git_hash_algo *algo;
+	const struct untracked_cache *uc = istate->untracked;
+	const char *suffix, *pending;
+	char *main_index;
+	const uint32_t historical = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	int paired, suspended = 0;
+
+	/* Never revive an epoch which an earlier mutation has invalidated. */
+	if (state && state->backoff_token)
+		return clean_status_fsmonitor_backoff_suspended(istate);
+	if (!state || !istate->repo || !istate->repo->worktree ||
+	    !fsm_settings__is_watch_limit_backoff(istate->repo) ||
+	    !fstat_is_reliable() || istate != istate->repo->index ||
+	    !clean_status_index_path_is_main(istate->repo,
+					     istate->repo->index_file) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    repo_config_values(istate->repo)->apply_sparse_checkout ||
+	    !istate->repo->config_values_private_.trust_ctime ||
+	    !istate->repo->config_values_private_.check_stat ||
+	    repo_has_replace_refs_uncached(istate->repo) ||
+	    !state->config_enforced || !state->current_config_valid ||
+	    !state->current_semantic_valid || !state->current_attr_valid ||
+	    !state->current_tracked_policy_valid ||
+	    state->external_history_restored || !state->disk_config_valid ||
+	    state->disk_config_invalid || !state->disk_config_raw.len ||
+	    !state->disk_semantic_valid || !state->disk_attr_valid ||
+	    !state->disk_tracked_policy_valid || !state->manifest.disk_valid ||
+	    !istate->fsmonitor_extension_seen || !istate->fsmonitor_token_valid ||
+	    !istate->fsmonitor_last_update ||
+	    !skip_prefix(istate->fsmonitor_last_update, "builtin:", &suffix) ||
+	    !*suffix || !strcmp(suffix, "fake") ||
+	    !state->disk_config_token ||
+	    strcmp(state->disk_config_token, istate->fsmonitor_last_update) ||
+	    istate->fsmonitor_last_update_pending ||
+	    istate->fsmonitor_pending_token_from_provider ||
+	    istate->fsmonitor_legacy_untracked_fallback ||
+	    !uc || !uc->root || !uc->root->valid ||
+	    uc->fsmonitor_dirty_paths.len ||
+	    !istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_extension_invalid ||
+	    !istate->fsmonitor_untracked_token)
+		return 0;
+	algo = istate->repo->hash_algo;
+	if (memcmp(state->disk_config_hash, state->current_config_hash,
+		   algo->rawsz) ||
+	    memcmp(state->disk_semantic_hash, state->current_semantic_hash,
+		   algo->rawsz) ||
+	    memcmp(state->disk_attr_hash, state->current_attr_hash, algo->rawsz) ||
+	    memcmp(state->disk_tracked_policy_hash,
+		   state->current_tracked_policy_hash, algo->rawsz))
+		return 0;
+
+	paired = state->manifest.disk_flags == FSMONITOR_CLEAN_PROOF_ALL &&
+		clean_status_has_current_full_fsmonitor_proof(istate) &&
+		!memcmp(state->manifest.disk_hash, state->manifest.current_hash,
+			algo->rawsz) &&
+		istate->fsmonitor_untracked_valid && uc->root->valid_recursive &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token);
+	if (!paired &&
+	    !(state->manifest.disk_flags == historical &&
+	      !istate->fsmonitor_untracked_valid && uc->fsmonitor_revalidation &&
+	      skip_prefix(istate->fsmonitor_untracked_token, "pending:", &pending) &&
+	      !strcmp(suffix, pending)))
+		return 0;
+	if (clean_status_index_snapshot_pin_proof_epoch(&source, istate))
+		return 0;
+	main_index = xstrfmt("%s/index", repo_get_git_dir(istate->repo));
+	if (!clean_status_index_snapshot_still_matches_path(
+		    &source, main_index, algo) ||
+	    !untracked_cache_preserve_for_revalidation(istate) ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(&source, istate) ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &source, main_index, algo))
+		goto done;
+
+	/* Only historical path semantics survive. Nothing is currently clean. */
+	clean_status_manifest_adopt_disk(&state->manifest);
+	state->manifest.current_flags = historical;
+	clean_status_clear_authenticated_new_directories(istate);
+	state->authenticated_bootstrap_manifest = 0;
+	state->config_revalidated = 0;
+	state->initial_coherent = 0;
+	state->config_mismatch = 1;
+	/* Replacements check their attributes; no current filter scope survives. */
+	state->filter_scope_valid = 0;
+	FREE_AND_NULL(state->config_revalidated_token);
+	state->backoff_token = xstrdup(istate->fsmonitor_last_update);
+	state->backoff_suspended = 1;
+	state->semantic_baseline_pending = 1;
+	suspended = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/watch-limit-suspended", 1);
+done:
+	free(main_index);
+	clean_status_index_snapshot_release(&source);
+	return suspended;
 }
 
 static int path_has_no_new_attribute_sources(
@@ -316,10 +465,12 @@ int clean_status_index_entry_is_semantically_safe(
 	const struct cache_entry *entry = old ? old : new_entry;
 	struct conv_attrs attrs;
 	const char *base;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
 
-	if (!state || !state->config_revalidated ||
-	    !clean_status_revalidated_token_matches(istate) ||
-	    (state->filter_configured && !state->filter_scope_valid) ||
+	if (!state ||
+	    (!suspended && !clean_status_revalidated_token_matches(istate)) ||
+	    (!suspended && state->filter_configured &&
+	     !state->filter_scope_valid) ||
 	    istate->split_index ||
 	    istate->sparse_index || !entry)
 		return 0;
@@ -338,6 +489,11 @@ int clean_status_index_entry_is_semantically_safe(
 	base = base ? base + 1 : entry->name;
 	if (!fspathcmp(base, ".gitattributes") ||
 	    !fspathcmp(base, ".gitignore"))
+		return 0;
+	if (suspended &&
+	    (!old || !new_entry || !S_ISREG(old->ce_mode) ||
+	     !S_ISREG(new_entry->ce_mode) ||
+	     !clean_status_manifest_path_attributes_unchanged(istate, entry->name)))
 		return 0;
 	if (state->filter_configured) {
 		convert_attrs((struct index_state *)istate, &attrs, entry->name);
@@ -377,6 +533,94 @@ static unsigned int clean_status_directory_lower_bound(
 			high = middle;
 	}
 	return low;
+}
+
+static int clean_status_changed_directory_is_semantically_safe(
+	const struct index_state *istate, const char *name)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct strbuf candidate = STRBUF_INIT;
+	const char *basename;
+	unsigned int first, i, namespace_unstable = 0;
+	size_t len;
+	int parent_fd, next, removed, safe = 0;
+
+	if (!state || !fstat_is_reliable() ||
+	    !state->current_config_valid || !state->current_attr_valid ||
+	    !state->config_enforced || !state->config_revalidated ||
+	    !clean_status_revalidated_token_matches(istate) ||
+	    !state->manifest.current_valid || !state->manifest.checked ||
+	    state->manifest.current_invalidated ||
+	    (state->manifest.current_flags & FSMONITOR_CLEAN_PROOF_ALL) !=
+		FSMONITOR_CLEAN_PROOF_ALL ||
+	    (state->filter_configured && !state->filter_scope_valid) ||
+	    istate->split_index || istate->sparse_index ||
+	    !istate->repo->config_values_private_.trust_ctime ||
+	    !istate->repo->config_values_private_.check_stat)
+		return 0;
+
+	len = strlen(name);
+	if (!len || name[len - 1] != '/')
+		return 0;
+	first = clean_status_directory_lower_bound(istate, name);
+	if (first >= istate->cache_nr ||
+	    !starts_with(istate->cache[first]->name, name))
+		return 0;
+	/* Each descendant independently authenticates its attribute ancestry. */
+	if (istate->cache_nr - first > 64 &&
+	    starts_with(istate->cache[first + 64]->name, name))
+		return 0;
+
+	if (attr_manifest_cursor_init(&cursor,
+				      state->manifest.current.buf,
+				      state->manifest.current.len,
+				      istate->repo->hash_algo))
+		return 0;
+	while ((next = attr_manifest_cursor_next(&cursor, &entry)) > 0)
+		if (entry.path_len >= len &&
+		    !memcmp(entry.path, name, len))
+			return 0;
+	if (next < 0 || semantic_verify_root_init(istate->repo, &root))
+		return 0;
+
+	path = semantic_verify_path_new(root);
+	strbuf_addstr(&candidate, name);
+	strbuf_addstr(&candidate, ".gitattributes");
+	if (semantic_verify_resolve_parent(path, candidate.buf, 0,
+					   &parent_fd, &basename)) {
+		if (errno != ENOENT)
+			goto done;
+		removed = 1;
+	} else {
+		removed = 0;
+	}
+
+	for (i = first; i < istate->cache_nr &&
+	     starts_with(istate->cache[i]->name, name); i++)
+		if (!clean_status_index_entry_is_semantically_safe(
+				istate, removed ? istate->cache[i] : NULL,
+				removed ? NULL : istate->cache[i]))
+			goto done;
+
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	path = NULL;
+	safe = !namespace_unstable && semantic_verify_root_stable(root);
+	if (safe)
+		trace2_data_intmax("fsmonitor", istate->repo,
+				   removed ?
+				   "semantic/authenticated-removed-directory" :
+				   "semantic/authenticated-restored-directory", 1);
+
+done:
+	if (path)
+		semantic_verify_path_free(path, &namespace_unstable, NULL);
+	semantic_verify_root_clear(root);
+	strbuf_release(&candidate);
+	return safe;
 }
 
 void clean_status_set_authenticated_new_directories(
@@ -427,22 +671,24 @@ int clean_status_directory_event_is_semantically_safe(
 	const struct clean_status_state *state = istate->clean_status;
 	const char *path, *end;
 
-	if (!state || !state->authenticated_new_directories_token ||
-	    !clean_status_revalidated_token_matches(istate) ||
-	    strcmp(state->authenticated_new_directories_token,
-		   istate->fsmonitor_last_update))
+	if (!state || !clean_status_revalidated_token_matches(istate))
 		return 0;
-	path = state->authenticated_new_directories.buf;
-	end = path + state->authenticated_new_directories.len;
-	while (path < end) {
-		if (!strcmp(path, name)) {
-			trace2_data_intmax("fsmonitor", istate->repo,
-					   "semantic/authenticated-new-directory", 1);
-			return 1;
+	if (state->authenticated_new_directories_token &&
+	    !strcmp(state->authenticated_new_directories_token,
+		    istate->fsmonitor_last_update)) {
+		path = state->authenticated_new_directories.buf;
+		end = path + state->authenticated_new_directories.len;
+		while (path < end) {
+			if (!strcmp(path, name)) {
+				trace2_data_intmax("fsmonitor", istate->repo,
+					"semantic/authenticated-new-directory", 1);
+				return 1;
+			}
+			path += strlen(path) + 1;
 		}
-		path += strlen(path) + 1;
 	}
-	return 0;
+	return clean_status_changed_directory_is_semantically_safe(
+		istate, name);
 }
 
 int clean_status_capture_attr_snapshot(
@@ -589,6 +835,8 @@ void clean_status_mark_fsmonitor_config_valid(struct index_state *istate,
 	state->config_mismatch = 0;
 	state->strong_mismatch = 0;
 	state->semantic_baseline_pending = 0;
+	state->backoff_suspended = 0;
+	FREE_AND_NULL(state->backoff_token);
 	state->manifest.current_flags = FSMONITOR_CLEAN_PROOF_ALL;
 	state->config_revalidated = state->current_semantic_valid &&
 		state->current_attr_valid && state->manifest.current_valid;
@@ -611,6 +859,7 @@ void clean_status_release(struct index_state *istate)
 	strbuf_release(&istate->clean_status->authenticated_new_directories);
 	free(istate->clean_status->disk_config_token);
 	free(istate->clean_status->config_revalidated_token);
+	free(istate->clean_status->backoff_token);
 	free(istate->clean_status->authenticated_new_directories_token);
 	FREE_AND_NULL(istate->clean_status);
 }

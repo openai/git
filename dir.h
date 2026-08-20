@@ -221,6 +221,8 @@ struct untracked_cache {
 	unsigned int use_fsmonitor : 1;
 	/* A lost provider boundary requires ordinary directory validation. */
 	unsigned int fsmonitor_revalidation : 1;
+	/* Process-local: a legacy cache was discarded on read. */
+	unsigned int fsmonitor_legacy_discarded : 1;
 };
 
 /**

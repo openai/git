@@ -543,8 +543,7 @@ int cmd_reset(int argc,
 			    (the_repository->index->split_index ||
 			     the_repository->index->sparse_index ||
 			     (the_repository->index->cache_changed &
-			      (CE_ENTRY_CHANGED | CE_ENTRY_ADDED |
-			       RESOLVE_UNDO_CHANGED))))
+			      RESOLVE_UNDO_CHANGED)))
 				clean_status_invalidate_current_proof(
 					the_repository->index);
 			the_repository->index->updated_skipworktree = 1;

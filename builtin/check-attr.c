@@ -3,6 +3,7 @@
 #include "config.h"
 #include "attr.h"
 #include "environment.h"
+#include "fsmonitor.h"
 #include "gettext.h"
 #include "object-name.h"
 #include "quote.h"
@@ -115,6 +116,7 @@ int cmd_check_attr(int argc,
 	struct attr_check *check;
 	struct object_id initialized_oid;
 	int cnt, i, doubledash, filei;
+	int scoped_bootstrap = 0;
 
 	if (!is_bare_repository(the_repository))
 		setup_work_tree(the_repository);
@@ -126,13 +128,6 @@ int cmd_check_attr(int argc,
 
 	prepare_repo_settings(the_repository);
 	the_repository->settings.command_requires_full_index = 0;
-
-	if (repo_read_index(the_repository) < 0) {
-		die("invalid cache");
-	}
-
-	if (cached_attrs)
-		git_attr_set_direction(GIT_ATTR_INDEX);
 
 	doubledash = -1;
 	for (i = 0; doubledash < 0 && i < argc; i++) {
@@ -175,6 +170,18 @@ int cmd_check_attr(int argc,
 		if (filei >= argc)
 			error_with_usage("No file specified");
 	}
+
+	scoped_bootstrap = !stdin_paths && !source &&
+		argc - filei > 0 && argc - filei <= 64;
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
+	if (repo_read_index(the_repository) < 0)
+		die("invalid cache");
+	if (scoped_bootstrap)
+		fsmonitor_end_scoped_bootstrap(the_repository->index);
+
+	if (cached_attrs)
+		git_attr_set_direction(GIT_ATTR_INDEX);
 
 	check = attr_check_alloc();
 	if (!all_attrs) {

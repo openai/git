@@ -14,6 +14,7 @@ struct clean_status_state {
 	struct strbuf authenticated_new_directories;
 	char *disk_config_token;
 	char *config_revalidated_token;
+	char *backoff_token;
 	char *authenticated_new_directories_token;
 	int source_index_fd;
 	unsigned char current_config_hash[GIT_MAX_RAWSZ];
@@ -55,6 +56,7 @@ struct clean_status_state {
 	unsigned disk_config_seen : 1;
 	unsigned disk_config_invalid : 1;
 	unsigned semantic_baseline_pending : 1;
+	unsigned backoff_suspended : 1;
 };
 
 struct clean_status_state *clean_status_get_state(struct index_state *istate);
