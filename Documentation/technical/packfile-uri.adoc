@@ -25,6 +25,13 @@ Clients should then download and index all the given URIs (in addition to
 downloading and indexing the packfile given in the `packfile` section of the
 response) before performing the connectivity check.
 
+URI packs are normally indexed in advertised order, since a later pack may
+contain a `REF_DELTA` whose base is installed by an earlier response pack.
+If the server advertises `no-ref-delta` and the client requests it, the
+promise covers the inline pack and every URI pack. A client may then index
+URI packs concurrently, while rejecting any pack that contains a
+`REF_DELTA`.
+
 Server design
 -------------
 
