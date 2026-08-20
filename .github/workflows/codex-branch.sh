@@ -3598,17 +3598,43 @@ prepare_pinned_plan () (
 	if test -f "$pinned_merge_root"
 	then
 		root=$(state_value "$state" pinned-merge-root)
+		rooted=$state/pinned-merge-rooted-topics
+		: >"$rooted"
 		while IFS="$tab" read -r name current_tip
 		do
 			topic_source_base=$(plan_source_base \
 				"$desired_source_bases" "$name")
 			test -n "$topic_source_base" ||
 				die "pinned merge graph has no source boundary for '$name'"
-			test "$topic_source_base" = "$root" ||
-				die "pinned merge graph topic '$name' has a different reviewed source boundary; split it before publication"
 			git merge-base --is-ancestor "$topic_source_base" \
 				"$current_tip" ||
 				die "pinned merge graph topic '$name' is outside its reviewed source boundary"
+			if test "$topic_source_base" != "$root"
+			then
+				# A linear child can extend the same reviewed graph.
+				# Require its exact pinned parent, not merely an
+				# ancestor of the child or a previously generated tip.
+				# Plans list prerequisites first, so accepted rows
+				# prove the chain back to the one replay root.
+				prerequisites=$(plan_prerequisites "$desired" "$name")
+				set -- $prerequisites
+				test $# = 1 ||
+					die "pinned merge graph topic '$name' has more than one prerequisite"
+				prerequisite=$1
+				prerequisite_tip=$(current_topic_tip "$topics" \
+					"$prerequisite")
+				test "$prerequisite" != "$base_name" &&
+					test "$topic_source_base" = "$prerequisite_tip" &&
+					grep -F -x -- "$prerequisite" "$rooted" >/dev/null ||
+					die "pinned merge graph topic '$name' has a different reviewed source boundary; split it before publication"
+				merge_commit=$(git rev-list --min-parents=2 \
+					--max-count=1 "$topic_source_base..$current_tip") ||
+					die "could not inspect pinned dependent topic '$name'"
+				test -z "$merge_commit" ||
+					die "pinned merge graph topic '$name' has a merge-shaped dependent range"
+			fi
+			printf '%s\n' "$name" >>"$rooted" ||
+				die "could not retain rooted pinned topic '$name'"
 		done <"$topics"
 	fi
 	: >"$state/map"

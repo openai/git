@@ -8394,6 +8394,533 @@ test_expect_success 'pinned plans keep source refs immutable while rebuilding ou
 	)
 '
 
+setup_pinned_merge_chain () (
+	git init --bare pinned-merge-chain.git &&
+	test_create_repo pinned-merge-chain-source &&
+	(
+		cd pinned-merge-chain-source &&
+		git remote add origin ../pinned-merge-chain.git &&
+		write base shared &&
+		write base child-history &&
+		git add shared child-history &&
+		install_rerere_train &&
+		git commit -m "merge chain base" &&
+		install_reviewed_automation_topic &&
+		git switch -c aa/codex/enrolled "$automation_tip" &&
+		write enrolled enrolled-file &&
+		git add enrolled-file &&
+		git commit -m "merge chain stable topic" &&
+		stable_topic=$(git rev-parse HEAD) &&
+		stable_tree=$(git rev-parse "$stable_topic^{tree}") &&
+		codex_tip=$(make_test_integration aa/codex/enrolled \
+			"$stable_topic" "$automation_codex_tip" "$stable_tree") &&
+		git branch codex "$codex_tip" &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_pinned_meta_state meta master codex codex-unstable &&
+		git switch -c bb/codex/merge-root-unstable codex &&
+		write root root-file &&
+		git add root-file &&
+		git commit -m "merge chain root" &&
+		git switch -c chain-side-a codex &&
+		write side-a shared &&
+		git add shared &&
+		git commit -m "merge chain side a" &&
+		git switch bb/codex/merge-root-unstable &&
+		git merge --no-ff chain-side-a -m "merge chain side a" &&
+		git switch -c chain-side-b codex &&
+		write side-b shared &&
+		git add shared &&
+		git commit -m "merge chain side b" &&
+		git switch bb/codex/merge-root-unstable &&
+		test_must_fail git merge --no-ff chain-side-b \
+			-m "merge chain side b" &&
+		write resolved shared &&
+		git add shared &&
+		git commit -m "resolve merge chain side b" &&
+		git switch -c chain-side-c codex &&
+		write side-c side-c-file &&
+		git add side-c-file &&
+		git commit -m "merge chain side c" &&
+		git switch -c chain-side-d codex &&
+		write side-d side-d-file &&
+		git add side-d-file &&
+		git commit -m "merge chain side d" &&
+		git switch bb/codex/merge-root-unstable &&
+		git merge --no-ff chain-side-c chain-side-d \
+			-m "merge chain octopus" &&
+		root=$(git rev-parse HEAD) &&
+		git switch -c cc/codex/linear-child-unstable &&
+		write child child-file &&
+		git add child-file &&
+		git commit -m "merge chain child" &&
+		write temporary child-history &&
+		git add child-history &&
+		git commit -m "merge chain historical touch" &&
+		write base child-history &&
+		git add child-history &&
+		git commit -m "revert merge chain historical touch" &&
+		child=$(git rev-parse HEAD) &&
+		git switch -c dd/codex/linear-grandchild-unstable &&
+		write grandchild grandchild-file &&
+		git add grandchild-file &&
+		git commit -m "merge chain grandchild" &&
+		grandchild=$(git rev-parse HEAD) &&
+		for tip in "$root" "$child" "$grandchild"
+		do
+			git update-ref "refs/heads/codex-pins/$tip" "$tip" ||
+				return 1
+		done &&
+		git switch meta &&
+		{
+			printf "%s\t%s\t%s\t%s\n" \
+				bb/codex/merge-root-unstable "$root" "$root" codex &&
+			printf "%s\t%s\t%s\t%s\n" \
+				cc/codex/linear-child-unstable "$child" "$child" \
+				bb/codex/merge-root-unstable &&
+			printf "%s\t%s\t%s\t%s\n" \
+				dd/codex/linear-grandchild-unstable \
+				"$grandchild" "$grandchild" \
+				cc/codex/linear-child-unstable
+		} >chain.rows &&
+		write_pinned_plan codex-unstable codex chain.rows \
+			codex-unstable.plan &&
+		git add codex-unstable.plan &&
+		git commit -m "meta: pin the merge chain" &&
+		git push origin --all
+	) &&
+	git clone pinned-merge-chain.git pinned-merge-chain-runner &&
+	(
+		cd pinned-merge-chain-runner &&
+		fetch_all &&
+		pinned_merge_chain_rewrite initial &&
+		sh "$codex_branch" verify-output --inputs initial-inputs \
+			--updates initial-updates --result initial-result &&
+		apply_test_updates origin initial-updates &&
+		fetch_all
+	) &&
+	(
+		cd pinned-merge-chain-source &&
+		git switch master &&
+		write moved moved-base-file &&
+		git add moved-base-file &&
+		git commit -m "move merge chain stable base" &&
+		git push origin master
+	) &&
+	(
+		cd pinned-merge-chain-runner &&
+		fetch_all
+	)
+)
+
+clone_pinned_merge_chain () (
+	fixture=$1 &&
+	git clone --bare pinned-merge-chain.git "$fixture.git" &&
+	git clone "$fixture.git" "$fixture-runner" &&
+	(
+		cd "$fixture-runner" &&
+		fetch_all
+	)
+)
+
+pinned_merge_chain_rewrite () (
+	prefix=$1 &&
+	sh "$codex_branch" rewrite --remote origin --base master \
+		--codex codex --result "$prefix-result" \
+		--updates "$prefix-updates" --inputs "$prefix-inputs" \
+		--failure "$prefix-failure"
+)
+
+pinned_merge_chain_reject () (
+	prefix=$1 &&
+	pattern=$2 &&
+	fixture_remote=$(git remote get-url origin) &&
+	snapshot_refs "$fixture_remote" >"$prefix-before" &&
+	test_expect_code 1 sh "$codex_branch" rewrite --remote origin \
+		--base master --codex codex --result "$prefix-result" \
+		--updates "$prefix-updates" --inputs "$prefix-inputs" \
+		--failure "$prefix-failure" \
+		>"$prefix.out" 2>"$prefix.err" &&
+	test_grep "$pattern" "$prefix.err" &&
+	snapshot_refs "$fixture_remote" >"$prefix-after" &&
+	test_cmp "$prefix-before" "$prefix-after"
+)
+
+pinned_merge_chain_generated_tip () (
+	updates=$1 &&
+	name=$2 &&
+	meta=$(updated_tip meta "$updates") &&
+	git show "$meta:codex.config" |
+		git config --file /dev/stdin --get "branch.$name.codex-tip"
+)
+
+pinned_merge_chain_add_topic () (
+	name=$1 &&
+	tip=$2 &&
+	source_base=$3 &&
+	prerequisite=$4 &&
+	git config --file codex-unstable.plan --add plan.topic \
+		"refs/heads/$name" &&
+	printf '\n' >>codex-unstable.plan &&
+	git config --file codex-unstable.plan "branch.$name.remote" . &&
+	git config --file codex-unstable.plan "branch.$name.source-ref" \
+		"refs/heads/$name" &&
+	git config --file codex-unstable.plan "branch.$name.source-tip" \
+		"$tip" &&
+	git config --file codex-unstable.plan "branch.$name.source-base" \
+		"$source_base" &&
+	git config --file codex-unstable.plan "branch.$name.merge" \
+		"refs/heads/$prerequisite"
+)
+
+pinned_merge_chain_graph () (
+	base=$1 &&
+	tip=$2 &&
+	output=$3 &&
+	git rev-list "$base..$tip" >"$output.commits" &&
+	: >"$output.unsorted" &&
+	while read -r oid
+	do
+		label=$(git show -s --format='%an <%ae>%x09%aI%x09%s' "$oid") &&
+		parents=$(git show -s --format=%P "$oid") &&
+		printf '%s' "$label" >>"$output.unsorted" &&
+		for parent in $parents
+		do
+			if test "$parent" = "$base"
+			then
+				label=ROOT
+			else
+				label=$(git show -s --format=%s "$parent") ||
+					return 1
+			fi &&
+			printf '\t%s' "$label" >>"$output.unsorted" || return 1
+		done &&
+		printf '\n' >>"$output.unsorted" || return 1
+	done <"$output.commits" &&
+	LC_ALL=C sort "$output.unsorted" >"$output"
+)
+
+test_expect_success 'pinned merge chain setup' '
+	setup_pinned_merge_chain
+'
+
+test_expect_success 'pinned merge chain preserves linear descendants across a base move' '
+	(
+		cd pinned-merge-chain-runner &&
+		root=$(git rev-parse origin/bb/codex/merge-root-unstable) &&
+		child=$(git rev-parse origin/cc/codex/linear-child-unstable) &&
+		grandchild=$(git rev-parse \
+			origin/dd/codex/linear-grandchild-unstable) &&
+		old_base=$(git rev-parse origin/codex) &&
+		test "$(git rev-list --count "$old_base..$grandchild")" = 12 &&
+		test "$(git rev-list --count --min-parents=2 \
+			"$old_base..$grandchild")" = 3 &&
+		test "$(git rev-list --count --min-parents=2 \
+			"$root..$grandchild")" = 0 &&
+		git show origin/meta:codex-unstable.plan >before.plan &&
+		snapshot_refs ../pinned-merge-chain.git >before.refs &&
+		pinned_merge_chain_rewrite moved &&
+		stable=$(updated_tip codex moved-updates) &&
+		meta=$(updated_tip meta moved-updates) &&
+		unstable=$(updated_tip codex-unstable moved-updates) &&
+		git show "$meta:codex.config" >moved.config &&
+		git show "$meta:codex-unstable.plan" >after.plan &&
+		test_cmp before.plan after.plan &&
+		for name in bb/codex/merge-root-unstable \
+			cc/codex/linear-child-unstable \
+			dd/codex/linear-grandchild-unstable
+		do
+			source=$(git rev-parse "origin/$name") &&
+			generated=$(git config --file moved.config \
+				--get "branch.$name.codex-tip") &&
+			test "$generated" != "$source" &&
+			test "$(git config --file moved.config \
+				--get "branch.$name.source-tip")" = "$source" &&
+			test "$(git rev-parse "origin/codex-pins/$source")" = \
+				"$source" &&
+			git merge-base --is-ancestor "$stable" "$generated" &&
+			git merge-base --is-ancestor "$generated" "$unstable" ||
+				return 1
+		done &&
+		new_root=$(pinned_merge_chain_generated_tip moved-updates \
+			bb/codex/merge-root-unstable) &&
+		new_child=$(pinned_merge_chain_generated_tip moved-updates \
+			cc/codex/linear-child-unstable) &&
+		new_grandchild=$(pinned_merge_chain_generated_tip moved-updates \
+			dd/codex/linear-grandchild-unstable) &&
+		git merge-base --is-ancestor "$new_root" "$new_child" &&
+		git merge-base --is-ancestor "$new_child" "$new_grandchild" &&
+		test "$(git rev-list --count "$new_root..$new_child")" = 3 &&
+		test "$(git rev-list --count "$new_child..$new_grandchild")" = 1 &&
+		test "$(git rev-list --count "$stable..$new_grandchild")" = 12 &&
+		test "$(git rev-list --count --min-parents=2 \
+			"$stable..$new_grandchild")" = 3 &&
+		pinned_merge_chain_graph "$old_base" "$grandchild" old.graph &&
+		pinned_merge_chain_graph "$stable" "$new_grandchild" new.graph &&
+		test_cmp old.graph new.graph &&
+		test "$(git show "$new_grandchild:shared")" = resolved &&
+		test "$(git show "$new_grandchild:child-history")" = base &&
+		test "$(git show "$new_grandchild:moved-base-file")" = moved &&
+		cut -f1 moved-updates | LC_ALL=C sort >actual-updates &&
+		printf "%s\n" refs/heads/codex refs/heads/codex-unstable \
+			refs/heads/meta >expect-updates &&
+		test_cmp expect-updates actual-updates &&
+		sh "$codex_branch" verify-output --inputs moved-inputs \
+			--updates moved-updates --result moved-result &&
+		snapshot_refs ../pinned-merge-chain.git >after.refs &&
+		test_cmp before.refs after.refs
+	)
+'
+
+test_expect_success 'pinned merge chain rejects non-exact and stale source boundaries' '
+	for case in interior stale
+	do
+		fixture=merge-chain-$case &&
+		clone_pinned_merge_chain "$fixture" &&
+		(
+			cd "$fixture-runner" &&
+			old_child=$(git rev-parse \
+				origin/cc/codex/linear-child-unstable^) &&
+			case "$case" in
+			interior) name=cc/codex/linear-child-unstable ;;
+			stale) name=dd/codex/linear-grandchild-unstable ;;
+			esac &&
+			git switch --detach origin/meta &&
+			git config --file codex-unstable.plan \
+				"branch.$name.source-base" "$old_child" &&
+			git add codex-unstable.plan &&
+			git commit -m "meta: test a non-exact chain boundary" &&
+			git push origin HEAD:meta &&
+			fetch_all &&
+			pinned_merge_chain_reject rejected \
+				"different reviewed source boundary"
+		) || return 1
+	done
+'
+
+test_expect_success 'pinned merge chain rejects a generated prerequisite boundary' '
+	clone_pinned_merge_chain merge-chain-generated &&
+	(
+		cd merge-chain-generated-runner &&
+		pinned_merge_chain_rewrite generated &&
+		root=$(pinned_merge_chain_generated_tip generated-updates \
+			bb/codex/merge-root-unstable) &&
+		child=$(pinned_merge_chain_generated_tip generated-updates \
+			cc/codex/linear-child-unstable) &&
+		test "$root" != "$(git rev-parse \
+			origin/bb/codex/merge-root-unstable)" &&
+		test "$(git rev-list --count --min-parents=2 "$root..$child")" = 0 &&
+		git switch --detach origin/meta &&
+		git config --file codex-unstable.plan \
+			branch.cc/codex/linear-child-unstable.source-tip "$child" &&
+		git config --file codex-unstable.plan \
+			branch.cc/codex/linear-child-unstable.source-base "$root" &&
+		git add codex-unstable.plan &&
+		git commit -m "meta: test a generated chain boundary" &&
+		git push --force origin HEAD:meta \
+			"$child:refs/heads/cc/codex/linear-child-unstable" \
+			"$child:refs/heads/codex-pins/$child" &&
+		fetch_all &&
+		pinned_merge_chain_reject rejected \
+			"different reviewed source boundary"
+	)
+'
+
+test_expect_success 'pinned merge chain rejects an unrelated root' '
+	clone_pinned_merge_chain merge-chain-unrelated &&
+	(
+		cd merge-chain-unrelated-runner &&
+		boundary=$(git rev-parse origin/master) &&
+		git switch -c ee/codex/unrelated-unstable "$boundary" &&
+		write unrelated unrelated-file &&
+		git add unrelated-file &&
+		git commit -m "unrelated linear root" &&
+		tip=$(git rev-parse HEAD) &&
+		git switch --detach origin/meta &&
+		pinned_merge_chain_add_topic ee/codex/unrelated-unstable \
+			"$tip" "$boundary" codex &&
+		git add codex-unstable.plan &&
+		git commit -m "meta: test an unrelated root" &&
+		git push origin HEAD:meta ee/codex/unrelated-unstable \
+			"$tip:refs/heads/codex-pins/$tip" &&
+		fetch_all &&
+		pinned_merge_chain_reject rejected \
+			"different reviewed source boundary"
+	)
+'
+
+test_expect_success 'pinned merge chain rejects a merge-shaped descendant' '
+	clone_pinned_merge_chain merge-chain-merged-child &&
+	(
+		cd merge-chain-merged-child-runner &&
+		boundary=$(git rev-parse \
+			origin/dd/codex/linear-grandchild-unstable) &&
+		git switch -c ee/codex/merged-child-unstable "$boundary" &&
+		write main merged-child-main &&
+		git add merged-child-main &&
+		git commit -m "merged child main" &&
+		git switch -c merged-child-side "$boundary" &&
+		write side merged-child-side &&
+		git add merged-child-side &&
+		git commit -m "merged child side" &&
+		git switch ee/codex/merged-child-unstable &&
+		git merge --no-ff merged-child-side -m "merge child side" &&
+		tip=$(git rev-parse HEAD) &&
+		git switch --detach origin/meta &&
+		pinned_merge_chain_add_topic ee/codex/merged-child-unstable \
+			"$tip" "$boundary" dd/codex/linear-grandchild-unstable &&
+		git add codex-unstable.plan &&
+		git commit -m "meta: test a merge-shaped descendant" &&
+		git push origin HEAD:meta ee/codex/merged-child-unstable \
+			"$tip:refs/heads/codex-pins/$tip" &&
+		fetch_all &&
+		pinned_merge_chain_reject rejected \
+			"pinned merge-shaped topics have different reviewed source boundaries"
+	)
+'
+
+test_expect_success 'pinned merge chain rejects current and reverted child-path overlap' '
+	for path in child-file child-history
+	do
+		fixture=merge-chain-overlap-$path &&
+		clone_pinned_merge_chain "$fixture" &&
+		(
+			cd "$fixture-runner" &&
+			root=$(git rev-parse origin/bb/codex/merge-root-unstable) &&
+			grandchild=$(git rev-parse \
+				origin/dd/codex/linear-grandchild-unstable) &&
+			if test "$path" = child-history
+			then
+				git diff --quiet "$root" "$grandchild" -- "$path"
+			fi &&
+			git switch master &&
+			write overlapping "$path" &&
+			git add "$path" &&
+			git commit -m "move an overlapping child path" &&
+			git push origin master &&
+			fetch_all &&
+			pinned_merge_chain_reject rejected \
+				"pinned merge graph overlaps its moved base"
+		) || return 1
+	done
+'
+
+test_expect_success 'pinned merge chain rejects invalid prerequisite graphs' '
+	for case in out-of-order cycle wrong-parent
+	do
+		fixture=merge-chain-$case &&
+		clone_pinned_merge_chain "$fixture" &&
+		(
+			cd "$fixture-runner" &&
+			git switch --detach origin/meta &&
+			case "$case" in
+			out-of-order)
+				git config --file codex-unstable.plan \
+					--unset-all plan.topic &&
+				for name in cc/codex/linear-child-unstable \
+					bb/codex/merge-root-unstable \
+					dd/codex/linear-grandchild-unstable
+				do
+					git config --file codex-unstable.plan \
+						--add plan.topic "refs/heads/$name" || return 1
+				done &&
+				pattern="orders prerequisite .* after"
+				;;
+			cycle)
+				git config --file codex-unstable.plan \
+					branch.bb/codex/merge-root-unstable.merge \
+					refs/heads/dd/codex/linear-grandchild-unstable &&
+				pattern="orders prerequisite .* after"
+				;;
+			wrong-parent)
+				git config --file codex-unstable.plan \
+					branch.dd/codex/linear-grandchild-unstable.merge \
+					refs/heads/bb/codex/merge-root-unstable &&
+				pattern="different reviewed source boundary"
+				;;
+			esac &&
+			git add codex-unstable.plan &&
+			git commit -m "meta: test an invalid prerequisite graph" &&
+			git push origin HEAD:meta &&
+			fetch_all &&
+			pinned_merge_chain_reject rejected "$pattern"
+		) || return 1
+	done
+'
+
+test_expect_success 'pinned merge chain verifier rejects a dropped child commit' '
+	clone_pinned_merge_chain merge-chain-forged &&
+	(
+		cd merge-chain-forged-runner &&
+		pinned_merge_chain_rewrite valid &&
+		sh "$codex_branch" verify-output --inputs valid-inputs \
+			--updates valid-updates --result valid-result &&
+		stable=$(updated_tip codex valid-updates) &&
+		unstable=$(updated_tip codex-unstable valid-updates) &&
+		meta=$(updated_tip meta valid-updates) &&
+		old_meta=$(git rev-parse origin/meta) &&
+		root=$(pinned_merge_chain_generated_tip valid-updates \
+			bb/codex/merge-root-unstable) &&
+		child=$(pinned_merge_chain_generated_tip valid-updates \
+			cc/codex/linear-child-unstable) &&
+		grandchild=$(pinned_merge_chain_generated_tip valid-updates \
+			dd/codex/linear-grandchild-unstable) &&
+		fake_child=$(git show -s --format=%B "$child" |
+			git -c commit.gpgSign=false commit-tree "$child^{tree}" \
+				-p "$child~2") &&
+		fake_grandchild=$(git show -s --format=%B "$grandchild" |
+			git -c commit.gpgSign=false commit-tree \
+				"$grandchild^{tree}" -p "$fake_child") &&
+		test "$(git rev-list --count "$root..$child")" = 3 &&
+		test "$(git rev-list --count "$root..$fake_child")" = 2 &&
+		test "$(git rev-parse "$grandchild^{tree}")" = \
+			"$(git rev-parse "$fake_grandchild^{tree}")" &&
+		fake_unstable=$stable &&
+		for entry in bb:merge-root cc:linear-child dd:linear-grandchild
+		do
+			prefix=${entry%:*} &&
+			name=${entry#*:} &&
+			case "$name" in
+			merge-root) tip=$root ;;
+			linear-child) tip=$fake_child ;;
+			linear-grandchild) tip=$fake_grandchild ;;
+			esac &&
+			tree=$(git merge-tree --write-tree "$fake_unstable" "$tip") &&
+			fake_unstable=$(make_test_unstable_integration \
+				"$prefix/codex/$name-unstable" "$tip" \
+				"$fake_unstable" "$tree") || return 1
+		done &&
+		test "$(git rev-parse "$unstable^{tree}")" = \
+			"$(git rev-parse "$fake_unstable^{tree}")" &&
+		git show "$meta:codex.config" |
+			sed -e "s/$child/$fake_child/g" \
+				-e "s/$grandchild/$fake_grandchild/g" \
+				-e "s/$unstable/$fake_unstable/g" >forged.config &&
+		blob=$(git hash-object -w forged.config) &&
+		index=$PWD/forged-child.index &&
+		rm -f "$index" &&
+		GIT_INDEX_FILE=$index git read-tree "$meta^{tree}" &&
+		GIT_INDEX_FILE=$index git update-index --add --cacheinfo \
+			100644,"$blob",codex.config &&
+		tree=$(GIT_INDEX_FILE=$index git write-tree) &&
+		fake_meta=$(printf "%s\n" "meta: forge a dropped child commit" |
+			GIT_AUTHOR_NAME=$codex_bot_name \
+			GIT_AUTHOR_EMAIL=$codex_bot_email \
+			GIT_COMMITTER_NAME=$codex_bot_name \
+			GIT_COMMITTER_EMAIL=$codex_bot_email \
+			git -c commit.gpgSign=false commit-tree \
+				"$tree" -p "$old_meta") &&
+		sed -e "s/$meta/$fake_meta/g" \
+			-e "s/$unstable/$fake_unstable/g" \
+			valid-updates >forged-updates &&
+		test_expect_code 1 sh "$codex_branch" verify-output \
+			--inputs valid-inputs --updates forged-updates \
+			--result valid-result >forged.out 2>forged.err &&
+		test_grep "merge rewrite collapses distinct original commits" \
+			forged.err
+	)
+'
+
 test_expect_success 'a v2 controller can bootstrap both pinned plans in one meta change' '
 	git init --bare pinned-bootstrap.git &&
 	test_create_repo pinned-bootstrap-source &&
