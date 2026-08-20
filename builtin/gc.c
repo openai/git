@@ -1593,7 +1593,8 @@ static int maintenance_task_geometric_repack(struct maintenance_run_opts *opts,
 	child.odb_to_close = the_repository->objects;
 
 	strvec_pushl(&child.args, "repack", "-d", "-l", NULL);
-	if (geometry.split < geometry.pack_nr)
+	if (geometry.split < geometry.pack_nr ||
+	    geometry.promisor_split < geometry.promisor_pack_nr)
 		strvec_pushf(&child.args, "--geometric=%d",
 			     geometry.split_factor);
 	else
@@ -1648,7 +1649,7 @@ static int geometric_repack_auto_condition(struct gc_config *cfg UNUSED)
 	 * When we'd merge at least two packs with one another we always
 	 * perform the repack.
 	 */
-	if (geometry.split) {
+	if (geometry.split || geometry.promisor_split) {
 		ret = 1;
 		goto out;
 	}
