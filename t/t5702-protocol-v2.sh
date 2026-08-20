@@ -1300,6 +1300,38 @@ test_expect_success 'part of packfile response provided as URI' '
 	test_line_count = 6 filelist
 '
 
+test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child-no-ref no-ref-* &&
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	git -C "$P" config uploadpack.allowNoRefDelta true &&
+	echo one >"$P/one" &&
+	echo two >"$P/two" &&
+	echo three >"$P/three" &&
+	git -C "$P" add one two three &&
+	git -C "$P" commit -m objects &&
+	# A one-object pack cannot contain a delta.
+	configure_exclusion "$P" one >/dev/null &&
+	configure_exclusion "$P" two >/dev/null &&
+	configure_exclusion "$P" three >/dev/null &&
+
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/no-ref-index.trace" \
+	GIT_TRACE_PACKET="$TRASH_DIRECTORY/no-ref-packet.trace" \
+	GIT_TEST_SIDEBAND_ALL=1 \
+	git -c protocol.version=2 -c fetch.uriprotocols=http \
+		-c fetch.packfileUriJobs=2 \
+		clone "$HTTPD_URL/smart/http_parent" http_child-no-ref &&
+
+	test_grep "> no-ref-delta" no-ref-packet.trace &&
+	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta" \
+		no-ref-index.trace >no-ref-indexers &&
+	test_line_count = 4 no-ref-indexers &&
+	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=1" \
+		no-ref-index.trace >no-ref-uri-indexers &&
+	test_line_count = 3 no-ref-uri-indexers
+'
+
 test_expect_success 'packfile URIs with fetch instead of clone' '
 	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
 	rm -rf "$P" http_child log &&
