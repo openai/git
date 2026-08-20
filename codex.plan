@@ -8,6 +8,7 @@
 	topic = refs/heads/dr/codex/dugite
 	topic = refs/heads/tb/codex/lto-pgo
 	topic = refs/heads/tb/codex/packfile-uri-concurrency
+	topic = refs/heads/af/codex/pack-bytes
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -48,5 +49,12 @@
 	remote = .
 	source-ref = refs/heads/tb/codex/packfile-uri-concurrency
 	source-tip = 4cc8b3223b233aa3b795b1265e6e7cf3d63c7170
+	source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7
+	merge = refs/heads/master
+
+[branch "af/codex/pack-bytes"]
+	remote = .
+	source-ref = refs/heads/af/codex/pack-bytes
+	source-tip = 9abdcdc650f32a4b03c31d0595e0b29892749574
 	source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7
 	merge = refs/heads/master
