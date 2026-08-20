@@ -8722,7 +8722,7 @@ test_expect_success 'pinned merge chain rejects a generated prerequisite boundar
 			"$child:refs/heads/codex-pins/$child" &&
 		fetch_all &&
 		pinned_merge_chain_reject rejected \
-			"different reviewed source boundary"
+			"topic .cc/codex/linear-child-unstable. has a different reviewed source boundary"
 	)
 '
 
