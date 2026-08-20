@@ -392,6 +392,19 @@ test_expect_success 'setup and absorb a submodule' '
 	test_cmp expect out
 '
 
+test_expect_success 'describe --broken ignores diff submodule presentation settings' '
+	test_when_finished "git -C sub1 checkout -- initial.t && rm -f sub1/untracked" &&
+	test_config diff.ignoreSubmodules all &&
+	test_write_lines untracked >sub1/untracked &&
+	git --no-optional-locks describe --dirty --broken >out &&
+	test_grep ! ".*-dirty$" out &&
+	test_write_lines changed >sub1/initial.t &&
+	test_set_magic_mtime .git/index &&
+	git --no-optional-locks describe --dirty --broken >out &&
+	test_grep ".*-dirty$" out &&
+	test_is_magic_mtime .git/index
+'
+
 test_expect_success 'describe chokes on severely broken submodules' '
 	mv .git/modules/sub1/ .git/modules/sub_moved &&
 	test_must_fail git describe --dirty
@@ -400,6 +413,13 @@ test_expect_success 'describe chokes on severely broken submodules' '
 test_expect_success 'describe ignoring a broken submodule' '
 	git describe --broken >out &&
 	test_grep broken out
+'
+
+test_expect_success 'describe --broken honors --no-optional-locks' '
+	test_set_magic_mtime .git/index &&
+	git --no-optional-locks describe --broken >out &&
+	test_grep broken out &&
+	test_is_magic_mtime .git/index
 '
 
 test_expect_success 'describe with --work-tree ignoring a broken submodule' '
@@ -790,6 +810,34 @@ test_expect_success 'describe --broken --dirty with a file with changed stat' '
 		test_cmp expect actual
 	)
 '
+
+for broken in '' '--broken'
+do
+	test_expect_success "describe --dirty $broken honors --no-optional-locks" '
+		test_when_finished "rm -fr describe-optional-locks" &&
+		git init describe-optional-locks &&
+		(
+			cd describe-optional-locks &&
+			test_commit --annotate base tracked &&
+			git config diff.autoRefreshIndex false &&
+			test_set_magic_mtime tracked &&
+			test_set_magic_mtime .git/index +1 &&
+			git --no-optional-locks describe --dirty $broken >actual &&
+			test_grep "^base$" actual &&
+			test_is_magic_mtime .git/index +1 &&
+			test_write_lines changed >tracked &&
+			git --no-optional-locks describe --dirty $broken >actual &&
+			test_grep "^base-dirty$" actual &&
+			test_is_magic_mtime .git/index +1 &&
+			git checkout -- tracked &&
+			test_set_magic_mtime tracked &&
+			test_set_magic_mtime .git/index +1 &&
+			git describe --dirty $broken >actual &&
+			test_grep "^base$" actual &&
+			! test_is_magic_mtime .git/index +1
+		)
+	'
+done
 
 test_expect_success '--always with no refs falls back to commit hash' '
 	git rev-parse HEAD >expect &&
