@@ -31,6 +31,7 @@
 #include "run-command.h"
 #include "setup.h"
 #include "strvec.h"
+#include "trace2.h"
 
 static const char index_pack_usage[] =
 "git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
@@ -42,6 +43,43 @@ struct object_entry {
 	signed char type;
 	signed char real_type;
 };
+
+/*
+ * Hash workers own no repository state. They only hash immutable full-blob
+ * buffers; the main thread retires their results and performs the usual
+ * collision/content checks before releasing those buffers.
+ */
+struct first_pass_hash_job {
+	struct object_entry *obj;
+	struct object_id oid;
+	void *data;
+	int done;
+};
+
+struct first_pass_hash_pool {
+	pthread_t *threads;
+	pthread_mutex_t mutex;
+	pthread_cond_t work_ready;
+	pthread_cond_t result_ready;
+	struct first_pass_hash_job *queue;
+	size_t nr_threads, queue_size;
+	size_t first, next_work, nr, pending;
+	size_t buffered, jobs;
+	int stop;
+};
+
+#define FIRST_PASS_HASH_MAX_THREADS 32
+
+static int first_pass_hash_threads;
+static size_t first_pass_hash_buffer_size = 64 * 1024 * 1024;
+static size_t first_pass_hash_min_size = 64 * 1024;
+static struct first_pass_hash_pool first_pass_hash_pool;
+
+static struct first_pass_hash_job *reserve_first_pass_hash(struct object_entry *obj);
+static void submit_first_pass_hash(struct first_pass_hash_job *job,
+				   struct object_entry *obj, void *data);
+static void start_first_pass_hash(void);
+static void finish_first_pass_hash(void);
 
 struct object_stat {
 	unsigned delta_depth;
@@ -479,7 +517,7 @@ static void *unpack_entry_data(off_t offset, size_t size,
 	char hdr[32];
 	int hdrlen;
 
-	if (!is_delta_type(type)) {
+	if (!is_delta_type(type) && oid) {
 		hdrlen = format_object_header(hdr, sizeof(hdr), type, size);
 		git_hash_init(&c, the_hash_algo);
 		git_hash_update(&c, hdr, hdrlen);
@@ -520,7 +558,8 @@ static void *unpack_entry_data(off_t offset, size_t size,
 static void *unpack_raw_entry(struct object_entry *obj,
 			      off_t *ofs_offset,
 			      struct object_id *ref_oid,
-			      struct object_id *oid)
+			      struct object_id *oid,
+			      struct first_pass_hash_job **hash_job)
 {
 	unsigned char *p;
 	size_t size, c;
@@ -582,7 +621,9 @@ static void *unpack_raw_entry(struct object_entry *obj,
 	}
 	obj->hdr_size = consumed_bytes - obj->idx.offset;
 
-	data = unpack_entry_data(obj->idx.offset, obj->size, obj->type, oid);
+	*hash_job = reserve_first_pass_hash(obj);
+	data = unpack_entry_data(obj->idx.offset, obj->size, obj->type,
+				 *hash_job ? NULL : oid);
 	obj->idx.crc32 = input_crc32;
 	return data;
 }
@@ -978,6 +1019,171 @@ static void sha1_object(const void *data, struct object_entry *obj_entry,
 	free(new_data);
 }
 
+static void *first_pass_hash_worker(void *data UNUSED)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+
+	trace2_thread_start("index-pack-hash");
+	for (;;) {
+		struct first_pass_hash_job *job;
+
+		pthread_mutex_lock(&pool->mutex);
+		while (!pool->pending && !pool->stop)
+			pthread_cond_wait(&pool->work_ready, &pool->mutex);
+		if (!pool->pending) {
+			pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+		job = &pool->queue[pool->next_work];
+		pool->next_work = (pool->next_work + 1) % pool->queue_size;
+		pool->pending--;
+		pthread_mutex_unlock(&pool->mutex);
+
+		/* This uses the same collision-detecting hash as the serial path. */
+		hash_object_file(the_hash_algo, job->data, job->obj->size,
+				 OBJ_BLOB, &job->oid);
+
+		pthread_mutex_lock(&pool->mutex);
+		job->done = 1;
+		pthread_cond_signal(&pool->result_ready);
+		pthread_mutex_unlock(&pool->mutex);
+	}
+	trace2_thread_exit();
+	return NULL;
+}
+
+static void retire_first_pass_hash(void)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+	struct first_pass_hash_job *job;
+	size_t allocation;
+
+	pthread_mutex_lock(&pool->mutex);
+	if (!pool->nr)
+		BUG("no queued first-pass hash to retire");
+	job = &pool->queue[pool->first];
+	while (!job->done)
+		pthread_cond_wait(&pool->result_ready, &pool->mutex);
+	pool->first = (pool->first + 1) % pool->queue_size;
+	pool->nr--;
+	pthread_mutex_unlock(&pool->mutex);
+
+	/* All ODB and object-cache access stays on the main thread. */
+	oidcpy(&job->obj->idx.oid, &job->oid);
+	sha1_object(job->data, NULL, job->obj->size, OBJ_BLOB,
+		    &job->obj->idx.oid);
+	allocation = st_add(job->obj->size, 1);
+	free(job->data);
+	pool->buffered -= allocation;
+}
+
+static struct first_pass_hash_job *reserve_first_pass_hash(struct object_entry *obj)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+	size_t allocation;
+
+	if (!pool->nr_threads || obj->type != OBJ_BLOB ||
+	    obj->size < first_pass_hash_min_size ||
+	    obj->size >= first_pass_hash_buffer_size ||
+	    obj->size > repo_settings_get_big_file_threshold(the_repository))
+		return NULL;
+
+	allocation = st_add(obj->size, 1);
+	while (pool->nr == pool->queue_size ||
+	       allocation > first_pass_hash_buffer_size - pool->buffered)
+		retire_first_pass_hash();
+
+	/* Reserve before the producer allocates the inflated blob. */
+	pool->buffered += allocation;
+	return &pool->queue[(pool->first + pool->nr) % pool->queue_size];
+}
+
+static void submit_first_pass_hash(struct first_pass_hash_job *job,
+				   struct object_entry *obj, void *data)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+
+	assert(pool->nr_threads && data && obj->type == OBJ_BLOB);
+	job->obj = obj;
+	job->data = data;
+	job->done = 0;
+
+	pthread_mutex_lock(&pool->mutex);
+	pool->nr++;
+	pool->pending++;
+	pool->jobs++;
+	pthread_cond_signal(&pool->work_ready);
+	pthread_mutex_unlock(&pool->mutex);
+}
+
+static void stop_first_pass_hash(size_t nr_threads)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+	size_t i;
+
+	pthread_mutex_lock(&pool->mutex);
+	pool->stop = 1;
+	pthread_cond_broadcast(&pool->work_ready);
+	pthread_mutex_unlock(&pool->mutex);
+	for (i = 0; i < nr_threads; i++)
+		pthread_join(pool->threads[i], NULL);
+	pthread_cond_destroy(&pool->result_ready);
+	pthread_cond_destroy(&pool->work_ready);
+	pthread_mutex_destroy(&pool->mutex);
+	free(pool->queue);
+	free(pool->threads);
+}
+
+static void start_first_pass_hash(void)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+	size_t i;
+	int ret;
+
+	/* These modes share fsck/object-cache state; retain their serial path. */
+	if (!HAVE_THREADS || !first_pass_hash_threads || strict ||
+	    do_fsck_object || record_outgoing_links ||
+	    first_pass_hash_min_size >= first_pass_hash_buffer_size) {
+		trace2_data_intmax("index-pack", the_repository,
+				  "first_pass_hash/threads", 0);
+		return;
+	}
+
+	pool->nr_threads = first_pass_hash_threads;
+	pool->queue_size = st_mult(pool->nr_threads, 2);
+	CALLOC_ARRAY(pool->threads, pool->nr_threads);
+	CALLOC_ARRAY(pool->queue, pool->queue_size);
+	pthread_mutex_init(&pool->mutex, NULL);
+	pthread_cond_init(&pool->work_ready, NULL);
+	pthread_cond_init(&pool->result_ready, NULL);
+	for (i = 0; i < pool->nr_threads; i++) {
+		ret = pthread_create(&pool->threads[i], NULL,
+				     first_pass_hash_worker, NULL);
+		if (ret) {
+			stop_first_pass_hash(i);
+			die(_("unable to create index-pack hash thread: %s"),
+			    strerror(ret));
+		}
+	}
+	trace2_data_intmax("index-pack", the_repository,
+			  "first_pass_hash/threads", pool->nr_threads);
+}
+
+static void finish_first_pass_hash(void)
+{
+	struct first_pass_hash_pool *pool = &first_pass_hash_pool;
+
+	if (!pool->nr_threads)
+		return;
+	while (pool->nr)
+		retire_first_pass_hash();
+
+	stop_first_pass_hash(pool->nr_threads);
+	trace2_data_intmax("index-pack", the_repository,
+			  "first_pass_hash/jobs", pool->jobs);
+	pool->nr_threads = 0;
+}
+
 /*
  * Ensure that this node has been reconstructed and return its contents.
  *
@@ -1255,6 +1461,8 @@ static void parse_pack_objects(unsigned char *hash)
 	struct stat st;
 	struct git_hash_ctx tmp_ctx;
 
+	start_first_pass_hash();
+
 	if (verbose)
 		progress = start_progress(
 				the_repository,
@@ -1263,9 +1471,10 @@ static void parse_pack_objects(unsigned char *hash)
 				nr_objects);
 	for (i = 0; i < nr_objects; i++) {
 		struct object_entry *obj = &objects[i];
+		struct first_pass_hash_job *hash_job;
 		void *data = unpack_raw_entry(obj, &ofs_delta->offset,
 					      &ref_delta_oid,
-					      &obj->idx.oid);
+					      &obj->idx.oid, &hash_job);
 		obj->real_type = obj->type;
 		if (obj->type == OBJ_OFS_DELTA) {
 			nr_ofs_deltas++;
@@ -1276,6 +1485,9 @@ static void parse_pack_objects(unsigned char *hash)
 			oidcpy(&ref_deltas[nr_ref_deltas].oid, &ref_delta_oid);
 			ref_deltas[nr_ref_deltas].obj_no = i;
 			nr_ref_deltas++;
+		} else if (hash_job) {
+			submit_first_pass_hash(hash_job, obj, data);
+			data = NULL;
 		} else if (!data) {
 			/* large blobs, check later */
 			obj->real_type = OBJ_BAD;
@@ -1287,6 +1499,7 @@ static void parse_pack_objects(unsigned char *hash)
 		display_progress(progress, i+1);
 	}
 	objects[i].idx.offset = consumed_bytes;
+	finish_first_pass_hash();
 	stop_progress(&progress);
 
 	/* Check pack integrity */
@@ -1666,6 +1879,23 @@ static int git_index_pack_config(const char *k, const char *v,
 				 const struct config_context *ctx, void *cb)
 {
 	struct pack_idx_option *opts = cb;
+
+	if (!strcmp(k, "indexpack.hashthreads")) {
+		first_pass_hash_threads = git_config_int(k, v, ctx->kvi);
+		if (first_pass_hash_threads < 0 ||
+		    first_pass_hash_threads > FIRST_PASS_HASH_MAX_THREADS)
+			die(_("%s must be between 0 and %d"),
+			    k, FIRST_PASS_HASH_MAX_THREADS);
+		return 0;
+	}
+	if (!strcmp(k, "indexpack.hashbuffersize")) {
+		first_pass_hash_buffer_size = git_config_ulong(k, v, ctx->kvi);
+		return 0;
+	}
+	if (!strcmp(k, "indexpack.hashminsize")) {
+		first_pass_hash_min_size = git_config_ulong(k, v, ctx->kvi);
+		return 0;
+	}
 
 	if (!strcmp(k, "pack.indexversion")) {
 		opts->version = git_config_int(k, v, ctx->kvi);
