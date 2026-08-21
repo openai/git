@@ -38,6 +38,11 @@ void fsm_listen__dtor(struct fsmonitor_daemon_state *state);
  */
 void fsm_listen__loop(struct fsmonitor_daemon_state *state);
 
+#ifdef __APPLE__
+/* Request delivery of all FSEvents that occurred before this call. */
+void fsm_listen__flush_async(struct fsmonitor_daemon_state *state);
+#endif
+
 /*
  * Gently request that the fsmonitor listener thread shutdown.
  * It does not wait for it to stop.  The caller should do a JOIN

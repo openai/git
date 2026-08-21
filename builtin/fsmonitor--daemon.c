@@ -238,6 +238,37 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 						     &state->main_lock,
 						     &ts);
 		if (err == ETIMEDOUT && cookie->result == FCIR_INIT) {
+#ifdef __APPLE__
+			struct timeval rescue_now;
+
+			/*
+			 * FSEvents may be healthy but late enough that its normal
+			 * delivery misses our bounded wait.  Flush only after that
+			 * wait expires, so successful queries pay no extra cost.
+			 * The asynchronous flush cannot block on the listener callback,
+			 * which needs main_lock to publish the cookie.
+			 */
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: requesting FSEvents flush after initial timeout");
+			fsm_listen__flush_async(state);
+
+			/*
+			 * Give the listener one more bounded interval to deliver and
+			 * publish the cookie rather than falling back to a full index
+			 * scan.  A broken provider still reaches the existing error
+			 * path instead of hanging a client indefinitely.
+			 */
+			gettimeofday(&rescue_now, NULL);
+			ts.tv_sec = rescue_now.tv_sec + 1;
+			ts.tv_nsec = rescue_now.tv_usec * 1000;
+			err = 0;
+			while (cookie->result == FCIR_INIT && !err)
+				err = pthread_cond_timedwait(&state->cookies_cond,
+							     &state->main_lock,
+							     &ts);
+#endif
+		}
+		if (err == ETIMEDOUT && cookie->result == FCIR_INIT) {
 			trace_printf_key(&trace_fsmonitor,
 					 "cookie_wait timed out");
 			cookie->result = FCIR_ERROR;
