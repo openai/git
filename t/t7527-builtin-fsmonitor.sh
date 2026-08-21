@@ -196,6 +196,49 @@ test_expect_success 'implicit daemon start' '
 	test_must_fail git -C test_implicit fsmonitor--daemon status
 '
 
+test_expect_success MACOS 'rescue a delayed FSEvents cookie after timeout' '
+	test_when_finished "stop_daemon_delete_repo test_delayed_cookie" &&
+
+	git init test_delayed_cookie &&
+	(
+		GIT_TEST_FSMONITOR_COOKIE_DELAY_MS=1200 &&
+		GIT_TRACE_FSMONITOR="$PWD/delayed-cookie.trace" &&
+		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS GIT_TRACE_FSMONITOR &&
+		git -C test_delayed_cookie fsmonitor--daemon start \
+			--start-timeout=10
+	) &&
+
+	test-tool -C test_delayed_cookie fsmonitor-client query \
+		--token 0 >actual 2>error &&
+	test_file_not_empty actual &&
+	test_grep "cookie_wait: requesting FSEvents flush after initial timeout" \
+		delayed-cookie.trace &&
+	test_grep "cookie-seen:" delayed-cookie.trace &&
+	test_grep ! "cookie_wait timed out$" delayed-cookie.trace &&
+	test_must_be_empty error
+'
+
+test_expect_success MACOS 'fall back when a delayed FSEvents cookie stays late' '
+	test_when_finished "stop_daemon_delete_repo test_lost_cookie" &&
+
+	git init test_lost_cookie &&
+	(
+		GIT_TEST_FSMONITOR_COOKIE_DELAY_MS=2500 &&
+		GIT_TRACE_FSMONITOR="$PWD/lost-cookie.trace" &&
+		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS GIT_TRACE_FSMONITOR &&
+		git -C test_lost_cookie fsmonitor--daemon start \
+			--start-timeout=10
+	) &&
+
+	test-tool -C test_lost_cookie fsmonitor-client query \
+		--token 0 >actual 2>error &&
+	test_file_not_empty actual &&
+	test_grep "cookie_wait: requesting FSEvents flush after initial timeout" \
+		lost-cookie.trace &&
+	test_grep "cookie_wait timed out$" lost-cookie.trace &&
+	test_must_be_empty error
+'
+
 # Verify that the daemon has shutdown.  Spin a few seconds to
 # make the test a little more robust during CI testing.
 #

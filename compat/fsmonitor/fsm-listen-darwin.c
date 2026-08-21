@@ -29,6 +29,7 @@
 #include "fsmonitor--daemon.h"
 #include "fsmonitor-path-utils.h"
 #include "gettext.h"
+#include "parse.h"
 #include "simple-ipc.h"
 #include "string-list.h"
 #include "trace.h"
@@ -57,6 +58,8 @@ struct fsm_listen_data
 
 	unsigned int stream_scheduled:1;
 	unsigned int stream_started:1;
+	unsigned int test_cookie_delayed:1;
+	unsigned long test_cookie_delay_ms;
 };
 
 static void log_flags_set(const char *path, const FSEventStreamEventFlags flag)
@@ -453,6 +456,11 @@ invalid_event:
 	}
 
 	free(resolved);
+	if (cookie_list.nr && data->test_cookie_delay_ms &&
+	    !data->test_cookie_delayed) {
+		data->test_cookie_delayed = 1;
+		sleep_millisec(data->test_cookie_delay_ms);
+	}
 	fsmonitor_publish(state, batch, &cookie_list);
 	string_list_clear(&cookie_list, 0);
 	strbuf_release(&tmp);
@@ -511,6 +519,8 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 
 	CALLOC_ARRAY(data, 1);
 	state->listen_data = data;
+	data->test_cookie_delay_ms = git_env_ulong(
+		"GIT_TEST_FSMONITOR_COOKIE_DELAY_MS", 0);
 
 	data->cfsr_event_path_key = CFStringCreateWithCString(
 		NULL, "path", kCFStringEncodingUTF8);
@@ -584,6 +594,11 @@ void fsm_listen__stop_async(struct fsmonitor_daemon_state *state)
 	data->shutdown_style = SHUTDOWN_EVENT;
 	pthread_cond_broadcast(&data->dq_finished);
 	pthread_mutex_unlock(&data->dq_lock);
+}
+
+void fsm_listen__flush_async(struct fsmonitor_daemon_state *state)
+{
+	FSEventStreamFlushAsync(state->listen_data->stream);
 }
 
 void fsm_listen__loop(struct fsmonitor_daemon_state *state)
