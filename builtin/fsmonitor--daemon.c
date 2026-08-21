@@ -8,12 +8,14 @@
 #include "environment.h"
 #include "gettext.h"
 #include "parse-options.h"
+
 #include "fsmonitor-ll.h"
 #include "fsmonitor-ipc.h"
 #include "fsmonitor-settings.h"
 #include "compat/fsmonitor/fsm-health.h"
 #include "compat/fsmonitor/fsm-listen.h"
 #include "fsmonitor--daemon.h"
+#include "khash.h"
 
 #include "simple-ipc.h"
 #include "strmap.h"
@@ -30,6 +32,19 @@ static const char * const builtin_fsmonitor__daemon_usage[] = {
 };
 
 #ifdef HAVE_FSMONITOR_DAEMON_BACKEND
+static khint_t fsmonitor_path_hash(const char *path)
+{
+	return memhash(&path, sizeof(path));
+}
+
+static int fsmonitor_path_equal(const char *a, const char *b)
+{
+	return a == b;
+}
+
+KHASH_INIT(fsmonitor_path_set, const char *, int, 0,
+	   fsmonitor_path_hash, fsmonitor_path_equal)
+
 /*
  * Global state loaded from config.
  */
@@ -421,6 +436,7 @@ struct fsmonitor_batch {
 	const char **interned_paths;
 	size_t nr, alloc;
 	time_t pinned_time;
+	kh_fsmonitor_path_set_t *overflow_paths;
 };
 
 static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
@@ -520,6 +536,7 @@ void fsmonitor_batch__free_list(struct fsmonitor_batch *batch)
 		 * are interned, so we don't own them.  We only own
 		 * the array.
 		 */
+		kh_destroy_fsmonitor_path_set(batch->overflow_paths);
 		free(batch->interned_paths);
 		free(batch);
 
@@ -552,16 +569,93 @@ static void fsmonitor_batch__combine(struct fsmonitor_batch *batch_dest,
 			batch_src->interned_paths[k];
 }
 
+static void fsmonitor_batch__add_overflow_path(struct fsmonitor_batch *batch,
+					       const char *path)
+{
+	int added;
+
+	kh_put_fsmonitor_path_set(batch->overflow_paths, path, &added);
+	if (!added)
+		return;
+
+	ALLOC_GROW(batch->interned_paths, batch->nr + 1, batch->alloc);
+	batch->interned_paths[batch->nr++] = path;
+}
+
+/*
+ * Collapse this batch and everything older than it into one deduplicated
+ * overflow batch.  Every path is interned, so pointer identity is sufficient.
+ *
+ * Keep the set with the overflow batch.  Future compactions then hash only
+ * newly retired paths instead of repeatedly rebuilding the complete set.
+ */
+static size_t fsmonitor_batch__compact_tail(struct fsmonitor_batch *batch,
+					    size_t *input_nr)
+{
+	struct fsmonitor_batch compacted = { 0 };
+	struct fsmonitor_batch *item, *overflow = NULL;
+
+	*input_nr = 0;
+	for (item = batch; item; item = item->next) {
+		*input_nr = st_add(*input_nr, item->nr);
+		if (item->overflow_paths) {
+			overflow = item;
+			break;
+		}
+	}
+
+	if (overflow) {
+		/*
+		 * Reuse the persistent set and array from the prior overflow
+		 * batch.  Only the newly retired paths need a lookup.
+		 */
+		if (overflow->next)
+			BUG("overflow batch is not the batch tail");
+		for (item = batch; item != overflow; item = item->next) {
+			size_t k;
+
+			for (k = 0; k < item->nr; k++)
+				fsmonitor_batch__add_overflow_path(
+					overflow, item->interned_paths[k]);
+		}
+		compacted.interned_paths = overflow->interned_paths;
+		compacted.nr = overflow->nr;
+		compacted.alloc = overflow->alloc;
+		compacted.overflow_paths = overflow->overflow_paths;
+		overflow->interned_paths = NULL;
+		overflow->nr = overflow->alloc = 0;
+		overflow->overflow_paths = NULL;
+	} else {
+		compacted.overflow_paths = kh_init_fsmonitor_path_set();
+		for (item = batch; item; item = item->next) {
+			size_t k;
+
+			for (k = 0; k < item->nr; k++)
+				fsmonitor_batch__add_overflow_path(
+					&compacted, item->interned_paths[k]);
+		}
+	}
+
+	free(batch->interned_paths);
+	batch->interned_paths = compacted.interned_paths;
+	batch->nr = compacted.nr;
+	batch->alloc = compacted.alloc;
+	batch->overflow_paths = compacted.overflow_paths;
+
+	return batch->nr;
+}
+
 /*
  * To keep the batch list from growing unbounded in response to filesystem
- * activity, we try to truncate old batches from the end of the list as
- * they become irrelevant.
+ * activity, collapse old batches from the end of the list after a delay.
  *
- * We assume that the .git/index will be updated with the most recent token
- * any time the index is updated.  And future commands will only ask for
- * recent changes *since* that new token.  So as tokens advance into the
- * future, older batch items will never be requested/needed.  So we can
- * truncate them without loss of functionality.
+ * A repository may have multiple durable indexes with different tokens.  In
+ * particular, advancing a private GIT_INDEX_FILE does not advance .git/index.
+ * We therefore cannot discard old paths just because one client asked for a
+ * newer token.  Instead, keep their deduplicated union in an overflow batch.
+ * Requests older than the overflow sequence may receive extra paths, but not
+ * miss any.  A request at that sequence excludes the overflow batch and
+ * remains exact.
  *
  * However, multiple commands may be talking to the daemon concurrently
  * or perform a slow command, so a little "token skew" is possible.
@@ -580,6 +674,7 @@ static void fsmonitor_batch__combine(struct fsmonitor_batch *batch_dest,
  * the official list so that the caller can free it after leaving the lock.
  */
 #define MY_TIME_DELAY_SECONDS (5 * 60) /* seconds */
+static unsigned long truncate_delay_seconds = MY_TIME_DELAY_SECONDS;
 
 static struct fsmonitor_batch *with_lock__truncate_old_batches(
 	struct fsmonitor_daemon_state *state,
@@ -589,6 +684,7 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 
 	const struct fsmonitor_batch *batch;
 	struct fsmonitor_batch *remainder;
+	size_t input_nr, unique_nr;
 
 	if (!batch_marker)
 		return NULL;
@@ -597,13 +693,13 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 			 batch_marker->batch_seq_nr,
 			 (uint64_t)batch_marker->pinned_time);
 
-	for (batch = batch_marker; batch; batch = batch->next) {
+	for (batch = batch_marker->next; batch; batch = batch->next) {
 		time_t t;
 
-		if (!batch->pinned_time) /* an overflow batch */
+		if (batch->overflow_paths)
 			continue;
 
-		t = batch->pinned_time + MY_TIME_DELAY_SECONDS;
+		t = batch->pinned_time + truncate_delay_seconds;
 		if (t > batch_marker->pinned_time) /* too close to marker */
 			continue;
 
@@ -613,9 +709,20 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 	return NULL;
 
 truncate_past_here:
+	remainder = ((struct fsmonitor_batch *)batch)->next;
+	if (!remainder)
+		return NULL;
+
+	unique_nr = fsmonitor_batch__compact_tail(
+		(struct fsmonitor_batch *)batch, &input_nr);
+	trace_printf_key(&trace_fsmonitor,
+			 "Compact: batch %"PRIu64" covers %"PRIuMAX
+			 " of %"PRIuMAX" paths",
+			 batch->batch_seq_nr,
+			 (uintmax_t)unique_nr, (uintmax_t)input_nr);
+
 	state->current_token_data->batch_tail = (struct fsmonitor_batch *)batch;
 
-	remainder = ((struct fsmonitor_batch *)batch)->next;
 	((struct fsmonitor_batch *)batch)->next = NULL;
 
 	return remainder;
@@ -940,13 +1047,14 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			do_trivial = 1;
 
 		} else if (requested_oldest_seq_nr <
-			   token_data->batch_tail->batch_seq_nr) {
+			   token_data->batch_tail->batch_seq_nr &&
+			   !token_data->batch_tail->overflow_paths) {
 			/*
 			 * The client wants older events than we have for
-			 * this token_id.  This means that the end of our
-			 * batch list was truncated and we cannot give the
-			 * client a complete snapshot relative to their
-			 * request.
+			 * this token_id.  A normal tail means that the end
+			 * of our batch list was truncated and we cannot
+			 * give the client a complete snapshot.  An overflow
+			 * tail conservatively contains all older paths.
 			 */
 			trace_printf_key(&trace_fsmonitor,
 					 "client requested truncated data");
@@ -1410,6 +1518,9 @@ static int fsmonitor_run_daemon(void)
 	int err;
 
 	memset(&state, 0, sizeof(state));
+	truncate_delay_seconds = git_env_ulong(
+		"GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS",
+		MY_TIME_DELAY_SECONDS);
 
 	hashmap_init(&state.cookies, cookies_cmp, NULL, 0);
 	pthread_mutex_init(&state.main_lock, NULL);

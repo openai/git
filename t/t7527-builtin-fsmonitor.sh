@@ -239,6 +239,57 @@ test_expect_success MACOS 'fall back when a delayed FSEvents cookie stays late' 
 	test_must_be_empty error
 '
 
+test_expect_success MACOS 'private index cannot prune canonical index history' '
+	test_when_finished "stop_daemon_delete_repo test_index_history" &&
+	test_when_finished "rm -f private-index" &&
+
+	git init test_index_history &&
+	(
+		cd test_index_history &&
+		test_commit base tracked &&
+		test_commit other other &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		(
+			GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS=0 &&
+			export GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS &&
+			start_daemon --tf "$PWD/../index-history.trace"
+		) &&
+
+		GIT_INDEX_FILE="$PWD/.git/index" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		cp .git/index ../private-index &&
+		cp .git/index .git/index.before &&
+
+		echo first >>tracked &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo second >>other &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo third >>tracked &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo fourth >>other &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo fifth >>tracked &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		test_cmp .git/index.before .git/index &&
+		test_grep "Compact: batch" ../index-history.trace \
+			>../index-history.compactions &&
+		test_line_count = 3 ../index-history.compactions &&
+		test_grep "covers 2 of 3 paths" ../index-history.compactions &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/canonical.trace" \
+			git status --porcelain=v2 >.git/canonical &&
+		test_line_count = 2 .git/canonical &&
+		test_grep "^1 \.M .* tracked$" .git/canonical &&
+		test_grep "^1 \.M .* other$" .git/canonical &&
+		test_cmp .git/index.before .git/index &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/canonical.trace
+	)
+'
+
 # Verify that the daemon has shutdown.  Spin a few seconds to
 # make the test a little more robust during CI testing.
 #
