@@ -518,6 +518,8 @@ include::config/includeif.adoc[]
 
 include::config/index.adoc[]
 
+include::config/indexpack.adoc[]
+
 include::config/init.adoc[]
 
 include::config/instaweb.adoc[]

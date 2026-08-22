@@ -1,0 +1,21 @@
+indexPack.hashThreads::
+	Experimental number of workers used to hash full blobs during the
+	first pass of linkgit:git-index-pack[1]. The default, zero, disables
+	the workers. Values from 1 through 32 are accepted. Parsing and
+	inflation remain serial, and normal collision/content validation runs
+	on the main thread. This is independent of `pack.threads` and of
+	concurrent packfile-URI downloads. Strict, fsck, and promisor modes,
+	and builds without thread support, use the existing serial path.
+
+indexPack.hashBufferSize::
+	Maximum retained blob-buffer bytes for `indexPack.hashThreads`,
+	including the terminating byte, the producer's reserved buffer, and
+	completed results awaiting validation. Defaults to 64 MiB. At most
+	twice the number of hash workers can be outstanding. Objects that do
+	not fit use the existing serial path; the limit is not a bound on
+	Git's total memory use. Usual `k`, `m`, and `g` suffixes are accepted.
+
+indexPack.hashMinSize::
+	Minimum full-blob size eligible for `indexPack.hashThreads`.
+	Defaults to 64 KiB. Blobs above `core.bigFileThreshold` retain their
+	existing streaming path. Usual `k`, `m`, and `g` suffixes are accepted.

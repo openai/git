@@ -148,6 +148,11 @@ accessible through promisor objects.
 +
 Requires <pack-file> to not be specified.
 
+CONFIGURATION
+-------------
+
+include::config/indexpack.adoc[]
+
 NOTES
 -----
 
