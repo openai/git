@@ -8164,15 +8164,15 @@ verify_control_paths () {
 		automation_count=0
 		while IFS="$tab" read -r name source_tip prerequisites
 		do
+			source_base=$(plan_source_base \
+				"$graph/desired-source-bases" "$name")
+			test -n "$source_base" ||
+				die "pinned plan has no source boundary for '$name'"
 			case "$name" in
 			??/codex/automation)
 				automation_count=$((automation_count + 1))
 				test "$prerequisites" = master ||
 					die "automation topic '$name' must be based directly on master"
-				source_base=$(plan_source_base \
-					"$graph/desired-source-bases" "$name")
-				test -n "$source_base" ||
-					die "pinned plan has no source boundary for automation topic '$name'"
 				make_tmp_dir
 				git diff --name-only "$source_base" "$source_tip" \
 					>"$tmp_dir/automation-paths" ||
@@ -8193,21 +8193,8 @@ verify_control_paths () {
 				continue
 				;;
 			esac
-			for prerequisite in $prerequisites
-			do
-				if test "$prerequisite" = "$base_name"
-				then
-					dependency_source=$base_oid
-				else
-					dependency_source=$(plan_tip \
-						"$graph/desired-prerequisites" "$prerequisite")
-					test -n "$dependency_source" ||
-						die "pinned plan has no source for prerequisite '$prerequisite'"
-				fi
-				topic_control_paths_unchanged "$dependency_source" \
-					"$source_tip" ||
-					die "topic '$name' changes a protected controller or CI file"
-			done
+			topic_control_paths_unchanged "$source_base" "$source_tip" ||
+				die "topic '$name' changes a protected controller or CI file"
 		done <"$graph/desired-prerequisites"
 		test "$automation_count" = 1 ||
 			die "exactly one active ??/codex/automation topic is required"

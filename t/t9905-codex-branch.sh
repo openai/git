@@ -9206,8 +9206,10 @@ test_expect_success 'a pinned root keeps its reviewed boundary after base and so
 		(
 			cd ../pinned-root-boundary-source &&
 			git switch master &&
+			mkdir -p .github/workflows &&
+			write upstream .github/workflows/main.yml &&
 			write advanced advanced-base &&
-			git add advanced-base &&
+			git add .github/workflows/main.yml advanced-base &&
 			git commit -m "advance base after review" &&
 			git push origin master
 		) &&
