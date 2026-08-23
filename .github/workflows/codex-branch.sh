@@ -9858,7 +9858,12 @@ continue_rewrite () {
 		return 1
 	fi
 
-	say "All topic branches were rewritten. Review them, then publish atomically with:"
+	if test -f "$state/pinned-plan-mode"
+	then
+		say "All topic branches were rewritten. Review them, then freeze the candidate with:"
+	else
+		say "All topic branches were rewritten. Review them, then publish atomically with:"
+	fi
 	say
 	say "  $(shell_quote "$script_path") publish-topics --worktree $(shell_quote "$worktree")"
 }
@@ -9904,6 +9909,11 @@ publish_topics () {
 		fi
 		die "rewritten topic graph failed candidate validation; no refs were updated"
 	fi
+	if test -f "$state/pinned-plan-mode"
+	then
+		prepare_unstable_candidate "$worktree" "$state" "$candidate" \
+			"$tmp_dir/codex-conflict.md"
+	fi
 	stable_recovery=
 	if test "$(state_value "$state" config-version)" = 2
 	then
@@ -9930,6 +9940,59 @@ publish_topics () {
 		"$candidate_worktree" >/dev/null ||
 		die "could not remove the candidate verification worktree"
 	temporary_worktree=
+
+	if test -f "$state/pinned-plan-mode"
+	then
+		(
+			cd "$worktree" || exit 1
+			verify_inputs --remote "$remote" --base "$base_name" \
+				--codex "$codex_name" "$state/inputs"
+		) || die "pinned recovery inputs moved; no refs were updated"
+		choose_local_rebuild_session
+		mkdir -p "$session" ||
+			die "could not create pinned recovery session"
+		chmod 700 "$session" ||
+			die "could not protect pinned recovery session"
+		recovery_inputs=$session/codex-inputs
+		recovery_updates=$session/codex-updates
+		cp "$state/inputs" "$recovery_inputs" ||
+			die "could not freeze pinned recovery inputs"
+		cp "$tmp_dir/updates" "$recovery_updates" ||
+			die "could not freeze pinned recovery updates"
+		printf '%s\n' "$candidate" >"$session/codex-candidate" ||
+			die "could not freeze pinned recovery candidate"
+		create_bundle "$session/codex.bundle" "$state" "$candidate"
+		for name in codex.bundle codex-candidate codex-inputs \
+			codex-updates
+		do
+			chmod 600 "$session/$name" ||
+				die "could not protect pinned recovery file '$name'"
+		done
+		say "Pinned recovery session: $session"
+		say "No refs were updated. Stage the verified candidate with:"
+		say "  $(shell_quote "$script_path") stage \\"
+		say "    --remote $(shell_quote "$remote") --staging codex-staging \\"
+		say "    --inputs $(shell_quote "$recovery_inputs") \\"
+		say "    --updates $(shell_quote "$recovery_updates")${require_automation:+ --require-automation}"
+		unstable_candidate=$(awk -F '\t' \
+			'$1 == "refs/heads/codex-unstable" { print $3 }' \
+			"$tmp_dir/updates")
+		if test -n "$unstable_candidate" &&
+			! is_null_oid "$unstable_candidate"
+		then
+			say "  $(shell_quote "$script_path") stage \\"
+			say "    --remote $(shell_quote "$remote") \\"
+			say "    --staging codex-unstable-staging \\"
+			say "    --inputs $(shell_quote "$recovery_inputs") \\"
+			say "    --updates $(shell_quote "$recovery_updates")${require_automation:+ --require-automation}"
+		fi
+		say "After fresh staging CI passes, promote the same session with:"
+		say "  $(shell_quote "$script_path") promote \\"
+		say "    --remote $(shell_quote "$remote") --staging codex-staging \\"
+		say "    --inputs $(shell_quote "$recovery_inputs") \\"
+		say "    --updates $(shell_quote "$recovery_updates")${require_automation:+ --require-automation}"
+		return
+	fi
 
 	(
 		cd "$worktree" || exit 1

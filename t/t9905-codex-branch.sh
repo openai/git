@@ -9243,6 +9243,83 @@ test_expect_success 'a pinned root keeps its reviewed boundary after base and so
 	)
 '
 
+test_expect_success 'pinned conflict recovery freezes output artifacts' '
+	git init --bare pinned-conflict.git &&
+	test_create_repo pinned-conflict-source &&
+	(
+		cd pinned-conflict-source &&
+		git remote add origin ../pinned-conflict.git &&
+		write base shared &&
+		git add shared &&
+		install_rerere_train &&
+		git commit -m "pinned conflict base" &&
+		install_reviewed_automation_topic &&
+		git switch -c bb/codex/conflict "$automation_tip" &&
+		write topic shared &&
+		git add shared &&
+		git commit -m "pinned conflicting topic" &&
+		conflict=$(git rev-parse HEAD) &&
+		conflict_tree=$(git merge-tree --write-tree \
+			"$automation_codex_tip" "$conflict") &&
+		codex_tip=$(make_test_integration bb/codex/conflict \
+			"$conflict" "$automation_codex_tip" "$conflict_tree") &&
+		git branch codex "$codex_tip" &&
+		create_unstable_sentinel codex &&
+		git branch meta master &&
+		install_pinned_meta_state meta master codex codex-unstable &&
+		git switch master &&
+		write upstream shared &&
+		git add shared &&
+		git commit -m "move pinned conflict base" &&
+		git push origin --all
+	) &&
+	git clone pinned-conflict.git pinned-conflict-runner &&
+	(
+		cd pinned-conflict-runner &&
+		fetch_all &&
+		snapshot_refs ../pinned-conflict.git >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result result --updates updates --inputs inputs \
+			--failure failure --require-automation &&
+		digest=$(git hash-object inputs) &&
+		sh "$codex_branch" resolve --remote origin \
+			--base master --codex codex --inputs-oid "$digest" \
+			--worktree resolution --require-automation &&
+		write resolved resolution/shared &&
+		git -C resolution add shared &&
+		sh "$codex_branch" continue --worktree resolution &&
+		sh "$codex_branch" publish-topics --worktree resolution \
+			>publish.out &&
+		session=$(sed -n \
+			"s/^Pinned recovery session: //p" publish.out) &&
+		test -n "$session" &&
+		printf "%s\n" "$session" >session &&
+		test_line_count = 1 session &&
+		for name in codex.bundle codex-candidate codex-inputs \
+			codex-updates
+		do
+			test_path_is_file "$session/$name" || return 1
+		done &&
+		test_cmp inputs "$session/codex-inputs" &&
+		sh "$codex_branch" verify-output \
+			--inputs "$session/codex-inputs" \
+			--updates "$session/codex-updates" \
+			--result "$session/codex-candidate" \
+			--require-automation &&
+		candidate=$(cat "$session/codex-candidate") &&
+		test resolved = "$(git show "$candidate:shared")" &&
+		git bundle verify "$session/codex.bundle" &&
+		cut -f1 "$session/codex-updates" >actual-updates &&
+		printf "%s\n" refs/heads/codex refs/heads/codex-unstable \
+			refs/heads/meta >expected-updates &&
+		test_cmp expected-updates actual-updates &&
+		snapshot_refs ../pinned-conflict.git >after &&
+		test_cmp before after &&
+		git worktree remove --force resolution
+	)
+'
+
 test_expect_success 'pre-v3 bootstrap records authorization and can pin each explicit override' '
 	git init --bare pinned-bootstrap-command.git &&
 	test_create_repo pinned-bootstrap-command-source &&
