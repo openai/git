@@ -42,7 +42,7 @@ static int fsmonitor_path_equal(const char *a, const char *b)
 	return a == b;
 }
 
-KHASH_INIT(fsmonitor_path_set, const char *, int, 0,
+KHASH_INIT(fsmonitor_path_sequence, const char *, uint64_t, 1,
 	   fsmonitor_path_hash, fsmonitor_path_equal)
 
 /*
@@ -436,7 +436,7 @@ struct fsmonitor_batch {
 	const char **interned_paths;
 	size_t nr, alloc;
 	time_t pinned_time;
-	kh_fsmonitor_path_set_t *overflow_paths;
+	kh_fsmonitor_path_sequence_t *overflow_path_seqs;
 };
 
 static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
@@ -536,7 +536,7 @@ void fsmonitor_batch__free_list(struct fsmonitor_batch *batch)
 		 * are interned, so we don't own them.  We only own
 		 * the array.
 		 */
-		kh_destroy_fsmonitor_path_set(batch->overflow_paths);
+		kh_destroy_fsmonitor_path_sequence(batch->overflow_path_seqs);
 		free(batch->interned_paths);
 		free(batch);
 
@@ -570,13 +570,20 @@ static void fsmonitor_batch__combine(struct fsmonitor_batch *batch_dest,
 }
 
 static void fsmonitor_batch__add_overflow_path(struct fsmonitor_batch *batch,
-					       const char *path)
+					       const char *path,
+					       uint64_t batch_seq_nr)
 {
+	khint_t pos;
 	int added;
 
-	kh_put_fsmonitor_path_set(batch->overflow_paths, path, &added);
-	if (!added)
+	pos = kh_put_fsmonitor_path_sequence(
+		batch->overflow_path_seqs, path, &added);
+	if (!added) {
+		if (kh_value(batch->overflow_path_seqs, pos) < batch_seq_nr)
+			kh_value(batch->overflow_path_seqs, pos) = batch_seq_nr;
 		return;
+	}
+	kh_value(batch->overflow_path_seqs, pos) = batch_seq_nr;
 
 	ALLOC_GROW(batch->interned_paths, batch->nr + 1, batch->alloc);
 	batch->interned_paths[batch->nr++] = path;
@@ -598,7 +605,7 @@ static size_t fsmonitor_batch__compact_tail(struct fsmonitor_batch *batch,
 	*input_nr = 0;
 	for (item = batch; item; item = item->next) {
 		*input_nr = st_add(*input_nr, item->nr);
-		if (item->overflow_paths) {
+		if (item->overflow_path_seqs) {
 			overflow = item;
 			break;
 		}
@@ -616,23 +623,26 @@ static size_t fsmonitor_batch__compact_tail(struct fsmonitor_batch *batch,
 
 			for (k = 0; k < item->nr; k++)
 				fsmonitor_batch__add_overflow_path(
-					overflow, item->interned_paths[k]);
+					overflow, item->interned_paths[k],
+					item->batch_seq_nr);
 		}
 		compacted.interned_paths = overflow->interned_paths;
 		compacted.nr = overflow->nr;
 		compacted.alloc = overflow->alloc;
-		compacted.overflow_paths = overflow->overflow_paths;
+		compacted.overflow_path_seqs = overflow->overflow_path_seqs;
 		overflow->interned_paths = NULL;
 		overflow->nr = overflow->alloc = 0;
-		overflow->overflow_paths = NULL;
+		overflow->overflow_path_seqs = NULL;
 	} else {
-		compacted.overflow_paths = kh_init_fsmonitor_path_set();
+		compacted.overflow_path_seqs =
+			kh_init_fsmonitor_path_sequence();
 		for (item = batch; item; item = item->next) {
 			size_t k;
 
 			for (k = 0; k < item->nr; k++)
 				fsmonitor_batch__add_overflow_path(
-					&compacted, item->interned_paths[k]);
+					&compacted, item->interned_paths[k],
+					item->batch_seq_nr);
 		}
 	}
 
@@ -640,7 +650,7 @@ static size_t fsmonitor_batch__compact_tail(struct fsmonitor_batch *batch,
 	batch->interned_paths = compacted.interned_paths;
 	batch->nr = compacted.nr;
 	batch->alloc = compacted.alloc;
-	batch->overflow_paths = compacted.overflow_paths;
+	batch->overflow_path_seqs = compacted.overflow_path_seqs;
 
 	return batch->nr;
 }
@@ -653,9 +663,8 @@ static size_t fsmonitor_batch__compact_tail(struct fsmonitor_batch *batch,
  * particular, advancing a private GIT_INDEX_FILE does not advance .git/index.
  * We therefore cannot discard old paths just because one client asked for a
  * newer token.  Instead, keep their deduplicated union in an overflow batch.
- * Requests older than the overflow sequence may receive extra paths, but not
- * miss any.  A request at that sequence excludes the overflow batch and
- * remains exact.
+ * Keep the newest original sequence number for each path so that clients do
+ * not receive events that they consumed before their requested checkpoint.
  *
  * However, multiple commands may be talking to the daemon concurrently
  * or perform a slow command, so a little "token skew" is possible.
@@ -696,7 +705,7 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 	for (batch = batch_marker->next; batch; batch = batch->next) {
 		time_t t;
 
-		if (batch->overflow_paths)
+		if (!batch->pinned_time || batch->overflow_path_seqs)
 			continue;
 
 		t = batch->pinned_time + truncate_delay_seconds;
@@ -829,6 +838,18 @@ static int fsmonitor_parse_client_token(const char *buf_token,
 
 	return 0;
 }
+
+static void fsmonitor_reply_overflow_paths(
+	const struct fsmonitor_batch *batch,
+	uint64_t requested_oldest_seq_nr,
+	int hardlink_aware_query,
+	ipc_server_reply_cb *reply,
+	struct ipc_server_reply_data *reply_data,
+	struct strset *shown,
+	struct strbuf *payload,
+	uint64_t *total_response_len,
+	intmax_t *count,
+	intmax_t *duplicates);
 
 static int do_handle_client(struct fsmonitor_daemon_state *state,
 			    const char *command,
@@ -1048,13 +1069,14 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 
 		} else if (requested_oldest_seq_nr <
 			   token_data->batch_tail->batch_seq_nr &&
-			   !token_data->batch_tail->overflow_paths) {
+			   !token_data->batch_tail->overflow_path_seqs) {
 			/*
 			 * The client wants older events than we have for
 			 * this token_id.  A normal tail means that the end
 			 * of our batch list was truncated and we cannot
 			 * give the client a complete snapshot.  An overflow
-			 * tail conservatively contains all older paths.
+			 * tail retains the latest original sequence for each
+			 * older path.
 			 */
 			trace_printf_key(&trace_fsmonitor,
 					 "client requested truncated data");
@@ -1103,7 +1125,8 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	 */
 	strset_init_with_options(&shown, NULL, 0);
 	for (batch = batch_head;
-	     batch && batch->batch_seq_nr > requested_oldest_seq_nr;
+	     batch && batch->batch_seq_nr > requested_oldest_seq_nr &&
+	     !batch->overflow_path_seqs;
 	     batch = batch->next) {
 		size_t k;
 
@@ -1137,6 +1160,13 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 				count++;
 			}
 		}
+	}
+	if (batch && batch->batch_seq_nr > requested_oldest_seq_nr) {
+		fsmonitor_reply_overflow_paths(
+			batch, requested_oldest_seq_nr, hardlink_aware_query,
+			reply, reply_data, &shown, &payload,
+			&total_response_len, &count, &duplicates);
+		batch = batch->next;
 	}
 
 	if (payload.len) {
@@ -1193,6 +1223,60 @@ cleanup:
 	strbuf_release(&payload);
 
 	return 0;
+}
+
+static void fsmonitor_reply_overflow_paths(
+	const struct fsmonitor_batch *batch,
+	uint64_t requested_oldest_seq_nr,
+	int hardlink_aware_query,
+	ipc_server_reply_cb *reply,
+	struct ipc_server_reply_data *reply_data,
+	struct strset *shown,
+	struct strbuf *payload,
+	uint64_t *total_response_len,
+	intmax_t *count,
+	intmax_t *duplicates)
+{
+	size_t k;
+
+	if (!batch->overflow_path_seqs)
+		BUG("expected an overflow batch");
+
+	for (k = 0; k < batch->nr; k++) {
+		const char *s = batch->interned_paths[k];
+		khint_t pos = kh_get_fsmonitor_path_sequence(
+			batch->overflow_path_seqs, s);
+		size_t s_len;
+
+		if (pos == kh_end(batch->overflow_path_seqs))
+			BUG("overflow path is missing its sequence");
+		if (kh_value(batch->overflow_path_seqs, pos) <=
+		    requested_oldest_seq_nr)
+			continue;
+
+		if (!hardlink_aware_query &&
+		    starts_with(s, FSMONITOR_PATH_HARDLINK_INODE_PREFIX))
+			s = FSMONITOR_PATH_GLOBAL_INVALIDATE;
+
+		if (!strset_add(shown, s))
+			(*duplicates)++;
+		else {
+			trace_printf_key(&trace_fsmonitor,
+					 "send[%"PRIuMAX"]: %s", *count, s);
+
+			/* Each path gets written with a trailing NUL */
+			s_len = strlen(s) + 1;
+
+			if (payload->len + s_len >= LARGE_PACKET_DATA_MAX) {
+				reply(reply_data, payload->buf, payload->len);
+				*total_response_len += payload->len;
+				strbuf_reset(payload);
+			}
+
+			strbuf_add(payload, s, s_len);
+			(*count)++;
+		}
+	}
 }
 
 static ipc_server_application_cb handle_client;
