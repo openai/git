@@ -239,6 +239,41 @@ test_expect_success MACOS 'fall back when a delayed FSEvents cookie stays late' 
 	test_must_be_empty error
 '
 
+test_expect_success MACOS 'fresh unpinned batches honor the retention grace' '
+	test_when_finished "stop_daemon_delete_repo test_fresh_history" &&
+
+	git init test_fresh_history &&
+	(
+		cd test_fresh_history &&
+		printf "target/\\n" >.gitignore &&
+		printf "a\\n" >tracked-a &&
+		printf "b\\n" >tracked-b &&
+		git add .gitignore tracked-a tracked-b &&
+		git commit -m base &&
+		sane_unset GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS &&
+		start_daemon --tf "$PWD/../fresh-history.trace" &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+		mkdir target &&
+		for i in $(test_seq 1 5250)
+		do
+			printf "x\\n" >"target/ignored-$i" || return 1
+		done &&
+		test-tool fsmonitor-client query >../fresh-history.response &&
+		perl -0ne '\''$nr++; END { print "$nr\n" }'\'' \
+			<../fresh-history.response >../fresh-history.count &&
+		test "$(cat ../fresh-history.count)" -gt 1025 &&
+		git status --porcelain=v2 >.git/after-burst &&
+		printf "new\\n" >>tracked-a &&
+		git status --porcelain=v2 >.git/after-event &&
+		test_grep ! "Compact: batch" ../fresh-history.trace
+	)
+'
+
 test_expect_success MACOS 'private index cannot prune canonical index history' '
 	test_when_finished "stop_daemon_delete_repo test_index_history" &&
 	test_when_finished "rm -f private-index" &&
@@ -287,6 +322,91 @@ test_expect_success MACOS 'private index cannot prune canonical index history' '
 		test_cmp .git/index.before .git/index &&
 		! test_trace2_data fsm_client query/trivial-response 1 \
 			<.git/canonical.trace
+	)
+'
+
+test_expect_success MACOS,HARDLINKS \
+	'compaction does not replay consumed hardlink events' '
+	test_when_finished "stop_daemon_delete_repo test_hardlink_history" &&
+	test_when_finished "rm -f hardlink-private-index" &&
+
+	git init test_hardlink_history &&
+	(
+		cd test_hardlink_history &&
+		printf "target/\\n" >.gitignore &&
+		printf "a\\n" >tracked-a &&
+		printf "b\\n" >tracked-b &&
+		git add .gitignore tracked-a tracked-b &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		(
+			GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS=0 &&
+			export GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS &&
+			start_daemon --tf "$PWD/../hardlink-history.trace"
+		) &&
+		git config core.fsmonitor true &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+		mkdir target &&
+		printf "AAAA\\n" >target/object &&
+		ln target/object target/object-link &&
+		printf "BBBB\\n" >target/object-link &&
+		GIT_TRACE2_EVENT="$PWD/.git/consume.trace" \
+			git status --porcelain=v2 >.git/consume &&
+		test_must_be_empty .git/consume &&
+		test_trace2_data fsmonitor apply/hardlink-index-scan 1 \
+			<.git/consume.trace &&
+		git update-index --refresh --force-write-index &&
+		test-tool dump-fsmonitor >.git/checkpoint &&
+		checkpoint=$(sed -n "s/^fsmonitor last update //p" \
+			.git/checkpoint) &&
+		test -n "$checkpoint" &&
+		test "${checkpoint##*:}" -gt 0 &&
+		cp .git/index .git/index.before &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/control.trace" \
+			git status --porcelain=v2 >.git/control &&
+		test_must_be_empty .git/control &&
+		! test_trace2_data fsmonitor apply/hardlink-index-scan 1 \
+			<.git/control.trace &&
+		cp .git/index ../hardlink-private-index &&
+		grep -c "event: //inode:" ../hardlink-history.trace \
+			>.git/inodes.before &&
+		for i in $(test_seq 1 8)
+		do
+			if test $((i % 2)) -eq 0
+			then
+				printf "private-%s\\n" "$i" >>tracked-a
+			else
+				printf "private-%s\\n" "$i" >>tracked-b
+			fi &&
+			GIT_INDEX_FILE="$PWD/../hardlink-private-index" \
+				git add -u || return 1
+		done &&
+		test_cmp .git/index.before .git/index &&
+		grep -c "event: //inode:" ../hardlink-history.trace \
+			>.git/inodes.after &&
+		test_cmp .git/inodes.before .git/inodes.after &&
+		test_grep "Compact: batch" ../hardlink-history.trace &&
+		for i in $(test_seq 1 5)
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$PWD/.git/repeat-$i.trace" \
+				git status --porcelain=v2 \
+				>.git/repeat-$i || return 1
+			! test_trace2_data fsmonitor apply/hardlink-index-scan 1 \
+				<.git/repeat-$i.trace || return 1
+		done &&
+		test_cmp .git/index.before .git/index &&
+		test-tool fsmonitor-client query-legacy \
+			--token "$checkpoint" >.git/legacy &&
+		nul_to_q <.git/legacy >.git/legacy-q &&
+		test_grep ! "Q/Q" .git/legacy-q &&
+		test_grep ! "Q//Q" .git/legacy-q
 	)
 '
 
