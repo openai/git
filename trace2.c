@@ -250,18 +250,30 @@ int trace2_is_enabled(void)
 	return trace2_enabled;
 }
 
-static int is_signature_parameter(const char *parameter)
+static int is_signature_parameter(const char *parameter, int is_format)
 {
-	char *name = url_decode_parameter_name(&parameter);
-	char *p;
+	struct strbuf unescaped = STRBUF_INIT;
+	char *name, *p;
 	int ret;
 
+	/* A literal percent sign is doubled in a printf format string. */
+	if (is_format) {
+		while (*parameter && *parameter != '=') {
+			if (parameter[0] == '%' && parameter[1] == '%')
+				parameter++;
+			strbuf_addch(&unescaped, *parameter++);
+		}
+		parameter = unescaped.buf;
+	}
+
+	name = url_decode_parameter_name(&parameter);
 	for (p = name; *p; p++)
 		*p = tolower(*p);
 	ret = !strcmp(name, "sig") || !strcmp(name, "signature") ||
 	      ends_with(name, "-signature");
 
 	free(name);
+	strbuf_release(&unescaped);
 	return ret;
 }
 
@@ -271,7 +283,7 @@ static int is_signature_parameter(const char *parameter)
  * Returns the original if nothing needed to be redacted.
  * Returns a pointer that needs to be `free()`d otherwise.
  */
-static const char *redact_arg(const char *arg)
+static const char *redact_url(const char *arg, int is_format)
 {
 	const char *p, *colon;
 	const char *unredacted = arg;
@@ -303,7 +315,7 @@ static const char *redact_arg(const char *arg)
 			const char *equals = memchr(p, '=', end - p);
 
 			if (equals && equals + 1 < end &&
-			    is_signature_parameter(p)) {
+			    is_signature_parameter(p, is_format)) {
 				strbuf_add(&buf, unredacted,
 					   equals + 1 - unredacted);
 				strbuf_addstr(&buf, "<REDACTED>");
@@ -317,6 +329,55 @@ static const char *redact_arg(const char *arg)
 		return arg;
 	strbuf_addstr(&buf, unredacted);
 	return strbuf_detach(&buf, NULL);
+}
+
+static const char *redact_arg(const char *arg)
+{
+	return redact_url(arg, 0);
+}
+
+void tr2_redact_error(struct strbuf *buf, int is_format)
+{
+	size_t pos = 0;
+
+	if (!trace2_redact)
+		return;
+
+	while (pos < buf->len) {
+		const char *p = strcasestr(buf->buf + pos, "http");
+		const char *end, *scheme_end;
+		const char *redacted;
+		char *url;
+		size_t start;
+
+		if (!p)
+			break;
+		start = p - buf->buf;
+		pos = start + 4;
+		if (!skip_iprefix(p, "http://", &scheme_end) &&
+		    !skip_iprefix(p, "https://", &scheme_end))
+			continue;
+
+		/*
+		 * Whitespace, double quotes and angle brackets delimit URLs.
+		 * Other punctuation can belong to a signature, so preserve a
+		 * single quote only at the end of a single-quoted token.
+		 */
+		end = p + strcspn(p, " \t\r\n\v\f\"<>");
+		if (start && p[-1] == '\'' && end[-1] == '\'')
+			end--;
+
+		/* Also examine any further URLs in the unredacted text. */
+		pos = scheme_end - buf->buf;
+		url = xmemdupz(p, end - p);
+		redacted = redact_url(url, is_format);
+		if (redacted != url) {
+			strbuf_splice(buf, start, end - p,
+				      redacted, strlen(redacted));
+			free((char *)redacted);
+		}
+		free(url);
+	}
 }
 
 /*
