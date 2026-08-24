@@ -8770,13 +8770,17 @@ test_expect_success 'pinned plans keep source refs immutable while rebuilding ou
 			git push origin master
 		) &&
 		fetch_all &&
+		snapshot_refs ../pinned-plan.git >before-overlap &&
 		test_expect_code 1 sh "$codex_branch" rewrite \
 			--remote origin --base master --codex codex \
 			--result overlap-result --updates overlap-updates \
 			--inputs overlap-inputs --failure overlap-failure \
 			>overlap.out 2>overlap.err &&
-		test_grep "pinned merge graph overlaps its moved base" \
-			overlap.err &&
+		test_grep "Reproduce and preserve this exact topology-aware rebase" \
+			overlap-failure &&
+		test_grep "resolve" overlap-failure &&
+		snapshot_refs ../pinned-plan.git >after-overlap &&
+		test_cmp before-overlap after-overlap &&
 		(
 			cd ../pinned-plan-source &&
 			git fetch origin meta codex-unstable &&
@@ -9202,30 +9206,48 @@ test_expect_success 'pinned merge chain rejects a merge-shaped descendant' '
 	)
 '
 
-test_expect_success 'pinned merge chain rejects current and reverted child-path overlap' '
-	for path in child-file child-history
-	do
-		fixture=merge-chain-overlap-$path &&
-		clone_pinned_merge_chain "$fixture" &&
-		(
-			cd "$fixture-runner" &&
-			root=$(git rev-parse origin/bb/codex/merge-root-unstable) &&
-			grandchild=$(git rev-parse \
-				origin/dd/codex/linear-grandchild-unstable) &&
-			if test "$path" = child-history
-			then
-				git diff --quiet "$root" "$grandchild" -- "$path"
-			fi &&
-			git switch master &&
-			write overlapping "$path" &&
-			git add "$path" &&
-			git commit -m "move an overlapping child path" &&
-			git push origin master &&
-			fetch_all &&
-			pinned_merge_chain_reject rejected \
-				"pinned merge graph overlaps its moved base"
-		) || return 1
-	done
+test_expect_success 'pinned merge chain preserves recoverable overlap state' '
+	clone_pinned_merge_chain merge-chain-overlap &&
+	(
+		cd merge-chain-overlap-runner &&
+		git switch master &&
+		write overlapping child-file &&
+		git add child-file &&
+		git commit -m "move an overlapping child path" &&
+		git push origin master &&
+		fetch_all &&
+		fixture_remote=$(git remote get-url origin) &&
+		snapshot_refs "$fixture_remote" >before &&
+		test_expect_code 1 sh "$codex_branch" rewrite \
+			--remote origin --base master --codex codex \
+			--result rejected-result --updates rejected-updates \
+			--inputs rejected-inputs --failure rejected-failure \
+			>rejected.out 2>rejected.err &&
+		test_grep "resolve" rejected-failure &&
+		test_grep "No refs were updated" rejected-failure &&
+		snapshot_refs "$fixture_remote" >after-rewrite &&
+		test_cmp before after-rewrite &&
+		inputs_oid=$(git hash-object rejected-inputs) &&
+		sh "$codex_branch" resolve --remote origin --base master \
+			--codex codex --inputs-oid "$inputs_oid" \
+			--worktree resolution >resolve.out 2>resolve.err &&
+		state=$(git -C resolution rev-parse --path-format=absolute \
+			--git-path codex-rewrite-state) &&
+		private=$(cat "$state/unstable/merge-rebase-worktree") &&
+		test -d "$private" &&
+		test -n "$(git -C "$private" ls-files -u)" &&
+		write child "$private/child-file" &&
+		git -C "$private" add child-file &&
+		sh "$codex_branch" continue --worktree "$private" \
+			>continue.out 2>continue.err &&
+		test_grep "source refs unchanged" continue.out &&
+		sh "$codex_branch" publish-topics --worktree resolution \
+			>publish.out 2>publish.err &&
+		test_grep "Pinned recovery session" publish.out &&
+		test_grep "No refs were updated" publish.out &&
+		snapshot_refs "$fixture_remote" >after-publish &&
+		test_cmp before after-publish
+	)
 '
 
 test_expect_success 'pinned merge chain rejects invalid prerequisite graphs' '

@@ -1543,6 +1543,22 @@ state_path () {
 		--git-path codex-rewrite-state
 }
 
+recovery_state_path () {
+	worktree=$1
+	state=$(state_path "$worktree") || return 1
+	if test -f "$state/state-root"
+	then
+		state=$(sed -n '1p' "$state/state-root")
+		case "$state" in
+		/*) ;;
+		*) die "merge-graph recovery state is not absolute" ;;
+		esac
+		test -d "$state" ||
+			die "merge-graph recovery state '$state' is missing"
+	fi
+	printf '%s\n' "$state"
+}
+
 state_value () {
 	state=$1
 	key=$2
@@ -4309,6 +4325,40 @@ process_disjoint_pinned_merge_graph () (
 		die "could not finish pinned merge updates"
 )
 
+finish_merge_graph_rebase () (
+	state=$1
+	private=$(state_value "$state" merge-rebase-worktree)
+	root_worktree=$(state_value "$state" recovery-root-worktree)
+	base_oid=$(state_value "$state" base-oid)
+	tracking=$state/private-topic-refs
+
+	set -- git -C "$root_worktree" fetch --no-tags "$private"
+	while IFS="$tab" read -r name old ref
+	do
+		set -- "$@" "$ref"
+	done <"$tracking"
+	"$@" >/dev/null 2>&1 ||
+		die "could not import the completed merge-graph rebase"
+
+	while IFS="$tab" read -r name old ref
+	do
+		if test "$old" = "$(state_value "$state" merge-graph-root)"
+		then
+			new=$base_oid
+		else
+			new=$(git -C "$private" rev-parse "$ref") ||
+				die "could not read rewritten topic '$name'"
+		fi
+		git -C "$root_worktree" cat-file -e "$new^{commit}" ||
+			die "topic '$name' was not imported into the main object database"
+		git -C "$root_worktree" merge-base --is-ancestor \
+			"$base_oid" "$new" ||
+			die "rewritten topic '$name' lost its production base"
+		result_record "$state/results" "$name" "$new"
+	done <"$tracking"
+	finish_updates "$state"
+)
+
 process_merge_graph () (
 	worktree=$1
 	state=$2
@@ -4354,10 +4404,13 @@ process_merge_graph () (
 	if test -f "$state/pinned-merge-root"
 	then
 		prepare_pinned_merge_overlay "$state" "$root" "$base_oid"
-		test -f "$state/pinned-merge-disjoint-base" ||
-			die "pinned merge graph overlaps its moved base; restack it explicitly before publication"
-		process_disjoint_pinned_merge_graph "$state"
-		return 0
+		if test -f "$state/pinned-merge-disjoint-base"
+		then
+			process_disjoint_pinned_merge_graph "$state"
+			return 0
+		fi
+		: >"$state/pinned-merge-overlap-rebase" ||
+			die "could not retain pinned merge overlap state"
 	fi
 
 	if test "$root" = "$base_oid"
@@ -4410,6 +4463,16 @@ process_merge_graph () (
 	git -c core.fsmonitor=false clone --shared --no-checkout --no-tags \
 		"$source" "$private" >/dev/null 2>&1 ||
 		die "could not isolate the merge replay"
+	private_state=$(state_path "$private") ||
+		die "could not locate the private merge-replay state"
+	mkdir -p "$private_state" ||
+		die "could not prepare the private merge-replay state"
+	printf '%s\n' "$state" >"$private_state/state-root" ||
+		die "could not link the private merge-replay state"
+	printf '%s\n' "$private" >"$state/merge-rebase-worktree" ||
+		die "could not retain the merge-replay worktree"
+	printf '%s\n' "$worktree" >"$state/recovery-root-worktree" ||
+		die "could not retain the recovery worktree"
 	: >"$tracking"
 	index=0
 	while IFS="$tab" read -r name oid
@@ -4426,6 +4489,20 @@ process_merge_graph () (
 		-c advice.detachedHead=false switch --detach "$aggregate" \
 		>/dev/null 2>&1 ||
 		die "could not check out the synthetic merge graph"
+	if test -f "$state/pinned-plan-mode" &&
+		test -f "$state/published-base-oid" &&
+		test -f "$state/published-codex-oid"
+	then
+		published_base=$(state_value "$state" published-base-oid)
+		published_output=$(state_value "$state" published-codex-oid)
+		if test "$published_base" != "$published_output" &&
+			git merge-base --is-ancestor "$published_base" \
+				"$published_output"
+		then
+			train_rerere "$private" "$published_base" \
+				"$published_output"
+		fi
+	fi
 	if ! GIT_OBJECT_DIRECTORY=$object_directory \
 		GIT_COMMITTER_NAME=$bot_name GIT_COMMITTER_EMAIL=$bot_email \
 		GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git -C "$private" \
@@ -4439,6 +4516,11 @@ process_merge_graph () (
 		--keep-empty --reapply-cherry-picks --no-autostash \
 		--onto "$base_oid" "$root"
 	then
+		if continue_rerere_resolution "$private"
+		then
+			finish_merge_graph_rebase "$state"
+			return 0
+		fi
 		owner=$(awk -F '\t' 'NR == 1 { print $1 }' "$state/plan")
 		old=$(awk -F '\t' -v name="$owner" \
 			'$1 == name { print $2; exit }' "$topics")
@@ -4446,22 +4528,7 @@ process_merge_graph () (
 			"$old" "$root" "$base_oid" || return 1
 		return 1
 	fi
-	while IFS="$tab" read -r name old ref
-	do
-		if test "$old" = "$root"
-		then
-			new=$base_oid
-		else
-			new=$(git -C "$private" rev-parse "$ref") ||
-				die "could not read rewritten topic '$name'"
-		fi
-		git cat-file -e "$new^{commit}" ||
-			die "topic '$name' was not imported into the main object database"
-		git merge-base --is-ancestor "$base_oid" "$new" ||
-			die "rewritten topic '$name' lost its production base"
-		result_record "$state/results" "$name" "$new"
-	done <"$tracking"
-	finish_updates "$state"
+	finish_merge_graph_rebase "$state"
 )
 
 verify_merge_topology () (
@@ -4596,29 +4663,33 @@ verify_merge_topology () (
 	if test -f "$state/pinned-merge-root"
 	then
 		prepare_pinned_merge_overlay "$state" "$root" "$base"
-		test -f "$state/pinned-merge-disjoint-base" ||
-			die "pinned merge graph overlaps its moved base"
-		LC_ALL=C sort -u "$source" \
-				>"$state/verified-tree-commits" ||
-			die "could not sort verified merge commits"
-		write_pinned_merge_overlay_trees "$root" "$base" \
-				"$state/verified-tree-commits" \
-				"$state/verified-expected-trees"
-		exec 3<"$state/verified-expected-trees"
-		while IFS= read -r old
-		do
-			IFS= read -r expected_tree <&3 ||
-				die "could not read the expected replayed tree for $old"
-			new=$(awk -F '\t' -v oid="$old" \
-				'$1 == oid { print $2; exit }' "$map")
-			test -n "$new" ||
-				die "merge rewrite has no tree mapping for $old"
-			actual_tree=$(git rev-parse "$new^{tree}") ||
-				die "could not inspect replayed tree $new"
-			test "$actual_tree" = "$expected_tree" ||
-				die "pinned merge replay changes its reviewed tree outside the moved base"
-		done <"$state/verified-tree-commits"
-		exec 3<&-
+		if test -f "$state/pinned-merge-disjoint-base"
+		then
+			LC_ALL=C sort -u "$source" \
+					>"$state/verified-tree-commits" ||
+				die "could not sort verified merge commits"
+			write_pinned_merge_overlay_trees "$root" "$base" \
+					"$state/verified-tree-commits" \
+					"$state/verified-expected-trees"
+			exec 3<"$state/verified-expected-trees"
+			while IFS= read -r old
+			do
+				IFS= read -r expected_tree <&3 ||
+					die "could not read the expected replayed tree for $old"
+				new=$(awk -F '\t' -v oid="$old" \
+					'$1 == oid { print $2; exit }' "$map")
+				test -n "$new" ||
+					die "merge rewrite has no tree mapping for $old"
+				actual_tree=$(git rev-parse "$new^{tree}") ||
+					die "could not inspect replayed tree $new"
+				test "$actual_tree" = "$expected_tree" ||
+					die "pinned merge replay changes its reviewed tree outside the moved base"
+			done <"$state/verified-tree-commits"
+			exec 3<&-
+		else
+			test -f "$state/pinned-merge-overlap-rebase" ||
+				die "overlapping pinned merge graph was not rebased by the controller"
+		fi
 	fi
 
 	LC_ALL=C sort "$source" >"$source.sorted" ||
@@ -4744,24 +4815,65 @@ write_unstable_failure () {
 write_merge_graph_failure () {
 	path=$1
 	state=$2
-	worktree=$3
+	worktree=$(state_value "$state" merge-rebase-worktree)
 	test -n "$path" || return 0
 
 	failed_owner=$(state_value "$state" failed-owner)
 	failed_commit=$(state_value "$state" failed-commit)
 	output_name=$(state_value "$state" codex-name)
+	root_worktree=$(state_value "$state" recovery-root-worktree)
+	root_state=$(state_path "$root_worktree")
 	{
 		say "## No refs were updated"
 		say
 		say "Rebasing merge-shaped topic \`$failed_owner\` stopped while applying \`$failed_commit\`."
 		say "Neither \`$output_name\`, \`meta\`, nor a topic branch was updated."
 		say
-		say "Resolve this merge-graph conflict manually: restack the affected"
-		say "topic and its descendants onto their current prerequisites,"
-		say "publish the coherent topic graph in one exact-lease atomic push,"
-		say "and run \`Meta/rebuild\` again."
-		say "The linear \`resolve\`/\`continue\` recovery commands do not"
-		say "reconstruct a merge-shaped topic graph."
+		if test -z "$preserve_worktree"
+		then
+			inputs_oid=$(input_oid "$root_state/inputs")
+			remote=$(state_value "$root_state" remote)
+			base_name=$(state_value "$root_state" base-name)
+			codex_name=$(state_value "$root_state" codex-name)
+			require_automation=$(state_value "$root_state" \
+				require-automation)
+			say "Reproduce and preserve this exact topology-aware rebase with:"
+			say
+			set -- "$script_path" resolve --remote "$remote" \
+				--base "$base_name" --codex "$codex_name"
+			test -z "$require_automation" ||
+				set -- "$@" --require-automation
+			set -- "$@" --inputs-oid "$inputs_oid"
+			printf '  '
+			for arg in "$@"
+			do
+				printf '%s ' "$(shell_quote "$arg")"
+			done
+			printf '\n'
+			say
+			say "The resolve command leaves the complete stopped graph in a"
+			say "disposable worktree and prints the exact continue command."
+			return
+		fi
+		say "The controller preserved the complete topology-aware rebase in:"
+		say
+		say "  $(shell_quote "$worktree")"
+		say
+		say "Resolve the stopped commit there, then continue through the pinned"
+		say "controller. It will retain every rewritten topic boundary and verify"
+		say "that the result has exactly the reviewed commits and parent topology:"
+		say
+		say "  cd $(shell_quote "$worktree")"
+		say "  git status"
+		say "  git rebase --show-current-patch"
+		say "  # Edit the conflicted files."
+		say "  git add <files>"
+		say "  git diff --cached --check"
+		say "  $(shell_quote "$script_path") continue --worktree ."
+		say
+		say "Repeat the edit/add/continue sequence for later conflicts. No source"
+		say "ref moves; the completed stable and unstable candidate is frozen for"
+		say "the normal staging-CI and atomic-promotion gates."
 		if test -n "$(git -C "$worktree" -c core.fsmonitor=false \
 			diff --name-only --diff-filter=U)"
 		then
@@ -5327,6 +5439,45 @@ create_unstable_sentinel () (
 		die "could not create the empty codex-unstable sentinel"
 )
 
+finish_unstable_candidate () (
+	worktree=$1
+	root_state=$2
+	unstable_state=$3
+	stable_candidate=$4
+	unstable_old=$5
+	failure_file=$6
+
+	if ! unstable_candidate=$(assemble_candidate "$worktree" \
+		"$unstable_state")
+	then
+		if test -f "$unstable_state/integration-failed-name"
+		then
+			write_integration_failure "$failure_file" \
+				"$unstable_state" "$worktree"
+			die "codex-unstable integration conflicts while merging '$(state_value "$unstable_state" integration-failed-name)'; no refs were updated"
+		fi
+		die "codex-unstable candidate validation failed; no refs were updated"
+	fi
+	git merge-base --is-ancestor "$stable_candidate" \
+		"$unstable_candidate" ||
+		die "codex-unstable candidate does not contain its exact codex base"
+	test "$stable_candidate" != "$unstable_candidate" ||
+		die "codex-unstable candidate is not strictly ahead of codex"
+	verify_unstable_control_paths "$stable_candidate" \
+		"$unstable_candidate" "$unstable_state"
+	if ! is_null_oid "$unstable_old" &&
+		git merge-base --is-ancestor "$stable_candidate" "$unstable_old" &&
+		test "$(git rev-parse "$unstable_candidate^{tree}")" = \
+			"$(git rev-parse "$unstable_old^{tree}")" &&
+		codex_has_expected_integrations "$unstable_state" "$unstable_old"
+	then
+		unstable_candidate=$unstable_old
+	fi
+	printf '%s\n' "$unstable_candidate" \
+		>"$root_state/unstable-output-oid" ||
+		die "could not retain the unstable output candidate"
+)
+
 prepare_unstable_candidate () (
 	worktree=$1
 	state=$2
@@ -5398,6 +5549,21 @@ prepare_unstable_candidate () (
 	fi
 
 	unstable_state=$state/unstable
+	if test -f "$unstable_state/topic-updates"
+	then
+		test "$(state_value "$unstable_state" base-oid)" = \
+			"$stable_candidate" ||
+			die "completed unstable recovery belongs to a different stable candidate"
+		require_state_controller "$unstable_state"
+		finish_unstable_candidate "$worktree" "$root_state" \
+			"$unstable_state" "$stable_candidate" "$unstable_old" \
+			"$failure_file"
+		return
+	fi
+	if test -d "$unstable_state"
+	then
+		die "unstable recovery is incomplete; continue its preserved rebase instead of rebuilding it"
+	fi
 	mkdir -p "$unstable_state" ||
 		die "could not prepare unstable reconstruction state"
 	cp "$state/inputs" "$unstable_state/inputs" ||
@@ -5479,35 +5645,8 @@ prepare_unstable_candidate () (
 		fi
 		die "conflict while rebasing unstable topic '$(state_value "$unstable_state" failed-owner)'; no refs were updated"
 	fi
-	if ! unstable_candidate=$(assemble_candidate "$worktree" \
-		"$unstable_state")
-	then
-		if test -f "$unstable_state/integration-failed-name"
-		then
-			write_integration_failure "$failure_file" \
-				"$unstable_state" "$worktree"
-			die "codex-unstable integration conflicts while merging '$(state_value "$unstable_state" integration-failed-name)'; no refs were updated"
-		fi
-		die "codex-unstable candidate validation failed; no refs were updated"
-	fi
-	git merge-base --is-ancestor "$stable_candidate" \
-		"$unstable_candidate" ||
-		die "codex-unstable candidate does not contain its exact codex base"
-	test "$stable_candidate" != "$unstable_candidate" ||
-		die "codex-unstable candidate is not strictly ahead of codex"
-	verify_unstable_control_paths "$stable_candidate" \
-		"$unstable_candidate" "$unstable_state"
-	if ! is_null_oid "$unstable_old" &&
-		git merge-base --is-ancestor "$stable_candidate" "$unstable_old" &&
-		test "$(git rev-parse "$unstable_candidate^{tree}")" = \
-			"$(git rev-parse "$unstable_old^{tree}")" &&
-		codex_has_expected_integrations "$unstable_state" "$unstable_old"
-	then
-		unstable_candidate=$unstable_old
-	fi
-	printf '%s\n' "$unstable_candidate" \
-		>"$root_state/unstable-output-oid" ||
-		die "could not retain the unstable output candidate"
+	finish_unstable_candidate "$worktree" "$root_state" "$unstable_state" \
+		"$stable_candidate" "$unstable_old" "$failure_file"
 )
 
 initialize_config () {
@@ -10082,12 +10221,28 @@ resolve_rebase () {
 	state=$(state_path "$worktree")
 	initialize_rewrite "$remote" "$base_name" "$codex_name" "$codex_name" \
 		"$worktree" "$state" "$inputs" "$topics" "$require_automation"
-	test ! -f "$state/merge-graph" ||
-		die "resolve does not reconstruct merge-shaped topic graphs; restack the reviewed graph and rerun Meta/rebuild"
 
-	if process_plan "$worktree" "$state"
+	if process_planned_graph "$worktree" "$state"
 	then
-		die "the pinned rewrite no longer conflicts; rerun the refresh Action"
+		candidate=$(assemble_candidate "$worktree" "$state") ||
+			die "the resolved production graph failed candidate validation"
+		if prepare_unstable_candidate "$worktree" "$state" "$candidate" \
+			/dev/stderr
+		then
+			die "the pinned rewrite no longer conflicts; rerun the refresh Action"
+		fi
+		say
+		say "Resolution worktree: $worktree"
+		say "Continue the preserved unstable rebase printed above."
+		return
+	fi
+
+	if test -f "$state/merge-graph"
+	then
+		write_merge_graph_failure /dev/stderr "$state" "$worktree"
+		say
+		say "Resolution worktree: $worktree"
+		return
 	fi
 
 	say
@@ -10118,6 +10273,42 @@ resolved_rebase_tip () {
 		"$failed_old" "$failed_onto"
 }
 
+continue_merge_graph_rewrite () {
+	worktree=$1
+	state=$2
+	expected=$(state_value "$state" merge-rebase-worktree)
+	actual=$(CDPATH= cd "$worktree" && pwd -P) ||
+		die "could not resolve merge-graph recovery worktree"
+	expected=$(CDPATH= cd "$expected" && pwd -P) ||
+		die "could not resolve the preserved merge-graph worktree"
+	test "$actual" = "$expected" ||
+		die "continue must run in the preserved merge-graph worktree '$expected'"
+	if rebase_in_progress "$worktree"
+	then
+		if test -n "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
+		then
+			die "the rebase still has unresolved paths; edit them, git add them, and rerun this command"
+		fi
+		if ! continue_rerere_resolution "$worktree"
+		then
+			say "Another merge-graph commit conflicts."
+			say "Edit the conflicted paths, git add them, and rerun:"
+			say "  $(shell_quote "$script_path") continue --worktree $(shell_quote "$worktree")"
+			return 1
+		fi
+	fi
+	require_clean_worktree "$worktree"
+	finish_merge_graph_rebase "$state"
+	rm -f "$state/failed-old" "$state/failed-owner" \
+		"$state/failed-parent" "$state/failed-onto" \
+		"$state/failed-commit"
+	root=$(state_value "$state" recovery-root-worktree)
+	say "The complete merge graph was rewritten with source refs unchanged."
+	say "Verify and freeze the stable and unstable candidate with:"
+	say
+	say "  $(shell_quote "$script_path") publish-topics --worktree $(shell_quote "$root")"
+}
+
 continue_rewrite () {
 	worktree=
 	while test $# -gt 0
@@ -10128,11 +10319,14 @@ continue_rewrite () {
 		esac
 	done
 	test -n "$worktree" || die "continue requires --worktree"
-	state=$(state_path "$worktree")
+	state=$(recovery_state_path "$worktree")
 	test -d "$state" || die "'$worktree' has no Codex rewrite state"
 	require_state_controller "$state"
-	test ! -f "$state/merge-graph" ||
-		die "continue does not reconstruct merge-shaped topic graphs; restack the reviewed graph and rerun Meta/rebuild"
+	if test -f "$state/merge-graph"
+	then
+		continue_merge_graph_rewrite "$worktree" "$state"
+		return
+	fi
 	if rebase_in_progress "$worktree"
 	then
 		if test -n "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
@@ -10227,8 +10421,13 @@ publish_topics () {
 	fi
 	if test -f "$state/pinned-plan-mode"
 	then
-		prepare_unstable_candidate "$worktree" "$state" "$candidate" \
+		if ! prepare_unstable_candidate "$worktree" "$state" "$candidate" \
 			"$tmp_dir/codex-conflict.md"
+		then
+			test ! -s "$tmp_dir/codex-conflict.md" ||
+				cat "$tmp_dir/codex-conflict.md" >&2
+			die "unstable candidate recovery stopped; no refs were updated"
+		fi
 	fi
 	stable_recovery=
 	if test "$(state_value "$state" config-version)" = 2
