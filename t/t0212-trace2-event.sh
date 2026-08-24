@@ -322,17 +322,17 @@ test_expect_success 'discard traces when there are too many files' '
 	head -n2 trace_target_dir/git-trace2-discard | tail -n1 | grep \"event\":\"too_many_files\"
 '
 
-# In the following "...redact..." tests, skip testing the GIT_TRACE2_REDACT=0
-# case because we would need to exactly model the full JSON event stream like
-# we did in the basic tests above and I do not think it is worth it.
+url="https://user:pwd@example.com/?sig=secret&expires=123"
+redacted_url="https://user:<REDACTED>@example.com/?sig=<REDACTED>&expires=123"
 
 test_expect_success 'unsafe URLs are redacted by default in cmd_start events' '
 	test_when_finished \
 		"rm -r trace.event" &&
 
 	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
-		test-tool trace2 300redact_start git clone https://user:pwd@example.com/ clone2 &&
-	test_grep ! user:pwd trace.event
+		test-tool trace2 300redact_start git clone "$url" clone2 &&
+	test_grep ! -E "user:pwd|secret" trace.event &&
+	test_grep -F "$redacted_url" trace.event
 '
 
 test_expect_success 'unsafe URLs are redacted by default in child_start events' '
@@ -340,8 +340,9 @@ test_expect_success 'unsafe URLs are redacted by default in child_start events' 
 		"rm -r trace.event" &&
 
 	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
-		test-tool trace2 301redact_child_start git clone https://user:pwd@example.com/ clone2 &&
-	test_grep ! user:pwd trace.event
+		test-tool trace2 301redact_child_start git clone "$url" clone2 &&
+	test_grep ! -E "user:pwd|secret" trace.event &&
+	test_grep -F "$redacted_url" trace.event
 '
 
 test_expect_success 'unsafe URLs are redacted by default in exec events' '
@@ -349,8 +350,9 @@ test_expect_success 'unsafe URLs are redacted by default in exec events' '
 		"rm -r trace.event" &&
 
 	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
-		test-tool trace2 302redact_exec git clone https://user:pwd@example.com/ clone2 &&
-	test_grep ! user:pwd trace.event
+		test-tool trace2 302redact_exec git clone "$url" clone2 &&
+	test_grep ! -E "user:pwd|secret" trace.event &&
+	test_grep -F "$redacted_url" trace.event
 '
 
 test_expect_success 'unsafe URLs are redacted by default in def_param events' '
@@ -358,8 +360,40 @@ test_expect_success 'unsafe URLs are redacted by default in def_param events' '
 		"rm -r trace.event" &&
 
 	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
-		test-tool trace2 303redact_def_param url https://user:pwd@example.com/ &&
-	test_grep ! user:pwd trace.event
+		test-tool trace2 303redact_def_param url "$url" &&
+	test_grep ! -E "user:pwd|secret" trace.event &&
+	test_grep -F "$redacted_url" trace.event
+'
+
+test_expect_success 'redact signature query values without changing the rest of the URL' '
+	test_when_finished "rm -f trace.event actual cases" &&
+	cat >cases <<-\EOF &&
+	?sig=secret ?sig=<REDACTED>
+	?expires=123&Signature=secret ?expires=123&Signature=<REDACTED>
+	?X-Blob-SIGNATURE=secret&expires=123 ?X-Blob-SIGNATURE=<REDACTED>&expires=123
+	?%73ig=secret%2Bvalue%3D&sig=other ?%73ig=<REDACTED>&sig=<REDACTED>
+	?SIG=secret#fragment ?SIG=<REDACTED>#fragment
+	?sig=&signature ?sig=&signature
+	?sig=sig=secret&expires=123 ?sig=<REDACTED>&expires=123
+	?design=value&signature-extra=value ?design=value&signature-extra=value
+	?value=sig=public ?value=sig=public
+	#fragment?sig=public #fragment?sig=public
+	EOF
+	while read input expect
+	do
+		: >trace.event &&
+		GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+			test-tool trace2 303redact_def_param url "https://example.com/pack$input" &&
+		grep "\"event\":\"def_param\"" trace.event >actual &&
+		test_grep -F "\"value\":\"https://example.com/pack$expect\"" actual || return 1
+	done <cases
+'
+
+test_expect_success 'URL signature redaction can be disabled' '
+	test_when_finished "rm trace.event" &&
+	GIT_TRACE2_REDACT=0 GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+		test-tool trace2 303redact_def_param url "$url" &&
+	test_grep -F "$url" trace.event
 '
 
 test_done
