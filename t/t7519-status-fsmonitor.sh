@@ -2519,6 +2519,137 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'clean non-fast-forward merges preserve authenticated worktree proofs' '
+	test_when_finished "rm -rf clean-no-ff-proof-*" &&
+	for mode in cli no-commit config
+	do
+		repo=clean-no-ff-proof-$mode &&
+		test_create_repo "$repo" &&
+		(
+			cd "$repo" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			test_commit base base &&
+			primary=$(git symbolic-ref --short HEAD) &&
+			git switch -c side &&
+			test_commit topic topic &&
+			git switch "$primary" &&
+			test_commit primary primary &&
+			git config core.untrackedCache true &&
+			git config core.fsmonitor true &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git update-index --fsmonitor &&
+			GIT_INDEX_FILE="$PWD/.git/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git status --porcelain=v2 >.git/prime &&
+			test_must_be_empty .git/prime &&
+			test_fsmonitor_full_proof .git/index paired &&
+			case "$mode" in
+			cli)
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+					git merge --no-ff --no-edit side
+				;;
+			no-commit)
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+					git merge --no-ff --no-commit side
+				;;
+			config)
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+					git -c merge.ff=false merge --no-edit side
+				;;
+			esac &&
+			test_fsmonitor_full_proof .git/index paired &&
+			cp .git/index .git/readonly.index &&
+			for run in 1 2 3
+			do
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$PWD/.git/status-$run.trace" \
+					git status --porcelain=v2 \
+						>.git/status-$run &&
+				test_cmp_bin .git/readonly.index .git/index &&
+				! test_trace2_data fsmonitor \
+					history/external-proof-invalidated 1 \
+					<.git/status-$run.trace &&
+				! have_t2_data_event fsmonitor \
+					semantic/manifest-scan-count \
+					<.git/status-$run.trace &&
+				if test "$mode" = no-commit
+				then
+					test_grep "^1 A\\. .* topic$" \
+						.git/status-$run
+				else
+					test_must_be_empty .git/status-$run
+				fi || return 1
+			done
+		) || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'non-fast-forward conflicts and alternate indexes fail closed' '
+	test_when_finished "rm -rf no-ff-alt-proof no-ff-conflict-proof" &&
+	test_create_repo no-ff-alt-proof &&
+	(
+		cd no-ff-alt-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_commit base base &&
+		primary=$(git symbolic-ref --short HEAD) &&
+		git switch -c side &&
+		test_commit topic topic &&
+		git switch "$primary" &&
+		test_commit primary primary &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_fsmonitor_full_proof .git/index paired &&
+		cp .git/index .git/alternate.index &&
+		GIT_INDEX_FILE="$PWD/.git/alternate.index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+			git merge --no-ff --no-commit side &&
+		! test_fsmonitor_full_proof .git/alternate.index paired \
+			2>.git/alternate.proof &&
+		test_grep ! FSUC .git/alternate.index
+	) &&
+	test_create_repo no-ff-conflict-proof &&
+	(
+		cd no-ff-conflict-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines base >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		primary=$(git symbolic-ref --short HEAD) &&
+		git switch -c side &&
+		test_write_lines side >tracked &&
+		git commit -am side &&
+		git switch "$primary" &&
+		test_write_lines primary >tracked &&
+		git commit -am primary &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_fsmonitor_full_proof .git/index paired &&
+		test_must_fail env \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
+			git merge --no-ff side &&
+		! test_fsmonitor_full_proof .git/index paired \
+			2>.git/conflict.proof &&
+		test_grep ! FSUC .git/index &&
+		git ls-files -u >.git/unmerged &&
+		test_file_not_empty .git/unmerged
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'full status durably repairs missing mixed-writer index proofs' '
 	test_when_finished "rm -rf mixed-writer-missing-proofs" &&
 	test_create_repo mixed-writer-missing-proofs &&

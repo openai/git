@@ -1472,7 +1472,7 @@ int cmd_merge(int argc,
 		goto done;
 	}
 
-	if (fast_forward != FF_NO && !getenv(INDEX_ENVIRONMENT) &&
+	if (!getenv(INDEX_ENVIRONMENT) &&
 	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
 		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository, &clean_digest);
