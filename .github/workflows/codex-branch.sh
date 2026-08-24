@@ -6,6 +6,7 @@ me=codex-branch
 tmp_dir=
 temporary_worktree=
 preserve_worktree=
+timings_file=
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path=${CODEX_ENTRYPOINT:-$script_dir/$(basename "$0")}
 meta_config_path=codex.config
@@ -25,10 +26,31 @@ die () {
 	exit 1
 }
 
+now_seconds () {
+	date +%s
+}
+
+record_timing () (
+	phase=$1
+	started=$2
+	finished=$(now_seconds) || return 0
+	elapsed=$((finished - started))
+	say "Timing: $phase ${elapsed}s"
+	test -n "$timings_file" || return 0
+	if ! printf '%s\t%s\t%s\t%s\n' "$phase" "$started" "$finished" \
+		"$elapsed" >>"$timings_file"
+	then
+		say "warning: could not record release timing in '$timings_file'"
+		exit 0
+	fi
+	chmod 600 "$timings_file" ||
+		say "warning: could not protect release timing '$timings_file'"
+)
+
 usage () {
 	cat <<-\EOF
 	usage: codex-branch check-topic <branch>
-	   or: codex-branch rebuild [--local]
+	   or: codex-branch rebuild [--local | --resume <session>]
 		[--enable-unstable | --disable-unstable]
 	   or: codex-branch publish <run-id>
 	   or: codex-branch initialize [--remote <remote>] [--base <branch>]
@@ -9208,26 +9230,37 @@ wait_for_refresh_run () (
 
 rebuild_codex () {
 	local_preparation=
+	resume_session=
 	rebuild_unstable_mode=
-	for option in "$@"
+	while test $# -gt 0
 	do
-		case "$option" in
+		case "$1" in
 		--local)
 			test -z "$local_preparation" || { usage >&2; exit 129; }
-			local_preparation=t
+			local_preparation=prepare
+			shift
+			;;
+		--resume)
+			test -z "$local_preparation" || { usage >&2; exit 129; }
+			require_arg "$@"
+			local_preparation=resume
+			resume_session=$2
+			shift 2
 			;;
 		--enable-unstable)
 			test -z "$rebuild_unstable_mode" || { usage >&2; exit 129; }
 			rebuild_unstable_mode=enable
+			shift
 			;;
 		--disable-unstable)
 			test -z "$rebuild_unstable_mode" || { usage >&2; exit 129; }
 			rebuild_unstable_mode=disable
+			shift
 			;;
 		*) usage >&2; exit 129 ;;
 		esac
 	done
-	test -z "$rebuild_unstable_mode" || test -n "$local_preparation" ||
+	test -z "$rebuild_unstable_mode" || test "$local_preparation" = prepare ||
 		die "changing the codex-unstable lane requires Meta/rebuild --local"
 	require_operator_context
 	if test -z "$local_preparation"
@@ -9237,13 +9270,22 @@ rebuild_codex () {
 		command -v zipinfo >/dev/null 2>&1 ||
 			die "Meta/rebuild requires zipinfo"
 	fi
+	set --
+	case "$local_preparation" in
+	prepare) set -- "$@" --local ;;
+	resume) set -- "$@" --resume "$resume_session" ;;
+	esac
+	case "$rebuild_unstable_mode" in
+	enable) set -- "$@" --enable-unstable ;;
+	disable) set -- "$@" --disable-unstable ;;
+	esac
 	refresh_meta_controller "$@"
-	if test -n "$local_preparation"
-	then
-		rebuild_codex_locally
-		return
-	fi
+	case "$local_preparation" in
+	prepare) rebuild_codex_locally; return ;;
+	resume) rebuild_codex_locally "$resume_session"; return ;;
+	esac
 
+	remote_total_started=$(now_seconds)
 	make_tmp_dir
 	repository=openai/git
 	endpoint="repos/$repository/actions/workflows/codex.yml/dispatches"
@@ -9269,6 +9311,7 @@ rebuild_codex () {
 	CODEX_EXPECTED_RUN_ATTEMPT=1
 	export CODEX_EXPECTED_RUN_ATTEMPT
 	publish_run "$run_id"
+	record_timing end-to-end "$remote_total_started"
 }
 
 artifact_value () (
@@ -9339,7 +9382,7 @@ wait_for_staging_ci () (
 	do
 		attempt=$((attempt + 1))
 		run_id=$("$gh_command" api --hostname github.com "$workflow_runs" --jq \
-			".workflow_runs | map(select(.id > ($baseline | tonumber) and .head_branch == \"$staging\" and .head_sha == \"$candidate\" and .event == \"push\" and .path == \".github/workflows/main.yml\")) | sort_by(.id) | .[0].id // empty") ||
+			".workflow_runs | map(select(.id > ($baseline | tonumber) and .head_branch == \"$staging\" and .head_sha == \"$candidate\" and .event == \"push\" and .path == \".github/workflows/main.yml\")) | sort_by(.id) | reverse | .[0].id // empty") ||
 			die "could not query staging CI"
 		test -z "$run_id" || break
 		sleep 5
@@ -9456,6 +9499,32 @@ freeze_local_candidate () {
 			die "could not protect frozen local candidate file '$name'"
 	done
 }
+
+write_local_candidate_identity () (
+	metadata=$1
+	output=$2
+	: >"$output" || die "could not create local candidate identity"
+	for name in codex.bundle codex-candidate codex-inputs codex-updates
+	do
+		test -f "$metadata/$name" && test ! -L "$metadata/$name" ||
+			die "local candidate file '$name' is not regular"
+		oid=$(git hash-object "$metadata/$name") ||
+			die "could not identify local candidate file '$name'"
+		printf '%s\t%s\n' "$name" "$oid" >>"$output" ||
+			die "could not record local candidate file '$name'"
+	done
+)
+
+revalidate_local_candidate () (
+	metadata=$1
+	expected_identity=$2
+	actual_identity=$tmp_dir/local-candidate-identity.current
+	write_local_candidate_identity "$metadata" "$actual_identity"
+	cmp -s "$expected_identity" "$actual_identity" ||
+		die "frozen local candidate changed while staging CI ran"
+	verify_inputs --remote origin --base master --codex codex \
+		"$metadata/codex-inputs"
+)
 
 verify_candidate_bundle () {
 	bundle=$1
@@ -9580,6 +9649,25 @@ prepare_local_candidate () {
 	freeze_local_candidate "$session" "$local_candidate_dir"
 }
 
+resume_local_candidate () {
+	requested_session=$1
+	test -d "$requested_session" && test ! -L "$requested_session" ||
+		die "resume session '$requested_session' is not a directory"
+	session=$(CDPATH= cd "$requested_session" && pwd -P) ||
+		die "could not resolve resume session '$requested_session'"
+	common_dir=$(git rev-parse --path-format=absolute --git-common-dir) ||
+		die "could not locate the shared repository state"
+	session_parent=$common_dir/codex-refresh
+	case "$session/" in
+	"$session_parent"/*) ;;
+	*) die "resume session must be inside '$session_parent'" ;;
+	esac
+	make_tmp_dir
+	local_candidate_dir=$tmp_dir/local-candidate
+	freeze_local_candidate "$session" "$local_candidate_dir"
+	say "Resuming local preparation session: $session"
+}
+
 reconcile_candidate_pr_state () (
 	inputs=$1
 	updates=$2
@@ -9593,48 +9681,76 @@ reconcile_candidate_pr_state () (
 	fi
 )
 
+prepare_staging_ci () (
+	repository=$1
+	candidate=$2
+	inputs=$3
+	updates=$4
+	staging=$5
+	started=$(now_seconds)
+	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=$staging&event=push&head_sha=$candidate&per_page=100"
+	live=$(remote_head_oid origin "refs/heads/$staging") ||
+		die "could not inspect $staging"
+	if test "$live" = "$candidate"
+	then
+		baseline=0
+		say "Reusing $staging at exact candidate $candidate."
+	else
+		baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
+			'[.workflow_runs[].id] | max // 0') ||
+			die "could not record the $staging CI baseline"
+		case "$baseline" in
+		''|*[!0-9]*) die "$staging CI baseline is not a numeric run ID" ;;
+		esac
+		# Record progress before stage_candidate calls the shell's other
+		# stateful helpers, which intentionally reuse global variable names.
+		printf '%s\t%s\t%s\t%s\n' "$staging" "$candidate" "$baseline" \
+			"$started" >"$6" || die "could not record $staging progress"
+		say "Publishing exact candidate $candidate to $staging."
+		stage_candidate --remote origin --staging "$staging" \
+			--inputs "$inputs" --updates "$updates" --require-automation
+		exit 0
+	fi
+	printf '%s\t%s\t%s\t%s\n' "$staging" "$candidate" "$baseline" \
+		"$started" >"$6" || die "could not record $staging progress"
+)
+
+wait_for_prepared_staging_ci () (
+	repository=$1
+	progress=$2
+	IFS="$tab" read -r staging candidate baseline started <"$progress" ||
+		die "could not read staging progress"
+	wait_for_staging_ci gh "$repository" "$candidate" "$baseline" \
+		"$staging"
+	record_timing "$staging-ci" "$started"
+)
+
 stage_and_wait_for_ci () {
 	repository=$1
 	candidate=$2
 	inputs=$3
 	updates=$4
-	staging=codex-staging
-	workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=$staging&event=push&head_sha=$candidate&per_page=100"
-	baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
-		'[.workflow_runs[].id] | max // 0') ||
-		die "could not record the staging CI baseline"
-	case "$baseline" in
-	''|*[!0-9]*) die "staging CI baseline is not a numeric run ID" ;;
-	esac
 	publisher=$(gh api --hostname github.com user --jq .login) ||
 		die "could not identify the GitHub CLI user"
 	test -n "$publisher" || die "GitHub CLI returned no authenticated user"
-	say "Publishing the prepared candidate with the credentials for origin."
 	say "GitHub API user: $publisher"
-	stage_candidate --remote origin --staging "$staging" \
-		--inputs "$inputs" --updates "$updates" --require-automation
-	reconcile_candidate_pr_state "$inputs" "$updates"
-	wait_for_staging_ci gh "$repository" "$candidate" "$baseline" \
-		"$staging"
+	stable_progress=$tmp_dir/codex-staging-progress
+	prepare_staging_ci "$repository" "$candidate" "$inputs" "$updates" \
+		codex-staging "$stable_progress"
+	unstable_progress=
 	unstable_candidate=$(awk -F '\t' \
 		'$1 == "refs/heads/codex-unstable" { print $3 }' "$updates")
 	if test -n "$unstable_candidate" &&
 		! is_null_oid "$unstable_candidate"
 	then
-		staging=codex-unstable-staging
-		workflow_runs="repos/$repository/actions/workflows/main.yml/runs?branch=$staging&event=push&head_sha=$unstable_candidate&per_page=100"
-		baseline=$(gh api --hostname github.com "$workflow_runs" --jq \
-			'[.workflow_runs[].id] | max // 0') ||
-			die "could not record the unstable staging CI baseline"
-		case "$baseline" in
-		''|*[!0-9]*) die "unstable staging CI baseline is not a numeric run ID" ;;
-		esac
-		stage_candidate --remote origin --staging "$staging" \
-			--inputs "$inputs" --updates "$updates" --require-automation
-		reconcile_candidate_pr_state "$inputs" "$updates"
-		wait_for_staging_ci gh "$repository" "$unstable_candidate" \
-			"$baseline" "$staging"
+		unstable_progress=$tmp_dir/codex-unstable-staging-progress
+		prepare_staging_ci "$repository" "$unstable_candidate" "$inputs" \
+			"$updates" codex-unstable-staging "$unstable_progress"
 	fi
+	reconcile_candidate_pr_state "$inputs" "$updates"
+	wait_for_prepared_staging_ci "$repository" "$stable_progress"
+	test -z "$unstable_progress" ||
+		wait_for_prepared_staging_ci "$repository" "$unstable_progress"
 }
 
 close_published_topic_review () (
@@ -9733,18 +9849,42 @@ close_published_topic_reviews () (
 )
 
 rebuild_codex_locally () {
-	prepare_local_candidate
+	total_started=$(now_seconds)
+	phase_started=$(now_seconds)
+	if test $# = 1
+	then
+		resume_local_candidate "$1"
+		timings_file=$session/codex-timings
+		record_timing resume-load "$phase_started"
+	else
+		test $# = 0 || { usage >&2; exit 129; }
+		prepare_local_candidate
+		timings_file=$session/codex-timings
+		record_timing preparation "$phase_started"
+	fi
+	phase_started=$(now_seconds)
 	verify_local_candidate "$local_candidate_dir"
+	local_candidate_identity=$tmp_dir/local-candidate-identity
+	write_local_candidate_identity "$local_candidate_dir" \
+		"$local_candidate_identity"
+	record_timing candidate-verification "$phase_started"
 	candidate=$(sed -n '1p' "$local_candidate_dir/codex-candidate")
+	phase_started=$(now_seconds)
 	stage_and_wait_for_ci openai/git "$candidate" \
 		"$local_candidate_dir/codex-inputs" \
 		"$local_candidate_dir/codex-updates"
+	record_timing staging-total "$phase_started"
 	require_operator_context
-	verify_local_candidate "$local_candidate_dir"
+	phase_started=$(now_seconds)
+	revalidate_local_candidate "$local_candidate_dir" \
+		"$local_candidate_identity"
+	record_timing input-revalidation "$phase_started"
+	phase_started=$(now_seconds)
 	promote --remote origin --staging codex-staging \
 		--inputs "$local_candidate_dir/codex-inputs" \
 		--updates "$local_candidate_dir/codex-updates" \
 		--require-automation
+	record_timing promotion "$phase_started"
 	reconcile_candidate_pr_state "$local_candidate_dir/codex-inputs" \
 		"$local_candidate_dir/codex-updates"
 	say "Published codex candidate $candidate from local preparation session $session."
@@ -9754,6 +9894,7 @@ rebuild_codex_locally () {
 		say "warning: publication succeeded, but its reviewed topic pull request could not be closed."
 	fi
 	say "Generated commits identify $bot_name <$bot_email>; the push uses your configured origin credentials."
+	record_timing total "$total_started"
 }
 
 publish_run () {
@@ -9762,6 +9903,8 @@ publish_run () {
 	case "$run_id" in
 	''|*[!0-9]*) die "Meta/publish requires a numeric Actions run ID" ;;
 	esac
+	total_started=$(now_seconds)
+	phase_started=$(now_seconds)
 
 	require_operator_context
 	command -v unzip >/dev/null 2>&1 || die "Meta/publish requires unzip"
@@ -9863,14 +10006,19 @@ publish_run () {
 	cmp -s "$tmp_dir/run" "$tmp_dir/run-current" ||
 		die "Actions run $run_id changed after artifact validation; start a fresh Meta/rebuild"
 
+	record_timing candidate-verification "$phase_started"
+	phase_started=$(now_seconds)
 	stage_and_wait_for_ci "$repository" "$artifact_candidate" \
 		"$metadata/codex-inputs" "$metadata/codex-updates"
+	record_timing staging-total "$phase_started"
 	read_refresh_run gh "$repository" "$run_id" "$tmp_dir/run-after-ci"
 	cmp -s "$tmp_dir/run" "$tmp_dir/run-after-ci" ||
 		die "Actions run $run_id changed while staging CI ran; start a fresh Meta/rebuild"
+	phase_started=$(now_seconds)
 	promote --remote origin --staging codex-staging \
 		--inputs "$metadata/codex-inputs" \
 		--updates "$metadata/codex-updates" --require-automation
+	record_timing promotion "$phase_started"
 	reconcile_candidate_pr_state "$metadata/codex-inputs" \
 		"$metadata/codex-updates"
 	say "Published codex candidate $artifact_candidate from Actions run $run_id."
@@ -9880,6 +10028,7 @@ publish_run () {
 		say "warning: publication succeeded, but its reviewed topic pull request could not be closed."
 	fi
 	say "Generated commits identify $bot_name <$bot_email>; the push uses your configured origin credentials."
+	record_timing total "$total_started"
 }
 
 resolve_rebase () {

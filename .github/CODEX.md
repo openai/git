@@ -170,6 +170,8 @@ After a plan change lands, publish the new generation:
 Meta/rebuild
 # or run preparation locally:
 Meta/rebuild --local
+# or resume the printed frozen local session:
+Meta/rebuild --resume <session-directory>
 ```
 
 Both forms prepare an immutable snapshot, build and verify each candidate,
@@ -178,12 +180,22 @@ stage exact SHAs, wait for fresh staging CI, and atomically promote
 `Meta/codex refresh --require-automation` is a local preview only; it pushes
 nothing.
 
+Local preparation keeps the candidate bundle, input snapshot, and update
+manifest in the printed session. A resumed release revalidates those exact
+files and live inputs instead of rebuilding them. Existing staging refs reuse
+their exact in-progress or successful CI run, and stable and unstable staging
+start before either wait begins so their CI can run concurrently. An actual CI
+failure still needs a successful rerun of that same run or a new candidate;
+resume never treats failed CI as valid. Each attempt appends phase and total
+durations to `codex-timings` in the session directory.
+
 If a replay conflicts, the controller leaves published refs unchanged and
 prints the pinned recovery command. Resolve only in that disposable worktree,
 then run the printed `continue` and `publish-topics` commands. For pinned
 plans, `publish-topics` keeps source refs immutable and freezes the verified
 candidate, inputs, updates, and bundle in a local recovery session; stage
-that exact session, wait for fresh staging CI, and promote it atomically. For
+that exact session with `Meta/rebuild --resume`, wait for fresh staging CI,
+and promote it atomically. For
 a pinned merge-shaped source, the controller uses its reviewed `source-base`
 as the exact old root and preserves the DAG across a moved generated base
 only when the two changed-path sets are disjoint. A linear dependent topic
