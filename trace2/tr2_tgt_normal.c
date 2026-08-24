@@ -152,6 +152,7 @@ static void fn_error_va_fl(const char *file, int line, const char *fmt,
 		strbuf_addch(&buf_payload, ' ');
 		maybe_append_string_va(&buf_payload, fmt, ap);
 	}
+	tr2_redact_error(&buf_payload, 0);
 	normal_io_write_fl(file, line, &buf_payload);
 	strbuf_release(&buf_payload);
 }

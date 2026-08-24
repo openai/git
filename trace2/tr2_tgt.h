@@ -3,6 +3,7 @@
 
 struct child_process;
 struct repository;
+struct strbuf;
 struct json_writer;
 struct tr2_timer_metadata;
 struct tr2_timer;
@@ -156,5 +157,11 @@ struct tr2_tgt {
 extern struct tr2_tgt tr2_tgt_event;
 extern struct tr2_tgt tr2_tgt_normal;
 extern struct tr2_tgt tr2_tgt_perf;
+
+/*
+ * Redact URLs in an error payload before writing it. Set is_format when
+ * redacting a printf format string, where literal '%' characters are doubled.
+ */
+void tr2_redact_error(struct strbuf *buf, int is_format);
 
 #endif /* TR2_TGT_H */
