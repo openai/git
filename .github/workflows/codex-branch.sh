@@ -3726,6 +3726,8 @@ continue_rerere_resolution () {
 	while rebase_in_progress "$worktree" &&
 		test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
 	do
+		before=$(git -C "$worktree" rev-parse --verify REBASE_HEAD \
+			2>/dev/null || :)
 		if ! GIT_COMMITTER_NAME=$bot_name \
 			GIT_COMMITTER_EMAIL=$bot_email \
 			GIT_EDITOR=true git -C "$worktree" \
@@ -3740,6 +3742,13 @@ continue_rerere_resolution () {
 				die "git rebase --continue failed without recoverable state"
 			test -n "$(git -C "$worktree" \
 				-c core.fsmonitor=false ls-files -u)" && return 1
+			after=$(git -C "$worktree" rev-parse --verify REBASE_HEAD \
+				2>/dev/null || :)
+			if test -n "$before" && test -n "$after" &&
+				test "$before" != "$after"
+			then
+				continue
+			fi
 			die "git rebase --continue failed after rerere staged a resolution"
 		fi
 	done
