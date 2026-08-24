@@ -28,8 +28,9 @@ typedef void(tr2_tgt_evt_exit_fl_t)(const char *file, int line,
 typedef void(tr2_tgt_evt_signal_t)(uint64_t us_elapsed_absolute, int signo);
 typedef void(tr2_tgt_evt_atexit_t)(uint64_t us_elapsed_absolute, int code);
 
-typedef void(tr2_tgt_evt_error_va_fl_t)(const char *file, int line,
-					const char *fmt, va_list ap);
+/* Error messages and format strings are redacted before dispatch. */
+typedef void(tr2_tgt_evt_error_fl_t)(const char *file, int line,
+				     const char *fmt, const char *message);
 
 typedef void(tr2_tgt_evt_command_path_fl_t)(const char *file, int line,
 					    const char *command_path);
@@ -128,7 +129,7 @@ struct tr2_tgt {
 	tr2_tgt_evt_exit_fl_t                   *pfn_exit_fl;
 	tr2_tgt_evt_signal_t                    *pfn_signal;
 	tr2_tgt_evt_atexit_t                    *pfn_atexit;
-	tr2_tgt_evt_error_va_fl_t               *pfn_error_va_fl;
+	tr2_tgt_evt_error_fl_t                  *pfn_error_fl;
 	tr2_tgt_evt_command_path_fl_t           *pfn_command_path_fl;
 	tr2_tgt_evt_command_ancestry_fl_t	*pfn_command_ancestry_fl;
 	tr2_tgt_evt_command_name_fl_t           *pfn_command_name_fl;

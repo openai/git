@@ -142,15 +142,15 @@ static void maybe_append_string_va(struct strbuf *buf, const char *fmt,
 	}
 }
 
-static void fn_error_va_fl(const char *file, int line, const char *fmt,
-			   va_list ap)
+static void fn_error_fl(const char *file, int line, const char *fmt,
+			const char *message)
 {
 	struct strbuf buf_payload = STRBUF_INIT;
 
 	strbuf_addstr(&buf_payload, "error");
 	if (fmt && *fmt) {
 		strbuf_addch(&buf_payload, ' ');
-		maybe_append_string_va(&buf_payload, fmt, ap);
+		strbuf_addstr(&buf_payload, message);
 	}
 	normal_io_write_fl(file, line, &buf_payload);
 	strbuf_release(&buf_payload);
@@ -384,7 +384,7 @@ struct tr2_tgt tr2_tgt_normal = {
 	.pfn_exit_fl = fn_exit_fl,
 	.pfn_signal = fn_signal,
 	.pfn_atexit = fn_atexit,
-	.pfn_error_va_fl = fn_error_va_fl,
+	.pfn_error_fl = fn_error_fl,
 	.pfn_command_path_fl = fn_command_path_fl,
 	.pfn_command_ancestry_fl = fn_command_ancestry_fl,
 	.pfn_command_name_fl = fn_command_name_fl,

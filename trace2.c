@@ -310,6 +310,44 @@ static const char *redact_arg(const char *arg)
 	return strbuf_detach(&buf, NULL);
 }
 
+static const char *redact_error_message(const char *message)
+{
+	struct strbuf buf = STRBUF_INIT;
+	const char *p = message, *unredacted = message;
+
+	if (!trace2_redact || !message)
+		return message;
+
+	while ((p = strstr(p, "http"))) {
+		const char *end;
+		const char *redacted;
+		char *url;
+
+		if (!starts_with(p, "http://") && !starts_with(p, "https://")) {
+			p += 4;
+			continue;
+		}
+		end = p + strcspn(p, " \t\r\n\v\f");
+		/* Keep punctuation surrounding URLs in diagnostics. */
+		while (end > p && strchr("'\".,:;)]}>", end[-1]))
+			end--;
+		url = xmemdupz(p, end - p);
+		redacted = redact_arg(url);
+		if (redacted != url) {
+			strbuf_add(&buf, unredacted, p - unredacted);
+			strbuf_addstr(&buf, redacted);
+			unredacted = end;
+			free((char *)redacted);
+		}
+		free(url);
+		p = end;
+	}
+	if (!buf.len)
+		return message;
+	strbuf_addstr(&buf, unredacted);
+	return strbuf_detach(&buf, NULL);
+}
+
 /*
  * Redacts arguments in an argument list.
  *
@@ -413,18 +451,33 @@ void trace2_cmd_error_va_fl(const char *file, int line, const char *fmt,
 			    va_list ap)
 {
 	struct tr2_tgt *tgt_j;
+	struct strbuf message = STRBUF_INIT;
+	const char *redacted_fmt, *redacted_message;
 	int j;
 
 	if (!trace2_enabled)
 		return;
 
-	/*
-	 * We expect each target function to treat 'ap' as constant
-	 * and use va_copy (because an 'ap' can only be walked once).
-	 */
+	if (fmt && *fmt) {
+		va_list copy_ap;
+
+		va_copy(copy_ap, ap);
+		strbuf_vaddf(&message, fmt, copy_ap);
+		va_end(copy_ap);
+	}
+	redacted_fmt = redact_error_message(fmt);
+	redacted_message = redact_error_message(message.buf);
+
 	for_each_wanted_builtin (j, tgt_j)
-		if (tgt_j->pfn_error_va_fl)
-			tgt_j->pfn_error_va_fl(file, line, fmt, ap);
+		if (tgt_j->pfn_error_fl)
+			tgt_j->pfn_error_fl(file, line, redacted_fmt,
+					    redacted_message);
+
+	if (redacted_fmt != fmt)
+		free((char *)redacted_fmt);
+	if (redacted_message != message.buf)
+		free((char *)redacted_message);
+	strbuf_release(&message);
 }
 
 void trace2_cmd_path_fl(const char *file, int line, const char *pathname)

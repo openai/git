@@ -396,4 +396,32 @@ test_expect_success 'URL signature redaction can be disabled' '
 	test_grep -F "$url" trace.event
 '
 
+test_expect_success 'redact URLs in error events without changing stderr' '
+	test_when_finished "rm trace.normal trace.perf trace.event errors stderr" &&
+	message="unable to access $SQ$url$SQ: try ${SQ}https://example.com/o${SQ}brien?signature=other$SQ." &&
+	expected="unable to access $SQ$redacted_url$SQ: try ${SQ}https://example.com/o${SQ}brien?signature=<REDACTED>$SQ." &&
+	GIT_TRACE2="$(pwd)/trace.normal" \
+	GIT_TRACE2_PERF="$(pwd)/trace.perf" \
+	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+		test-tool trace2 003error "$message" 2>stderr &&
+	grep " error " trace.normal >errors &&
+	grep "| error " trace.perf >>errors &&
+	grep "\"event\":\"error\"" trace.event >>errors &&
+	test_grep ! -E "user:pwd|secret|signature=other" errors &&
+	test_grep -F "$expected" trace.normal &&
+	test_grep -F "$expected" trace.perf &&
+	test_grep -F "$expected" trace.event &&
+	test_grep -F "\"fmt\":\"%s\"" errors &&
+	test_grep -F "$message" stderr
+'
+
+test_expect_success 'URL signature redaction can be disabled in error events' '
+	test_when_finished "rm trace.event errors stderr" &&
+	message="unable to access $SQ$url$SQ" &&
+	GIT_TRACE2_REDACT=0 GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+		test-tool trace2 003error "$message" 2>stderr &&
+	grep "\"event\":\"error\"" trace.event >errors &&
+	test_grep -F "$message" errors
+'
+
 test_done

@@ -230,15 +230,16 @@ static void maybe_add_string_va(struct json_writer *jw, const char *field_name,
 	}
 }
 
-static void fn_error_va_fl(const char *file, int line, const char *fmt,
-			   va_list ap)
+static void fn_error_fl(const char *file, int line, const char *fmt,
+			const char *message)
 {
 	const char *event_name = "error";
 	struct json_writer jw = JSON_WRITER_INIT;
 
 	jw_object_begin(&jw, 0);
 	event_fmt_prepare(event_name, file, line, NULL, &jw);
-	maybe_add_string_va(&jw, "msg", fmt, ap);
+	if (fmt && *fmt)
+		jw_object_string(&jw, "msg", message);
 	/*
 	 * Also emit the format string as a field in case
 	 * post-processors want to aggregate common error
@@ -696,7 +697,7 @@ struct tr2_tgt tr2_tgt_event = {
 	.pfn_exit_fl = fn_exit_fl,
 	.pfn_signal = fn_signal,
 	.pfn_atexit = fn_atexit,
-	.pfn_error_va_fl = fn_error_va_fl,
+	.pfn_error_fl = fn_error_fl,
 	.pfn_command_path_fl = fn_command_path_fl,
 	.pfn_command_ancestry_fl = fn_command_ancestry_fl,
 	.pfn_command_name_fl = fn_command_name_fl,

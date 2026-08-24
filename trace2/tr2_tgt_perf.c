@@ -234,13 +234,13 @@ static void maybe_append_string_va(struct strbuf *buf, const char *fmt,
 	}
 }
 
-static void fn_error_va_fl(const char *file, int line, const char *fmt,
-			   va_list ap)
+static void fn_error_fl(const char *file, int line, const char *fmt UNUSED,
+			const char *message)
 {
 	const char *event_name = "error";
 	struct strbuf buf_payload = STRBUF_INIT;
 
-	maybe_append_string_va(&buf_payload, fmt, ap);
+	strbuf_addstr(&buf_payload, message);
 
 	perf_io_write_fl(file, line, event_name, NULL, NULL, NULL, NULL,
 			 &buf_payload);
@@ -609,7 +609,7 @@ struct tr2_tgt tr2_tgt_perf = {
 	.pfn_exit_fl = fn_exit_fl,
 	.pfn_signal = fn_signal,
 	.pfn_atexit = fn_atexit,
-	.pfn_error_va_fl = fn_error_va_fl,
+	.pfn_error_fl = fn_error_fl,
 	.pfn_command_path_fl = fn_command_path_fl,
 	.pfn_command_ancestry_fl = fn_command_ancestry_fl,
 	.pfn_command_name_fl = fn_command_name_fl,
