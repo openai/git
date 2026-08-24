@@ -17,6 +17,7 @@
 #include "trace2/tr2_tgt.h"
 #include "trace2/tr2_tls.h"
 #include "trace2/tr2_tmr.h"
+#include "url.h"
 
 static int trace2_enabled;
 static int trace2_redact = 1;
@@ -249,9 +250,23 @@ int trace2_is_enabled(void)
 	return trace2_enabled;
 }
 
+static int is_signature_parameter(const char *parameter)
+{
+	char *name = url_decode_parameter_name(&parameter);
+	char *p;
+	int ret;
+
+	for (p = name; *p; p++)
+		*p = tolower(*p);
+	ret = !strcmp(name, "sig") || !strcmp(name, "signature") ||
+	      ends_with(name, "-signature");
+
+	free(name);
+	return ret;
+}
+
 /*
- * Redacts an argument, i.e. ensures that no password in
- * https://user:password@host/-style URLs is logged.
+ * Redact passwords and signature query parameters in HTTP(S) URLs.
  *
  * Returns the original if nothing needed to be redacted.
  * Returns a pointer that needs to be `free()`d otherwise.
@@ -259,22 +274,49 @@ int trace2_is_enabled(void)
 static const char *redact_arg(const char *arg)
 {
 	const char *p, *colon;
+	const char *unredacted = arg;
+	struct strbuf buf = STRBUF_INIT;
 	size_t at;
 
 	if (!trace2_redact ||
-	    (!skip_prefix(arg, "https://", &p) &&
-	     !skip_prefix(arg, "http://", &p)))
+	    (!skip_iprefix(arg, "https://", &p) &&
+	     !skip_iprefix(arg, "http://", &p)))
 		return arg;
 
-	at = strcspn(p, "@/");
-	if (p[at] != '@')
-		return arg;
+	/* Only an '@' in the authority can terminate user information. */
+	at = strcspn(p, "@/?#");
+	if (p[at] == '@') {
+		colon = memchr(p, ':', at);
+		if (colon) {
+			strbuf_add(&buf, arg, colon + 1 - arg);
+			strbuf_addstr(&buf, "<REDACTED>");
+			unredacted = p + at;
+		}
+	}
 
-	colon = memchr(p, ':', at);
-	if (!colon)
-		return arg;
+	/* A '?' following a fragment marker does not start a query. */
+	p += strcspn(p, "?#");
+	if (*p == '?') {
+		p++;
+		while (*p && *p != '#') {
+			const char *end = p + strcspn(p, "&#");
+			const char *equals = memchr(p, '=', end - p);
 
-	return xstrfmt("%.*s:<REDACTED>%s", (int)(colon - arg), arg, p + at);
+			if (equals && equals + 1 < end &&
+			    is_signature_parameter(p)) {
+				strbuf_add(&buf, unredacted,
+					   equals + 1 - unredacted);
+				strbuf_addstr(&buf, "<REDACTED>");
+				unredacted = end;
+			}
+			p = *end == '&' ? end + 1 : end;
+		}
+	}
+
+	if (!buf.len)
+		return arg;
+	strbuf_addstr(&buf, unredacted);
+	return strbuf_detach(&buf, NULL);
 }
 
 /*
