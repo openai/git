@@ -362,4 +362,17 @@ test_expect_success 'unsafe URLs are redacted by default in def_param events' '
 	test_grep ! user:pwd trace.event
 '
 
+test_expect_success 'signature query parameters are redacted' '
+	test_when_finished "rm trace.event" &&
+	for name in sig Signature X-Amz-Signature %73ig
+	do
+		url="HtTpS://example.com/?$name=secret&signature-extra=public" &&
+		expect="HtTpS://example.com/?$name=<REDACTED>&signature-extra=public" &&
+		: >trace.event &&
+		GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+			test-tool trace2 303redact_def_param url "$url" &&
+		test_grep -F "\"value\":\"$expect\"" trace.event || return 1
+	done
+'
+
 test_done
