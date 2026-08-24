@@ -71,9 +71,9 @@ change to the same topic needs another topic PR.
 
 Topic pull requests are review-only: approve them, but do not merge them.
 Automatic add/alter plans, human remove/reorder plans, and ordinary controller
-changes are distinct `meta` changes. Every open PR against `codex`,
-`codex-unstable`, or `meta`, plus retained plan history, receives one role,
-one build, and one lifecycle state:
+changes are distinct `meta` changes. Every open PR rooted at `codex`,
+`codex-unstable`, or `meta`, including stacked controller PRs, plus retained
+plan history, receives one role, one build, and one lifecycle state:
 
 - `kind:review-only`, `kind:auto-plan`, `kind:plan-policy`, or
   `kind:controller` identifies why the PR exists.

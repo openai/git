@@ -477,7 +477,19 @@ install_pr_state_gh () {
 			codex|codex-unstable)
 				cat "$FAKE_PR_STATE_DATA/$base.json"
 				;;
-			meta) cat "$FAKE_PR_STATE_DATA/plans.json" ;;
+			meta)
+				jq '[.[] | select((.baseRefName // "meta") == "meta")]' \
+					"$FAKE_PR_STATE_DATA/plans.json"
+				;;
+			"")
+				jq -s '.[0] + .[1] +
+					(.[2] | map(. + {
+						baseRefName:(.baseRefName // "meta")})) |
+					map(select((.state // "OPEN") == "OPEN"))' \
+					"$FAKE_PR_STATE_DATA/codex.json" \
+					"$FAKE_PR_STATE_DATA/codex-unstable.json" \
+					"$FAKE_PR_STATE_DATA/plans.json"
+				;;
 			*) exit 91 ;;
 			esac
 			;;
@@ -10508,16 +10520,19 @@ test_expect_success 'every open Codex pull request receives one exact classifica
 			pr-state-data/codex-unstable.json &&
 		jq -n --arg head "$meta" "[
 			{number:42,state:\"OPEN\",isDraft:true,
+			 baseRefName:\"meta\",
 			 headRefName:\"aa/codex-controller-draft\",
 			 headRefOid:\$head,body:\"\",labels:[],
 			 reviewDecision:\"\",mergeStateStatus:\"UNKNOWN\",
 			 statusCheckRollup:[]},
 			{number:71,state:\"OPEN\",isDraft:false,
+			 baseRefName:\"aa/codex-controller-draft\",
 			 headRefName:\"aa/codex-controller-ready\",
 			 headRefOid:\$head,body:\"\",labels:[],
 			 reviewDecision:\"APPROVED\",mergeStateStatus:\"CLEAN\",
 			 statusCheckRollup:[]},
 			{number:72,state:\"OPEN\",isDraft:false,
+			 baseRefName:\"aa/codex-controller-ready\",
 			 headRefName:\"aa/codex-controller-conflict\",
 			 headRefOid:\$head,body:\"\",labels:[],
 			 reviewDecision:\"APPROVED\",mergeStateStatus:\"DIRTY\",

@@ -499,7 +499,42 @@ classify_topics () {
 	done <"$state_dir/$lane-topics"
 }
 
+classify_controller () {
+	pull_number=$1
+	draft=$2
+	head_oid=$3
+	current_labels=$4
+	review_decision=$5
+	merge_state=$6
+
+	phase=codex:needs-review
+	test "$draft" != true || phase=codex:draft
+	test "$draft" = true ||
+		test "$review_decision" != APPROVED ||
+		phase=codex:ready
+	blocked=false
+	block_reason=-
+	if test "$phase" = codex:ready
+	then
+		case "$merge_state" in
+		DIRTY)
+			blocked=true
+			block_reason=blocked:merge-conflict
+			;;
+		BLOCKED)
+			blocked=true
+			block_reason=blocked:merge-policy
+			;;
+		esac
+	fi
+	record_classification "$pull_number" "$head_oid" \
+		"$current_labels" kind:controller "$(build_label meta)" \
+		"$phase" "$blocked" "$block_reason"
+}
+
 classify_meta () {
+	: >"$state_dir/controller-heads" ||
+		die "could not prepare controller stack inventory"
 	gh pr list --repo "$repository" --state all --base meta \
 		--limit 1000 \
 		--json number,state,isDraft,headRefName,headRefOid,body,labels,reviewDecision,mergeStateStatus,statusCheckRollup \
@@ -537,30 +572,10 @@ classify_meta () {
 		codex-plan/*) ;;
 		*)
 			test "$pull_state" = OPEN || continue
-			phase=codex:needs-review
-			test "$draft" != true || phase=codex:draft
-			test "$draft" = true ||
-				test "$review_decision" != APPROVED ||
-				phase=codex:ready
-			blocked=false
-			block_reason=-
-			if test "$phase" = codex:ready
-			then
-				case "$merge_state" in
-				DIRTY)
-					blocked=true
-					block_reason=blocked:merge-conflict
-					;;
-				BLOCKED)
-					blocked=true
-					block_reason=blocked:merge-policy
-					;;
-				esac
-			fi
-			record_classification "$pull_number" "$head_oid" \
-				"$current_labels" kind:controller \
-				"$(build_label meta)" "$phase" "$blocked" \
-				"$block_reason"
+			classify_controller "$pull_number" "$draft" "$head_oid" \
+				"$current_labels" "$review_decision" "$merge_state"
+			printf '%s\n' "$head_ref" >>"$state_dir/controller-heads" ||
+				die "could not retain controller stack root '$head_ref'"
 			continue
 			;;
 		esac
@@ -621,10 +636,54 @@ classify_meta () {
 	done <"$state_dir/plans"
 }
 
+classify_stacked_controllers () {
+	gh pr list --repo "$repository" --state open --limit 1000 \
+		--json number,isDraft,baseRefName,headRefName,headRefOid,labels,reviewDecision,mergeStateStatus \
+		>"$state_dir/open-pull-requests.json" ||
+		die "could not list open pull requests for controller stacks"
+	jq -r '
+		.[] |
+		[(.number | tostring), (.isDraft | tostring),
+		 .baseRefName, .headRefName, .headRefOid,
+		 ([.labels[].name] | @json),
+		 (.reviewDecision |
+		 if . == null or . == "" then "-" else . end),
+		 (.mergeStateStatus |
+		 if . == null or . == "" then "-" else . end)] | @tsv
+	' "$state_dir/open-pull-requests.json" \
+		>"$state_dir/open-pull-requests" ||
+		die "could not parse open pull requests for controller stacks"
+	: >"$state_dir/stacked-controllers" ||
+		die "could not prepare stacked controller inventory"
+	while :
+	do
+		progress=
+		while IFS="$tab" read -r pull_number draft base_ref head_ref \
+			head_oid current_labels review_decision merge_state
+		do
+			test -n "$pull_number" || continue
+			grep -F -x "$pull_number" "$state_dir/stacked-controllers" \
+				>/dev/null 2>&1 && continue
+			grep -F -x "$base_ref" "$state_dir/controller-heads" \
+				>/dev/null 2>&1 || continue
+			classify_controller "$pull_number" "$draft" "$head_oid" \
+				"$current_labels" "$review_decision" "$merge_state"
+			printf '%s\n' "$pull_number" \
+				>>"$state_dir/stacked-controllers" ||
+				die "could not retain stacked controller #$pull_number"
+			printf '%s\n' "$head_ref" >>"$state_dir/controller-heads" ||
+				die "could not retain controller stack head '$head_ref'"
+			progress=t
+		done <"$state_dir/open-pull-requests"
+		test -n "$progress" || break
+	done
+}
+
 labels >"$state_dir/managed-labels"
 : >"$state_dir/classifications"
 snapshot_refs
 classify_topics codex
 classify_topics codex-unstable
 classify_meta
+classify_stacked_controllers
 apply_classifications
