@@ -4364,27 +4364,34 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 		cd rerere-source &&
 		git remote add origin ../rerere.git &&
 		write base shared &&
-		git add shared &&
+		write base-two shared-two &&
+		git add shared shared-two &&
 		install_rerere_train &&
 		git commit -m base &&
+		topic_base=$(git rev-parse HEAD) &&
 
 		git switch -c aa/codex/rerere &&
 		write topic shared &&
 		git add shared &&
-		git commit -m "rerere topic" &&
+		git commit -m "rerere topic one" &&
+		write topic-two shared-two &&
+		git add shared-two &&
+		git commit -m "rerere topic two" &&
 
 		git switch master &&
 		write master shared &&
-		git add shared &&
+		write master-two shared-two &&
+		git add shared shared-two &&
 		git commit -m "rerere master" &&
 		git switch --detach master &&
 		test_must_fail git merge --no-ff aa/codex/rerere &&
 		write resolved shared &&
-		git add shared &&
+		write resolved-two shared-two &&
+		git add shared shared-two &&
 		git commit -m "record resolution" &&
 		git branch codex &&
 
-		git switch -c bb/codex/other aa/codex/rerere^ &&
+		git switch -c bb/codex/other "$topic_base" &&
 		write other other-file &&
 		git add other-file &&
 		git commit -m "independent rerere sibling" &&
@@ -4408,11 +4415,15 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 			--inputs inputs --failure failure \
 			>rewrite.out 2>rewrite.err &&
 		candidate=$(cat result) &&
-		new_topic=$(find_subject "rerere topic" "$candidate") &&
+		new_topic=$(find_subject "rerere topic two" "$candidate") &&
+		new_topic_one=$(find_subject "rerere topic one" "$candidate") &&
 		new_other=$(find_subject "independent rerere sibling" "$candidate") &&
 		test -n "$new_topic" &&
+		test -n "$new_topic_one" &&
 		test -n "$new_other" &&
 		test resolved = "$(git show "$new_topic:shared")" &&
+		test resolved-two = "$(git show "$new_topic:shared-two")" &&
+		has_codex_bot_committer "$new_topic_one" &&
 		has_codex_bot_committer "$new_topic" &&
 		manifest_has aa/codex/rerere \
 			"$old_topic" "$new_topic" updates &&
