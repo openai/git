@@ -195,15 +195,17 @@ then run the printed `continue` and `publish-topics` commands. For pinned
 plans, `publish-topics` keeps source refs immutable and freezes the verified
 candidate, inputs, updates, and bundle in a local recovery session; stage
 that exact session with `Meta/rebuild --resume`, wait for fresh staging CI,
-and promote it atomically. For
-a pinned merge-shaped source, the controller uses its reviewed `source-base`
-as the exact old root and preserves the DAG across a moved generated base
-only when the two changed-path sets are disjoint. A linear dependent topic
-can extend that graph when its reviewed boundary is the exact pinned source
-tip of a prerequisite already rooted in the graph. An overlapping base move,
-an unrelated boundary, or another merge-shaped source with a different
-reviewed root fails closed; restack the approved topic and pin its new head
-instead of flattening or guessing.
+and promote it atomically. For a pinned merge-shaped source, the controller
+uses its reviewed `source-base` as the exact old root and preserves the DAG
+across a moved generated base. Disjoint changes replay directly. Overlap uses
+one isolated topology-aware rebase, trained from the published graph's rerere
+history; `resolve` preserves a stopped stable or unstable graph and `continue`
+resumes it without moving source refs. Before freezing the candidate, the
+controller verifies a one-to-one commit mapping and unchanged parent topology.
+A linear dependent topic can extend that graph when its reviewed boundary is
+the exact pinned source tip of a prerequisite already rooted in the graph. An
+unrelated boundary or another merge-shaped source with a different reviewed
+root still fails closed instead of flattening or guessing.
 
 ## Required automation topic
 
