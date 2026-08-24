@@ -6347,6 +6347,35 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 			refs/codex-output/candidate &&
 		test_must_fail git show-ref --verify refs/codex-output/meta &&
 		test_must_fail git --git-dir=../publish-run.git show-ref --verify \
+			refs/heads/codex-staging &&
+
+		# Recreate the state immediately before promotion, then resume the
+		# retained immutable session without rebuilding it on master.
+		while IFS="$(printf "\t")" read -r ref old new
+		do
+			git --git-dir=../publish-run.git update-ref \
+				"$ref" "$old" "$new" || return 1
+		done <"$local_session/codex-updates" &&
+		resume_controller=$(awk -F "$(printf "\t")" \
+			'\''$1 == "refs/heads/meta" { print $2 }'\'' \
+			"$local_session/codex-updates") &&
+		git -C Meta -c advice.detachedHead=false switch --detach \
+			"$resume_controller" &&
+		: >"$support/git.log" &&
+		: >"$support/gh.log" &&
+		FAKE_DYNAMIC_CANDIDATE=1 \
+			run_prepared "$support/good.zip" rebuild \
+				--resume "$local_session" \
+				>"$support/resume.out" 2>"$support/resume.err" &&
+		test_grep "Resuming local preparation session: $local_session" \
+			"$support/resume.out" &&
+		test_grep "Published codex candidate $local_candidate from local preparation session $local_session" \
+			"$support/resume.out" &&
+		! grep -F "clone --shared --no-checkout" "$support/git.log" &&
+		test_grep "^resume-load" "$local_session/codex-timings" &&
+		test "$local_candidate" = "$(git --git-dir=../publish-run.git \
+			rev-parse refs/heads/codex)" &&
+		test_must_fail git --git-dir=../publish-run.git show-ref --verify \
 			refs/heads/codex-staging
 	)
 '
@@ -10138,8 +10167,23 @@ test_expect_success 'publication closes only its exact integrated topic review' 
 	)
 '
 
-test_expect_success 'checked-in release recovery manifest is the bound incident' '
-	test "$(git hash-object "$codex_root/codex.release-recovery")" = \
+test_expect_success 'consumed release recovery remains bound to its reviewed incident' '
+	{
+		printf "%s\n" "[recovery]" &&
+		printf "\t%s\n" \
+			"version = 1" \
+			"baseline-meta = ca1f7b4c4cc36f2c2fc1fed8d34e6b83d0d921c0" \
+			"lane = codex" \
+			"topic = refs/heads/tb/codex/release" \
+			"old-source-tip = ba107e0ae8c7142238bb612e530d51d42f0280d3" \
+			"new-source-tip = 40589b5333835ecd5e1b6187cbcec45d8382303e" \
+			"source-base = a97fcc37c2bc6340a8d7ce78dedf227aac4e9aa7" \
+			"merge = refs/heads/master" \
+			"pull-request = 22" \
+			"pull-request-head-ref = refs/heads/ttaylorr/release-source-ref-wip" \
+			"pull-request-head-tip = 257daf6f3d083ada30e26547fc50451ddcfbfb1d"
+	} >reviewed-release-recovery &&
+	test "$(git hash-object reviewed-release-recovery)" = \
 		8ef04578ac791a3499b1406a1d0ae9884bacd559 &&
 	git init --bare release-recovery-binding.git &&
 	test_create_repo release-recovery-binding-source &&
@@ -10151,7 +10195,8 @@ test_expect_success 'checked-in release recovery manifest is the bound incident'
 		git commit -m "release recovery binding base" &&
 		git branch codex &&
 		git switch -c meta &&
-		cp "$codex_root/codex.release-recovery" . &&
+		cp "$TRASH_DIRECTORY/reviewed-release-recovery" \
+			codex.release-recovery &&
 		git add codex.release-recovery &&
 		git commit -m "arm shipped recovery manifest" &&
 		git push origin master codex meta
@@ -10558,6 +10603,86 @@ test_expect_success 'label reconciliation preserves unrelated labels and rejects
 	test_grep "REMOVE.*28.*codex%3Aneeds-review" \
 		pr-state-mutations/pr-state-data/mutations &&
 	! grep -F keep-me pr-state-mutations/pr-state-data/mutations
+'
+
+test_expect_success 'both release lanes start CI before either lane waits' '
+	test_create_repo concurrent-staging &&
+	(
+		cd concurrent-staging &&
+		test_commit stable &&
+		stable=$(git rev-parse HEAD) &&
+		test_commit unstable &&
+		unstable=$(git rev-parse HEAD) &&
+		printf "refs/heads/codex\t-\t%s\nrefs/heads/codex-unstable\t-\t%s\n" \
+			"$stable" "$unstable" >updates &&
+		: >inputs &&
+		mkdir bin scratch &&
+		cat >bin/gh <<-\EOF &&
+		#!/bin/sh
+		case "$*" in
+		*" user --jq .login") printf "%s\n" test-publisher ;;
+		*"actions/workflows/main.yml/runs"*) printf "%s\n" 100 ;;
+		*) exit 91 ;;
+		esac
+		EOF
+		chmod +x bin/gh &&
+		cat >run-concurrent <<-\EOF &&
+		#!/bin/sh
+		set -- --help
+		. "$CODEX_BRANCH" >/dev/null
+		cleanup () { :; }
+		tmp_dir=$PWD/scratch
+		remote_head_oid () {
+			case "${FAKE_REUSE:-}:$2" in
+			1:refs/heads/codex-staging) printf "%s\n" "$FAKE_STABLE" ;;
+			1:refs/heads/codex-unstable-staging)
+				printf "%s\n" "$FAKE_UNSTABLE"
+				;;
+			esac
+		}
+		stage_candidate () {
+			lane=
+			while test $# -gt 0
+			do
+				case "$1" in
+				--staging) lane=$2; shift 2 ;;
+				*) shift ;;
+				esac
+			done
+			printf "stage %s\n" "$lane" >>"$FAKE_EVENT_LOG"
+		}
+		reconcile_candidate_pr_state () {
+			printf "%s\n" reconcile >>"$FAKE_EVENT_LOG"
+		}
+		wait_for_staging_ci () {
+			printf "wait %s baseline=%s\n" "$5" "$4" \
+				>>"$FAKE_EVENT_LOG"
+		}
+		stage_and_wait_for_ci openai/git "$FAKE_STABLE" \
+			"$FAKE_INPUTS" "$FAKE_UPDATES"
+		EOF
+		chmod +x run-concurrent &&
+		PATH="$PWD/bin:$PATH" CODEX_BRANCH="$codex_branch" \
+			FAKE_EVENT_LOG="$PWD/events" FAKE_STABLE="$stable" \
+			FAKE_UNSTABLE="$unstable" FAKE_INPUTS="$PWD/inputs" \
+			FAKE_UPDATES="$PWD/updates" sh run-concurrent >run.out &&
+		printf "stage codex-staging\nstage codex-unstable-staging\nreconcile\nwait codex-staging baseline=100\nwait codex-unstable-staging baseline=100\n" \
+			>expect &&
+		test_cmp expect events &&
+		: >events &&
+		PATH="$PWD/bin:$PATH" CODEX_BRANCH="$codex_branch" \
+			FAKE_REUSE=1 FAKE_EVENT_LOG="$PWD/events" \
+			FAKE_STABLE="$stable" FAKE_UNSTABLE="$unstable" \
+			FAKE_INPUTS="$PWD/inputs" FAKE_UPDATES="$PWD/updates" \
+			sh run-concurrent >reuse.out &&
+		printf "reconcile\nwait codex-staging baseline=0\nwait codex-unstable-staging baseline=0\n" \
+			>reuse.expect &&
+		test_cmp reuse.expect events &&
+		test_grep "Reusing codex-staging at exact candidate $stable" \
+			reuse.out &&
+		test_grep "Reusing codex-unstable-staging at exact candidate $unstable" \
+			reuse.out
+	)
 '
 
 test_done
