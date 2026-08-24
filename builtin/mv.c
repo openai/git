@@ -10,6 +10,8 @@
 #include "builtin.h"
 #include "abspath.h"
 #include "advice.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -205,11 +207,20 @@ static int pathmap_cmp(const void *cmp_data UNUSED,
 	return fspathcmp(e1->path, e2->path);
 }
 
+static int mv_config(const char *key, const char *value,
+		     const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
 int cmd_mv(int argc,
 	   const char **argv,
 	   const char *prefix,
 	   struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
+	int preserve_clean_history = !getenv(INDEX_ENVIRONMENT);
 	int i, flags, gitmodules_modified = 0;
 	int verbose = 0, show_only = 0, force = 0, ignore_errors = 0, ignore_sparse = 0;
 	struct option builtin_mv_options[] = {
@@ -240,7 +251,19 @@ int cmd_mv(int argc,
 	int ret;
 	struct repo_config_values *cfg = repo_config_values(the_repository);
 
-	repo_config(the_repository, git_default_config, NULL);
+	show_usage_with_options_if_asked(argc, argv,
+					 builtin_mv_usage, builtin_mv_options);
+
+	if (preserve_clean_history) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, mv_config, &clean_digest);
+		clean_status_config_final(&clean_digest);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+		clean_status_enable_external_history(the_repository);
+	} else {
+		repo_config(the_repository, git_default_config, NULL);
+	}
 
 	argc = parse_options(argc, argv, prefix, builtin_mv_options,
 			     builtin_mv_usage, 0);
@@ -571,6 +594,28 @@ remove_entry:
 						       the_repository->index->cache[pos],
 						       &st,
 						       0);
+		if (preserve_clean_history) {
+			struct cache_entry *old_entry =
+				the_repository->index->cache[pos];
+			struct cache_entry *new_entry;
+			size_t dstlen = strlen(dst);
+			int safe;
+
+			new_entry = make_empty_cache_entry(
+				the_repository->index, dstlen);
+			copy_cache_entry(new_entry, old_entry);
+			new_entry->ce_namelen = dstlen;
+			new_entry->index = 0;
+			memcpy(new_entry->name, dst, dstlen + 1);
+			safe = clean_status_index_entry_is_semantically_safe(
+				the_repository->index, old_entry, NULL) &&
+				clean_status_index_entry_is_semantically_safe(
+					the_repository->index, NULL, new_entry);
+			discard_cache_entry(new_entry);
+			if (!safe)
+				clean_status_invalidate_current_proof(
+					the_repository->index);
+		}
 		rename_index_entry_at(the_repository->index, pos, dst);
 
 		if (ignore_sparse &&

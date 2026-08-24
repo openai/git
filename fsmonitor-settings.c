@@ -15,6 +15,7 @@ struct fsmonitor_settings {
 	enum fsmonitor_mode mode;
 	enum fsmonitor_reason reason;
 	char *hook_path;
+	unsigned watch_limit_backoff : 1;
 };
 
 /*
@@ -124,6 +125,7 @@ static void lookup_fsmonitor_settings(struct repository *r)
 			trace2_data_intmax("fsm_client", r,
 					   "settings/inotify-watch-limit-backoff", 1);
 			fsm_settings__set_disabled(r);
+			r->settings.fsmonitor->watch_limit_backoff = 1;
 		} else if (bool_value)
 			fsm_settings__set_ipc(r);
 		else
@@ -159,6 +161,15 @@ enum fsmonitor_mode fsm_settings__get_mode(struct repository *r)
 	return r->settings.fsmonitor->mode;
 }
 
+int fsm_settings__is_watch_limit_backoff(struct repository *r)
+{
+	if (!r->settings.fsmonitor)
+		lookup_fsmonitor_settings(r);
+
+	return r->settings.fsmonitor->mode == FSMONITOR_MODE_DISABLED &&
+		r->settings.fsmonitor->watch_limit_backoff;
+}
+
 const char *fsm_settings__get_hook_path(struct repository *r)
 {
 	if (!r->settings.fsmonitor)
@@ -185,6 +196,7 @@ void fsm_settings__set_ipc(struct repository *r)
 
 	r->settings.fsmonitor->mode = FSMONITOR_MODE_IPC;
 	r->settings.fsmonitor->reason = reason;
+	r->settings.fsmonitor->watch_limit_backoff = 0;
 	FREE_AND_NULL(r->settings.fsmonitor->hook_path);
 }
 
@@ -206,6 +218,7 @@ void fsm_settings__set_hook(struct repository *r, const char *path)
 
 	r->settings.fsmonitor->mode = FSMONITOR_MODE_HOOK;
 	r->settings.fsmonitor->reason = reason;
+	r->settings.fsmonitor->watch_limit_backoff = 0;
 	FREE_AND_NULL(r->settings.fsmonitor->hook_path);
 	r->settings.fsmonitor->hook_path = strdup(path);
 }
@@ -217,6 +230,7 @@ void fsm_settings__set_disabled(struct repository *r)
 
 	r->settings.fsmonitor->mode = FSMONITOR_MODE_DISABLED;
 	r->settings.fsmonitor->reason = FSMONITOR_REASON_OK;
+	r->settings.fsmonitor->watch_limit_backoff = 0;
 	FREE_AND_NULL(r->settings.fsmonitor->hook_path);
 }
 
@@ -228,6 +242,7 @@ void fsm_settings__set_incompatible(struct repository *r,
 
 	r->settings.fsmonitor->mode = FSMONITOR_MODE_INCOMPATIBLE;
 	r->settings.fsmonitor->reason = reason;
+	r->settings.fsmonitor->watch_limit_backoff = 0;
 	FREE_AND_NULL(r->settings.fsmonitor->hook_path);
 }
 

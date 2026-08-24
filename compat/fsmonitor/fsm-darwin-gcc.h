@@ -40,9 +40,13 @@ typedef const FSEventStreamRef ConstFSEventStreamRef;
 typedef unsigned int CFStringEncoding;
 #define kCFStringEncodingUTF8 0x08000100
 
+typedef long CFIndex;
 typedef const struct __CFString *CFStringRef;
 typedef const struct __CFArray *CFArrayRef;
+typedef const struct __CFDictionary *CFDictionaryRef;
+typedef const struct __CFNumber *CFNumberRef;
 typedef const struct __CFRunLoop *CFRunLoopRef;
+#define kCFNumberSInt64Type 4
 
 struct FSEventStreamContext {
     long long version;
@@ -51,9 +55,11 @@ struct FSEventStreamContext {
 
 typedef struct FSEventStreamContext FSEventStreamContext;
 typedef unsigned int FSEventStreamEventFlags;
+#define kFSEventStreamCreateFlagUseCFTypes 0x01
 #define kFSEventStreamCreateFlagNoDefer 0x02
 #define kFSEventStreamCreateFlagWatchRoot 0x04
 #define kFSEventStreamCreateFlagFileEvents 0x10
+#define kFSEventStreamCreateFlagUseExtendedData 0x40
 
 typedef unsigned long long FSEventStreamEventId;
 #define kFSEventStreamEventIdSinceNow 0xFFFFFFFFFFFFFFFFULL
@@ -74,8 +80,17 @@ FSEventStreamRef FSEventStreamCreate(void *allocator,
 				     FSEventStreamCreateFlags flags);
 CFStringRef CFStringCreateWithCString(void *allocator, const char *string,
 				      CFStringEncoding encoding);
+CFIndex CFStringGetLength(CFStringRef string);
+CFIndex CFStringGetMaximumSizeForEncoding(CFIndex length,
+					  CFStringEncoding encoding);
+unsigned char CFStringGetCString(CFStringRef string, char *buffer,
+				 CFIndex buffer_size,
+				 CFStringEncoding encoding);
 CFArrayRef CFArrayCreate(void *allocator, const void **items, long long count,
 			 void *callbacks);
+const void *CFArrayGetValueAtIndex(CFArrayRef array, CFIndex index);
+const void *CFDictionaryGetValue(CFDictionaryRef dictionary, const void *key);
+unsigned char CFNumberGetValue(CFNumberRef number, CFIndex type, void *value);
 void CFRunLoopRun(void);
 void CFRunLoopStop(CFRunLoopRef run_loop);
 CFRunLoopRef CFRunLoopGetCurrent(void);

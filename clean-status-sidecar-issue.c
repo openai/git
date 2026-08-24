@@ -58,11 +58,29 @@ static int output_is_certifiable(const struct wt_status *status,
 		!status->ignored.nr;
 }
 
-static int history_is_certifiable(const struct index_state *istate)
+static int history_is_certifiable(
+	const struct index_state *istate,
+	const struct clean_status_config_digest *config)
 {
 	const struct clean_status_state *state = istate->clean_status;
 
+	/*
+	 * The configured-filter proof domain requires an authenticated,
+	 * fully classified inactive scope. A normalized disabled-filter
+	 * override shares that digest and is never certifiable.
+	 */
 	return state &&
+		state->filter_configured == config->filter_configured &&
+		(!config->filter_configured ||
+		 (!config->normalized_filter_disable &&
+		  state->current_config_valid &&
+		  state->current_semantic_valid &&
+		  !memcmp(state->current_config_hash, config->hash,
+			  istate->repo->hash_algo->rawsz) &&
+		  !memcmp(state->current_semantic_hash, config->semantic_hash,
+			  istate->repo->hash_algo->rawsz) &&
+		  state->filter_scope_valid &&
+		  !clean_status_filter_scope_needs_validation(istate))) &&
 		clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
 		clean_status_revalidated_token_matches(istate) &&
 		state->manifest.current_valid &&
@@ -211,12 +229,12 @@ int clean_status_issue_sidecar(
 	int installed = 0;
 
 	if (!is_lock_file_locked(index_lock) ||
-	    !config->finalized || config->filter_configured ||
+	    !config->finalized ||
 	    !output_is_certifiable(status, normal_clean_query)) {
 		trace_miss(repo, "issue-command-or-output");
 		goto done;
 	}
-	if (!history_is_certifiable(istate)) {
+	if (!history_is_certifiable(istate, config)) {
 		trace_miss(repo, "issue-coherent-history");
 		goto done;
 	}

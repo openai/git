@@ -738,7 +738,10 @@ but may cost more than normal preload depending on filesystem and cache
 state. Inconclusive scans are discarded before continuing with the normal
 preload. Currently this is supported on APFS, ext-family filesystems, and
 XFS, and only has an effect when `core.preloadIndex` is enabled. Defaults
-to false.
+to false, except that a whole-worktree, read-only `git status` may use it
+after the native file system monitor discards a legacy
+untracked cache. Setting this option explicitly to false also disables
+that recovery optimization.
 
 core.unsetenvvars::
 	Windows-only: comma-separated list of environment variables'

@@ -113,25 +113,34 @@ static int open_source_at(int parent_fd, const char *relative, int nofollow,
 
 static int parent_identity_stable(
 	struct exclude_source_proof *proof, const char *parent,
-	int held_fd, const struct stat *expected)
+	int held_fd, const struct stat *expected, int regular_source)
 {
 	struct stat held, reopened;
 	int fd = proof->open_parent(proof->open_data, parent);
+	/*
+	 * A regular source has its own held descriptor and repeated target
+	 * identity checks. Absence and nonregular sources cannot distinguish a
+	 * transient target change from harmless parent-directory churn.
+	 */
 	int stable = !fstat(held_fd, &held) &&
 		fd >= 0 && !fstat(fd, &reopened) &&
-		path_namespace_stat_equal(expected, &held) &&
-		path_namespace_stat_equal(expected, &reopened);
+		(regular_source ?
+		 (path_namespace_directory_stat_equal(expected, &held) &&
+		  path_namespace_directory_stat_equal(expected, &reopened)) :
+		 (path_namespace_stat_equal(expected, &held) &&
+		  path_namespace_stat_equal(expected, &reopened)));
 
 	if (fd >= 0)
 		close(fd);
 	return stable;
 }
 
-static int parent_stable(struct exclude_source_capture *capture)
+static int parent_stable(struct exclude_source_capture *capture,
+			 int regular_source)
 {
 	return parent_identity_stable(
 		capture->proof, capture->parent, capture->parent_fd,
-		&capture->parent_stat);
+		&capture->parent_stat, regular_source);
 }
 
 static void capture_free(struct exclude_source_capture *capture)
@@ -259,6 +268,23 @@ static int source_matches(struct exclude_source_capture *capture,
 	return ret;
 }
 
+static int source_matches_after_read(struct exclude_source_capture *capture,
+				     const struct stat *expected)
+{
+#if EXCLUDE_SOURCE_PROOF_HAS_ANCHORED_OPEN
+	if (S_ISREG(expected->st_mode)) {
+		struct stat named;
+		int flags = capture->nofollow ? AT_SYMLINK_NOFOLLOW : 0;
+
+		/* The final reopened descriptor still proves readability. */
+		return !fstatat(capture->parent_fd, capture->relative,
+				&named, flags) &&
+			path_namespace_stat_equal(expected, &named);
+	}
+#endif
+	return source_matches(capture, expected);
+}
+
 static int same_observation(
 	const struct exclude_source_proof_entry *entry,
 	int exists, size_t size, const struct object_id *oid)
@@ -317,7 +343,7 @@ void exclude_source_capture_record(
 
 	if (!source_stat) {
 		if (!exclude_source_capture_absent(capture) ||
-		    !parent_stable(capture) ||
+		    !parent_stable(capture, 0) ||
 		    !exclude_source_capture_absent(capture)) {
 			proof->invalid = 1;
 			return;
@@ -331,13 +357,18 @@ void exclude_source_capture_record(
 	    xsize_t(source_stat->st_size) != size ||
 	    fstat(source_fd, &final) ||
 	    !path_namespace_stat_equal(source_stat, &final) ||
-	    !source_matches(capture, &final) ||
-	    !parent_stable(capture)) {
+	    !parent_stable(capture, S_ISREG(final.st_mode)) ||
+	    fstat(source_fd, &final) ||
+	    !path_namespace_stat_equal(source_stat, &final) ||
+	    !source_matches(capture, &final)) {
 		proof->invalid = 1;
 		return;
 	}
-	hash_object_file(proof->istate->repo->hash_algo, buf, size,
-			 OBJ_BLOB, &oid);
+	if (!size)
+		oidcpy(&oid, proof->istate->repo->hash_algo->empty_blob);
+	else
+		hash_object_file(proof->istate->repo->hash_algo, buf, size,
+				 OBJ_BLOB, &oid);
 	record_observation(capture, 1, size, &oid);
 }
 
@@ -369,7 +400,7 @@ static int proof_entry_matches(
 		goto done;
 	if (!entry->exists) {
 		ret = exclude_source_capture_absent(capture) &&
-			parent_stable(capture) &&
+			parent_stable(capture, 0) &&
 			exclude_source_capture_absent(capture);
 		goto done;
 	}
@@ -384,12 +415,12 @@ static int proof_entry_matches(
 	if ((size_t)read_in_full(fd, buf, size) != size ||
 	    fstat(fd, &after) ||
 	    !path_namespace_stat_equal(&before, &after) ||
-	    !source_matches(capture, &after))
+	    !source_matches_after_read(capture, &after))
 		goto done;
 	hash_object_file(proof->istate->repo->hash_algo, buf, size,
 			 OBJ_BLOB, &oid);
 	if (!oideq(&oid, &entry->oid) ||
-	    !parent_stable(capture) ||
+	    !parent_stable(capture, S_ISREG(after.st_mode)) ||
 	    fstat(fd, &final) ||
 	    !path_namespace_stat_equal(&after, &final) ||
 	    !source_matches(capture, &final))

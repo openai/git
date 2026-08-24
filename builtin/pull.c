@@ -10,6 +10,8 @@
 
 #include "builtin.h"
 #include "advice.h"
+#include "clean-status-config.h"
+#include "clean-status.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
@@ -226,6 +228,9 @@ static enum rebase_type config_get_rebase(int *rebase_unspecified)
 static int git_pull_config(const char *var, const char *value,
 			   const struct config_context *ctx, void *cb)
 {
+	if (cb)
+		clean_status_config_add(cb, var, value, ctx);
+
 	if (!strcmp(var, "rebase.autostash")) {
 		/*
 		 * run_rebase() also reads this option. The reason we handle it here is
@@ -248,7 +253,7 @@ static int git_pull_config(const char *var, const char *value,
 		check_trust_level = 0;
 	}
 
-	return git_default_config(var, value, ctx, cb);
+	return git_default_config(var, value, ctx, NULL);
 }
 
 /**
@@ -862,6 +867,7 @@ int cmd_pull(int argc,
 	struct oid_array merge_heads = OID_ARRAY_INIT;
 	struct object_id orig_head, curr_head;
 	struct object_id rebase_fork_point;
+	struct clean_status_config_digest clean_digest;
 	int rebase_unspecified = 0;
 	int can_ff;
 	int divergent;
@@ -1015,7 +1021,16 @@ int cmd_pull(int argc,
 	if (!getenv("GIT_REFLOG_ACTION"))
 		set_reflog_message(argc, argv);
 
-	repo_config(the_repository, git_pull_config, NULL);
+	if (the_repository->gitdir && !getenv(INDEX_ENVIRONMENT)) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, git_pull_config, &clean_digest);
+		clean_status_config_final(&clean_digest);
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+	} else {
+		repo_config(the_repository, git_pull_config, NULL);
+	}
 	if (the_repository->gitdir) {
 		prepare_repo_settings(the_repository);
 		the_repository->settings.command_requires_full_index = 0;

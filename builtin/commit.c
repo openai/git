@@ -9,6 +9,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "abspath.h"
 #include "advice.h"
 #include "config.h"
 #include "lockfile.h"
@@ -22,6 +23,7 @@
 #include "environment.h"
 #include "diff.h"
 #include "commit.h"
+#include "fsmonitor.h"
 #include "fsmonitor-settings.h"
 #include "add-interactive.h"
 #include "gettext.h"
@@ -35,9 +37,11 @@
 #include "preload-index.h"
 #include "read-cache.h"
 #include "refs.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "string-list.h"
 #include "submodule.h"
+#include "symlinks.h"
 #include "rerere.h"
 #include "unpack-trees.h"
 #include "column.h"
@@ -51,6 +55,7 @@
 #include "pretty.h"
 #include "trace2.h"
 #include "trailer.h"
+#include "wrapper.h"
 
 static const char * const builtin_commit_usage[] = {
 	N_("git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]\n"
@@ -113,6 +118,7 @@ static const char *color_status_slots[] = {
 static const char *use_message_buffer;
 static struct lock_file index_lock; /* real index */
 static struct lock_file false_lock; /* used only for partial commits */
+static struct clean_status_commit_checkpoint *commit_checkpoint;
 static enum {
 	COMMIT_AS_IS = 1,
 	COMMIT_NORMAL,
@@ -245,6 +251,12 @@ static void status_init_config_with_clean_digest(
 	s->hints = advice_enabled(ADVICE_STATUS_HINTS); /* must come after repo_config() */
 }
 
+static void release_commit_checkpoint(void)
+{
+	clean_status_release_commit_checkpoint(commit_checkpoint);
+	commit_checkpoint = NULL;
+}
+
 static void rollback_index_files(void)
 {
 	switch (commit_style) {
@@ -258,6 +270,7 @@ static void rollback_index_files(void)
 		rollback_lock_file(&false_lock);
 		break;
 	}
+	release_commit_checkpoint();
 }
 
 static int commit_index_files(void)
@@ -268,6 +281,8 @@ static int commit_index_files(void)
 	case COMMIT_AS_IS:
 		break; /* nothing to do */
 	case COMMIT_NORMAL:
+		restore_locked_index_for_commit(the_repository->index,
+						&index_lock, commit_checkpoint);
 		err = commit_lock_file(&index_lock);
 		break;
 	case COMMIT_PARTIAL:
@@ -275,6 +290,7 @@ static int commit_index_files(void)
 		rollback_lock_file(&false_lock);
 		break;
 	}
+	release_commit_checkpoint();
 
 	return err;
 }
@@ -354,6 +370,9 @@ static void create_base_index(const struct commit *current_head)
 	opts.head_idx = 1;
 	opts.index_only = 1;
 	opts.merge = 1;
+	opts.preserve_semantic_history =
+		clean_status_external_history_enabled(the_repository->index) &&
+		clean_status_revalidated_token_matches(the_repository->index);
 	opts.src_index = the_repository->index;
 	opts.dst_index = the_repository->index;
 
@@ -431,7 +450,10 @@ static const char *prepare_index(const char **argv, const char *prefix,
 
 		refresh_cache_or_die(refresh_flags);
 
-		if (write_locked_index(the_repository->index, &index_lock, 0))
+		if (is_status ?
+		    write_locked_index(the_repository->index, &index_lock, 0) :
+		    write_locked_index_for_commit(the_repository->index, &index_lock,
+					  &commit_checkpoint))
 			die(_("unable to create temporary index"));
 
 		old_repo_index_file = the_repository->index_file;
@@ -460,6 +482,10 @@ static const char *prepare_index(const char **argv, const char *prefix,
 				die(_("unable to update temporary index"));
 		} else
 			warning(_("Failed to update main cache tree"));
+		if (!is_status &&
+		    !clean_status_advance_commit_checkpoint(
+			    commit_checkpoint, the_repository->index, &index_lock))
+			release_commit_checkpoint();
 
 		commit_style = COMMIT_NORMAL;
 		ret = get_lock_file_path(&index_lock);
@@ -494,7 +520,10 @@ static const char *prepare_index(const char **argv, const char *prefix,
 
 		refresh_cache_or_die(refresh_flags);
 		cache_tree_update(the_repository->index, WRITE_TREE_SILENT);
-		if (write_locked_index(the_repository->index, &index_lock, 0))
+		if (is_status ?
+		    write_locked_index(the_repository->index, &index_lock, 0) :
+		    write_locked_index_for_commit(the_repository->index, &index_lock,
+					  &commit_checkpoint))
 			die(_("unable to write new index file"));
 		commit_style = COMMIT_NORMAL;
 		ret = get_lock_file_path(&index_lock);
@@ -1676,6 +1705,185 @@ static int clean_status_sidecar_needs_reissue(struct repository *repo,
 	return reissue;
 }
 
+#ifdef __linux__
+static int clean_status_scoped_history_test_barrier(void)
+{
+	const char *ready =
+		getenv("GIT_TEST_CLEAN_STATUS_SCOPED_HISTORY_BARRIER_READY");
+	const char *resume =
+		getenv("GIT_TEST_CLEAN_STATUS_SCOPED_HISTORY_BARRIER_RESUME");
+	const char *scripted = getenv("GIT_TEST_FSMONITOR_QUERY_SEQUENCE");
+	struct stat fifo, opened;
+	char resumed;
+	int fd, failed;
+
+	if (!ready && !resume)
+		return 0;
+	if (!scripted || !*scripted || !ready || !*ready ||
+	    !resume || !*resume || lstat(resume, &fifo) ||
+	    !S_ISFIFO(fifo.st_mode) || fifo.st_uid != geteuid())
+		return -1;
+	fd = open(ready, O_WRONLY | O_CREAT | O_EXCL |
+			 O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return -1;
+	failed = fstat(fd, &opened) || !S_ISREG(opened.st_mode) ||
+		opened.st_uid != geteuid() || opened.st_nlink != 1 ||
+		write_in_full(fd, "ready\n", 6) != 6;
+	if (close(fd) || failed)
+		return -1;
+	fd = open(resume, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	failed = fstat(fd, &opened) || !S_ISFIFO(opened.st_mode) ||
+		opened.st_uid != geteuid() ||
+		opened.st_dev != fifo.st_dev || opened.st_ino != fifo.st_ino ||
+		read_in_full(fd, &resumed, 1) != 1;
+	if (close(fd) || failed)
+		return -1;
+	return 0;
+}
+
+static int clean_status_scoped_pathspec_is_bounded(
+	const struct wt_status *status)
+{
+	const struct pathspec *pathspec = &status->pathspec;
+	struct index_state *istate = status->repo->index;
+	int i;
+
+	if (pathspec->nr <= 0 || pathspec->nr > 64 ||
+	    pathspec->has_wildcard ||
+	    (pathspec->magic &
+	     (PATHSPEC_GLOB | PATHSPEC_ICASE |
+	      PATHSPEC_EXCLUDE | PATHSPEC_ATTR)))
+		return 0;
+	for (i = 0; i < pathspec->nr; i++) {
+		const struct pathspec_item *item = &pathspec->items[i];
+		const struct cache_entry *ce;
+		struct stat st;
+		int pos;
+
+		if (!item->match || item->len <= 0 ||
+		    item->match[item->len - 1] == '/' ||
+		    !strcmp(item->match, ".") ||
+		    has_symlink_leading_path(item->match, item->len) ||
+		    lstat(item->match, &st) || !S_ISREG(st.st_mode))
+			return 0;
+		pos = index_name_pos(istate, item->match, item->len);
+		if (pos < 0)
+			return 0;
+		ce = istate->cache[pos];
+		if (!S_ISREG(ce->ce_mode) || ce_stage(ce) ||
+		    ce_intent_to_add(ce) || ce_skip_worktree(ce) ||
+		    (ce->ce_flags & CE_VALID) ||
+		    !clean_status_index_entry_is_semantically_safe(
+			    istate, ce, ce))
+			return 0;
+	}
+	return 1;
+}
+#endif
+
+static int clean_status_scoped_provider_is_current(
+	const struct index_state *istate)
+{
+	return clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		clean_status_has_current_full_fsmonitor_proof(istate) &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_last_update &&
+		!istate->fsmonitor_last_update_pending &&
+		istate->fsmonitor_untracked_extension_seen &&
+		!istate->fsmonitor_untracked_extension_invalid &&
+		istate->fsmonitor_untracked_valid &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token) &&
+		istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid &&
+		istate->untracked->root->valid_recursive &&
+		!istate->untracked->root->fsmonitor_dirty &&
+		!istate->untracked->fsmonitor_dirty_paths.len &&
+		!istate->fsmonitor_untracked_must_persist &&
+		!clean_status_worktree_manifest_needs_refresh(istate) &&
+		!clean_status_manifest_global_fallback(istate) &&
+		!clean_status_external_history_was_restored(istate);
+}
+
+static int clean_status_defer_scoped_history_capture(
+	const struct wt_status *status,
+	struct clean_status_index_snapshot *snapshot)
+{
+#ifdef __linux__
+	struct repository *repo = status->repo;
+	struct index_state *istate = repo->index;
+	struct stat st;
+	char *physical, *selected, *canonical;
+	int eligible;
+
+	/*
+	 * Legacy checkpoints cannot authenticate a deferred source digest.
+	 * Keep their ordinary lock and content verification; only a later
+	 * clean proof may decide that publishing a checkpoint is unnecessary.
+	 */
+	if (clean_status_identity_is_durable() ||
+	    !untracked_files_arg || strcmp(untracked_files_arg, "no") ||
+	    status->show_untracked_files != SHOW_NO_UNTRACKED_FILES ||
+	    status->show_ignored_mode || status->submodule_summary ||
+	    !clean_status_scoped_pathspec_is_bounded(status) ||
+	    getenv(INDEX_ENVIRONMENT) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) ||
+	    getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) ||
+	    istate != repo->index || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    repo_config_get_split_index(repo) > 0 ||
+	    repo_config_values(repo)->apply_sparse_checkout ||
+	    !fstat_is_reliable() ||
+	    !repo->config_values_private_.trust_ctime ||
+	    !repo->config_values_private_.check_stat ||
+	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
+	    (istate->cache_changed &
+	     ~(FSMONITOR_CHANGED | UNTRACKED_CHANGED)) ||
+	    !clean_status_scoped_provider_is_current(istate) ||
+	    repo_has_replace_refs_uncached(repo))
+		return 0;
+
+	physical = xstrfmt("%s/index", repo_get_git_dir(repo));
+	selected = real_pathdup(repo_get_index_file(repo), 0);
+	canonical = real_pathdup(physical, 0);
+	eligible = selected && canonical &&
+		!fspathcmp(selected, canonical) &&
+		!lstat(physical, &st) && S_ISREG(st.st_mode) &&
+		st.st_nlink == 1 &&
+		!clean_status_index_snapshot_pin_proof_epoch(snapshot, istate);
+	if (!eligible)
+		clean_status_index_snapshot_release(snapshot);
+	free(canonical);
+	free(selected);
+	free(physical);
+	return eligible;
+#else
+	(void)status;
+	(void)snapshot;
+	return 0;
+#endif
+}
+
+static int clean_status_scoped_history_can_rollback(
+	const struct wt_status *status,
+	const struct clean_status_index_snapshot *snapshot)
+{
+	struct index_state *istate = status->repo->index;
+
+	return clean_status_scoped_provider_is_current(istate) &&
+		!(istate->cache_changed &
+		  ~(FSMONITOR_CHANGED | UNTRACKED_CHANGED)) &&
+		clean_status_index_snapshot_still_matches_proof_epoch(
+			snapshot, istate) &&
+		!has_racy_timestamp(istate);
+}
+
 int cmd_status(int argc,
 const char **argv,
 const char *prefix,
@@ -1696,8 +1904,17 @@ struct repository *repo UNUSED)
 	int normal_has_head;
 	int reissue_clean_sidecar = 0;
 	int repository_inputs_changed = 0;
+	int sidecar_provider_reset = 0;
 	int reissue_after_write = 0;
 	int save_history_after_write = 0;
+	int deferred_scoped_history = 0;
+	int guarded_scoped_history_source = 0;
+	int optional_status_writes;
+	struct clean_status_index_snapshot scoped_history_source = {
+		.fd = -1,
+	};
+	struct clean_status_index_write_receipt written_index =
+		CLEAN_STATUS_INDEX_WRITE_RECEIPT_INIT;
 	struct object_id oid;
 	static struct option builtin_status_options[] = {
 		OPT__VERBOSE(&verbose, N_("be verbose")),
@@ -1769,6 +1986,8 @@ struct repository *repo UNUSED)
 			     builtin_status_usage, 0);
 	finalize_colopts(&s.colopts, -1);
 	finalize_deferred_config(&s);
+	optional_status_writes = use_optional_locks() &&
+		!fsm_settings__is_watch_limit_backoff(the_repository);
 
 	handle_untracked_files_arg(&s);
 	handle_ignored_arg(&s);
@@ -1812,18 +2031,20 @@ struct repository *repo UNUSED)
 	s.certify_clean_status = exact_clean_query;
 	if (reusable_clean_query &&
 	    clean_status_try_sidecar(the_repository, &clean_digest,
-				     &repository_inputs_changed)) {
+				     &repository_inputs_changed,
+				     &sidecar_provider_reset)) {
 		if (exact_clean_query ||
 		    print_clean_sidecar(&s, prefix)) {
 			wt_status_collect_free_buffers(&s);
 			return 0;
 		}
 	}
-	if (normal_clean_query && use_optional_locks() &&
+	if (normal_clean_query && optional_status_writes &&
 	    clean_status_identity_is_durable())
 		reissue_clean_sidecar =
 			clean_status_sidecar_needs_reissue(
-				the_repository, repository_inputs_changed);
+				the_repository, repository_inputs_changed ||
+				sidecar_provider_reset);
 
 	if (status_format != STATUS_FORMAT_PORCELAIN &&
 	    status_format != STATUS_FORMAT_PORCELAIN_V2) {
@@ -1831,11 +2052,44 @@ struct repository *repo UNUSED)
 		if (isatty(2))
 			clean_status_enable_progress(the_repository);
 	}
+	if (optional_status_writes)
+		clean_status_require_external_history_source(the_repository);
 	repo_read_index(the_repository);
-	if (use_optional_locks())
-		clean_status_capture_external_history_source(
-			the_repository->index);
-	if (normal_clean_query && use_optional_locks() &&
+	if (sidecar_provider_reset) {
+		/*
+		 * The fast probe already lost the old provider boundary. Even
+		 * if the index reader's second query is empty, it must not
+		 * revive the tracked or untracked proof we just rejected. A
+		 * provider-owned, authenticated stat baseline has already
+		 * invalidated that proof and must retain its closing token.
+		 */
+		if (!clean_status_fsmonitor_semantic_baseline_pending(
+			    the_repository->index) ||
+		    !fsmonitor_pending_token_from_provider(the_repository->index)) {
+			clean_status_invalidate_current_manifest(the_repository->index);
+			fsmonitor_invalidate_semantics(the_repository->index);
+			untracked_cache_invalidate_all(the_repository->index);
+		}
+		trace2_data_intmax("status", the_repository,
+				   "clean-proof/provider-reset-carried", 1);
+	}
+	if (optional_status_writes) {
+		deferred_scoped_history =
+			clean_status_defer_scoped_history_capture(
+				&s, &scoped_history_source);
+		guarded_scoped_history_source = deferred_scoped_history;
+		if (deferred_scoped_history) {
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "history/scoped-source-capture-deferred", 1);
+#ifdef __linux__
+			if (clean_status_scoped_history_test_barrier())
+				die("invalid clean status scoped-history test barrier");
+#endif
+		} else
+			clean_status_capture_external_history_source(
+				the_repository->index);
+	}
+	if (normal_clean_query && optional_status_writes &&
 	    clean_status_identity_is_durable() &&
 	    (reissue_clean_sidecar ||
 	     clean_status_external_history_was_restored(
@@ -1848,7 +2102,7 @@ struct repository *repo UNUSED)
 		s.show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
 		!s.show_ignored_mode);
 
-	if (use_optional_locks())
+	if (optional_status_writes)
 		fd = repo_hold_locked_index(the_repository, &index_lock, 0);
 	else
 		fd = -1;
@@ -1874,7 +2128,36 @@ struct repository *repo UNUSED)
 
 	wt_status_collect(&s);
 
-	if (0 <= fd) {
+	if (0 <= fd && guarded_scoped_history_source &&
+	    !clean_status_index_snapshot_still_matches_proof_epoch(
+		    &scoped_history_source, the_repository->index)) {
+		rollback_lock_file(&index_lock);
+		fd = -1;
+		trace2_data_intmax("fsmonitor", the_repository,
+				   "history/scoped-source-epoch-mismatch", 1);
+	}
+	if (0 <= fd && deferred_scoped_history) {
+		if (clean_status_scoped_history_can_rollback(
+			    &s, &scoped_history_source)) {
+			rollback_lock_file(&index_lock);
+			fd = -1;
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "history/scoped-source-capture-skipped", 1);
+		} else {
+			trace2_data_intmax("fsmonitor", the_repository,
+					   "history/scoped-source-repair-required", 1);
+			if (!clean_status_capture_external_history_source_from_snapshot(
+				    the_repository->index, &scoped_history_source))
+				deferred_scoped_history = 0;
+			else {
+				rollback_lock_file(&index_lock);
+				fd = -1;
+				trace2_data_intmax("fsmonitor", the_repository,
+						   "history/scoped-source-epoch-mismatch", 1);
+			}
+		}
+	}
+	if (0 <= fd && !deferred_scoped_history) {
 		int external_restored =
 			clean_status_external_history_was_restored(
 				the_repository->index);
@@ -1951,8 +2234,19 @@ struct repository *repo UNUSED)
 			fd = -1;
 		}
 	}
+	if (0 <= fd && guarded_scoped_history_source &&
+	    !clean_status_index_snapshot_still_matches_proof_epoch(
+		    &scoped_history_source, the_repository->index)) {
+		rollback_lock_file(&index_lock);
+		fd = -1;
+		trace2_data_intmax("fsmonitor", the_repository,
+				   "history/scoped-source-epoch-mismatch", 1);
+	}
 	if (0 <= fd) {
-		repo_update_index_if_able(the_repository, &index_lock);
+		repo_update_index_if_able_with_receipt(the_repository, &index_lock,
+						      &written_index);
+		clean_status_index_adopt_write_receipt(the_repository->index,
+						      &written_index);
 		if (save_history_after_write &&
 		    !hook_exists(the_repository, "post-index-change") &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
@@ -1972,6 +2266,8 @@ struct repository *repo UNUSED)
 				rollback_lock_file(&index_lock);
 		}
 	}
+	clean_status_index_write_receipt_release(&written_index);
+	clean_status_index_snapshot_release(&scoped_history_source);
 
 	if (s.relative_paths)
 		s.prefix = prefix;
@@ -2127,6 +2423,9 @@ int cmd_commit(int argc,
 		&s, git_commit_config, &clean_digest);
 	clean_status_config_final(&clean_digest);
 	clean_status_set_config_digest(the_repository, &clean_digest);
+	if (!getenv(INDEX_ENVIRONMENT) && fstat_is_reliable() &&
+	    fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC)
+		clean_status_enable_external_history(the_repository);
 	s.commit_template = 1;
 	status_format = STATUS_FORMAT_NONE; /* Ignore status.short */
 	s.colopts = 0;
@@ -2305,6 +2604,7 @@ int cmd_commit(int argc,
 			    NULL, NULL, NULL, NULL);
 
 cleanup:
+	release_commit_checkpoint();
 	wt_status_collect_free_buffers(&s);
 	free_commit_extra_headers(extra);
 	commit_list_free(parents);

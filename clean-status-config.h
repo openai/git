@@ -6,6 +6,7 @@
 struct config_context;
 struct index_state;
 struct repository;
+struct clean_status_pending_filter;
 
 struct clean_status_config_digest {
 	struct git_hash_ctx ctx;
@@ -14,11 +15,18 @@ struct clean_status_config_digest {
 	unsigned char hash[GIT_MAX_RAWSZ];
 	unsigned char semantic_hash[GIT_MAX_RAWSZ];
 	unsigned char tracked_policy_hash[GIT_MAX_RAWSZ];
+	struct clean_status_pending_filter *pending_filter;
 	unsigned initialized : 1;
 	unsigned finalized : 1;
 	unsigned filter_configured : 1;
+	unsigned normalized_filter_disable : 1;
 	unsigned semantic_config_explicit : 1;
 	unsigned attribute_tree_configured : 1;
+	unsigned fsmonitor_value_seen : 1;
+	unsigned fsmonitor_value_boolean : 1;
+	unsigned fsmonitor_value_enabled : 1;
+	unsigned submodule_recurse_seen : 1;
+	unsigned submodule_recurse_known_false : 1;
 };
 
 void clean_status_config_init(struct clean_status_config_digest *digest,

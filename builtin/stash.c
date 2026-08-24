@@ -6,6 +6,7 @@
 #include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
@@ -22,6 +23,7 @@
 #include "entry.h"
 #include "preload-index.h"
 #include "read-cache.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "rerere.h"
 #include "revision.h"
@@ -334,7 +336,8 @@ static int clear_stash(int argc, const char **argv, const char *prefix,
 	return do_clear_stash();
 }
 
-static int reset_tree(struct object_id *i_tree, int update, int reset)
+static int reset_tree(struct object_id *i_tree, int update, int reset,
+		      int preserve_semantic_history)
 {
 	int nr_trees = 1;
 	struct unpack_trees_options opts;
@@ -359,6 +362,25 @@ static int reset_tree(struct object_id *i_tree, int update, int reset)
 	opts.head_idx = 1;
 	opts.src_index = the_repository->index;
 	opts.dst_index = the_repository->index;
+	opts.preserve_semantic_history = preserve_semantic_history &&
+		!update && !reset && fstat_is_reliable() &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_WORK_TREE_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(DB_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		!repo_config_values(the_repository)->apply_sparse_checkout &&
+		the_repository->config_values_private_.trust_ctime &&
+		the_repository->config_values_private_.check_stat &&
+		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC &&
+		!repo_has_replace_refs_uncached(the_repository) &&
+		the_repository->index->fsmonitor_untracked_valid &&
+		clean_status_has_persistent_fsmonitor_semantic_history(
+			the_repository->index) &&
+		clean_status_revalidated_token_matches(the_repository->index);
+	opts.preserve_backoff_history = preserve_semantic_history &&
+		!update && !reset &&
+		clean_status_fsmonitor_backoff_suspended(the_repository->index);
 	opts.merge = 1;
 	opts.reset = reset ? UNPACK_RESET_PROTECT_UNTRACKED : 0;
 	opts.update = update;
@@ -589,6 +611,7 @@ static void unstage_changes_unless_new(struct object_id *orig_tree)
 			struct stat st;
 
 			ce = the_repository->index->cache[pos];
+			clean_status_invalidate_current_proof(the_repository->index);
 			if (!lstat(ce->name, &st)) {
 				/* Conflicting path present; relocate it */
 				struct strbuf new_path = STRBUF_INIT;
@@ -629,6 +652,12 @@ static void unstage_changes_unless_new(struct object_id *orig_tree)
 					      &p->one->oid,
 					      p->one->path,
 					      0, 0);
+			if (!clean_status_index_entry_is_semantically_safe(
+				    the_repository->index,
+				    pos >= 0 ? the_repository->index->cache[pos] : NULL,
+				    ce))
+				clean_status_invalidate_current_proof(
+					the_repository->index);
 			add_index_entry(the_repository->index, ce, option);
 		}
 	}
@@ -655,6 +684,8 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	struct object_id index_tree;
 	struct tree *head, *merge, *merge_base;
 	struct lock_file lock = LOCK_INIT;
+
+	clean_status_prepare_main_index_history(the_repository);
 
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET, 0, 0,
@@ -694,6 +725,15 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 			discard_index(the_repository->index);
 			repo_read_index(the_repository);
 		}
+	}
+
+	/* The distinct-index path already reread after reset_head(). */
+	if (!has_index && is_null_oid(&the_repository->index->oid) &&
+	    clean_status_fsmonitor_backoff_suspended(the_repository->index)) {
+		/* The initial refresh may have replaced our source inode. */
+		discard_index(the_repository->index);
+		if (repo_read_index(the_repository) < 0)
+			return error(_("could not read index"));
 	}
 
 	init_ui_merge_options(&o, the_repository);
@@ -741,7 +781,11 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 	}
 
 	if (has_index) {
-		if (reset_tree(&index_tree, 0, 0))
+		/* The preceding publication replaced a null-checksum source inode. */
+		if (is_null_oid(&the_repository->index->oid) &&
+		    clean_status_fsmonitor_backoff_suspended(the_repository->index))
+			discard_index(the_repository->index);
+		if (reset_tree(&index_tree, 0, 0, 1))
 			ret = -1;
 	} else {
 		unstage_changes_unless_new(&c_tree);
@@ -761,10 +805,14 @@ restore_untracked:
 		 */
 		cp.git_cmd = 1;
 		cp.dir = prefix;
-		strvec_pushf(&cp.env, GIT_WORK_TREE_ENVIRONMENT"=%s",
-			     absolute_path(repo_get_work_tree(the_repository)));
-		strvec_pushf(&cp.env, GIT_DIR_ENVIRONMENT"=%s",
-			     absolute_path(repo_get_git_dir(the_repository)));
+		/* Keep discovered config origins stable unless discovery is overridden. */
+		if (getenv(GIT_DIR_ENVIRONMENT) ||
+		    getenv(GIT_WORK_TREE_ENVIRONMENT)) {
+			strvec_pushf(&cp.env, GIT_WORK_TREE_ENVIRONMENT"=%s",
+				     absolute_path(repo_get_work_tree(the_repository)));
+			strvec_pushf(&cp.env, GIT_DIR_ENVIRONMENT"=%s",
+				     absolute_path(repo_get_git_dir(the_repository)));
+		}
 		strvec_push(&cp.args, "status");
 		run_command(&cp);
 	}
@@ -1133,7 +1181,7 @@ static int do_store_stash(const struct object_id *w_commit, const char *stash_ms
 			  int quiet)
 {
 	struct stash_info info;
-	char revision[GIT_MAX_HEXSZ];
+	char revision[GIT_MAX_HEXSZ + 1];
 
 	oid_to_hex_r(revision, w_commit);
 	assert_stash_like(&info, revision);
@@ -1443,7 +1491,8 @@ done:
 	return ret;
 }
 
-static int stash_working_tree(struct stash_info *info, const struct pathspec *ps)
+static int stash_working_tree(struct stash_info *info, const struct pathspec *ps,
+			      int preserve_clean_history)
 {
 	int ret = 0;
 	struct rev_info rev;
@@ -1455,7 +1504,7 @@ static int stash_working_tree(struct stash_info *info, const struct pathspec *ps
 	copy_pathspec(&rev.prune_data, ps);
 
 	set_alternate_index_output(stash_index_path.buf);
-	if (reset_tree(&info->i_tree, 0, 0)) {
+	if (reset_tree(&info->i_tree, 0, 0, 0)) {
 		ret = -1;
 		goto done;
 	}
@@ -1487,8 +1536,13 @@ static int stash_working_tree(struct stash_info *info, const struct pathspec *ps
 		goto done;
 	}
 
-	if (write_index_as_tree(&info->w_tree, &istate, stash_index_path.buf, 0,
-				NULL)) {
+	if (preserve_clean_history)
+		clean_status_set_config_digest(the_repository, NULL);
+	ret = write_index_as_tree(&info->w_tree, &istate, stash_index_path.buf,
+				  0, NULL);
+	if (preserve_clean_history)
+		clean_status_set_config_digest(the_repository, &stash_clean_digest);
+	if (ret) {
 		ret = -1;
 		goto done;
 	}
@@ -1605,7 +1659,10 @@ static int do_create_stash(const struct pathspec *ps, struct strbuf *stash_msg_b
 			goto done;
 		}
 	} else {
-		if (stash_working_tree(info, ps)) {
+		if (stash_working_tree(info, ps,
+				       !include_untracked &&
+				       clean_status_external_history_enabled(
+					       the_repository->index))) {
 			if (!quiet)
 				fprintf_ln(stderr, _("Cannot save the current "
 						     "worktree state"));
@@ -1657,6 +1714,8 @@ static int create_stash(int argc, const char **argv, const char *prefix UNUSED,
 	strbuf_join_argv(&stash_msg_buf, argc - 1, ++argv, ' ');
 
 	memset(&ps, 0, sizeof(ps));
+	clean_status_enable_external_history(the_repository);
+	clean_status_set_config_digest(the_repository, &stash_clean_digest);
 	if (!check_changes_tracked_files(&ps))
 		return 0;
 
@@ -1706,15 +1765,12 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	}
 
 	/*
-	 * Keep whole-worktree history bound while inspecting the worktree.
-	 * If changes are found, invalidate it before stash machinery
-	 * mutates the index or worktree.
+	 * Even a cancelled patch selection can refresh the real index. Attach
+	 * authenticated history before that first read, independently of the
+	 * eventual stash operation. Whole-worktree changes still invalidate
+	 * their proof below, and each writer must validate its own changes.
 	 */
-	if (preserve_clean_history) {
-		clean_status_enable_external_history(the_repository);
-		clean_status_set_config_digest(the_repository,
-					       &stash_clean_digest);
-	}
+	clean_status_prepare_main_index_history(the_repository);
 	repo_read_index_preload(the_repository, NULL, 0);
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
@@ -1748,7 +1804,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			printf_ln(_("No local changes to save"));
 		goto done;
 	}
-	if (preserve_clean_history) {
+	if (preserve_clean_history && !(patch_mode || only_staged)) {
 		clean_status_invalidate_current_proof(the_repository->index);
 		if (clean_status_should_write_fsmonitor_config(
 			    the_repository->index))
@@ -1773,6 +1829,33 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			    interactive_opts, only_staged, &info, &patch, quiet)) {
 		ret = -1;
 		goto done;
+	}
+	if (preserve_clean_history && (patch_mode || only_staged)) {
+		/*
+		 * A cancelled selection has not changed the worktree. Invalidate
+		 * only after it succeeds, but before publishing the stash. Patch
+		 * selection may have loaded its private index into repo->index,
+		 * so reread the original selected index under a fresh lock.
+		 */
+		if (repo_hold_locked_index(the_repository, &index_lock,
+					   LOCK_REPORT_ON_ERROR) < 0) {
+			ret = error(_("could not write index"));
+			goto done;
+		}
+		discard_index(the_repository->index);
+		if (repo_read_index(the_repository) < 0) {
+			ret = error(_("could not read index"));
+			goto done;
+		}
+		clean_status_invalidate_current_proof(the_repository->index);
+		if (clean_status_should_write_fsmonitor_config(
+			    the_repository->index))
+			the_repository->index->cache_changed |= FSMONITOR_CHANGED;
+		if (write_locked_index(the_repository->index, &index_lock,
+				       COMMIT_LOCK | SKIP_IF_UNCHANGED)) {
+			ret = error(_("could not write index"));
+			goto done;
+		}
 	}
 
 	if (do_store_stash(&info.w_commit, stash_msg_buf.buf, 1)) {

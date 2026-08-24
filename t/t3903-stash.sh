@@ -953,6 +953,31 @@ test_expect_success 'store called with non-stash commit' '
 	test_must_fail git stash store HEAD
 '
 
+test_expect_success 'stash store and push support explicit SHA-256 repositories' '
+	test_when_finished "rm -rf stash-explicit-sha256" &&
+	git init --object-format=sha256 stash-explicit-sha256 &&
+	(
+		cd stash-explicit-sha256 &&
+		git config core.fsmonitor false &&
+		test "$(git rev-parse --show-object-format)" = sha256 &&
+		echo original >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		echo stored >tracked &&
+		oid=$(git stash create) &&
+		test "${#oid}" -eq 64 &&
+		git stash store -m stored "$oid" &&
+		test "$oid" = "$(git rev-parse refs/stash)" &&
+		test "$oid" = "$(git reflog --format=%H -1 refs/stash)" &&
+		git stash clear &&
+		echo pushed >tracked &&
+		git stash push -m pushed -- tracked &&
+		test "$(cat tracked)" = original &&
+		git stash pop &&
+		test "$(cat tracked)" = pushed
+	)
+'
+
 test_expect_success 'store updates stash ref and reflog' '
 	git stash clear &&
 	git reset --hard &&
