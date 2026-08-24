@@ -202,15 +202,20 @@ test_expect_success MACOS 'rescue a delayed FSEvents cookie after timeout' '
 	git init test_delayed_cookie &&
 	(
 		GIT_TEST_FSMONITOR_COOKIE_DELAY_MS=1200 &&
-		GIT_TRACE_FSMONITOR="$PWD/delayed-cookie.trace" &&
-		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS GIT_TRACE_FSMONITOR &&
-		git -C test_delayed_cookie fsmonitor--daemon start \
-			--start-timeout=10
+		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS &&
+		start_daemon -C test_delayed_cookie \
+			--tf "$PWD/delayed-cookie.trace" --tk true
 	) &&
 
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
 	test-tool -C test_delayed_cookie fsmonitor-client query \
-		--token 0 >actual 2>error &&
-	test_file_not_empty actual &&
+		--token "$token" >actual 2>error &&
+	nul_to_q <actual >actual-q &&
+	response=$(sed -n "s/Q.*//p" actual-q) &&
+	test "${response%:*}" = "${token%:*}" &&
+	test_grep "^builtin:.*Q$" actual-q &&
+	test_grep ! "Q/Q" actual-q &&
+	test_grep ! "Q//Q" actual-q &&
 	test_grep "cookie_wait: requesting FSEvents flush after initial timeout" \
 		delayed-cookie.trace &&
 	test_grep "cookie-seen:" delayed-cookie.trace &&
@@ -224,15 +229,18 @@ test_expect_success MACOS 'fall back when a delayed FSEvents cookie stays late' 
 	git init test_lost_cookie &&
 	(
 		GIT_TEST_FSMONITOR_COOKIE_DELAY_MS=2500 &&
-		GIT_TRACE_FSMONITOR="$PWD/lost-cookie.trace" &&
-		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS GIT_TRACE_FSMONITOR &&
-		git -C test_lost_cookie fsmonitor--daemon start \
-			--start-timeout=10
+		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS &&
+		start_daemon -C test_lost_cookie \
+			--tf "$PWD/lost-cookie.trace" --tk true
 	) &&
 
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
 	test-tool -C test_lost_cookie fsmonitor-client query \
-		--token 0 >actual 2>error &&
-	test_file_not_empty actual &&
+		--token "$token" >actual 2>error &&
+	nul_to_q <actual >actual-q &&
+	response=$(sed -n "s/Q.*//p" actual-q) &&
+	test "${response%:*}" != "${token%:*}" &&
+	test_grep "Q/Q$" actual-q &&
 	test_grep "cookie_wait: requesting FSEvents flush after initial timeout" \
 		lost-cookie.trace &&
 	test_grep "cookie_wait timed out$" lost-cookie.trace &&
