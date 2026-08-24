@@ -375,4 +375,36 @@ test_expect_success 'signature query parameters are redacted' '
 	done
 '
 
+test_expect_success 'error targets redact URLs without changing stderr' '
+	test_when_finished "rm trace.normal trace.perf trace.event stderr" &&
+	url="https://example.com/?sig=secret." &&
+	message="unable to access $SQ$url$SQ" &&
+	expect="unable to access ${SQ}https://example.com/?sig=<REDACTED>$SQ" &&
+	GIT_TRACE2="$(pwd)/trace.normal" \
+	GIT_TRACE2_PERF="$(pwd)/trace.perf" \
+	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+		test-tool trace2 003error "$message" 2>stderr &&
+	test_grep -F "$expect" trace.normal &&
+	test_grep -F "$expect" trace.perf &&
+	test_grep -F "$expect" trace.event &&
+	test_grep -F "\"fmt\":\"%s\"" trace.event &&
+	test_grep -F "$message" stderr
+'
+
+test_expect_success 'error redaction finds adjacent URLs' '
+	test_when_finished "rm trace.event stderr" &&
+	message="https://example.com/#fragment,https://example.com/?sig=secret" &&
+	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+		test-tool trace2 003error "$message" 2>stderr &&
+	test_grep "\"event\":\"error\".*sig=<REDACTED>" trace.event
+'
+
+test_expect_success 'URL signature redaction can be disabled' '
+	test_when_finished "rm trace.event stderr" &&
+	GIT_TRACE2_REDACT=0 GIT_TRACE2_EVENT="$(pwd)/trace.event" \
+		test-tool trace2 003error "https://example.com/?sig=secret" 2>stderr &&
+	test_grep "\"event\":\"start\".*sig=secret" trace.event &&
+	test_grep "\"event\":\"error\".*sig=secret" trace.event
+'
+
 test_done
