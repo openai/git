@@ -9268,6 +9268,13 @@ test_expect_success 'pinned merge chain preserves recoverable overlap state' '
 			>publish.out 2>publish.err &&
 		test_grep "Pinned recovery session" publish.out &&
 		test_grep "No refs were updated" publish.out &&
+		session=$(sed -n \
+			"s/^Pinned recovery session: //p" publish.out) &&
+		test -n "$session" &&
+		sh "$codex_branch" verify-output \
+			--inputs "$session/codex-inputs" \
+			--updates "$session/codex-updates" \
+			--result "$session/codex-candidate" &&
 		snapshot_refs "$fixture_remote" >after-publish &&
 		test_cmp before after-publish
 	)

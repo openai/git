@@ -4672,6 +4672,10 @@ verify_merge_topology () (
 	if test -f "$state/pinned-merge-root"
 	then
 		prepare_pinned_merge_overlay "$state" "$root" "$base"
+		# A disjoint replay has one mechanically expected tree per commit.
+		# An overlapping replay may contain conflict resolutions, so its
+		# durable proof is the one-to-one commit and parent mapping below,
+		# not producer-local recovery state.
 		if test -f "$state/pinned-merge-disjoint-base"
 		then
 			LC_ALL=C sort -u "$source" \
@@ -4695,9 +4699,6 @@ verify_merge_topology () (
 					die "pinned merge replay changes its reviewed tree outside the moved base"
 			done <"$state/verified-tree-commits"
 			exec 3<&-
-		else
-			test -f "$state/pinned-merge-overlap-rebase" ||
-				die "overlapping pinned merge graph was not rebased by the controller"
 		fi
 	fi
 
