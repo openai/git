@@ -4743,7 +4743,8 @@ static void create_autostash_internal(struct repository *r,
 		struct child_process stash = CHILD_PROCESS_INIT;
 		struct reset_working_tree_options ropts = {
 			.flags = RESET_WORKING_TREE_HARD |
-				 RESET_WORKING_TREE_UPDATE_HEAD,
+				 RESET_WORKING_TREE_UPDATE_HEAD |
+				 RESET_WORKING_TREE_PRESERVE_SEMANTIC_HISTORY,
 		};
 		struct object_id oid;
 

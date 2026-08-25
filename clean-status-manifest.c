@@ -3,6 +3,7 @@
 #include "attr.h"
 #include "attr-manifest.h"
 #include "bloom.h"
+#include "clean-status.h"
 #include "clean-status-config.h"
 #include "clean-status-index.h"
 #include "clean-status-internal.h"
@@ -22,8 +23,10 @@
 #include "read-cache-ll.h"
 #include "replace-object.h"
 #include "repository.h"
+#include "semantic-verify.h"
 #include "semantic-verify-internal.h"
 #include "sparse-index.h"
+#include "string-list.h"
 #include "trace2.h"
 #include "tree.h"
 #include "tree-walk.h"
@@ -37,6 +40,18 @@ struct invalidate_manifest_data {
 	const struct strbuf *current;
 	int invalidated;
 };
+
+/*
+ * Only the second provider query after a closed semantic proof may reuse its
+ * manifest. A directory delta must authenticate every affected attribute
+ * source, hash, and absence; its tracked and untracked entries remain dirty.
+ * Directory timestamps never establish tracked-file content.
+ */
+static struct {
+	struct index_state *index;
+	const struct semantic_verify_proof *proof;
+	unsigned reused : 1;
+} manifest_directory_delta;
 
 static int build_manifest(struct index_state *istate,
 			  struct strbuf *manifest,
@@ -137,6 +152,348 @@ static int find_manifest_entry(
 		}
 	}
 	return -1;
+}
+
+void clean_status_manifest_begin_directory_delta(
+	struct index_state *istate, const struct semantic_verify_proof *proof)
+{
+	if (manifest_directory_delta.index)
+		BUG("nested clean-status directory delta");
+	if (!proof || !semantic_verify_proof_is_current(istate, proof))
+		return;
+	manifest_directory_delta.index = istate;
+	manifest_directory_delta.proof = proof;
+	manifest_directory_delta.reused = 0;
+}
+
+int clean_status_manifest_end_directory_delta(struct index_state *istate)
+{
+	int reused;
+
+	if (manifest_directory_delta.index != istate)
+		return 0;
+	reused = manifest_directory_delta.reused;
+	manifest_directory_delta.index = NULL;
+	manifest_directory_delta.proof = NULL;
+	manifest_directory_delta.reused = 0;
+	return reused;
+}
+
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+static int directory_manifest_entry_path_compare(
+	const struct attr_manifest_entry *entry, const char *name)
+{
+	size_t len = strlen(name);
+	size_t common = entry->path_len < len ? entry->path_len : len;
+	int cmp = memcmp(entry->path, name, common);
+
+	if (cmp)
+		return cmp;
+	return entry->path_len < len ? -1 : entry->path_len > len;
+}
+
+static int directory_attribute_source_matches(
+	struct index_state *istate, struct semantic_verify_path *path,
+	const char *name, const struct attr_manifest_entry *entry,
+	size_t position)
+{
+	const struct cache_entry *indexed;
+	const struct git_hash_algo *algo = istate->repo->hash_algo;
+	const char *basename;
+	unsigned char observed[GIT_MAX_RAWSZ];
+	struct stat st;
+	int parent_fd, found, pos;
+
+	if (semantic_verify_resolve_parent(path, name, position,
+					   &parent_fd, &basename))
+		return 0;
+	if (fstatat(parent_fd, basename, &st, AT_SYMLINK_NOFOLLOW)) {
+		if (errno != ENOENT)
+			return 0;
+	} else if (!S_ISREG(st.st_mode) || st.st_nlink != 1) {
+		return 0;
+	}
+	if (worktree_attr_source_read(path, name, position, algo,
+				      observed, &found))
+		return 0;
+	if (found)
+		return entry && entry->source == ATTR_MANIFEST_WORKTREE &&
+			!memcmp(entry->hash, observed, algo->rawsz);
+	if (!fstatat(parent_fd, basename, &st, AT_SYMLINK_NOFOLLOW) ||
+	    errno != ENOENT)
+		return 0;
+	pos = index_name_pos(istate, name, strlen(name));
+	if (pos < 0)
+		return !entry;
+	indexed = istate->cache[pos];
+	if (!S_ISREG(indexed->ce_mode) || ce_stage(indexed) ||
+	    ce_skip_worktree(indexed) || ce_intent_to_add(indexed) ||
+	    (indexed->ce_flags & CE_VALID))
+		return 0;
+	return entry && entry->source == ATTR_MANIFEST_INDEX &&
+		!memcmp(entry->hash, indexed->oid.hash, algo->rawsz);
+}
+#endif
+
+int clean_status_manifest_path_attributes_unchanged(
+	const struct index_state *istate, const char *name)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	const struct clean_status_state *state =
+		istate ? istate->clean_status : NULL;
+	const struct git_hash_algo *algo;
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	struct strbuf candidate = STRBUF_INIT;
+	const char *slash = name;
+	unsigned int namespace_unstable = 0;
+	size_t position = 0;
+	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+	int safe = 0;
+
+	if (!istate || !istate->repo || !name || !*name ||
+	    !verify_path(name, 0) ||
+	    !clean_status_fsmonitor_backoff_suspended(istate) ||
+	    istate->split_index || istate->sparse_index != INDEX_EXPANDED ||
+	    istate->cache_nr > INT_MAX || !state ||
+	    !state->manifest.current_valid || !state->manifest.checked ||
+	    state->manifest.current_invalidated ||
+	    state->manifest.global_fallback ||
+	    (state->manifest.current_flags & required) != required)
+		return 0;
+	algo = istate->repo->hash_algo;
+	if (!algo || !attr_manifest_valid(state->manifest.current.buf,
+					state->manifest.current.len, algo) ||
+	    semantic_verify_root_init(istate->repo, &root))
+		goto done;
+	path = semantic_verify_path_new(root);
+	if (!path)
+		goto done;
+
+	/* The root source applies even to a path without any slash. */
+	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+	for (;;) {
+		struct attr_manifest_entry entry;
+		const struct attr_manifest_entry *historical = NULL;
+		int pos;
+
+		if (candidate.len > INT_MAX)
+			goto done;
+		if (!find_manifest_entry(&state->manifest.current,
+					 candidate.buf, algo, &entry))
+			historical = &entry;
+		/*
+		 * Attribute fallback can read stage #2 of an unmerged path.
+		 * The shared matcher accepts only stage #0, so do not mistake
+		 * an unmerged source for historical absence. The expanded-index
+		 * guard above makes this lookup non-mutating.
+		 */
+		pos = index_name_pos((struct index_state *)istate,
+				     candidate.buf, candidate.len);
+		if (pos < 0) {
+			unsigned int first = -(pos + 1);
+
+			if (first < istate->cache_nr &&
+			    !strcmp(istate->cache[first]->name, candidate.buf))
+				goto done;
+		}
+		if (!directory_attribute_source_matches(
+				(struct index_state *)istate, path, candidate.buf,
+				historical, position++))
+			goto done;
+		slash = strchr(slash, '/');
+		if (!slash)
+			break;
+		strbuf_reset(&candidate);
+		strbuf_add(&candidate, name, slash - name + 1);
+		strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+		slash++;
+	}
+
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	path = NULL;
+	safe = !namespace_unstable && semantic_verify_root_stable(root);
+
+done:
+	if (path)
+		semantic_verify_path_free(path, NULL, NULL);
+	semantic_verify_root_clear(root);
+	strbuf_release(&candidate);
+	return safe;
+#else
+	(void)istate;
+	(void)name;
+	return 0;
+#endif
+}
+
+int clean_status_manifest_directory_unchanged(
+	struct index_state *istate, const char *directory)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	struct clean_status_state *state = istate->clean_status;
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	struct clean_status_index_snapshot snapshot;
+	struct clean_status_config_digest config;
+	struct attr_fingerprint attrs;
+	struct attr_manifest_cursor manifest_cursor;
+	struct attr_manifest_entry manifest_entry;
+	struct string_list candidates = STRING_LIST_INIT_DUP;
+	struct strbuf candidate = STRBUF_INIT;
+	const struct git_hash_algo *algo = istate->repo->hash_algo;
+	const char *previous = NULL;
+	unsigned int first, namespace_unstable = 0;
+	size_t len, previous_len = 0;
+	int pos, manifest_ret, pinned = 0, safe = 0;
+	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+
+	if (manifest_directory_delta.index != istate ||
+	    !manifest_directory_delta.proof ||
+	    !fsmonitor_pending_token_from_provider(istate) ||
+	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC ||
+	    !fstat_is_reliable() || getenv(INDEX_ENVIRONMENT) ||
+	    istate != istate->repo->index || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    repo_config_values(istate->repo)->apply_sparse_checkout || !state ||
+	    !state->current_config_valid || !state->current_semantic_valid ||
+	    !state->current_tracked_policy_valid || !state->current_attr_valid ||
+	    !state->config_enforced ||
+	    (state->filter_configured && !state->filter_scope_valid) ||
+	    !state->manifest.scan_count || !state->manifest.current_valid ||
+	    !state->manifest.checked || state->manifest.current_invalidated ||
+	    state->manifest.global_fallback ||
+	    (state->manifest.current_flags & required) != required ||
+	    !semantic_verify_proof_is_current(
+		istate, manifest_directory_delta.proof) ||
+	    clean_status_config_read_repository(istate->repo, &config) ||
+	    !config.finalized ||
+	    config.filter_configured != state->filter_configured ||
+	    config.semantic_config_explicit != state->current_semantic_explicit ||
+	    memcmp(config.hash, state->current_config_hash, algo->rawsz) ||
+	    memcmp(config.semantic_hash, state->current_semantic_hash,
+		   algo->rawsz) ||
+	    memcmp(config.tracked_policy_hash,
+		   state->current_tracked_policy_hash, algo->rawsz) ||
+	    attr_fingerprint_repository(istate->repo, &attrs) ||
+	    attrs.sources_present != state->current_attr_sources_present ||
+	    memcmp(attrs.content_hash, state->current_attr_hash, algo->rawsz) ||
+	    memcmp(attrs.namespace_hash,
+		   state->current_attr_namespace_hash, algo->rawsz) ||
+	    !attr_manifest_valid(state->manifest.current.buf,
+				 state->manifest.current.len, algo))
+		goto done;
+
+	len = strlen(directory);
+	if (!len || directory[len - 1] != '/')
+		goto done;
+	pos = index_name_pos(istate, directory, len);
+	if (pos >= 0)
+		goto done;
+	first = -pos - 1;
+	if (first >= istate->cache_nr ||
+	    !starts_with(istate->cache[first]->name, directory))
+		goto done;
+	if (clean_status_index_snapshot_pin_proof_epoch(&snapshot, istate))
+		goto done;
+	pinned = 1;
+	if (semantic_verify_root_init(istate->repo, &root))
+		goto done;
+	path = semantic_verify_path_new(root);
+	if (!path)
+		goto done;
+
+	strbuf_addstr(&candidate, directory);
+	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+	string_list_append(&candidates, candidate.buf);
+	for (unsigned int i = first; i < istate->cache_nr &&
+	     starts_with(istate->cache[i]->name, directory); i++) {
+		const struct cache_entry *ce = istate->cache[i];
+		const char *slash = ce->name + len;
+
+		if (ce_stage(ce) || ce_skip_worktree(ce) ||
+		    ce_intent_to_add(ce) || (ce->ce_flags & CE_VALID) ||
+		    S_ISSPARSEDIR(ce->ce_mode))
+			goto done;
+		while ((slash = strchr(slash, '/')) != NULL) {
+			size_t parent_len = slash - ce->name;
+
+			if (!previous || previous_len <= parent_len ||
+			    previous[parent_len] != '/' ||
+			    memcmp(previous, ce->name, parent_len)) {
+				strbuf_reset(&candidate);
+				strbuf_add(&candidate, ce->name, parent_len + 1);
+				strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+				string_list_append(&candidates, candidate.buf);
+			}
+			slash++;
+		}
+		previous = ce->name;
+		previous_len = ce_namelen(ce);
+	}
+	string_list_sort(&candidates);
+	string_list_remove_duplicates(&candidates, 0);
+	if (attr_manifest_cursor_init(&manifest_cursor,
+				      state->manifest.current.buf,
+				      state->manifest.current.len, algo))
+		goto done;
+	manifest_ret = attr_manifest_cursor_next(&manifest_cursor,
+						 &manifest_entry);
+	for (size_t i = 0; i < candidates.nr; i++) {
+		const char *name = candidates.items[i].string;
+		const struct attr_manifest_entry *entry = NULL;
+
+		while (manifest_ret > 0 &&
+		       directory_manifest_entry_path_compare(
+			       &manifest_entry, name) < 0)
+			manifest_ret = attr_manifest_cursor_next(
+				&manifest_cursor, &manifest_entry);
+		if (manifest_ret < 0)
+			goto done;
+		if (manifest_ret > 0 &&
+		    !directory_manifest_entry_path_compare(
+			    &manifest_entry, name))
+			entry = &manifest_entry;
+		if (!directory_attribute_source_matches(
+				istate, path, name, entry,
+				first + i))
+			goto done;
+	}
+
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	path = NULL;
+	if (namespace_unstable || !semantic_verify_root_stable(root) ||
+	    !clean_status_index_snapshot_still_matches_proof_epoch(
+		&snapshot, istate) ||
+	    !semantic_verify_proof_is_current(
+		istate, manifest_directory_delta.proof) ||
+	    attr_fingerprint_repository(istate->repo, &attrs) ||
+	    attrs.sources_present != state->current_attr_sources_present ||
+	    memcmp(attrs.content_hash, state->current_attr_hash, algo->rawsz) ||
+	    memcmp(attrs.namespace_hash,
+		   state->current_attr_namespace_hash, algo->rawsz))
+		goto done;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "semantic/manifest-directory-reused", 1);
+	manifest_directory_delta.reused = 1;
+	safe = 1;
+
+done:
+	if (path)
+		semantic_verify_path_free(path, NULL, NULL);
+	semantic_verify_root_clear(root);
+	if (pinned)
+		clean_status_index_snapshot_release(&snapshot);
+	string_list_clear(&candidates, 0);
+	strbuf_release(&candidate);
+	return safe;
+#else
+	(void)istate;
+	(void)directory;
+	return 0;
+#endif
 }
 
 int clean_status_manifest_reconcile_deleted_attribute(

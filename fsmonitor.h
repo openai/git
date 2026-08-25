@@ -2,6 +2,7 @@
 #define FSMONITOR_H
 
 #include "fsmonitor-ll.h"
+#include "clean-status.h"
 #include "dir.h"
 #include "fsmonitor-settings.h"
 #include "object.h"
@@ -36,6 +37,15 @@ struct fsmonitor_query_result {
 }
 
 void fsmonitor_query_result_release(struct fsmonitor_query_result *result);
+
+/*
+ * Encode an already classified and alias-resolved worktree event. The caller
+ * must have verified that worktree_len names the path's worktree prefix.
+ */
+void fsmonitor_format_worktree_paths(
+	struct strbuf *paths, const char *path, size_t worktree_len,
+	int is_file, int is_directory);
+
 enum fsmonitor_query_outcome fsmonitor_parse_builtin_response(
 	const struct strbuf *raw, struct fsmonitor_query_result *result);
 enum fsmonitor_query_outcome query_builtin_fsmonitor(
@@ -55,6 +65,11 @@ static inline int fsmonitor_stat_can_be_valid(const struct stat *st)
 }
 
 void fsmonitor_invalidate_semantics(struct index_state *istate);
+
+/* Bound conservative bootstrap to one index read; never issue a proof. */
+void fsmonitor_begin_scoped_bootstrap(struct index_state *istate);
+int fsmonitor_scoped_bootstrap_is_active(const struct index_state *istate);
+int fsmonitor_end_scoped_bootstrap(struct index_state *istate);
 
 /*
  * Check if refresh_fsmonitor has been called at least once.
@@ -108,8 +123,11 @@ static inline void mark_fsmonitor_valid(struct index_state *istate, struct cache
 static inline void mark_fsmonitor_invalid(struct index_state *istate, struct cache_entry *ce)
 {
 	enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(istate->repo);
+	int backoff = fsm_settings__is_watch_limit_backoff(istate->repo);
 
-	if (fsm_mode > FSMONITOR_MODE_DISABLED) {
+	if (fsm_mode > FSMONITOR_MODE_DISABLED || backoff) {
+		if (backoff)
+			clean_status_invalidate_current_proof(istate);
 		ce->ce_flags &= ~CE_FSMONITOR_VALID;
 		untracked_cache_invalidate_path(istate, ce->name, 1);
 		trace_printf_key(&trace_fsmonitor, "mark_fsmonitor_invalid '%s'", ce->name);

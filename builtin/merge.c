@@ -13,6 +13,8 @@
 
 #include "abspath.h"
 #include "advice.h"
+#include "clean-status-config.h"
+#include "clean-status.h"
 #include "config.h"
 #include "editor.h"
 #include "environment.h"
@@ -1373,6 +1375,7 @@ int cmd_merge(int argc,
 	struct commit_list *common = NULL;
 	const char *best_strategy = NULL, *wt_strategy = NULL;
 	struct commit_list *remoteheads = NULL, *p;
+	struct clean_status_config_digest clean_digest;
 	void *branch_to_free, *argv_to_free = NULL;
 	int orig_argc = argc;
 	int merge_log_config = -1;
@@ -1467,6 +1470,12 @@ int cmd_merge(int argc,
 		/* Invoke 'git commit' */
 		ret = cmd_commit(nargc, nargv, prefix, the_repository);
 		goto done;
+	}
+
+	if (fast_forward != FF_NO && !getenv(INDEX_ENVIRONMENT) &&
+	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
+		clean_status_enable_external_history(the_repository);
+		clean_status_set_config_digest(the_repository, &clean_digest);
 	}
 
 	if (repo_read_index_unmerged(the_repository))

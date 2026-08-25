@@ -8,7 +8,9 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "attr-fingerprint.h"
 #include "clean-status.h"
+#include "clean-status-index.h"
 #include "clean-status-sidecar.h"
 #include "config.h"
 #include "ewah/ewok.h"
@@ -17,19 +19,25 @@
 #include "commit.h"
 #include "environment.h"
 #include "gettext.h"
+#include "fsmonitor-ll.h"
+#include "fsmonitor.h"
 #include "fsmonitor-settings.h"
 #include "tag.h"
+#include "trace2.h"
 #include "diff.h"
 #include "diff-merges.h"
 #include "diffcore.h"
+#include "dir.h"
 #include "preload-index.h"
 #include "read-cache-ll.h"
 #include "revision.h"
 #include "log-tree.h"
 #include "setup.h"
+#include "thread-utils.h"
 #include "oid-array.h"
 #include "tree.h"
 #include "worktree.h"
+#include "wt-status.h"
 
 #define DIFF_NO_INDEX_EXPLICIT 1
 #define DIFF_NO_INDEX_IMPLICIT 2
@@ -43,6 +51,8 @@ static const char builtin_diff_usage[] =
 "   or: git diff [<options>] --no-index [--] <path> <path> [<pathspec>...]"
 "\n"
 COMMON_DIFF_OPTIONS_HELP;
+
+static int scoped_diff_bootstrap_used;
 
 static const char *blob_path(struct object_array_entry *entry)
 {
@@ -145,6 +155,8 @@ static void builtin_diff_index(struct rev_info *revs,
 			       int argc, const char **argv)
 {
 	unsigned int option = 0;
+	int scoped_bootstrap;
+
 	while (1 < argc) {
 		const char *arg = argv[1];
 		if (!strcmp(arg, "--cached") || !strcmp(arg, "--staged"))
@@ -163,8 +175,13 @@ static void builtin_diff_index(struct rev_info *revs,
 	    revs->max_count != -1 || revs->min_age != -1 ||
 	    revs->max_age != -1)
 		usage(builtin_diff_usage);
-	if (!(option & DIFF_INDEX_CACHED)) {
+	if (!(option & DIFF_INDEX_CACHED))
 		setup_work_tree(the_repository);
+	scoped_bootstrap = (option & DIFF_INDEX_CACHED) ||
+		diff_has_bounded_regular_pathspec(&revs->diffopt.pathspec);
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
+	if (!(option & DIFF_INDEX_CACHED)) {
 		if (repo_read_index_preload(the_repository,
 					    &revs->diffopt.pathspec, 0) < 0) {
 			die_errno("repo_read_index_preload");
@@ -172,6 +189,9 @@ static void builtin_diff_index(struct rev_info *revs,
 	} else if (repo_read_index(the_repository) < 0) {
 		die_errno("repo_read_cache");
 	}
+	if (scoped_bootstrap)
+		scoped_diff_bootstrap_used |=
+			fsmonitor_end_scoped_bootstrap(the_repository->index);
 	run_diff_index(revs, option);
 }
 
@@ -239,27 +259,221 @@ static void builtin_diff_combined(struct rev_info *revs,
 	oid_array_clear(&parents);
 }
 
+static pthread_mutex_t diff_refresh_warning_mutex;
+static int diff_refresh_warning_seen;
+
+static void capture_diff_refresh_warning(const char *message UNUSED,
+					 va_list params UNUSED)
+{
+	pthread_mutex_lock(&diff_refresh_warning_mutex);
+	diff_refresh_warning_seen = 1;
+	pthread_mutex_unlock(&diff_refresh_warning_mutex);
+}
+
+static int can_close_diff_fsmonitor_token(struct index_state *istate)
+{
+	return fsmonitor_pending_token_from_provider(istate) &&
+		fstat_is_reliable() &&
+		the_repository->config_values_private_.trust_ctime &&
+		the_repository->config_values_private_.check_stat &&
+		!getenv(INDEX_ENVIRONMENT) &&
+		!istate->split_index && istate->sparse_index == INDEX_EXPANDED &&
+		!unmerged_index(istate) &&
+		fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_IPC;
+}
+
+static int reuse_diff_recovery_observations(
+	struct index_state *istate,
+	const struct clean_status_index_snapshot *source)
+{
+	struct attr_source_snapshot *attrs = NULL;
+	struct clean_status_proof_epoch *epoch = NULL;
+	int reused = 0;
+	unsigned int i;
+
+	if (!clean_status_index_snapshot_still_matches_proof_epoch(
+		    source, istate) ||
+	    !clean_status_index_can_reuse_source_logical_hash(istate) ||
+	    !clean_status_fsmonitor_semantic_baseline_pending(istate) ||
+	    clean_status_fsmonitor_strong_mismatch(istate) ||
+	    clean_status_filter_scope_needs_validation(istate) ||
+	    clean_status_manifest_global_fallback(istate) ||
+	    clean_status_worktree_manifest_needs_refresh(istate) ||
+	    clean_status_capture_attr_snapshot(istate, &attrs) || !attrs)
+		goto done;
+
+	epoch = clean_status_capture_proof_epoch(istate, attrs, 0);
+	if (!epoch || !clean_status_proof_epoch_prime_matches(istate, epoch))
+		goto done;
+
+	/* Observations made before the proof epoch cannot certify tracked files. */
+	for (i = 0; i < istate->cache_nr; i++)
+		istate->cache[i]->ce_flags &=
+			~(CE_UPTODATE | CE_FSMONITOR_VALID);
+	preload_index_bulk_result_clear(istate);
+	reused = 1;
+	trace2_data_intmax("diff", istate->repo,
+			   "recovery/reused-provider-observations", 1);
+
+done:
+	clean_status_release_proof_epoch(epoch);
+	attr_source_snapshot_free(attrs);
+	return reused;
+}
+
 static void refresh_index_quietly(void)
 {
 	struct lock_file lock_file = LOCK_INIT;
+	struct index_state *istate = the_repository->index;
+	int can_close_token;
+	int preserve_untracked;
 	int fd;
+	int refreshed;
 
-	if (!use_optional_locks())
+	if (!use_optional_locks() ||
+	    fsm_settings__is_watch_limit_backoff(the_repository))
 		return;
 
+	can_close_token = can_close_diff_fsmonitor_token(istate);
+	if (can_close_token &&
+	    !repo_config_values(the_repository)->apply_sparse_checkout &&
+	    istate->untracked &&
+	    istate->untracked->root &&
+	    istate->fsmonitor_untracked_extension_seen &&
+	    !istate->fsmonitor_untracked_extension_invalid &&
+	    !istate->fsmonitor_untracked_valid) {
+		struct clean_status_index_snapshot source = { .fd = -1 };
+		struct clean_status_config_digest digest;
+		struct object_id exclude_digest;
+		struct stat scanned_worktree;
+		struct wt_status status;
+		report_fn original_warning;
+		int proof_complete;
+		int warning_seen;
+
+		if (clean_status_index_snapshot_open_allow_null_checksum(
+			    &source, repo_get_index_file(the_repository),
+			    the_repository->hash_algo))
+			return;
+		if (clean_status_config_read_repository(the_repository,
+						       &digest)) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		clean_status_set_config_digest(the_repository, &digest);
+		if (!reuse_diff_recovery_observations(istate, &source)) {
+			discard_index(istate);
+			repo_read_index(the_repository);
+		}
+		if (!clean_status_index_snapshot_still_matches_proof_epoch(
+			    &source, istate)) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		refresh_fsmonitor(istate);
+		if (!can_close_diff_fsmonitor_token(istate) ||
+		    repo_config_values(the_repository)->apply_sparse_checkout ||
+		    !istate->untracked || !istate->untracked->root ||
+		    !istate->fsmonitor_untracked_extension_seen ||
+		    istate->fsmonitor_untracked_extension_invalid ||
+		    istate->fsmonitor_untracked_valid) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		if (HAVE_THREADS &&
+		    pthread_mutex_init(&diff_refresh_warning_mutex, NULL)) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		diff_refresh_warning_seen = 0;
+		original_warning = get_warn_routine();
+		set_warn_routine(capture_diff_refresh_warning);
+		wt_status_prepare(the_repository, &status);
+		status.certify_clean_status = 1;
+		status.show_untracked_files = istate->untracked->dir_flags ?
+			SHOW_NORMAL_UNTRACKED_FILES : SHOW_ALL_UNTRACKED_FILES;
+		wt_status_start_untracked_cache_preload(&status);
+		wt_status_refresh_index(&status,
+					REFRESH_QUIET | REFRESH_UNMERGED |
+					REFRESH_DEFER_BULK_DIRTY, 1);
+		proof_complete = !status.certify_untracked_scan_failed &&
+			!wt_status_certified_excludes_digest(
+				&status, &exclude_digest, &scanned_worktree) &&
+			!fsmonitor_has_pending_token(istate) &&
+			istate->fsmonitor_untracked_valid &&
+			istate->fsmonitor_last_update &&
+			istate->fsmonitor_untracked_token &&
+			!strcmp(istate->fsmonitor_last_update,
+				istate->fsmonitor_untracked_token) &&
+			(!istate->clean_status ||
+			 clean_status_revalidated_token_matches(istate));
+		wt_status_collect_free_buffers(&status);
+		set_warn_routine(original_warning);
+		pthread_mutex_lock(&diff_refresh_warning_mutex);
+		warning_seen = diff_refresh_warning_seen;
+		pthread_mutex_unlock(&diff_refresh_warning_mutex);
+		pthread_mutex_destroy(&diff_refresh_warning_mutex);
+		string_list_clear(&status.untracked, 0);
+		string_list_clear(&status.ignored, 0);
+		free(status.branch);
+		if (!proof_complete || warning_seen) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		fd = repo_hold_locked_index(the_repository, &lock_file, 0);
+		if (fd < 0) {
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		if (!clean_status_index_snapshot_still_matches_path(
+			    &source, repo_get_index_file(the_repository),
+			    the_repository->hash_algo)) {
+			rollback_lock_file(&lock_file);
+			clean_status_index_snapshot_release(&source);
+			return;
+		}
+		repo_update_index_if_able(the_repository, &lock_file);
+		clean_status_index_snapshot_release(&source);
+		return;
+	}
 	fd = repo_hold_locked_index(the_repository, &lock_file, 0);
 	if (fd < 0)
 		return;
-	discard_index(the_repository->index);
+	discard_index(istate);
 	repo_read_index(the_repository);
-	refresh_index(the_repository->index, REFRESH_QUIET|REFRESH_UNMERGED, NULL, NULL,
-		      NULL);
+	can_close_token = can_close_diff_fsmonitor_token(istate);
+	refreshed = refresh_index(istate,
+			REFRESH_QUIET | REFRESH_UNMERGED |
+			(can_close_token ? REFRESH_IN_PROOF_EPOCH : 0),
+			NULL, NULL, NULL);
+	preserve_untracked = istate->untracked &&
+		istate->untracked->fsmonitor_revalidation;
+	/* A complete tracked refresh cannot also authenticate untracked files. */
+	if (!refreshed && can_close_token &&
+	    fsmonitor_pending_token_from_provider(istate) &&
+	    fsmonitor_query_pending_token(istate, 0) == FSMONITOR_TOKEN_CLEAN) {
+		clean_status_mark_fsmonitor_config_valid(
+			istate, istate->fsmonitor_last_update_pending);
+		fsmonitor_accept_pending_token(istate, 0, 0);
+		if (preserve_untracked &&
+		    clean_status_revalidated_token_matches(istate)) {
+			/*
+			 * Preserve directory snapshots only as candidates. Their
+			 * pending proof requires a full untracked revalidation.
+			 */
+			istate->untracked->fsmonitor_revalidation = 1;
+			istate->fsmonitor_untracked_token =
+				xstrdup(istate->fsmonitor_last_update);
+			clean_status_begin_fsmonitor_semantic_baseline(istate);
+		}
+	}
 	repo_update_index_if_able(the_repository, &lock_file);
 }
 
 static void builtin_diff_files(struct rev_info *revs, int argc, const char **argv)
 {
 	unsigned int options = 0;
+	int scoped_bootstrap;
 
 	while (1 < argc && argv[1][0] == '-') {
 		if (!strcmp(argv[1], "--base"))
@@ -290,10 +504,17 @@ static void builtin_diff_files(struct rev_info *revs, int argc, const char **arg
 		diff_merges_set_dense_combined_if_unset(revs);
 
 	setup_work_tree(the_repository);
+	scoped_bootstrap =
+		diff_has_bounded_regular_pathspec(&revs->diffopt.pathspec);
+	if (scoped_bootstrap)
+		fsmonitor_begin_scoped_bootstrap(the_repository->index);
 	if (repo_read_index_preload(the_repository, &revs->diffopt.pathspec,
 				    0) < 0) {
 		die_errno("repo_read_index_preload");
 	}
+	if (scoped_bootstrap)
+		scoped_diff_bootstrap_used |=
+			fsmonitor_end_scoped_bootstrap(the_repository->index);
 	run_diff_files(revs, options);
 }
 
@@ -415,9 +636,8 @@ void prepare_diff_external_history(struct repository *repo)
 	    repo_config_values(repo)->apply_sparse_checkout)
 		goto done;
 	worktree = get_current_worktree(repo);
-	if (!worktree || !is_main_worktree(worktree) ||
-	    clean_status_config_read_repository(repo, &digest) ||
-	    digest.filter_configured)
+	if (!worktree ||
+	    clean_status_config_read_repository(repo, &digest))
 		goto done;
 	clean_status_set_config_digest(repo, &digest);
 	clean_status_enable_external_history(repo);
@@ -440,6 +660,8 @@ int cmd_diff(int argc,
 	int nongit = 0, no_index = 0;
 	int result;
 	struct symdiff sdiff;
+
+	scoped_diff_bootstrap_used = 0;
 
 	/*
 	 * We could get N tree-ish in the rev.pending_objects list.
@@ -677,7 +899,8 @@ int cmd_diff(int argc,
 				      ent.objects, ent.nr,
 				      first_non_parent);
 	result = diff_result_code(&rev);
-	if (1 < rev.diffopt.skip_stat_unmatch)
+	if (1 < rev.diffopt.skip_stat_unmatch &&
+	    !scoped_diff_bootstrap_used)
 		refresh_index_quietly();
 	release_revisions(&rev);
 	object_array_clear(&ent);

@@ -9,6 +9,7 @@
 #include "builtin.h"
 #include "abspath.h"
 #include "advice.h"
+#include "clean-status.h"
 #include "config.h"
 #include "editor.h"
 #include "environment.h"
@@ -2463,6 +2464,8 @@ int cmd_am(int argc,
 
 	/* Ensure a valid committer ident can be constructed */
 	git_committer_info(IDENT_STRICT);
+
+	clean_status_prepare_main_index_history(the_repository);
 
 	if (repo_read_index_preload(the_repository, NULL, 0) < 0)
 		die(_("failed to read the index"));

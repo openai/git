@@ -5,10 +5,14 @@
  */
 #define USE_THE_REPOSITORY_VARIABLE
 #include "builtin.h"
+#include "abspath.h"
+#include "clean-status.h"
+#include "clean-status-config.h"
 #include "config.h"
 #include "environment.h"
 #include "gettext.h"
 #include "hex.h"
+#include "strbuf.h"
 #include "tree.h"
 #include "cache-tree.h"
 #include "parse-options.h"
@@ -18,11 +22,50 @@ static const char * const write_tree_usage[] = {
 	NULL
 };
 
+static int write_tree_config(const char *key, const char *value,
+			     const struct config_context *ctx, void *data)
+{
+	clean_status_config_add(data, key, value, ctx);
+	return git_default_config(key, value, ctx, NULL);
+}
+
+static int write_tree_uses_worktree_index(void)
+{
+	const char *index_file = getenv(INDEX_ENVIRONMENT);
+	struct strbuf worktree_index = STRBUF_INIT;
+	struct stat st;
+	char *expected = NULL, *expected_lock = NULL, *actual = NULL;
+	int matches = 0;
+
+	if (!index_file)
+		return 1;
+	if (lstat(index_file, &st) || !S_ISREG(st.st_mode))
+		return 0;
+
+	strbuf_addf(&worktree_index, "%s/index",
+		    repo_get_git_dir(the_repository));
+	expected = real_pathdup(worktree_index.buf, 0);
+	actual = real_pathdup(index_file, 0);
+	if (expected && actual) {
+		expected_lock = xstrfmt("%s.lock", expected);
+		if (!strcmp(expected, actual) ||
+		    !strcmp(expected_lock, actual))
+			matches = 1;
+	}
+
+	free(expected);
+	free(expected_lock);
+	free(actual);
+	strbuf_release(&worktree_index);
+	return matches;
+}
+
 int cmd_write_tree(int argc,
 		   const char **argv,
 		   const char *cmd_prefix,
 		   struct repository *repo UNUSED)
 {
+	struct clean_status_config_digest clean_digest;
 	int flags = 0, ret;
 	const char *tree_prefix = NULL;
 	struct object_id oid;
@@ -44,7 +87,19 @@ int cmd_write_tree(int argc,
 		OPT_END()
 	};
 
-	repo_config(the_repository, git_default_config, NULL);
+	show_usage_with_options_if_asked(argc, argv,
+					 write_tree_usage, write_tree_options);
+
+	if (write_tree_uses_worktree_index()) {
+		clean_status_config_init(&clean_digest,
+					 the_repository->hash_algo);
+		repo_config(the_repository, write_tree_config, &clean_digest);
+		clean_status_config_final(&clean_digest);
+		clean_status_set_config_digest(the_repository, &clean_digest);
+		clean_status_enable_external_history(the_repository);
+	} else {
+		repo_config(the_repository, git_default_config, NULL);
+	}
 	argc = parse_options(argc, argv, cmd_prefix, write_tree_options,
 			     write_tree_usage, 0);
 

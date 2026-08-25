@@ -410,15 +410,18 @@ static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
 	if (test_env_value < 0)
 		test_env_value = git_env_bool("GIT_TEST_FSMONITOR_TOKEN", 0);
 
+#ifdef __APPLE__
+	strbuf_addstr(&token->token_id,
+		      FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX);
+#endif
+	strbuf_addstr(&token->token_id,
+		      FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX);
+
 	if (!test_env_value) {
 		struct timeval tv;
 		struct tm tm;
 		time_t secs;
 
-#ifdef __APPLE__
-		strbuf_addstr(&token->token_id,
-			      FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX);
-#endif
 		gettimeofday(&tv, NULL);
 		secs = tv.tv_sec;
 		gmtime_r(&secs, &tm);
@@ -710,6 +713,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	int do_flush = 0;
 	int do_cookie = 0;
 	int invalid_binding = 0;
+	int hardlink_aware_query = 0;
 	enum fsmonitor_cookie_item_result cookie_result;
 
 	if (strcmp(command, "quit") &&
@@ -719,8 +723,14 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 		const char *identity;
 		const char *query;
 
-		if (!skip_prefix(command, FSMONITOR_IPC_QUERY_PREFIX,
-				 &identity) ||
+		if (skip_prefix(command, FSMONITOR_IPC_HARDLINK_QUERY_PREFIX,
+				&identity))
+			hardlink_aware_query = 1;
+		else if (!skip_prefix(command, FSMONITOR_IPC_QUERY_PREFIX,
+				      &identity))
+			identity = NULL;
+
+		if (!identity ||
 		    !(query = strchr(identity, '\n')) ||
 		    query - identity != FSMONITOR_IPC_WORKTREE_ID_HEX ||
 		    state->worktree_identity.len != FSMONITOR_IPC_WORKTREE_ID_HEX ||
@@ -747,8 +757,11 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	if (!strcmp(command, FSMONITOR_IPC_CAPABILITY_COMMAND)) {
 		static const char capabilities[] =
 			FSMONITOR_IPC_QUERY_VERSION "\n"
+			FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
 #ifdef __APPLE__
+			FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
 			FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+			FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
 #endif
 			;
 
@@ -842,6 +855,14 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			error(_("fsmonitor: cookie_result '%d' != SEEN"),
 			      cookie_result);
 			do_trivial = 1;
+			/*
+			 * This boundary could not be synchronized. Retire it so
+			 * a later successful cookie cannot make an old client's
+			 * token appear complete again. An aborted cookie already
+			 * belongs to a listener-initiated reset.
+			 */
+			if (cookie_result == FCIR_ERROR)
+				do_flush = 1;
 		}
 	}
 
@@ -950,6 +971,10 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 		for (k = 0; k < batch->nr; k++) {
 			const char *s = batch->interned_paths[k];
 			size_t s_len;
+
+			if (!hardlink_aware_query &&
+			    starts_with(s, FSMONITOR_PATH_HARDLINK_INODE_PREFIX))
+				s = FSMONITOR_PATH_GLOBAL_INVALIDATE;
 
 			if (!strset_add(&shown, s))
 				duplicates++;

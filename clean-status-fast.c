@@ -22,9 +22,10 @@
 int clean_status_try_sidecar(
 	struct repository *repo UNUSED,
 	const struct clean_status_config_digest *config UNUSED,
-	int *repository_inputs_changed)
+	int *repository_inputs_changed, int *provider_reset)
 {
 	*repository_inputs_changed = 0;
+	*provider_reset = 0;
 	return 0;
 }
 
@@ -199,7 +200,7 @@ static int current_worktree_is_main(struct repository *repo)
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config,
-	int *repository_inputs_changed)
+	int *repository_inputs_changed, int *provider_reset)
 {
 	struct clean_status_sidecar_record record =
 		CLEAN_STATUS_SIDECAR_RECORD_INIT;
@@ -216,7 +217,9 @@ int clean_status_try_sidecar(
 	int ret = 0;
 
 	*repository_inputs_changed = 0;
-	if (!config->finalized || config->filter_configured ||
+	*provider_reset = 0;
+	if (!config->finalized ||
+	    (config->filter_configured && config->normalized_filter_disable) ||
 	    getenv(INDEX_ENVIRONMENT) || is_bare_repository(repo) ||
 	    !repo_get_work_tree(repo) ||
 	    !current_worktree_is_main(repo) ||
@@ -237,6 +240,7 @@ int clean_status_try_sidecar(
 	}
 	if (memcmp(config->hash, record.sidecar.proof.config_hash,
 		   repo->hash_algo->rawsz)) {
+		*repository_inputs_changed = 1;
 		trace_miss(repo, "fast-config-changed");
 		goto done;
 	}
@@ -280,8 +284,16 @@ int clean_status_try_sidecar(
 	query_token = xmemdupz(
 		record.sidecar.token, record.sidecar.token_len);
 	if (query_builtin_fsmonitor(query_token, &query) !=
-		    FSMONITOR_QUERY_DELTA ||
-	    query.paths.len) {
+		    FSMONITOR_QUERY_DELTA) {
+		if (query.outcome == FSMONITOR_QUERY_TRIVIAL)
+			trace2_data_intmax("fsm_client", NULL,
+					   "query/trivial-response", 1);
+		/* A later successful query cannot erase this lost boundary. */
+		*provider_reset = 1;
+		trace_miss(repo, "fast-provider-changed");
+		goto done;
+	}
+	if (query.paths.len) {
 		trace_miss(repo, "fast-provider-changed");
 		goto done;
 	}
@@ -291,7 +303,9 @@ int clean_status_try_sidecar(
 	}
 
 	if (clean_status_config_read_repository(repo, &fresh_config) ||
-	    fresh_config.filter_configured ||
+	    fresh_config.filter_configured != config->filter_configured ||
+	    (fresh_config.filter_configured &&
+	     fresh_config.normalized_filter_disable) ||
 	    memcmp(fresh_config.hash, config->hash,
 		   repo->hash_algo->rawsz)) {
 		trace_miss(repo, "fast-config-raced");
