@@ -2,18 +2,27 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "advice.h"
+#include "attr.h"
+#include "attr-fingerprint.h"
 #include "wt-status.h"
+#include "cache-tree.h"
 #include "object.h"
 #include "dir.h"
 #include "commit.h"
+#include "clean-status.h"
+#include "clean-status-index.h"
 #include "diff.h"
 #include "environment.h"
+#include "exclude-source-proof.h"
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
 #include "object-name.h"
 #include "path.h"
+#include "preload-index.h"
+#include "replace-object.h"
 #include "revision.h"
 #include "diffcore.h"
 #include "quote.h"
@@ -26,6 +35,7 @@
 #include "column.h"
 #include "read-cache.h"
 #include "setup.h"
+#include "semantic-verify.h"
 #include "strbuf.h"
 #include "trace.h"
 #include "trace2.h"
@@ -34,7 +44,9 @@
 #include "worktree.h"
 #include "lockfile.h"
 #include "sequencer.h"
+#include "fsmonitor.h"
 #include "fsmonitor-settings.h"
+#include "wrapper.h"
 
 #define AB_DELAY_WARNING_IN_MS (2 * 1000)
 #define UF_DELAY_WARNING_IN_MS (2 * 1000)
@@ -457,6 +469,19 @@ static char short_submodule_status(struct wt_status_change_data *d)
 	return d->worktree_status;
 }
 
+static struct wt_status_change_data *wt_status_get_change(
+	struct wt_status *s, const char *path)
+{
+	struct string_list_item *it = string_list_insert(&s->change, path);
+	struct wt_status_change_data *d = it->util;
+
+	if (!d) {
+		CALLOC_ARRAY(d, 1);
+		it->util = d;
+	}
+	return d;
+}
+
 static void wt_status_collect_changed_cb(struct diff_queue_struct *q,
 					 struct diff_options *options UNUSED,
 					 void *data)
@@ -469,16 +494,10 @@ static void wt_status_collect_changed_cb(struct diff_queue_struct *q,
 	s->workdir_dirty = 1;
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p;
-		struct string_list_item *it;
 		struct wt_status_change_data *d;
 
 		p = q->queue[i];
-		it = string_list_insert(&s->change, p->two->path);
-		d = it->util;
-		if (!d) {
-			CALLOC_ARRAY(d, 1);
-			it->util = d;
-		}
+		d = wt_status_get_change(s, p->two->path);
 		if (!d->worktree_status)
 			d->worktree_status = p->status;
 		if (S_ISGITLINK(p->two->mode)) {
@@ -524,6 +543,74 @@ static void wt_status_collect_changed_cb(struct diff_queue_struct *q,
 	}
 }
 
+static struct cache_entry **wt_status_collect_preload_changes(
+	struct wt_status *s, size_t *direct_nr)
+{
+	struct index_state *istate = s->repo->index;
+	struct cache_entry **direct = NULL;
+	size_t direct_alloc = 0;
+	uint64_t modified = 0, deleted = 0;
+
+	*direct_nr = 0;
+	if (istate->preload_bulk_tracked_nr != istate->cache_nr)
+		goto clear;
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		struct cache_entry *ce = istate->cache[i];
+		struct wt_status_change_data *d;
+		unsigned char state =
+			istate->preload_bulk_tracked_state[i];
+		unsigned int worktree_mode = 0;
+		int status;
+
+		if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_MODIFIED) {
+			struct stat st;
+
+			if (lstat(ce->name, &st))
+				continue;
+			worktree_mode = ce_mode_from_stat(
+				s->repo, ce, st.st_mode);
+			status = DIFF_STATUS_MODIFIED;
+			modified++;
+		} else if (state == PRELOAD_BULK_TRACKED_DEFINITIVE_DELETED) {
+			status = DIFF_STATUS_DELETED;
+			deleted++;
+		} else {
+			continue;
+		}
+
+		d = wt_status_get_change(s, ce->name);
+		if (!d->worktree_status)
+			d->worktree_status = status;
+		d->mode_index = ce->ce_mode;
+		d->mode_worktree = worktree_mode;
+		oidcpy(&d->oid_index, &ce->oid);
+		ce_mark_uptodate(ce);
+		ALLOC_GROW(direct, *direct_nr + 1, direct_alloc);
+		direct[(*direct_nr)++] = ce;
+		s->workdir_dirty = 1;
+	}
+	trace2_data_intmax("status", s->repo, "preload/direct_modified",
+			   modified);
+	trace2_data_intmax("status", s->repo, "preload/direct_deleted",
+			   deleted);
+
+clear:
+	/*
+	 * The tracked result is single-use. Keep a closed excludes digest
+	 * available until the index writer has consumed it.
+	 */
+	preload_index_bulk_result_consume(istate);
+	return direct;
+}
+
+static void wt_status_release_preload_changes(
+	struct cache_entry **direct, size_t direct_nr)
+{
+	for (size_t i = 0; i < direct_nr; i++)
+		direct[i]->ce_flags &= ~CE_UPTODATE;
+	free(direct);
+}
+
 static int unmerged_mask(struct index_state *istate, const char *path)
 {
 	int pos, mask;
@@ -553,16 +640,10 @@ static void wt_status_collect_updated_cb(struct diff_queue_struct *q,
 
 	for (i = 0; i < q->nr; i++) {
 		struct diff_filepair *p;
-		struct string_list_item *it;
 		struct wt_status_change_data *d;
 
 		p = q->queue[i];
-		it = string_list_insert(&s->change, p->two->path);
-		d = it->util;
-		if (!d) {
-			CALLOC_ARRAY(d, 1);
-			it->util = d;
-		}
+		d = wt_status_get_change(s, p->two->path);
 		if (!d->index_status)
 			d->index_status = p->status;
 		switch (p->status) {
@@ -638,8 +719,16 @@ void wt_status_collect_changes_trees(struct wt_status *s,
 
 static void wt_status_collect_changes_worktree(struct wt_status *s)
 {
+	struct cache_entry **direct;
+	size_t direct_nr;
 	struct rev_info rev;
 
+	if (s->tracked_from_fsmonitor) {
+		preload_index_bulk_result_consume(s->repo->index);
+		return;
+	}
+
+	direct = wt_status_collect_preload_changes(s, &direct_nr);
 	repo_init_revisions(s->repo, &rev, NULL);
 	setup_revisions(0, NULL, &rev, NULL);
 	rev.diffopt.output_format |= DIFF_FORMAT_CALLBACK;
@@ -659,14 +748,56 @@ static void wt_status_collect_changes_worktree(struct wt_status *s)
 	rev.diffopt.rename_limit = s->rename_limit >= 0 ? s->rename_limit : rev.diffopt.rename_limit;
 	rev.diffopt.rename_score = s->rename_score >= 0 ? s->rename_score : rev.diffopt.rename_score;
 	copy_pathspec(&rev.prune_data, &s->pathspec);
-	run_diff_files(&rev, 0);
+	run_diff_files(&rev, s->bulk_update_index_stat ?
+		       DIFF_UPDATE_INDEX_STAT : 0);
+	wt_status_release_preload_changes(direct, direct_nr);
 	release_revisions(&rev);
+}
+
+static int wt_status_cache_tree_matches_reference(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	struct object_id reference_tree;
+	struct strbuf reference = STRBUF_INIT;
+	int matches = 0;
+
+	if (!s->allow_clean_status_shortcuts || s->is_initial ||
+	    getenv(INDEX_ENVIRONMENT) || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    !istate->cache_tree ||
+	    istate->cache_tree->entry_count < 0 ||
+	    (unsigned int)istate->cache_tree->entry_count !=
+		    istate->cache_nr)
+		return 0;
+
+	/*
+	 * A replacement below the root can change the effective tree without
+	 * changing the root object name stored in the commit.
+	 */
+	if (replace_refs_enabled(s->repo)) {
+		prepare_replace_object(s->repo);
+		if (oidmap_get_size(&s->repo->objects->replace_map))
+			return 0;
+	}
+
+	strbuf_addf(&reference, "%s^{tree}", s->reference);
+	if (!repo_get_oid_tree(s->repo, reference.buf, &reference_tree) &&
+	    oideq(&istate->cache_tree->oid, &reference_tree))
+		matches = 1;
+	strbuf_release(&reference);
+	return matches;
 }
 
 static void wt_status_collect_changes_index(struct wt_status *s)
 {
 	struct rev_info rev;
 	struct setup_revision_opt opt;
+
+	if (wt_status_cache_tree_matches_reference(s)) {
+		trace2_data_intmax("status", s->repo,
+				   "index/cache-tree-match", 1);
+		return;
+	}
 
 	repo_init_revisions(s->repo, &rev, NULL);
 	memset(&opt, 0, sizeof(opt));
@@ -706,6 +837,13 @@ static void wt_status_collect_changes_index(struct wt_status *s)
 
 	copy_pathspec(&rev.prune_data, &s->pathspec);
 	run_diff_index(&rev, DIFF_INDEX_CACHED);
+	if (!s->pathspec.nr && !s->is_initial &&
+	    !s->ignore_submodule_arg && !s->repo->index->split_index &&
+	    s->repo->index->sparse_index == INDEX_EXPANDED && !s->change.nr) {
+		s->index_tree_verified = 1;
+		trace2_data_intmax("status", s->repo,
+				   "index/full-tree-match", 1);
+	}
 	release_revisions(&rev);
 }
 
@@ -803,19 +941,630 @@ static void wt_status_collect_changes_initial(struct wt_status *s)
 	strbuf_release(&base);
 }
 
-static void wt_status_collect_untracked(struct wt_status *s)
+static unsigned int wt_status_untracked_dir_flags(const struct wt_status *s)
+{
+	if (s->show_untracked_files == SHOW_ALL_UNTRACKED_FILES)
+		return 0;
+	return DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+}
+
+static unsigned int wt_status_exclude_preload_flags(const struct wt_status *s)
+{
+	const struct untracked_cache *untracked = s->repo->index->untracked;
+
+	if (untracked)
+		return untracked->dir_flags;
+	return wt_status_untracked_dir_flags(s);
+}
+
+struct wt_status_exclude_context {
+	int root_fd;
+};
+
+static void wt_status_release_exclude_proof(struct wt_status *s)
+{
+	exclude_source_proof_release(s->certify_exclude_proof);
+	s->certify_exclude_proof = NULL;
+	if (s->certify_exclude_context) {
+		if (s->certify_exclude_context->root_fd >= 0)
+			close(s->certify_exclude_context->root_fd);
+		FREE_AND_NULL(s->certify_exclude_context);
+	}
+	oidclr(&s->certify_exclude_digest, s->repo->hash_algo);
+	s->certify_exclude_digest_valid = 0;
+	s->certify_untracked_scan_failed = 0;
+}
+
+#if EXCLUDE_SOURCE_PROOF_HAS_ANCHORED_OPEN
+
+static int wt_status_open_exclude_parent(void *data, const char *path)
+{
+	struct wt_status_exclude_context *context = data;
+	int flags = O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC |
+		O_NOFOLLOW;
+
+	if (is_absolute_path(path))
+		return open(path, flags);
+	return openat(context->root_fd, path, flags);
+}
+
+static void wt_status_prepare_exclude_proof(
+	struct wt_status *s, struct dir_struct *dir)
+{
+	struct wt_status_exclude_context *context;
+	const char *worktree;
+
+	if (!s->certify_clean_status)
+		return;
+	if (!s->certify_exclude_proof) {
+		worktree = repo_get_work_tree(s->repo);
+		if (!worktree)
+			return;
+		CALLOC_ARRAY(context, 1);
+		context->root_fd = open_nofollow(
+			worktree,
+			O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC);
+		if (context->root_fd < 0) {
+			free(context);
+			return;
+		}
+		s->certify_exclude_context = context;
+		s->certify_exclude_proof = exclude_source_proof_create(
+			s->repo->index, context,
+			wt_status_open_exclude_parent,
+			EXCLUDE_SOURCE_PROOF_NONBLOCKING);
+	}
+	dir->internal.exclude_source_proof =
+		s->certify_exclude_proof;
+}
+
+static void wt_status_record_exclude_digest(struct wt_status *s)
+{
+	if (s->certify_exclude_digest_valid ||
+	    !s->certify_exclude_proof)
+		return;
+	s->certify_exclude_digest_valid =
+		!exclude_source_proof_digest(
+			s->certify_exclude_proof,
+			s->repo->hash_algo,
+			&s->certify_exclude_digest);
+}
+
+#else
+
+static void wt_status_prepare_exclude_proof(
+	struct wt_status *s UNUSED, struct dir_struct *dir UNUSED)
+{
+}
+
+static void wt_status_record_exclude_digest(struct wt_status *s UNUSED)
+{
+}
+
+#endif
+
+int wt_status_certified_excludes_digest(
+	struct wt_status *s, struct object_id *digest,
+	struct stat *scanned_worktree)
+{
+	if (s->certify_untracked_scan_failed ||
+	    !s->certify_exclude_digest_valid ||
+	    !s->certify_exclude_proof ||
+	    !s->certify_exclude_context ||
+	    s->certify_exclude_context->root_fd < 0 ||
+	    !exclude_source_proof_validate(
+		    s->certify_exclude_proof) ||
+	    fstat(s->certify_exclude_context->root_fd,
+		  scanned_worktree))
+		return -1;
+	oidcpy(digest, &s->certify_exclude_digest);
+	return 0;
+}
+
+static int wt_status_begin_attr_snapshot(struct wt_status *s)
+{
+	int ret;
+	int hook_provider =
+		fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_HOOK;
+
+	if (s->attr_snapshot_failed)
+		return -1;
+	if (s->attr_source_snapshot)
+		return 0;
+	ret = clean_status_capture_attr_snapshot(
+		s->repo->index, &s->attr_source_snapshot);
+	if (ret < 0) {
+		s->attr_snapshot_failed = 1;
+		untracked_cache_invalidate_all(s->repo->index);
+		fsmonitor_invalidate_semantics(s->repo->index);
+		return -1;
+	}
+	if (s->attr_source_snapshot)
+		git_attr_source_snapshot_begin(s->attr_source_snapshot);
+	if (!s->repo->index->fsmonitor_legacy_untracked_fallback &&
+	    ((ret > 0 &&
+	      (!hook_provider ||
+	       (ret & CLEAN_STATUS_ATTR_CONTENT_CHANGED))) ||
+	     (clean_status_fsmonitor_strong_mismatch(s->repo->index) &&
+	      !hook_provider))) {
+		/*
+		 * Hook providers have no closing query with which to adopt
+		 * missing semantic history, so absence alone must preserve
+		 * their established path-reporting contract. Namespace-only
+		 * churn can arise from an index rewrite and is likewise not
+		 * evidence that the hook missed a semantic change. Changed
+		 * attribute contents are current evidence and invalidate
+		 * cached semantics regardless of provider.
+		 */
+		untracked_cache_invalidate_all(s->repo->index);
+		fsmonitor_invalidate_semantics(s->repo->index);
+	}
+	return ret;
+}
+
+void wt_status_start_untracked_cache_preload(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	unsigned int dir_flags;
+	int has_fsmonitor =
+		fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED;
+	int reopened_valid_token = 0;
+
+	if (s->untracked_cache_preload)
+		BUG("untracked-cache preload already started");
+	if (!use_optional_locks())
+		s->certify_clean_status = 0;
+	wt_status_begin_attr_snapshot(s);
+	/* Record the provider token before either filesystem traversal. */
+	refresh_fsmonitor(istate);
+	if (s->certify_clean_status &&
+	    !fsmonitor_has_pending_token(istate))
+		reopened_valid_token =
+			fsmonitor_reopen_token(istate) &&
+			istate->fsmonitor_untracked_valid &&
+			istate->untracked && istate->untracked->root &&
+			istate->untracked->use_fsmonitor &&
+			!clean_status_fsmonitor_semantic_adoption_needed(istate);
+	if (has_fsmonitor &&
+	    (!fsmonitor_has_pending_token(istate) ||
+	     reopened_valid_token ||
+	     !fstat_is_reliable())) {
+		s->untracked_cache_preload =
+			untracked_cache_preload_start_fsmonitor_excludes(
+				istate, wt_status_exclude_preload_flags(s),
+				s->pathspec.nr ? &s->pathspec : NULL);
+		return;
+	}
+	if ((s->pathspec.nr &&
+	     (!istate->untracked ||
+	      !istate->untracked->fsmonitor_revalidation ||
+	      !fsmonitor_pending_token_from_provider(istate))) ||
+	    s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
+	    s->show_ignored_mode)
+		return;
+
+	dir_flags = wt_status_untracked_dir_flags(s);
+
+	if (s->show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
+	    !istate->untracked &&
+	    istate->sparse_index == INDEX_EXPANDED)
+		istate->preload_untracked = &s->untracked;
+	/* Restore verified stats before cached excludes inspect them. */
+	if (fstat_is_reliable() && !istate->split_index &&
+	    fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_IPC &&
+	    fsmonitor_pending_token_from_provider(istate) &&
+	    clean_status_fsmonitor_semantic_adoption_needed(istate) &&
+	    istate->untracked && istate->untracked->root) {
+		trace2_data_intmax("status", s->repo,
+				   "fsmonitor_token/untracked-deferred", 1);
+		return;
+	}
+	if (has_fsmonitor &&
+	    (!istate->untracked ||
+	     !istate->untracked->fsmonitor_revalidation ||
+	     istate->untracked->use_fsmonitor ||
+	     !fsmonitor_pending_token_from_provider(istate)))
+		return;
+
+	s->untracked_cache_preload =
+		untracked_cache_preload_start_ordinary(istate, dir_flags);
+	if (s->untracked_cache_preload &&
+	    istate->untracked->fsmonitor_revalidation) {
+		trace2_data_intmax("status", s->repo,
+				   "untracked/provider-reset-preload", 1);
+		if (s->pathspec.nr)
+			trace2_data_intmax("status", s->repo,
+					   "untracked/provider-reset-scoped-preload", 1);
+	}
+}
+
+static void wt_status_finish_untracked_cache_preload(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+	size_t index_invalidated = 0;
+
+	if (!s->untracked_cache_preload)
+		return;
+	s->untracked_cache_preloaded = untracked_cache_preload_finish(
+		s->untracked_cache_preload, istate,
+		wt_status_exclude_preload_flags(s), &index_invalidated);
+	s->untracked_cache_preload = NULL;
+	if (!index_invalidated)
+		return;
+
+	s->tracked_from_fsmonitor = 0;
+	preload_index_bulk_result_clear(istate);
+	trace2_data_intmax("status", s->repo,
+			   "fsmonitor/exclude-index-invalidated",
+			   index_invalidated);
+}
+
+static struct untracked_cache_dir *wt_status_find_cached_directory(
+	struct untracked_cache_dir *root,
+	const char *path,
+	size_t len)
+{
+	struct untracked_cache_dir *dir = root;
+	const char *end = path + len;
+
+	while (path < end) {
+		const char *slash = memchr(path, '/', end - path);
+		size_t component_len = slash ? slash - path : end - path;
+		struct untracked_cache_dir *child = NULL;
+		size_t first = 0, last = dir->dirs_nr;
+
+		if (!component_len) {
+			path++;
+			continue;
+		}
+		while (last > first) {
+			size_t next = first + ((last - first) >> 1);
+			struct untracked_cache_dir *candidate = dir->dirs[next];
+			int compare = strncmp(path, candidate->name,
+					      component_len);
+
+			if (!compare && candidate->name[component_len])
+				compare = -1;
+			if (!compare) {
+				child = candidate;
+				break;
+			}
+			if (compare < 0)
+				last = next;
+			else
+				first = next + 1;
+		}
+		if (!child || !child->recurse || child->check_only)
+			return NULL;
+		dir = child;
+		path += component_len;
+		if (path < end)
+			path++;
+	}
+	return dir;
+}
+
+static void wt_status_collect_cached_directory(
+	const struct untracked_cache_dir *dir,
+	struct strbuf *path,
+	struct index_state *istate,
+	const struct pathspec *pathspec,
+	struct string_list *untracked)
+{
+	size_t base_len = path->len;
+
+	if (!dir->has_untracked)
+		return;
+	for (size_t i = 0; i < dir->untracked_nr; i++) {
+		const char *name = dir->untracked[i];
+
+		strbuf_setlen(path, base_len);
+		strbuf_addstr(path, name);
+		if (index_name_is_other(istate, path->buf, path->len) &&
+		    match_pathspec(istate, pathspec,
+				   path->buf, path->len, 0, NULL,
+				   path->len && path->buf[path->len - 1] == '/'))
+			string_list_append(untracked, path->buf);
+	}
+	for (size_t i = 0; i < dir->dirs_nr; i++) {
+		const struct untracked_cache_dir *child = dir->dirs[i];
+
+		if (!child->recurse || child->check_only ||
+		    !child->has_untracked)
+			continue;
+		strbuf_setlen(path, base_len);
+		strbuf_addstr(path, child->name);
+		strbuf_addch(path, '/');
+		wt_status_collect_cached_directory(
+			child, path, istate, pathspec, untracked);
+	}
+	strbuf_setlen(path, base_len);
+}
+
+static int wt_status_index_directory_pos(
+	struct index_state *istate, const char *path, size_t len, int first)
+{
+	int last = istate->cache_nr;
+
+	if (first < last &&
+	    ce_namelen(istate->cache[first]) == len &&
+	    !memcmp(istate->cache[first]->name, path, len))
+		return -1;
+
+	while (last > first) {
+		int next = first + ((last - first) >> 1);
+		const struct cache_entry *ce = istate->cache[next];
+		int compare = strncmp(ce->name, path, len);
+
+		if (!compare)
+			compare = (unsigned char)ce->name[len] - '/';
+		if (compare < 0)
+			first = next + 1;
+		else
+			last = next;
+	}
+	return first;
+}
+
+static int wt_status_pathspec_matches_clean_tracked_entries(
+	struct wt_status *s, int validate_entries)
+{
+	struct index_state *istate = s->repo->index;
+	int i, positive = 0;
+
+	if ((!validate_entries && !s->tracked_from_fsmonitor) ||
+	    !s->pathspec.nr ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    fsmonitor_has_pending_token(istate) ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC)
+		return 0;
+
+	for (i = 0; i < s->pathspec.nr; i++) {
+		const struct pathspec_item *item = &s->pathspec.items[i];
+		const struct cache_entry *ce;
+		size_t len = item->len;
+		int pos, subtree = 0, selected = 0, trailing = 0, wildcard = 0;
+
+		if (item->magic & PATHSPEC_EXCLUDE)
+			continue;
+		positive = 1;
+		if ((item->magic & ~(PATHSPEC_FROMTOP | PATHSPEC_LITERAL |
+				     PATHSPEC_GLOB)) || !len)
+			return 0;
+		if (item->nowildcard_len != item->len) {
+			if (!validate_entries ||
+			    (s->pathspec.magic & PATHSPEC_ATTR))
+				return 0;
+			len = item->nowildcard_len;
+			if (!len)
+				return 0;
+			wildcard = 1;
+		}
+		if (!wildcard && item->match[len - 1] == '/') {
+			trailing = 1;
+			while (len && item->match[len - 1] == '/')
+				len--;
+			if (!len)
+				return 0;
+		}
+		pos = index_name_pos(istate, item->match, len);
+		if (pos >= 0 && trailing && memchr(item->match, '/', len) &&
+		    !validate_entries)
+			return 0;
+		if (pos < 0) {
+			if (!validate_entries)
+				return 0;
+			pos = -pos - 1;
+			if (!wildcard) {
+				pos = wt_status_index_directory_pos(
+					istate, item->match, len, pos);
+				if (pos < 0)
+					return 0;
+			}
+			subtree = 1;
+		}
+		if (wildcard)
+			subtree = 1;
+		for (; pos < istate->cache_nr; pos++) {
+			ce = istate->cache[pos];
+			if (subtree &&
+			    (ce_namelen(ce) < len ||
+			     strncmp(ce->name, item->match, len) ||
+			     (!wildcard && (ce_namelen(ce) == len ||
+					    ce->name[len] != '/'))))
+				break;
+			if (((subtree &&
+			      (wildcard || (s->pathspec.magic & PATHSPEC_EXCLUDE))) ||
+			     (validate_entries && trailing)) &&
+			    !(s->pathspec.magic & PATHSPEC_ATTR) &&
+			    !ce_path_match(istate, ce, &s->pathspec, NULL)) {
+				selected = 1;
+				if (!subtree)
+					break;
+				continue;
+			}
+			if (S_ISGITLINK(ce->ce_mode) &&
+			    s->ignore_submodule_arg &&
+			    !strcmp(s->ignore_submodule_arg, "all")) {
+				if (validate_entries &&
+				    (ce->ce_flags & ~(CE_UPTODATE | CE_HASHED |
+						      CE_FSMONITOR_VALID |
+						      CE_UPDATE_IN_BASE)))
+					return 0;
+				selected = 1;
+				if (!subtree)
+					break;
+				continue;
+			}
+			if ((!S_ISREG(ce->ce_mode) && !S_ISLNK(ce->ce_mode)) ||
+			    (validate_entries &&
+			     (!(ce->ce_flags & CE_FSMONITOR_VALID) ||
+			      (ce->ce_flags & ~(CE_UPTODATE | CE_HASHED |
+					CE_FSMONITOR_VALID |
+					CE_UPDATE_IN_BASE)))))
+				return 0;
+			selected = 1;
+			if (!subtree)
+				break;
+		}
+		if (!selected && !validate_entries)
+			return 0;
+	}
+	return positive;
+}
+
+static int wt_status_ignored_submodules_are_clean(struct wt_status *s)
+{
+	const struct index_state *istate = s->repo->index;
+	const unsigned int supported_flags =
+		CE_UPTODATE | CE_HASHED | CE_FSMONITOR_VALID |
+		CE_UPDATE_IN_BASE;
+
+	if (s->pathspec.nr || !s->ignore_submodule_arg ||
+	    strcmp(s->ignore_submodule_arg, "all"))
+		return 0;
+
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *ce = istate->cache[i];
+
+		if ((ce->ce_flags & ~supported_flags) ||
+		    (!S_ISGITLINK(ce->ce_mode) &&
+		     (!(ce->ce_flags & CE_FSMONITOR_VALID) ||
+		      (!S_ISREG(ce->ce_mode) && !S_ISLNK(ce->ce_mode)))))
+			return 0;
+	}
+	return 1;
+}
+
+static int wt_status_collect_cached_pathspec(
+	struct wt_status *s,
+	struct dir_struct *dir,
+	struct string_list *untracked)
+{
+	struct index_state *istate = s->repo->index;
+	struct untracked_cache *uc = istate->untracked;
+	const struct pathspec_item *item;
+	const struct cache_entry *ce;
+	struct untracked_cache_dir *selected;
+	struct strbuf path = STRBUF_INIT;
+	size_t len;
+	int pos;
+
+	if (!s->pathspec.nr || s->pathspec.has_wildcard ||
+	    (s->pathspec.magic & ~(PATHSPEC_FROMTOP | PATHSPEC_LITERAL)) ||
+	    s->show_ignored_mode ||
+	    s->show_untracked_files != SHOW_NORMAL_UNTRACKED_FILES ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    !istate->fsmonitor_untracked_valid ||
+	    fsmonitor_has_pending_token(istate) ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC ||
+	    !uc || !uc->root || !uc->use_fsmonitor ||
+	    dir->untracked != uc || dir->flags != uc->dir_flags ||
+	    dir->internal.unmanaged_exclude_files ||
+	    dir->internal.exclude_list_group[EXC_CMDL].nr ||
+	    !oideq(&dir->internal.ss_info_exclude.oid,
+		   &uc->ss_info_exclude.oid) ||
+	    !oideq(&dir->internal.ss_excludes_file.oid,
+		   &uc->ss_excludes_file.oid))
+		return 0;
+
+	if (wt_status_pathspec_matches_clean_tracked_entries(s, 0)) {
+		trace2_data_intmax("status", s->repo,
+				   "untracked/pathspec-cache", 1);
+		return 1;
+	}
+	if (s->pathspec.nr != 1)
+		return 0;
+
+	item = &s->pathspec.items[0];
+	if (item->nowildcard_len != item->len)
+		return 0;
+	len = item->len;
+	if (len && item->match[len - 1] == '/')
+		len--;
+	if (!len)
+		return 0;
+
+	pos = index_name_pos(istate, item->match, len);
+	if (pos >= 0)
+		return 0;
+	pos = wt_status_index_directory_pos(
+		istate, item->match, len, -pos - 1);
+	if (pos < 0)
+		return 0;
+	if (pos >= istate->cache_nr)
+		return 0;
+	ce = istate->cache[pos];
+	if (ce_namelen(ce) <= len || ce->name[len] != '/' ||
+	    strncmp(ce->name, item->match, len))
+		return 0;
+
+	selected = wt_status_find_cached_directory(
+		uc->root, item->match, len);
+	if (!selected)
+		return 0;
+
+	strbuf_add(&path, item->match, len);
+	strbuf_addch(&path, '/');
+	if (!uc->root->valid || !selected->valid ||
+	    !selected->valid_recursive) {
+		if (read_directory_cached_subtree(
+			    dir, istate, selected, path.buf, path.len,
+			    &s->pathspec) < 0) {
+			strbuf_release(&path);
+			return 0;
+		}
+		trace2_data_intmax("status", s->repo,
+				   "untracked/pathspec-refreshed", 1);
+	}
+	wt_status_collect_cached_directory(
+		selected, &path, istate, &s->pathspec, untracked);
+	strbuf_release(&path);
+	trace2_data_intmax("status", s->repo,
+			   "untracked/pathspec-cache", 1);
+	return 1;
+}
+
+static void wt_status_materialize_deferred_untracked(
+	struct index_state *istate)
+{
+	const char *path, *end;
+
+	if (!istate->untracked ||
+	    !istate->untracked->fsmonitor_dirty_paths.len)
+		return;
+	path = istate->untracked->fsmonitor_dirty_paths.buf;
+	end = path + istate->untracked->fsmonitor_dirty_paths.len;
+
+	/* Deferred provider paths are not saved with the cache. */
+	while (path < end) {
+		size_t len = strlen(path) + 1;
+
+		untracked_cache_invalidate_path(istate, path, 1);
+		path += len;
+	}
+	istate->cache_changed |= UNTRACKED_CHANGED;
+	istate->fsmonitor_untracked_must_persist = 1;
+}
+
+static int wt_status_collect_untracked_1(
+	struct wt_status *s,
+	struct string_list *untracked,
+	struct string_list *ignored)
 {
 	int i;
+	int used_untracked_cache;
 	struct dir_struct dir = DIR_INIT;
 	uint64_t t_begin = getnanotime();
 	struct index_state *istate = s->repo->index;
 
-	if (!s->show_untracked_files)
-		return;
+	if (!s->show_untracked_files) {
+		wt_status_materialize_deferred_untracked(istate);
+		return 0;
+	}
 
 	if (s->show_untracked_files != SHOW_ALL_UNTRACKED_FILES)
-		dir.flags |=
-			DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+		dir.flags |= wt_status_untracked_dir_flags(s);
 	if (s->show_ignored_mode) {
 		dir.flags |= DIR_SHOW_IGNORED_TOO;
 
@@ -825,28 +1574,762 @@ static void wt_status_collect_untracked(struct wt_status *s)
 		dir.untracked = istate->untracked;
 	}
 
+	wt_status_prepare_exclude_proof(s, &dir);
 	setup_standard_excludes(&dir);
+	wt_status_record_exclude_digest(s);
+	wt_status_finish_untracked_cache_preload(s);
+	dir.internal.untracked_cache_preloaded =
+		s->untracked_cache_preloaded;
 
-	fill_directory(&dir, istate, &s->pathspec);
+	if (wt_status_collect_cached_pathspec(s, &dir, untracked)) {
+		used_untracked_cache = 1;
+	} else if (wt_status_pathspec_matches_clean_tracked_entries(s, 0)) {
+		trace2_data_intmax("status", s->repo,
+				   "untracked/pathspec-cache", 1);
+		used_untracked_cache = 0;
+	} else {
+		fill_directory(&dir, istate, &s->pathspec);
+		if (s->certify_clean_status && dir.internal.traversal_failed)
+			s->certify_untracked_scan_failed = 1;
+		used_untracked_cache = dir.untracked &&
+			dir.untracked == istate->untracked;
 
-	for (i = 0; i < dir.nr; i++) {
-		struct dir_entry *ent = dir.entries[i];
-		if (index_name_is_other(istate, ent->name, ent->len))
-			string_list_append(&s->untracked, ent->name);
+		for (i = 0; i < dir.nr; i++) {
+			struct dir_entry *ent = dir.entries[i];
+			if (index_name_is_other(istate, ent->name, ent->len))
+				string_list_append(untracked, ent->name);
+		}
 	}
-	string_list_sort_u(&s->untracked, 0);
+	string_list_sort_u(untracked, 0);
+	if (!s->pathspec.nr && used_untracked_cache && dir.nr &&
+	    dir.untracked->dir_opened && !dir.internal.traversal_failed &&
+	    !clean_status_external_history_was_restored(istate) &&
+	    (istate->cache_changed & UNTRACKED_CHANGED))
+		istate->fsmonitor_untracked_must_persist = 1;
 
 	for (i = 0; i < dir.ignored_nr; i++) {
 		struct dir_entry *ent = dir.ignored[i];
 		if (index_name_is_other(istate, ent->name, ent->len))
-			string_list_append(&s->ignored, ent->name);
+			string_list_append(ignored, ent->name);
 	}
-	string_list_sort_u(&s->ignored, 0);
+	string_list_sort_u(ignored, 0);
 
 	dir_clear(&dir);
+	if (!used_untracked_cache)
+		wt_status_materialize_deferred_untracked(istate);
 
 	if (advice_enabled(ADVICE_STATUS_U_OPTION))
 		s->untracked_in_ms = (getnanotime() - t_begin) / 1000000;
+	if (used_untracked_cache)
+		fsmonitor_mark_untracked_cache_valid(istate);
+	return used_untracked_cache;
+}
+
+static int wt_status_can_use_bulk_provider(
+	struct wt_status *s, unsigned int refresh_flags)
+{
+	return !s->show_ignored_mode && !s->pathspec.nr &&
+		!s->repo->index->fsmonitor_legacy_untracked_fallback &&
+		!clean_status_filter_scope_needs_validation(s->repo->index) &&
+		(refresh_flags & REFRESH_DEFER_BULK_DIRTY) &&
+		preload_index_bulk_can_close_provider(s->repo->index);
+}
+
+static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
+	struct wt_status *s, unsigned int refresh_flags)
+{
+	struct index_state *istate = s->repo->index;
+	struct semantic_verify_options options = SEMANTIC_VERIFY_OPTIONS_INIT;
+	struct semantic_verify_proof *proof = NULL;
+	int ret;
+
+	if (!fstat_is_reliable() || istate->split_index ||
+	    istate->fsmonitor_legacy_untracked_fallback ||
+	    s->show_ignored_mode ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    !fsmonitor_has_pending_token(istate) ||
+	    !fsmonitor_pending_token_from_provider(istate) ||
+	    !clean_status_fsmonitor_semantic_adoption_needed(istate))
+		return NULL;
+	if (wt_status_can_use_bulk_provider(s, refresh_flags)) {
+		trace2_data_intmax("status", s->repo,
+				   "semantic_verify/bulk_scan", 1);
+		return NULL;
+	}
+
+	options.require_proof_epoch = 1;
+	options.validate_filter_scope =
+		clean_status_filter_scope_needs_validation(istate);
+	options.attr_snapshot = s->attr_source_snapshot;
+	trace2_region_enter("status", "semantic_verify", s->repo);
+	ret = semantic_verify_prepare(istate, &options, &proof);
+	trace2_data_intmax("status", s->repo,
+			   "semantic_verify/prepared", !ret);
+	trace2_region_leave("status", "semantic_verify", s->repo);
+	if (ret) {
+		semantic_verify_proof_clear(proof);
+		return NULL;
+	}
+	return proof;
+}
+
+static int wt_status_collect_untracked(struct wt_status *s)
+{
+	if (s->untracked_from_token_closure && !s->show_ignored_mode)
+		return 1;
+	if (s->untracked_from_preload && !s->show_ignored_mode)
+		return 0;
+	return wt_status_collect_untracked_1(
+		s, &s->untracked, &s->ignored);
+}
+
+#define FSMONITOR_TOKEN_MAX_QUERIES 3
+
+struct wt_status_token_closure {
+	struct wt_status *status;
+	unsigned int refresh_flags;
+	int require_untracked;
+	int can_prime;
+	int use_bulk_provider;
+	int untracked_ready;
+	int untracked_proof_complete;
+	struct string_list staged_untracked;
+	struct string_list staged_ignored;
+	int staged_untracked_ready;
+	int staged_output_matches_status;
+	int refresh_result;
+	int queries;
+};
+
+static void wt_status_discard_staged_untracked(
+	struct wt_status_token_closure *closure)
+{
+	string_list_clear(&closure->staged_untracked, 0);
+	string_list_clear(&closure->staged_ignored, 0);
+	closure->staged_untracked_ready = 0;
+}
+
+static int wt_status_stage_untracked(
+	struct wt_status_token_closure *closure)
+{
+	struct wt_status *s = closure->status;
+	struct index_state *istate = s->repo->index;
+	struct pathspec pathspec = s->pathspec;
+	enum untracked_status_type requested_untracked =
+		s->show_untracked_files;
+	int prime_configured_cache =
+		requested_untracked == SHOW_ALL_UNTRACKED_FILES &&
+		istate->untracked && !s->untracked_cache_preload &&
+		istate->untracked->dir_flags ==
+			(DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES);
+
+	wt_status_discard_staged_untracked(closure);
+	closure->staged_output_matches_status = !prime_configured_cache;
+	/* A provider token can certify only a complete untracked traversal. */
+	if (pathspec.nr)
+		memset(&s->pathspec, 0, sizeof(s->pathspec));
+	if (prime_configured_cache)
+		s->show_untracked_files = SHOW_NORMAL_UNTRACKED_FILES;
+	closure->staged_untracked_ready =
+		wt_status_collect_untracked_1(
+			s,
+			&closure->staged_untracked,
+			&closure->staged_ignored) ||
+		(!istate->untracked &&
+		 !s->certify_untracked_scan_failed);
+	s->show_untracked_files = requested_untracked;
+	if (prime_configured_cache) {
+		string_list_clear(&closure->staged_untracked, 0);
+		string_list_clear(&closure->staged_ignored, 0);
+	}
+	if (closure->staged_untracked_ready &&
+	    istate->preload_untracked == &s->untracked) {
+		if (closure->staged_untracked.nr ||
+		    !closure->use_bulk_provider)
+			istate->preload_untracked = NULL;
+		else
+			wt_status_discard_staged_untracked(closure);
+	}
+	if (pathspec.nr) {
+		s->pathspec = pathspec;
+		/* The ordinary scoped traversal supplies the displayed results. */
+		string_list_clear(&closure->staged_untracked, 0);
+		string_list_clear(&closure->staged_ignored, 0);
+	}
+	if (!closure->staged_untracked_ready)
+		wt_status_discard_staged_untracked(closure);
+	return closure->staged_untracked_ready;
+}
+
+static void wt_status_publish_staged_untracked(
+	struct wt_status_token_closure *closure)
+{
+	struct wt_status *s = closure->status;
+
+	if (!closure->staged_untracked_ready ||
+	    !closure->staged_output_matches_status || s->pathspec.nr)
+		return;
+	if (s->untracked.nr || s->ignored.nr)
+		BUG("publishing untracked results over collected status");
+	SWAP(s->untracked, closure->staged_untracked);
+	SWAP(s->ignored, closure->staged_ignored);
+	s->untracked_from_token_closure = 1;
+	closure->staged_untracked_ready = 0;
+}
+
+static int wt_status_untracked_cache_valid(
+	const struct wt_status_token_closure *closure)
+{
+	const struct index_state *istate = closure->status->repo->index;
+
+	return closure->untracked_ready &&
+		istate->untracked && istate->untracked->root;
+}
+
+static void wt_status_record_bulk_untracked(
+	struct wt_status_token_closure *closure)
+{
+	if (closure->status->repo->index->preload_untracked_complete)
+		closure->untracked_proof_complete = 1;
+}
+
+static int fsmonitor_token_requires_rescan(enum fsmonitor_token_result result)
+{
+	return result == FSMONITOR_TOKEN_CHANGED ||
+		result == FSMONITOR_TOKEN_TRIVIAL;
+}
+
+static void wt_status_release_attr_snapshot(struct wt_status *s);
+
+static int wt_status_attr_snapshot_matches(struct wt_status *s)
+{
+	if (s->attr_snapshot_failed)
+		return 0;
+	return !s->attr_source_snapshot ||
+		attr_source_snapshot_matches_repository(
+			s->repo, s->attr_source_snapshot);
+}
+
+static int wt_status_refresh_invalidated_manifest(struct wt_status *s)
+{
+	if (!clean_status_worktree_manifest_needs_refresh(s->repo->index))
+		return 0;
+	return clean_status_refresh_worktree_manifest(s->repo->index) < 0 ?
+		-1 : 0;
+}
+
+static void wt_status_reset_attr_snapshot_if_changed(struct wt_status *s)
+{
+	if (wt_status_attr_snapshot_matches(s))
+		return;
+	wt_status_release_attr_snapshot(s);
+	wt_status_begin_attr_snapshot(s);
+	trace2_data_intmax("status", s->repo,
+			   "semantic/attribute-epoch-rejected", 1);
+}
+
+static void wt_status_discard_semantic_verify(
+	struct wt_status *s, struct semantic_verify_proof **proof,
+	const char *reason)
+{
+	if (!*proof)
+		return;
+	trace2_data_string("status", s->repo, "semantic_verify/discard",
+			   reason);
+	semantic_verify_proof_clear(*proof);
+	*proof = NULL;
+	git_attr_invalidate_all();
+}
+
+static void wt_status_refresh_for_token(
+	struct wt_status *s, unsigned int refresh_flags,
+	struct clean_status_proof_epoch **epoch, int use_bulk_provider,
+	int *refresh_result)
+{
+	struct index_state *istate = s->repo->index;
+
+	if (!*epoch)
+		*epoch = clean_status_capture_proof_epoch(
+			istate, s->attr_source_snapshot, 0);
+	if (*epoch && use_bulk_provider)
+		istate->preload_bulk_proof_epoch = *epoch;
+	if (*epoch) {
+		*refresh_result |= refresh_index(
+			istate, refresh_flags | REFRESH_IN_PROOF_EPOCH,
+			&s->pathspec, NULL, NULL);
+	}
+	istate->preload_bulk_proof_epoch = NULL;
+}
+
+static int wt_status_close_ordinary_fsmonitor_token(
+	struct wt_status_token_closure *closure,
+	int refreshed_before_closure)
+{
+	struct wt_status *s = closure->status;
+	struct index_state *istate = s->repo->index;
+	struct clean_status_proof_epoch *scan_epoch = NULL;
+	int reliable_stat = fstat_is_reliable();
+	int validate_epoch = reliable_stat &&
+		!istate->fsmonitor_legacy_untracked_fallback;
+
+	/*
+	 * A pending token must close a refresh begun after its epoch was
+	 * captured. A refresh performed before entering token closure cannot
+	 * be validated by capturing its inputs afterward.
+	 */
+	if (validate_epoch) {
+		if (s->allow_clean_status_shortcuts &&
+		    s->certify_clean_status &&
+		    closure->can_prime &&
+		    !s->untracked_cache_preload &&
+		    !getenv(INDEX_ENVIRONMENT) &&
+		    !istate->split_index &&
+		    istate->sparse_index == INDEX_EXPANDED &&
+		    istate->fsmonitor_token_valid &&
+		    clean_status_revalidated_token_matches(istate) &&
+		    !clean_status_manifest_global_fallback(istate) &&
+		    !clean_status_worktree_manifest_needs_refresh(istate) &&
+		    clean_status_index_entries_are_certifiable(istate) &&
+		    (scan_epoch = clean_status_capture_proof_epoch(
+			istate, s->attr_source_snapshot, 0)) &&
+		    wt_status_stage_untracked(closure) &&
+		    closure->staged_untracked.nr &&
+		    !clean_status_worktree_manifest_needs_refresh(istate)) {
+			s->tracked_from_fsmonitor = 1;
+			closure->untracked_ready = 1;
+			closure->untracked_proof_complete = 1;
+		} else {
+			if (closure->staged_untracked_ready) {
+				closure->untracked_ready = 1;
+				closure->untracked_proof_complete = 1;
+			}
+			wt_status_refresh_for_token(
+				s, closure->refresh_flags, &scan_epoch,
+				closure->use_bulk_provider,
+				&closure->refresh_result);
+		}
+		if (!scan_epoch)
+			return 0;
+	} else if (!refreshed_before_closure ||
+		   istate->fsmonitor_legacy_untracked_fallback) {
+		closure->refresh_result |= refresh_index(
+			istate, closure->refresh_flags, &s->pathspec,
+			NULL, NULL);
+	}
+	wt_status_record_bulk_untracked(closure);
+	if (!closure->untracked_proof_complete && closure->can_prime) {
+		closure->untracked_ready =
+			wt_status_stage_untracked(closure);
+		closure->untracked_proof_complete =
+			closure->untracked_ready;
+		if (closure->queries)
+			trace2_data_intmax(
+				"status", s->repo,
+				"fsmonitor_token/untracked-after-retry",
+				closure->untracked_ready);
+	}
+
+	while (closure->queries < FSMONITOR_TOKEN_MAX_QUERIES) {
+		enum fsmonitor_token_result result;
+
+		if (validate_epoch &&
+		    !clean_status_proof_epoch_start_token_matches(
+			    istate, scan_epoch))
+			break;
+		closure->queries++;
+		result = fsmonitor_query_pending_token(
+			istate,
+			wt_status_untracked_cache_valid(closure));
+		if (result == FSMONITOR_TOKEN_CLEAN) {
+			if (validate_epoch &&
+			    !clean_status_proof_epoch_matches(
+				    istate, scan_epoch)) {
+				wt_status_reset_attr_snapshot_if_changed(s);
+				break;
+			}
+			if (closure->untracked_proof_complete ||
+			    !closure->require_untracked) {
+				if (preload_index_bulk_result_accept(istate) < 0)
+					break;
+				if (validate_epoch)
+					clean_status_mark_fsmonitor_config_valid(
+						istate,
+						istate->fsmonitor_last_update_pending);
+				clean_status_release_proof_epoch(scan_epoch);
+				fsmonitor_accept_pending_token(
+					istate,
+					closure->untracked_proof_complete,
+					wt_status_untracked_cache_valid(
+						closure));
+				if (s->tracked_from_fsmonitor) {
+					s->certify_clean_status = 0;
+					trace2_data_intmax("status", s->repo,
+							   "fsmonitor/tracked-clean", 1);
+				}
+				return 1;
+			}
+			break;
+		}
+		s->tracked_from_fsmonitor = 0;
+		wt_status_discard_staged_untracked(closure);
+		closure->untracked_proof_complete =
+			!closure->require_untracked ||
+			(!istate->untracked && !closure->can_prime);
+		clean_status_release_proof_epoch(scan_epoch);
+		scan_epoch = NULL;
+		if (!fsmonitor_token_requires_rescan(result))
+			break;
+
+		/* Rescan invalidations returned by the closure query. */
+		wt_status_reset_attr_snapshot_if_changed(s);
+		if (wt_status_refresh_invalidated_manifest(s))
+			break;
+		if (validate_epoch) {
+			wt_status_refresh_for_token(
+				s, closure->refresh_flags, &scan_epoch,
+				closure->use_bulk_provider,
+				&closure->refresh_result);
+			if (!scan_epoch)
+				break;
+		} else {
+			closure->refresh_result |= refresh_index(
+				istate, closure->refresh_flags,
+				&s->pathspec, NULL, NULL);
+		}
+		wt_status_record_bulk_untracked(closure);
+		if (!closure->untracked_proof_complete &&
+		    closure->can_prime) {
+			closure->untracked_ready =
+				wt_status_stage_untracked(closure);
+			closure->untracked_proof_complete =
+				closure->untracked_ready;
+		}
+	}
+	clean_status_release_proof_epoch(scan_epoch);
+	return 0;
+}
+
+enum wt_status_token_closure_result {
+	WT_STATUS_TOKEN_CLOSURE_FALLBACK = -1,
+	WT_STATUS_TOKEN_CLOSURE_RETRY,
+	WT_STATUS_TOKEN_CLOSURE_ACCEPTED,
+};
+
+static enum wt_status_token_closure_result
+wt_status_close_semantic_fsmonitor_token(
+	struct wt_status_token_closure *closure,
+	struct semantic_verify_proof **proof)
+{
+	struct wt_status *s = closure->status;
+	struct index_state *istate = s->repo->index;
+	enum fsmonitor_token_result result;
+	int defer_untracked =
+		closure->can_prime &&
+		!closure->untracked_proof_complete;
+	int applied;
+
+	if (!semantic_verify_start_token_is_current(istate, *proof)) {
+		wt_status_discard_semantic_verify(
+			s, proof, "start-token-drift");
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+
+	/* The first query closes the tracked scan and its semantic proof. */
+	closure->queries++;
+	result = fsmonitor_query_pending_token(
+		istate, defer_untracked ? 0 :
+		wt_status_untracked_cache_valid(closure));
+	if (result != FSMONITOR_TOKEN_CLEAN) {
+		wt_status_discard_semantic_verify(
+			s, proof, "token-reset");
+		if (fsmonitor_token_requires_rescan(result))
+			return WT_STATUS_TOKEN_CLOSURE_RETRY;
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+
+	applied = semantic_verify_apply_after_closure(istate, *proof);
+	if (applied < 0) {
+		wt_status_reset_attr_snapshot_if_changed(s);
+		wt_status_discard_semantic_verify(
+			s, proof, "closure-drift");
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+	closure->refresh_result |= refresh_index(
+		istate, closure->refresh_flags, &s->pathspec, NULL, NULL);
+	trace2_data_intmax("status", s->repo,
+			   "fsmonitor_token/semantic-closed", 1);
+	if (!semantic_verify_proof_is_current(istate, *proof)) {
+		wt_status_reset_attr_snapshot_if_changed(s);
+		wt_status_discard_semantic_verify(
+			s, proof, "closure-drift");
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+
+	if (defer_untracked) {
+		closure->untracked_ready =
+			wt_status_stage_untracked(closure);
+		closure->untracked_proof_complete =
+			closure->untracked_ready;
+		trace2_data_intmax(
+			"status", s->repo,
+			"fsmonitor_token/untracked-after-semantic",
+			closure->untracked_ready);
+		if (!closure->untracked_ready ||
+		    closure->queries >= FSMONITOR_TOKEN_MAX_QUERIES)
+			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+
+		/* A second query closes the subsequent untracked scan. */
+		closure->queries++;
+		result = fsmonitor_query_pending_token(
+			istate,
+			wt_status_untracked_cache_valid(closure));
+		if (result != FSMONITOR_TOKEN_CLEAN) {
+			int reuse_semantic_subtrees =
+				result == FSMONITOR_TOKEN_CHANGED &&
+				!clean_status_filter_scope_needs_validation(istate) &&
+				!clean_status_worktree_manifest_needs_refresh(istate) &&
+				semantic_verify_proof_is_current(istate, *proof);
+
+			wt_status_discard_staged_untracked(closure);
+			if (reuse_semantic_subtrees) {
+				/* Recompute scanned subtrees after the localized delta. */
+				untracked_cache_recompute_fsmonitor_valid_recursive(
+					istate->untracked);
+				trace2_data_intmax(
+					"status", s->repo,
+					"fsmonitor_token/reused-semantic-subtrees", 1);
+			} else {
+				untracked_cache_invalidate_all(istate);
+				fsmonitor_invalidate_semantics(istate);
+			}
+			closure->untracked_ready = 0;
+			closure->untracked_proof_complete = 0;
+			wt_status_discard_semantic_verify(
+				s, proof, "token-reset");
+			if (fsmonitor_token_requires_rescan(result))
+				return WT_STATUS_TOKEN_CLOSURE_RETRY;
+			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+		}
+		if (!semantic_verify_proof_is_current(istate, *proof)) {
+			wt_status_reset_attr_snapshot_if_changed(s);
+			wt_status_discard_semantic_verify(
+				s, proof, "closure-drift");
+			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+		}
+	}
+	if (semantic_verify_accept_filter_scope(istate, *proof) < 0) {
+		wt_status_discard_semantic_verify(
+			s, proof, "filter-scope-drift");
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+
+	clean_status_mark_fsmonitor_config_valid(
+		istate, istate->fsmonitor_last_update_pending);
+	semantic_verify_proof_clear(*proof);
+	*proof = NULL;
+	fsmonitor_accept_pending_token(
+		istate, closure->untracked_proof_complete,
+		wt_status_untracked_cache_valid(closure));
+	return WT_STATUS_TOKEN_CLOSURE_ACCEPTED;
+}
+
+static int wt_status_tracked_fsmonitor_state_is_current(
+	struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+
+	return s->allow_clean_status_shortcuts &&
+		!s->certify_clean_status &&
+		!getenv(INDEX_ENVIRONMENT) && !istate->split_index &&
+		istate->sparse_index == INDEX_EXPANDED &&
+		fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_IPC &&
+		is_fsmonitor_refreshed(istate) &&
+		!fsmonitor_has_pending_token(istate) &&
+		istate->fsmonitor_token_valid &&
+		istate->fsmonitor_last_update &&
+		*istate->fsmonitor_last_update &&
+		clean_status_revalidated_token_matches(istate) &&
+		!clean_status_manifest_global_fallback(istate) &&
+		!clean_status_worktree_manifest_needs_refresh(istate);
+}
+
+static int wt_status_close_fsmonitor_token(
+	struct wt_status *s, struct semantic_verify_proof *proof,
+	unsigned int refresh_flags, int require_untracked,
+	int refreshed_before_closure)
+{
+	struct index_state *istate = s->repo->index;
+	struct wt_status_token_closure closure = {
+		.status = s,
+		.refresh_flags = refresh_flags,
+		.require_untracked = require_untracked,
+		.staged_untracked = STRING_LIST_INIT_DUP,
+		.staged_ignored = STRING_LIST_INIT_DUP,
+	};
+	enum wt_status_token_closure_result result;
+
+	refresh_fsmonitor(istate);
+	if (!fsmonitor_has_pending_token(istate) ||
+	    fsm_settings__get_mode(s->repo) != FSMONITOR_MODE_IPC) {
+		int attr_inputs_match =
+			wt_status_attr_snapshot_matches(s) &&
+			!clean_status_worktree_manifest_needs_refresh(istate);
+
+		wt_status_discard_semantic_verify(
+			s, &proof, "provider-unavailable");
+		if (!refreshed_before_closure && attr_inputs_match &&
+		    wt_status_tracked_fsmonitor_state_is_current(s) &&
+		    (wt_status_pathspec_matches_clean_tracked_entries(s, 1) ||
+		     clean_status_index_entries_are_certifiable(istate) ||
+		     wt_status_ignored_submodules_are_clean(s))) {
+			s->tracked_from_fsmonitor = 1;
+			trace2_data_intmax(
+				"status", s->repo,
+				"fsmonitor/tracked-clean", 1);
+			return 0;
+		}
+		if (refreshed_before_closure && attr_inputs_match &&
+		    s->tracked_from_fsmonitor &&
+		    wt_status_tracked_fsmonitor_state_is_current(s))
+			return closure.refresh_result;
+		s->tracked_from_fsmonitor = 0;
+		if (!refreshed_before_closure && attr_inputs_match)
+			return refresh_index(
+				istate, refresh_flags, &s->pathspec,
+				NULL, NULL);
+		if (refreshed_before_closure && attr_inputs_match)
+			return closure.refresh_result;
+
+		wt_status_reset_attr_snapshot_if_changed(s);
+		if (fsmonitor_has_pending_token(istate))
+			fsmonitor_reject_pending_token(istate);
+		untracked_cache_invalidate_all(istate);
+		fsmonitor_invalidate_semantics(istate);
+		closure.refresh_result |= refresh_index(
+			istate, refresh_flags, &s->pathspec, NULL, NULL);
+		return closure.refresh_result;
+	}
+
+	s->tracked_from_fsmonitor = 0;
+	closure.can_prime = require_untracked &&
+		(istate->untracked || s->certify_clean_status) &&
+		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
+		!s->show_ignored_mode;
+	closure.use_bulk_provider =
+		wt_status_can_use_bulk_provider(s, refresh_flags);
+	closure.untracked_ready = !istate->untracked ||
+		!istate->untracked->root ||
+		(istate->fsmonitor_legacy_untracked_adopted &&
+		 istate->fsmonitor_untracked_valid &&
+		 istate->untracked->root->valid_recursive) ||
+		(!require_untracked &&
+		 (s->show_untracked_files == SHOW_NO_UNTRACKED_FILES ||
+		  s->show_ignored_mode) &&
+		 istate->fsmonitor_untracked_token &&
+		 istate->fsmonitor_last_update &&
+		 !strcmp(istate->fsmonitor_untracked_token,
+			 istate->fsmonitor_last_update));
+	closure.untracked_proof_complete =
+		!require_untracked || !istate->untracked ||
+		(istate->fsmonitor_legacy_untracked_adopted &&
+		 closure.untracked_ready);
+	if (require_untracked && !closure.can_prime &&
+	    !closure.untracked_ready)
+		BUG("cannot close required untracked scan");
+	trace2_region_enter("status", "fsmonitor_token_closure", s->repo);
+	wt_status_reset_attr_snapshot_if_changed(s);
+	if (wt_status_refresh_invalidated_manifest(s))
+		goto fallback;
+
+	if (proof) {
+		result = wt_status_close_semantic_fsmonitor_token(
+			&closure, &proof);
+		if (result == WT_STATUS_TOKEN_CLOSURE_ACCEPTED)
+			goto accepted;
+		if (result == WT_STATUS_TOKEN_CLOSURE_FALLBACK)
+			goto fallback;
+		wt_status_reset_attr_snapshot_if_changed(s);
+		if (wt_status_refresh_invalidated_manifest(s))
+			goto fallback;
+	}
+
+	if (wt_status_close_ordinary_fsmonitor_token(
+		    &closure, refreshed_before_closure))
+		goto accepted;
+
+	/* Keep the last valid token and fall back to complete scans. */
+fallback:
+	s->tracked_from_fsmonitor = 0;
+	wt_status_discard_semantic_verify(s, &proof, "fallback");
+	wt_status_discard_staged_untracked(&closure);
+	preload_index_bulk_result_clear(istate);
+	fsmonitor_reject_pending_token(istate);
+	if (fstat_is_reliable()) {
+		if (closure.can_prime)
+			untracked_cache_invalidate_all(istate);
+		fsmonitor_invalidate_semantics(istate);
+	}
+	closure.refresh_result |= refresh_index(
+		istate, refresh_flags, &s->pathspec, NULL, NULL);
+accepted:
+	wt_status_publish_staged_untracked(&closure);
+	wt_status_discard_staged_untracked(&closure);
+	trace2_region_leave("status", "fsmonitor_token_closure", s->repo);
+	return closure.refresh_result;
+}
+
+int wt_status_refresh_index(struct wt_status *s,
+			    unsigned int refresh_flags,
+			    int require_untracked)
+{
+	struct index_state *istate = s->repo->index;
+	struct semantic_verify_proof *proof;
+	int ret;
+
+	wt_status_begin_attr_snapshot(s);
+	refresh_fsmonitor(istate);
+	proof = wt_status_prepare_semantic_verify(s, refresh_flags);
+	ret = wt_status_close_fsmonitor_token(
+		s, proof, refresh_flags, require_untracked, 0);
+	if (istate->preload_untracked == &s->untracked) {
+		s->untracked_from_preload =
+			istate->preload_untracked_complete;
+		istate->preload_untracked = NULL;
+		istate->preload_untracked_complete = 0;
+	}
+	return ret;
+}
+
+static void wt_status_release_attr_snapshot(struct wt_status *s)
+{
+	if (s->attr_source_snapshot)
+		git_attr_source_snapshot_end(s->attr_source_snapshot);
+	attr_source_snapshot_free(s->attr_source_snapshot);
+	s->attr_source_snapshot = NULL;
+	s->attr_snapshot_failed = 0;
+}
+
+void wt_status_invalidate_refresh(struct wt_status *s)
+{
+	struct index_state *istate = s->repo->index;
+
+	s->tracked_from_fsmonitor = 0;
+	if (s->untracked_from_token_closure) {
+		string_list_clear(&s->untracked, 0);
+		string_list_clear(&s->ignored, 0);
+		s->untracked_from_token_closure = 0;
+	}
+	wt_status_release_exclude_proof(s);
+	wt_status_release_attr_snapshot(s);
+	if (!s->pathspec.nr && !istate->split_index &&
+	    fsmonitor_reopen_token(istate))
+		return;
+	if (fsmonitor_has_pending_token(istate))
+		fsmonitor_reject_pending_token(istate);
+	clean_status_invalidate_current_manifest(istate);
+	untracked_cache_invalidate_all(istate);
+	fsmonitor_invalidate_semantics(istate);
 }
 
 static int has_unmerged(struct wt_status *s)
@@ -864,6 +2347,16 @@ static int has_unmerged(struct wt_status *s)
 
 void wt_status_collect(struct wt_status *s)
 {
+	int used_untracked_cache;
+
+	if (fsm_settings__get_mode(s->repo) > FSMONITOR_MODE_DISABLED)
+		wt_status_finish_untracked_cache_preload(s);
+	wt_status_begin_attr_snapshot(s);
+	wt_status_close_fsmonitor_token(
+		s, NULL, REFRESH_QUIET | REFRESH_UNMERGED,
+		s->show_untracked_files != SHOW_NO_UNTRACKED_FILES &&
+		!s->show_ignored_mode, 1);
+
 	trace2_region_enter("status", "worktrees", s->repo);
 	wt_status_collect_changes_worktree(s);
 	trace2_region_leave("status", "worktrees", s->repo);
@@ -879,8 +2372,20 @@ void wt_status_collect(struct wt_status *s)
 	}
 
 	trace2_region_enter("status", "untracked", s->repo);
-	wt_status_collect_untracked(s);
+	used_untracked_cache = wt_status_collect_untracked(s);
 	trace2_region_leave("status", "untracked", s->repo);
+
+	/* Hook providers have no second query with which to close the scan. */
+	if (fsmonitor_has_pending_token(s->repo->index) && !s->pathspec.nr &&
+	    fsm_settings__get_mode(s->repo) == FSMONITOR_MODE_HOOK &&
+	    (used_untracked_cache || !s->repo->index->untracked ||
+	     !s->repo->index->untracked->root)) {
+		if (fsmonitor_pending_token_from_provider(s->repo->index))
+			fsmonitor_accept_pending_token(
+				s->repo->index, 1, used_untracked_cache);
+		else
+			fsmonitor_reject_pending_token(s->repo->index);
+	}
 
 	wt_status_get_state(s->repo, &s->state, s->branch && !strcmp(s->branch, "HEAD"));
 	if (s->state.merge_in_progress && !has_unmerged(s))
@@ -889,6 +2394,10 @@ void wt_status_collect(struct wt_status *s)
 
 void wt_status_collect_free_buffers(struct wt_status *s)
 {
+	untracked_cache_preload_release(s->untracked_cache_preload);
+	s->untracked_cache_preload = NULL;
+	wt_status_release_exclude_proof(s);
+	wt_status_release_attr_snapshot(s);
 	wt_status_state_free_buffers(&s->state);
 }
 

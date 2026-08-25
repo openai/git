@@ -5,6 +5,7 @@
 #include "fsmonitor-ipc.h"
 #include "fsmonitor-settings.h"
 #include "fsmonitor-path-utils.h"
+#include "trace2.h"
 
 /*
  * We keep this structure definition private and have getters
@@ -119,7 +120,11 @@ static void lookup_fsmonitor_settings(struct repository *r)
 	switch (repo_config_get_maybe_bool(r, "core.fsmonitor", &bool_value)) {
 
 	case 0: /* config value was set to <bool> */
-		if (bool_value)
+		if (bool_value && fsmonitor_ipc__watch_limit_backoff(r)) {
+			trace2_data_intmax("fsm_client", r,
+					   "settings/inotify-watch-limit-backoff", 1);
+			fsm_settings__set_disabled(r);
+		} else if (bool_value)
 			fsm_settings__set_ipc(r);
 		else
 			fsm_settings__set_disabled(r);
