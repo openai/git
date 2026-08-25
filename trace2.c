@@ -275,8 +275,8 @@ static const char *redact_arg(const char *arg)
 	size_t at;
 
 	if (!trace2_redact ||
-	    (!skip_prefix(arg, "https://", &p) &&
-	     !skip_prefix(arg, "http://", &p)))
+	    (!skip_iprefix(arg, "https://", &p) &&
+	     !skip_iprefix(arg, "http://", &p)))
 		return arg;
 
 	at = strcspn(p, "@/?#");
@@ -318,12 +318,13 @@ static const char *redact_error_message(const char *message)
 	if (!trace2_redact || !message)
 		return message;
 
-	while ((p = strstr(p, "http"))) {
+	while ((p = strcasestr(p, "http"))) {
 		const char *end;
 		const char *redacted;
 		char *url;
 
-		if (!starts_with(p, "http://") && !starts_with(p, "https://")) {
+		if (!skip_iprefix(p, "http://", &end) &&
+		    !skip_iprefix(p, "https://", &end)) {
 			p += 4;
 			continue;
 		}

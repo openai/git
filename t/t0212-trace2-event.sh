@@ -322,8 +322,8 @@ test_expect_success 'discard traces when there are too many files' '
 	head -n2 trace_target_dir/git-trace2-discard | tail -n1 | grep \"event\":\"too_many_files\"
 '
 
-url="https://user:pwd@example.com/?sig=secret&expires=123"
-redacted_url="https://user:<REDACTED>@example.com/?sig=<REDACTED>&expires=123"
+url="HtTpS://user:pwd@example.com/?sig=secret&expires=123"
+redacted_url="HtTpS://user:<REDACTED>@example.com/?sig=<REDACTED>&expires=123"
 
 test_expect_success 'unsafe URLs are redacted by default in cmd_start events' '
 	test_when_finished \
@@ -368,24 +368,24 @@ test_expect_success 'unsafe URLs are redacted by default in def_param events' '
 test_expect_success 'redact signature query values without changing the rest of the URL' '
 	test_when_finished "rm -f trace.event actual cases" &&
 	cat >cases <<-\EOF &&
-	?sig=secret ?sig=<REDACTED>
-	?expires=123&Signature=secret ?expires=123&Signature=<REDACTED>
-	?X-Blob-SIGNATURE=secret&expires=123 ?X-Blob-SIGNATURE=<REDACTED>&expires=123
-	?%73ig=secret%2Bvalue%3D&sig=other ?%73ig=<REDACTED>&sig=<REDACTED>
-	?SIG=secret#fragment ?SIG=<REDACTED>#fragment
-	?sig=&signature ?sig=&signature
-	?sig=sig=secret&expires=123 ?sig=<REDACTED>&expires=123
-	?design=value&signature-extra=value ?design=value&signature-extra=value
-	?value=sig=public ?value=sig=public
-	#fragment?sig=public #fragment?sig=public
+	http ?sig=secret ?sig=<REDACTED>
+	HTTPS ?expires=123&Signature=secret ?expires=123&Signature=<REDACTED>
+	hTtP ?X-Blob-SIGNATURE=secret&expires=123 ?X-Blob-SIGNATURE=<REDACTED>&expires=123
+	https ?%73ig=secret%2Bvalue%3D&sig=other ?%73ig=<REDACTED>&sig=<REDACTED>
+	HTTP ?SIG=secret#fragment ?SIG=<REDACTED>#fragment
+	https ?sig=&signature ?sig=&signature
+	https ?sig=sig=secret&expires=123 ?sig=<REDACTED>&expires=123
+	https ?design=value&signature-extra=value ?design=value&signature-extra=value
+	https ?value=sig=public ?value=sig=public
+	https #fragment?sig=public #fragment?sig=public
 	EOF
-	while read input expect
+	while read scheme input expect
 	do
 		: >trace.event &&
 		GIT_TRACE2_EVENT="$(pwd)/trace.event" \
-			test-tool trace2 303redact_def_param url "https://example.com/pack$input" &&
+			test-tool trace2 303redact_def_param url "$scheme://example.com/pack$input" &&
 		grep "\"event\":\"def_param\"" trace.event >actual &&
-		test_grep -F "\"value\":\"https://example.com/pack$expect\"" actual || return 1
+		test_grep -F "\"value\":\"$scheme://example.com/pack$expect\"" actual || return 1
 	done <cases
 '
 
@@ -398,8 +398,8 @@ test_expect_success 'URL signature redaction can be disabled' '
 
 test_expect_success 'redact URLs in error events without changing stderr' '
 	test_when_finished "rm trace.normal trace.perf trace.event errors stderr" &&
-	message="unable to access $SQ$url$SQ: try ${SQ}https://example.com/o${SQ}brien?signature=other$SQ." &&
-	expected="unable to access $SQ$redacted_url$SQ: try ${SQ}https://example.com/o${SQ}brien?signature=<REDACTED>$SQ." &&
+	message="unable to access $SQ$url$SQ: try ${SQ}HTTP://example.com/o${SQ}brien?signature=other$SQ." &&
+	expected="unable to access $SQ$redacted_url$SQ: try ${SQ}HTTP://example.com/o${SQ}brien?signature=<REDACTED>$SQ." &&
 	GIT_TRACE2="$(pwd)/trace.normal" \
 	GIT_TRACE2_PERF="$(pwd)/trace.perf" \
 	GIT_TRACE2_EVENT="$(pwd)/trace.event" \
