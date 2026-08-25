@@ -1906,6 +1906,8 @@ struct repository *repo UNUSED)
 	int repository_inputs_changed = 0;
 	int sidecar_provider_reset = 0;
 	int reissue_after_write = 0;
+	int issue_exact_after_write = 0;
+	int exact_after_write_candidate = 0;
 	int save_history_after_write = 0;
 	int deferred_scoped_history = 0;
 	int guarded_scoped_history_source = 0;
@@ -2204,6 +2206,17 @@ struct repository *repo UNUSED)
 			reissue_clean_sidecar && preserve_entry_changes &&
 			!external_restored && !persist_restored_boundary &&
 			!hook_exists(the_repository, "post-index-change");
+		/*
+		 * An exact query may have completed a clean scan while repairing
+		 * the provider checkpoint or cached stat data.  Bind its proof to
+		 * the repaired index, after the resumable history is durable.
+		 */
+		exact_after_write_candidate = exact_clean_query &&
+			preserve_entry_changes && !external_restored &&
+			!persist_restored_boundary &&
+			!hook_exists(the_repository, "post-index-change");
+		issue_exact_after_write =
+			exact_after_write_candidate && external_saved;
 
 		if (the_repository->index->fsmonitor_legacy_untracked_fallback &&
 		    !preserve_entry_changes && !external_saved) {
@@ -2251,17 +2264,23 @@ struct repository *repo UNUSED)
 		    !hook_exists(the_repository, "post-index-change") &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
 			if (clean_status_save_external_history(
-				    the_repository->index))
+				    the_repository->index)) {
 				trace2_data_intmax("fsmonitor", the_repository,
 						   "history/external-postwrite-stored", 1);
+				if (exact_after_write_candidate)
+					issue_exact_after_write = 1;
+			}
 			rollback_lock_file(&index_lock);
 		}
-		if (reissue_after_write &&
+		if ((reissue_after_write || issue_exact_after_write) &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
 			if (clean_status_issue_sidecar(
-				    &s, &clean_digest, &index_lock, 1))
+				    &s, &clean_digest, &index_lock,
+				    reissue_after_write))
 				trace2_data_intmax("status", the_repository,
-						   "clean-proof/postwrite-reissued", 1);
+						   reissue_after_write ?
+						   "clean-proof/postwrite-reissued" :
+						   "clean-proof/postwrite-issued", 1);
 			else
 				rollback_lock_file(&index_lock);
 		}
