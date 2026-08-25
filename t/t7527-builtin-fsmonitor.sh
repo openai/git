@@ -88,6 +88,13 @@ stop_daemon_delete_repo () {
 	rm -rf $1
 }
 
+stop_daemon_delete_linked_repo () {
+	r=$1 &&
+	wt=$2 &&
+	{ maybe_timeout 30 git -C "$wt" fsmonitor--daemon stop 2>/dev/null || :; } &&
+	rm -rf "$r" "$wt"
+}
+
 start_daemon () {
 	r= tf= t2= tk= &&
 
@@ -2049,6 +2056,119 @@ test_expect_success 'bound query replaces a legacy daemon' '
 			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
 			.git/warm.trace
 	)
+'
+
+test_expect_success MACOS \
+	'read-only legacy upgrade waits for one writable exact repair' '
+	test_when_finished \
+		"stop_daemon_delete_repo legacy-read-only-upgrade" &&
+	test_create_repo legacy-read-only-upgrade &&
+	(
+		cd legacy-read-only-upgrade &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		git config core.fsmonitor false &&
+		for i in $(test_seq 1 64)
+		do
+			test_write_lines "$i" >"tracked-$i" || return 1
+		done &&
+		git add . &&
+		git commit -qm base &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 \
+			--fsmonitor-capability-superset &&
+		git status --porcelain=v2 --untracked-files=normal \
+			--no-ahead-behind >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_path_is_missing .git/index.csts &&
+		test-tool simple-ipc stop-daemon --name="$ipc_path" &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 --fsmonitor-legacy &&
+		cp .git/index .git/index.before &&
+
+		for label in first repeat
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$PWD/.git/$label.trace" \
+				git status --porcelain=v2 >.git/$label &&
+			test_must_be_empty .git/$label &&
+			test_cmp_bin .git/index.before .git/index &&
+			test_trace2_data index refresh/sum_lstat 64 \
+				<.git/$label.trace || return 1
+		done &&
+		test_trace2_data fsm_client query/incompatible-daemon 1 \
+			<.git/first.trace &&
+		test_path_is_missing .git/index.csts &&
+		{ git fsmonitor--daemon stop 2>/dev/null || :; } &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
+			git status --porcelain=v2 >.git/repair &&
+		test_must_be_empty .git/repair &&
+		! test_cmp_bin .git/index.before .git/index &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep "fsmonitor last update builtin:test:1" \
+			.git/fsmonitor
+	)
+'
+
+test_expect_success MACOS \
+	'linked worktree legacy upgrade uses its writable index repair' '
+	test_when_finished \
+		"stop_daemon_delete_linked_repo legacy-linked legacy-linked-wt" &&
+	test_create_repo legacy-linked &&
+	(
+		cd legacy-linked &&
+		git config core.fsmonitor false &&
+		for i in $(test_seq 1 32)
+		do
+			test_write_lines "$i" >"tracked-$i" || return 1
+		done &&
+		git add . &&
+		git commit -qm base &&
+		git worktree add -q -b linked ../legacy-linked-wt
+	) &&
+	git -C legacy-linked config core.preloadIndex false &&
+	git -C legacy-linked config core.untrackedCache true &&
+	git -C legacy-linked config core.fsmonitor true &&
+	gitdir=$(git -C legacy-linked-wt rev-parse --absolute-git-dir) &&
+	ipc_path=$(git -C legacy-linked-wt rev-parse --path-format=absolute \
+		--git-path fsmonitor--daemon.ipc) &&
+	test-tool simple-ipc start-daemon \
+		--name="$ipc_path" --threads=1 \
+		--fsmonitor-capability-superset &&
+	git -C legacy-linked-wt status --porcelain=v2 \
+		--untracked-files=normal --no-ahead-behind >linked.prime &&
+	test_must_be_empty linked.prime &&
+	test-tool simple-ipc stop-daemon --name="$ipc_path" &&
+	test-tool simple-ipc start-daemon \
+		--name="$ipc_path" --threads=1 --fsmonitor-legacy &&
+	cp "$gitdir/index" linked.index.before &&
+	for label in first repeat
+	do
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/linked-$label.trace" \
+			git -C legacy-linked-wt status --porcelain=v2 \
+				>linked-$label &&
+		test_must_be_empty linked-$label &&
+		test_cmp_bin linked.index.before "$gitdir/index" &&
+		test_trace2_data index refresh/sum_lstat 32 \
+			<linked-$label.trace || return 1
+	done &&
+	{ git -C legacy-linked-wt fsmonitor--daemon stop 2>/dev/null || :; } &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+	GIT_TRACE2_EVENT="$PWD/linked-repair.trace" \
+		git -C legacy-linked-wt status --porcelain=v2 >linked-repair &&
+	test_must_be_empty linked-repair &&
+	! test_cmp_bin linked.index.before "$gitdir/index" &&
+	test_path_is_missing "$gitdir/index.csts" &&
+	test-tool -C legacy-linked-wt dump-fsmonitor >linked.fsmonitor &&
+	test_grep "fsmonitor last update builtin:test:1" \
+		linked.fsmonitor
 '
 
 test_expect_success MACOS 'bound query upgrades stale directory event daemon' '

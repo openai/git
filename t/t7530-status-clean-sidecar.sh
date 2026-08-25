@@ -1727,7 +1727,7 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
-	'exact status persists stat repairs before a sidecar' '
+	'exact status installs a sidecar after stat repairs' '
 	test_when_finished "stop_daemon external-stat-exact" &&
 	setup_repo external-stat-exact &&
 	git -C external-stat-exact config core.autocrlf false &&
@@ -1740,21 +1740,32 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_trace2_data fsmonitor history/external-stored 1 \
 		<external-stat-exact.trace &&
-	test_path_is_missing external-stat-exact/.git/index.csts &&
+	test_path_is_file external-stat-exact/.git/index.csts &&
 	test_grep "\"label\":\"do_write_index\"" \
 		external-stat-exact.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<external-stat-exact.trace &&
+	test_trace2_data status clean-proof/postwrite-issued 1 \
+		<external-stat-exact.trace &&
 	git -C external-stat-exact -c core.fsmonitor=false \
 		diff-index --quiet HEAD &&
+	cp external-stat-exact/.git/index external-stat-exact.index &&
+	cp external-stat-exact/.git/index.csts external-stat-exact.sidecar &&
 
-	test_env GIT_TRACE2_EVENT="$PWD/external-stat-exact-issue.trace" \
+	test_env GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/external-stat-exact-issue.trace" \
 		bulk_status -C external-stat-exact status --porcelain=v2 \
 		>actual &&
 	test_must_be_empty actual &&
-	test_trace2_data fsmonitor history/external-stored 1 \
+	test_trace2_data status clean-proof/hit 1 \
 		<external-stat-exact-issue.trace &&
-	test_path_is_file external-stat-exact/.git/index.csts &&
+	test_grep ! "\"label\":\"do_read_index\"" \
+		external-stat-exact-issue.trace &&
 	test_grep ! "\"label\":\"do_write_index\"" \
-		external-stat-exact-issue.trace
+		external-stat-exact-issue.trace &&
+	test_cmp_bin external-stat-exact.index external-stat-exact/.git/index &&
+	test_cmp_bin external-stat-exact.sidecar \
+		external-stat-exact/.git/index.csts
 '
 
 test_expect_success DURABLE_FSMONITOR \
@@ -2005,6 +2016,10 @@ test_expect_success DURABLE_FSMONITOR \
 	prime_semantic_history sidecar-shape &&
 
 	bulk_status -C sidecar-shape status --porcelain=2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_missing sidecar-shape/.git/index.csts &&
+	bulk_status -C sidecar-shape status --porcelain=v2 \
+		--untracked-files=normal --no-ahead-behind >actual &&
 	test_must_be_empty actual &&
 	test_path_is_missing sidecar-shape/.git/index.csts &&
 
