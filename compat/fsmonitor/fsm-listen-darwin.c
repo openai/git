@@ -24,7 +24,7 @@
 #endif
 
 #include "git-compat-util.h"
-#include "fsmonitor-ll.h"
+#include "fsmonitor.h"
 #include "fsm-listen.h"
 #include "fsmonitor--daemon.h"
 #include "fsmonitor-path-utils.h"
@@ -37,6 +37,8 @@ struct fsm_listen_data
 {
 	CFStringRef cfsr_worktree_path;
 	CFStringRef cfsr_gitdir_path;
+	CFStringRef cfsr_event_path_key;
+	CFStringRef cfsr_event_inode_key;
 
 	CFArrayRef cfar_paths_to_watch;
 	int nr_paths_watching;
@@ -221,13 +223,14 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 {
 	struct fsmonitor_daemon_state *state = ctx;
 	struct fsm_listen_data *data = state->listen_data;
-	char **paths = (char **)event_paths;
+	CFArrayRef events = event_paths;
 	struct fsmonitor_batch *batch = NULL;
 	struct string_list cookie_list = STRING_LIST_INIT_DUP;
 	const char *path_k;
 	const char *slash;
 	char *resolved = NULL;
 	struct strbuf tmp = STRBUF_INIT;
+	struct strbuf event_path = STRBUF_INIT;
 	enum fsmonitor_path_type path_type;
 
 	/*
@@ -235,15 +238,39 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 	 * list and without holding any locks.
 	 */
 	for (size_t k = 0; k < num_of_events; k++) {
+		CFDictionaryRef event = CFArrayGetValueAtIndex(events, k);
+		CFStringRef path = event ?
+			CFDictionaryGetValue(event, data->cfsr_event_path_key) :
+			NULL;
+		CFNumberRef inode = event ?
+			CFDictionaryGetValue(event, data->cfsr_event_inode_key) :
+			NULL;
+		CFIndex path_size;
+		int64_t file_id = 0;
+
 		/*
-		 * On Mac, we receive an array of absolute paths.
+		 * Extended events retain their inode even when their pathname has
+		 * already been removed by the time this callback runs.
 		 */
+		if (!path)
+			goto invalid_event;
+		path_size = CFStringGetMaximumSizeForEncoding(
+			CFStringGetLength(path), kCFStringEncodingUTF8);
+		if (path_size < 0)
+			goto invalid_event;
+		strbuf_reset(&event_path);
+		strbuf_grow(&event_path, path_size + 1);
+		if (!CFStringGetCString(path, event_path.buf, path_size + 1,
+					kCFStringEncodingUTF8))
+			goto invalid_event;
+		strbuf_setlen(&event_path, strlen(event_path.buf));
+
 		free(resolved);
-		resolved = fsmonitor__resolve_alias(paths[k], &state->alias);
+		resolved = fsmonitor__resolve_alias(event_path.buf, &state->alias);
 		if (resolved)
 			path_k = resolved;
 		else
-			path_k = paths[k];
+			path_k = event_path.buf;
 
 		/*
 		 * If you want to debug FSEvents, log them to GIT_TRACE_FSMONITOR.
@@ -315,16 +342,24 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 		if (ef_is_hardlink(event_flags[k]) &&
 		    path_type == IS_WORKDIR_PATH) {
 			/*
-			 * An event for one name does not prove that all names of the
-			 * inode are in this watch cone.  Make the client content-check
-			 * the entire tracked set rather than trusting path-local stats.
+			 * The daemon never reads the index. Let an inode-aware client
+			 * invalidate every tracked alias without disturbing unrelated
+			 * ignored hardlinks. Missing inode data must remain fail-closed.
 			 */
 			if (trace_pass_fl(&trace_fsmonitor))
 				log_flags_set(path_k, event_flags[k]);
 			if (!batch)
 				batch = fsmonitor_batch__new();
-			my_add_path(batch, FSMONITOR_PATH_GLOBAL_INVALIDATE);
-			continue;
+			if (!inode || !CFNumberGetValue(inode, kCFNumberSInt64Type,
+						 &file_id) || !file_id) {
+				my_add_path(batch, FSMONITOR_PATH_GLOBAL_INVALIDATE);
+			} else {
+				strbuf_reset(&tmp);
+				strbuf_addf(&tmp, "%s%016"PRIx64,
+					    FSMONITOR_PATH_HARDLINK_INODE_PREFIX,
+					    (uint64_t)file_id);
+				my_add_path(batch, tmp.buf);
+			}
 		}
 
 		switch (path_type) {
@@ -385,26 +420,19 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 			 * know how much to invalidate/refresh.
 			 */
 
-			if (event_flags[k] & (kFSEventStreamEventFlagItemIsFile | kFSEventStreamEventFlagItemIsSymlink)) {
-				const char *rel = path_k +
-					state->path_worktree_watch.len + 1;
-
+			fsmonitor_format_worktree_paths(
+				&tmp, path_k, state->path_worktree_watch.len,
+				!!(event_flags[k] &
+				   (kFSEventStreamEventFlagItemIsFile |
+				    kFSEventStreamEventFlagItemIsSymlink)),
+				!!(event_flags[k] &
+				   kFSEventStreamEventFlagItemIsDir));
+			for (const char *relative = tmp.buf;
+			     relative < tmp.buf + tmp.len;
+			     relative += strlen(relative) + 1) {
 				if (!batch)
 					batch = fsmonitor_batch__new();
-				my_add_path(batch, rel);
-			}
-
-			if (event_flags[k] & kFSEventStreamEventFlagItemIsDir) {
-				const char *rel = path_k +
-					state->path_worktree_watch.len + 1;
-
-				strbuf_reset(&tmp);
-				strbuf_addstr(&tmp, rel);
-				strbuf_addch(&tmp, '/');
-
-				if (!batch)
-					batch = fsmonitor_batch__new();
-				my_add_path(batch, tmp.buf);
+				my_add_path(batch, relative);
 			}
 
 			break;
@@ -415,18 +443,28 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 					 "ignoring '%s'", path_k);
 			break;
 		}
+		continue;
+
+invalid_event:
+		fsmonitor_force_resync(state);
+		fsmonitor_batch__free_list(batch);
+		string_list_clear(&cookie_list, 0);
+		batch = NULL;
 	}
 
 	free(resolved);
 	fsmonitor_publish(state, batch, &cookie_list);
 	string_list_clear(&cookie_list, 0);
 	strbuf_release(&tmp);
+	strbuf_release(&event_path);
 	return;
 
 force_shutdown:
 	free(resolved);
 	fsmonitor_batch__free_list(batch);
 	string_list_clear(&cookie_list, 0);
+	strbuf_release(&tmp);
+	strbuf_release(&event_path);
 
 	pthread_mutex_lock(&data->dq_lock);
 	data->shutdown_style = FORCE_SHUTDOWN;
@@ -458,7 +496,9 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 {
 	FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagNoDefer |
 		kFSEventStreamCreateFlagWatchRoot |
-		kFSEventStreamCreateFlagFileEvents;
+		kFSEventStreamCreateFlagFileEvents |
+		kFSEventStreamCreateFlagUseCFTypes |
+		kFSEventStreamCreateFlagUseExtendedData;
 	FSEventStreamContext ctx = {
 		0,
 		state,
@@ -471,6 +511,13 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 
 	CALLOC_ARRAY(data, 1);
 	state->listen_data = data;
+
+	data->cfsr_event_path_key = CFStringCreateWithCString(
+		NULL, "path", kCFStringEncodingUTF8);
+	data->cfsr_event_inode_key = CFStringCreateWithCString(
+		NULL, "fileID", kCFStringEncodingUTF8);
+	if (!data->cfsr_event_path_key || !data->cfsr_event_inode_key)
+		goto failed;
 
 	data->cfsr_worktree_path = CFStringCreateWithCString(
 		NULL, state->path_worktree_watch.buf, kCFStringEncodingUTF8);

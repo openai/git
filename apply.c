@@ -13,12 +13,15 @@
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "base85.h"
+#include "clean-status.h"
+#include "clean-status-index.h"
 #include "config.h"
 #include "odb.h"
 #include "delta.h"
 #include "diff.h"
 #include "dir.h"
 #include "environment.h"
+#include "fsmonitor-settings.h"
 #include "gettext.h"
 #include "hex.h"
 #include "xdiff-interface.h"
@@ -31,6 +34,7 @@
 #include "path.h"
 #include "quote.h"
 #include "read-cache.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "rerere.h"
 #include "apply.h"
@@ -4440,9 +4444,79 @@ static void patch_stats(struct apply_state *state, struct patch *patch)
 	}
 }
 
+static int patch_preserves_clean_history(struct apply_state *state,
+					 struct patch *patch)
+{
+	struct index_state *istate = state->repo->index;
+	const struct cache_entry *old;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
+	int pos;
+
+	if (!state->update_index || state->ita_only || state->threeway ||
+	    state->apply_with_reject || state->fake_ancestor ||
+	    state->index_file || !fstat_is_reliable() ||
+	    (getenv(INDEX_ENVIRONMENT) &&
+	     !clean_status_index_path_is_main(istate->repo,
+					      istate->repo->index_file)) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) ||
+	    getenv(DB_ENVIRONMENT) || getenv(ALTERNATE_DB_ENVIRONMENT) ||
+	    istate != istate->repo->index || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    repo_config_values(istate->repo)->apply_sparse_checkout ||
+	    !istate->repo->config_values_private_.trust_ctime ||
+	    !istate->repo->config_values_private_.check_stat ||
+	    (fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC &&
+	     !suspended) ||
+	    repo_has_replace_refs_uncached(istate->repo) ||
+	    patch->is_new > 0 || patch->is_delete > 0 || patch->is_copy ||
+	    patch->is_rename || patch->conflicted_threeway ||
+	    !patch->old_name || !patch->new_name ||
+	    strcmp(patch->old_name, patch->new_name) ||
+	    !S_ISREG(patch->old_mode) || !S_ISREG(patch->new_mode) ||
+	    create_ce_mode(patch->old_mode) !=
+		create_ce_mode(patch->new_mode) ||
+	    !clean_status_external_history_enabled(istate) ||
+	    !istate->untracked ||
+	    !istate->untracked->root)
+		return 0;
+	if (suspended) {
+		/* Keep only the authenticated historical boundary during backoff. */
+		if (!clean_status_fsmonitor_semantic_baseline_pending(istate) ||
+		    !istate->untracked->root->valid ||
+		    !istate->untracked->fsmonitor_revalidation)
+			return 0;
+	} else if (!clean_status_has_persistent_fsmonitor_semantic_history(istate) ||
+		   !clean_status_revalidated_token_matches(istate) ||
+		   !istate->fsmonitor_token_valid ||
+		   !istate->fsmonitor_untracked_valid ||
+		   !istate->fsmonitor_untracked_extension_seen ||
+		   istate->fsmonitor_untracked_extension_invalid ||
+		   !istate->fsmonitor_last_update ||
+		   !istate->fsmonitor_untracked_token ||
+		   strcmp(istate->fsmonitor_last_update,
+			  istate->fsmonitor_untracked_token) ||
+		   !istate->untracked->use_fsmonitor) {
+		return 0;
+	}
+
+	pos = index_name_pos(istate, patch->old_name,
+			     strlen(patch->old_name));
+	if (pos < 0)
+		return 0;
+	old = istate->cache[pos];
+	return S_ISREG(old->ce_mode) &&
+		old->ce_mode == create_ce_mode(patch->new_mode) &&
+		clean_status_index_entry_is_semantically_safe(
+			istate, old, old);
+}
+
 static int remove_file(struct apply_state *state, struct patch *patch, int rmdir_empty)
 {
-	if (state->update_index && !state->ita_only) {
+	if (state->update_index && !state->ita_only &&
+	    !patch_preserves_clean_history(state, patch)) {
+		if (clean_status_external_history_enabled(state->repo->index))
+			clean_status_invalidate_current_proof(state->repo->index);
 		if (remove_file_from_index(state->repo->index, patch->old_name) < 0)
 			return error(_("unable to remove %s from index"), patch->old_name);
 	}
@@ -4455,6 +4529,7 @@ static int remove_file(struct apply_state *state, struct patch *patch, int rmdir
 }
 
 static int add_index_file(struct apply_state *state,
+			  struct patch *patch,
 			  const char *path,
 			  unsigned mode,
 			  void *buf,
@@ -4463,6 +4538,7 @@ static int add_index_file(struct apply_state *state,
 	struct stat st;
 	struct cache_entry *ce;
 	int namelen = strlen(path);
+	int options = ADD_CACHE_OK_TO_ADD;
 
 	ce = make_empty_cache_entry(state->repo->index, namelen);
 	memcpy(ce->name, path, namelen);
@@ -4497,7 +4573,13 @@ static int add_index_file(struct apply_state *state,
 				       "for newly created file %s"), path);
 		}
 	}
-	if (add_index_entry(state->repo->index, ce, ADD_CACHE_OK_TO_ADD) < 0) {
+	if (patch_preserves_clean_history(state, patch)) {
+		options |= ADD_CACHE_OK_TO_REPLACE |
+			ADD_CACHE_PRESERVE_CLEAN_HISTORY;
+	} else if (clean_status_external_history_enabled(state->repo->index)) {
+		clean_status_invalidate_current_proof(state->repo->index);
+	}
+	if (add_index_entry(state->repo->index, ce, options) < 0) {
 		discard_cache_entry(ce);
 		return error(_("unable to add cache entry for %s"), path);
 	}
@@ -4697,7 +4779,7 @@ static int create_file(struct apply_state *state, struct patch *patch)
 	if (patch->conflicted_threeway)
 		return add_conflicted_stages_file(state, patch);
 	else if (state->check_index || (state->ita_only && patch->is_new > 0))
-		return add_index_file(state, path, mode, buf, size);
+		return add_index_file(state, patch, path, mode, buf, size);
 	return 0;
 }
 
@@ -4827,6 +4909,18 @@ static int write_out_results(struct apply_state *state, struct patch *list)
 	int errs = 0;
 	struct patch *l;
 	struct string_list cpath = STRING_LIST_INIT_DUP;
+
+	if (state->update_index &&
+	    clean_status_external_history_enabled(state->repo->index)) {
+		for (l = list; l; l = l->next) {
+			if (l->rejected ||
+			    !patch_preserves_clean_history(state, l)) {
+				clean_status_invalidate_current_proof(
+					state->repo->index);
+				break;
+			}
+		}
+	}
 
 	for (phase = 0; phase < 2; phase++) {
 		l = list;

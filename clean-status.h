@@ -8,6 +8,9 @@ struct cache_entry;
 struct attr_source_snapshot;
 struct clean_status_progress;
 struct clean_status_proof_epoch;
+struct clean_status_index_snapshot;
+struct clean_status_commit_checkpoint;
+struct clean_status_backoff_transfer;
 struct lock_file;
 struct repository;
 struct stat;
@@ -23,6 +26,7 @@ void clean_status_set_config_digest(
 	struct repository *repo,
 	const struct clean_status_config_digest *digest);
 void clean_status_enable_external_history(struct repository *repo);
+void clean_status_prepare_main_index_history(struct repository *repo);
 int clean_status_external_history_enabled(const struct index_state *istate);
 void clean_status_enable_progress(struct repository *repo);
 struct clean_status_progress *clean_status_start_progress(
@@ -63,8 +67,13 @@ int clean_status_try_preserve_tracked_config_epoch(
 	struct index_state *istate);
 int clean_status_revalidated_token_matches(
 	const struct index_state *istate);
+int clean_status_suspend_fsmonitor_for_backoff(struct index_state *istate);
+int clean_status_fsmonitor_backoff_suspended(
+	const struct index_state *istate);
 
 int clean_status_has_persistent_fsmonitor_semantic_history(
+	const struct index_state *istate);
+int clean_status_has_current_full_fsmonitor_proof(
 	const struct index_state *istate);
 int clean_status_has_worktree_manifest_history(
 	const struct index_state *istate);
@@ -79,6 +88,8 @@ void clean_status_begin_fsmonitor_semantic_baseline(
 
 int clean_status_refresh_worktree_manifest(struct index_state *istate);
 int clean_status_manifest_global_fallback(const struct index_state *istate);
+int clean_status_pending_revalidation_manifest_unchanged(
+	const struct index_state *istate);
 int clean_status_has_authenticated_worktree_manifest(
 	const struct index_state *istate);
 int clean_status_has_authenticated_bootstrap_manifest(
@@ -105,7 +116,7 @@ int clean_status_issue_sidecar(
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config,
-	int *repository_inputs_changed);
+	int *repository_inputs_changed, int *provider_reset);
 
 int clean_status_read_fsmonitor_config(struct index_state *istate,
 				       const void *data, unsigned long size);
@@ -138,8 +149,12 @@ int clean_status_has_recovered_tracked_stat(
 	const struct index_state *istate);
 int clean_status_external_history_owns_index(
 	const struct index_state *istate);
+void clean_status_require_external_history_source(struct repository *repo);
 void clean_status_capture_external_history_source(
 	struct index_state *istate);
+int clean_status_capture_external_history_source_from_snapshot(
+	struct index_state *istate,
+	const struct clean_status_index_snapshot *snapshot);
 int clean_status_save_external_history(struct index_state *istate);
 void clean_status_copy_fsmonitor_history(struct index_state *dst,
 					 const struct index_state *src);
@@ -147,6 +162,51 @@ int clean_status_transfer_current_proof_if_same_index(
 	struct index_state *dst, const struct index_state *src);
 int clean_status_transfer_current_proof_if_semantically_same_index(
 	struct index_state *dst, const struct index_state *src);
+
+/*
+ * A canonical main-index source may lend suspended historical state to an
+ * in-process replacement. The caller must abandon the capture on any unsafe
+ * mutation, move the original extensions, and transfer before discarding src.
+ * This never grants a current tracked or untracked proof.
+ */
+struct clean_status_backoff_transfer *clean_status_capture_backoff_transfer(
+	struct index_state *src);
+int clean_status_backoff_transfer_entry_is_safe(
+	const struct clean_status_backoff_transfer *transfer,
+	const struct cache_entry *old, const struct cache_entry *new_entry);
+int clean_status_transfer_backoff_history(
+	struct clean_status_backoff_transfer *transfer,
+	struct index_state *dst, struct index_state *src);
+void clean_status_release_backoff_transfer(
+	struct clean_status_backoff_transfer *transfer);
+
+/*
+ * Historical-only state for a parent-owned, uncommitted main-index write.
+ * Capture before the first write; record its closed output before hooks.
+ * The caller releases the checkpoint and any replacement index state. The
+ * entries-only restore reader borrows fd and grants no current clean proof.
+ */
+struct clean_status_commit_checkpoint *clean_status_capture_commit_checkpoint(
+	struct index_state *istate, struct lock_file *lock);
+void clean_status_record_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint,
+	struct index_state *istate, struct lock_file *lock);
+/* Seal safe same-path interactive changes before running ordinary hooks. */
+int clean_status_advance_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint,
+	const struct index_state *current, struct lock_file *lock);
+int clean_status_commit_checkpoint_changed(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock);
+int clean_status_commit_checkpoint_still_valid(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock);
+int clean_status_prepare_commit_checkpoint_restore(
+	const struct clean_status_commit_checkpoint *checkpoint,
+	struct lock_file *lock, const struct index_state *current,
+	struct index_state *replacement, int fd);
+void clean_status_release_commit_checkpoint(
+	struct clean_status_commit_checkpoint *checkpoint);
 
 void clean_status_release(struct index_state *istate);
 

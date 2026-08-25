@@ -10,6 +10,7 @@
 #define MAX_UNPACK_TREES 8
 
 struct cache_entry;
+struct clean_status_backoff_transfer;
 struct unpack_trees_options;
 struct pattern_list;
 
@@ -71,7 +72,8 @@ struct unpack_trees_options {
 		     exiting_early,
 		     dry_run,
 		     skip_cache_tree_update,
-		     preserve_semantic_history;
+		     preserve_semantic_history,
+		     preserve_backoff_history;
 	enum unpack_trees_reset_type reset;
 	const char *prefix;
 	const char *super_prefix;
@@ -105,6 +107,7 @@ struct unpack_trees_options {
 		struct string_list unpack_rejects[NB_UNPACK_TREES_WARNING_TYPES];
 
 		struct index_state result;
+		struct clean_status_backoff_transfer *backoff_transfer;
 
 		struct pattern_list *pl;
 		struct dir_struct *dir;

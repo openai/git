@@ -1,8 +1,11 @@
 #include "git-compat-util.h"
+#include "abspath.h"
 #include "clean-status.h"
 #include "clean-status-index.h"
 #include "clean-status-internal.h"
 #include "clean-status-sidecar.h"
+#include "dir.h"
+#include "environment.h"
 #include "hash-framing.h"
 #include "object.h"
 #include "read-cache-ll.h"
@@ -14,6 +17,56 @@
 	(CE_STAGEMASK | CE_EXTENDED | CE_VALID | CE_EXTENDED_FLAGS)
 #define LOGICAL_INDEX_BENIGN_FLAGS \
 	(CE_UPTODATE | CE_HASHED | CE_FSMONITOR_VALID)
+
+static int index_path_matches_main(
+	const char *path, const char *canonical,
+	const struct clean_status_identity *main_identity)
+{
+	struct clean_status_identity identity;
+	struct stat st;
+	char *resolved;
+	int matches;
+
+	if (!path || !*path || lstat(path, &st) ||
+	    clean_status_identity_from_stat(&identity, &st) ||
+	    !clean_status_identity_equal(&identity, main_identity))
+		return 0;
+	resolved = real_pathdup(path, 0);
+	matches = resolved && !fspathcmp(resolved, canonical);
+	free(resolved);
+	return matches;
+}
+
+int clean_status_index_path_is_main(struct repository *repo, const char *path)
+{
+	struct clean_status_identity main_identity;
+	struct stat st;
+	const char *selected = getenv(INDEX_ENVIRONMENT);
+	char *main_index, *canonical = NULL;
+	int matches = 0;
+
+	if (!repo || !repo->initialized || !repo->gitdir || !*repo->gitdir ||
+	    !repo->index_file || !*repo->index_file || !path || !*path)
+		return 0;
+	/* repo_git_path("index") follows GIT_INDEX_FILE, including lockfiles. */
+	main_index = xstrfmt("%s/index", repo_get_git_dir(repo));
+	if (lstat(main_index, &st) ||
+	    clean_status_identity_from_stat(&main_identity, &st))
+		goto done;
+	canonical = real_pathdup(main_index, 0);
+	if (!canonical ||
+	    !index_path_matches_main(repo->index_file, canonical, &main_identity) ||
+	    !index_path_matches_main(path, canonical, &main_identity) ||
+	    (selected &&
+	     !index_path_matches_main(selected, canonical, &main_identity)) ||
+	    !index_path_matches_main(main_index, canonical, &main_identity))
+		goto done;
+	matches = 1;
+done:
+	free(canonical);
+	free(main_index);
+	return matches;
+}
 
 static int snapshot_read(
 	int fd, const struct stat *st, const struct git_hash_algo *algo,
@@ -58,13 +111,17 @@ static int snapshot_open(
 {
 	struct clean_status_identity named;
 	struct stat fd_st, named_st;
-	int fd;
+	int fd, flags = O_RDONLY | O_CLOEXEC;
 
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->fd = -1;
-	fd = open_nofollow(path, O_RDONLY);
+#ifdef O_NONBLOCK
+	flags |= O_NONBLOCK;
+#endif
+	fd = open_nofollow(path, flags);
 	if (fd < 0 ||
 	    fstat(fd, &fd_st) ||
+	    !S_ISREG(fd_st.st_mode) ||
 	    lstat(path, &named_st) ||
 	    clean_status_identity_from_stat(&snapshot->identity, &fd_st) ||
 	    clean_status_identity_from_stat(&named, &named_st) ||
@@ -222,6 +279,160 @@ void clean_status_index_snapshot_release(
 	if (snapshot->fd >= 0)
 		close(snapshot->fd);
 	snapshot->fd = -1;
+}
+
+static int write_receipt_owner_matches(const struct stat *st)
+{
+#ifdef __APPLE__
+	return st->st_uid == geteuid();
+#else
+	(void)st;
+	return 0;
+#endif
+}
+
+static int write_receipt_is_eligible(const struct index_state *istate)
+{
+	const struct clean_status_state *state;
+
+	if (!istate || !istate->initialized || !istate->repo ||
+	    !istate->repo->initialized)
+		return 0;
+	state = istate->clean_status;
+	return clean_status_identity_is_durable() && fstat_is_reliable() &&
+		state && state->config_enforced && state->current_config_valid &&
+		state->source_identity_valid &&
+		clean_status_external_history_enabled(istate) &&
+		!getenv(INDEX_ENVIRONMENT) && istate == istate->repo->index &&
+		!istate->split_index && istate->sparse_index == INDEX_EXPANDED &&
+		!repo_config_values(istate->repo)->apply_sparse_checkout &&
+		is_null_oid(&istate->oid);
+}
+
+int clean_status_index_prepare_write_receipt(
+	struct index_state *istate, int lock_fd,
+	struct clean_status_index_write_receipt *receipt)
+{
+#if defined(__APPLE__) && defined(F_DUPFD_CLOEXEC) && \
+	defined(F_GETFL) && defined(O_ACCMODE)
+	struct clean_status_identity initial, held;
+	struct stat before, after;
+	int owned, flags;
+
+	if (!receipt || receipt->snapshot.fd >= 0 || receipt->istate ||
+	    receipt->recorded || !write_receipt_is_eligible(istate) ||
+	    lock_fd < 0)
+		return -1;
+	flags = fcntl(lock_fd, F_GETFL);
+	if (flags < 0 || (flags & O_ACCMODE) != O_RDWR ||
+	    fstat(lock_fd, &before) || !write_receipt_owner_matches(&before) ||
+	    clean_status_identity_from_stat(&initial, &before))
+		return -1;
+	/* The writer closes its descriptor before committing the lockfile. */
+	owned = fcntl(lock_fd, F_DUPFD_CLOEXEC, 0);
+	if (owned < 0)
+		return -1;
+	if (fstat(owned, &after) ||
+	    clean_status_identity_from_stat(&held, &after) ||
+	    !clean_status_identity_equal(&initial, &held)) {
+		close(owned);
+		return -1;
+	}
+	receipt->snapshot.fd = owned;
+	receipt->source_identity = istate->clean_status->source_identity;
+	receipt->istate = istate;
+	return 0;
+#else
+	(void)istate;
+	(void)lock_fd;
+	(void)receipt;
+	return -1;
+#endif
+}
+
+void clean_status_index_record_write_receipt(
+	struct index_state *istate,
+	struct clean_status_index_write_receipt *receipt)
+{
+	struct clean_status_index_snapshot snapshot;
+	struct stat st;
+
+	if (!receipt || receipt->snapshot.fd < 0)
+		return;
+	if (receipt->recorded || receipt->istate != istate ||
+	    !write_receipt_is_eligible(istate) ||
+	    !clean_status_identity_equal(
+		    &receipt->source_identity,
+		    &istate->clean_status->source_identity))
+		goto fail;
+
+	/* Capture ctime after our rename, but before any hook can change it. */
+	snapshot = receipt->snapshot;
+	if (fstat(snapshot.fd, &st) || !write_receipt_owner_matches(&st) ||
+	    clean_status_identity_from_stat(&snapshot.identity, &st) ||
+	    snapshot_read(snapshot.fd, &st, istate->repo->hash_algo,
+			  &snapshot.version, &snapshot.cache_nr,
+			  &snapshot.checksum) ||
+	    snapshot.version != istate->version ||
+	    snapshot.cache_nr != istate->cache_nr ||
+	    !oideq(&snapshot.checksum, &istate->oid) ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &snapshot, istate->repo->index_file,
+		    istate->repo->hash_algo))
+		goto fail;
+	receipt->snapshot = snapshot;
+	receipt->recorded = 1;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/own-write-source-recorded", 1);
+	return;
+
+fail:
+	clean_status_index_write_receipt_release(receipt);
+}
+
+int clean_status_index_adopt_write_receipt(
+	struct index_state *istate,
+	struct clean_status_index_write_receipt *receipt)
+{
+	struct clean_status_state *state;
+	struct stat st;
+	int adopted = 0;
+
+	if (!receipt || !receipt->recorded || receipt->istate != istate ||
+	    !write_receipt_is_eligible(istate))
+		goto done;
+	state = istate->clean_status;
+	if (!clean_status_identity_equal(&receipt->source_identity,
+					 &state->source_identity) ||
+	    receipt->snapshot.version != istate->version ||
+	    receipt->snapshot.cache_nr != istate->cache_nr ||
+	    !oideq(&receipt->snapshot.checksum, &istate->oid) ||
+	    fstat(receipt->snapshot.fd, &st) ||
+	    !write_receipt_owner_matches(&st) ||
+	    !clean_status_index_snapshot_still_matches_path(
+		    &receipt->snapshot, istate->repo->index_file,
+		    istate->repo->hash_algo))
+		goto done;
+
+	/* The original descriptor and logical digest still name the old source. */
+	state->source_identity = receipt->snapshot.identity;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/own-write-source-adopted", 1);
+	adopted = 1;
+
+done:
+	clean_status_index_write_receipt_release(receipt);
+	return adopted;
+}
+
+void clean_status_index_write_receipt_release(
+	struct clean_status_index_write_receipt *receipt)
+{
+	if (!receipt)
+		return;
+	clean_status_index_snapshot_release(&receipt->snapshot);
+	memset(receipt, 0, sizeof(*receipt));
+	receipt->snapshot.fd = -1;
 }
 
 int clean_status_index_entries_are_certifiable(
