@@ -2932,8 +2932,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			for role in main linked
 			do
 				case "$role" in
-				main) worktree="$repo" ;;
-				linked) worktree="$linked" ;;
+				main)
+					worktree="$repo" &&
+					invalidated=96
+					;;
+				linked)
+					worktree="$linked" &&
+					invalidated=192
+					;;
 				esac &&
 				if test "$mode" != ff
 				then
@@ -2956,9 +2962,21 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				test_must_be_empty "$gitdir/prime" &&
 				perl "$PWD/.git/check-pull-proof.pl" \
 					<"$gitdir/index" &&
-				test_write_lines "$mode-$role" \
-					>"upstream-$mode-$role" &&
-				git add "upstream-$mode-$role" &&
+				if test "$mode" = ff
+				then
+					mkdir -p "upstream-$mode-$role/nested" &&
+					for file in $(test_seq 1 96)
+					do
+						test_write_lines "$mode-$role-$file" \
+							>"upstream-$mode-$role/nested/$file" ||
+							return 1
+					done &&
+					git add "upstream-$mode-$role"
+				else
+					test_write_lines "$mode-$role" \
+						>"upstream-$mode-$role" &&
+					git add "upstream-$mode-$role"
+				fi &&
 				git commit -qm "upstream-$mode-$role" &&
 				git push --quiet origin main &&
 				if test "$mode" = autostash
@@ -2971,7 +2989,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCC \
 				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 				GIT_TRACE2_EVENT="$gitdir/pull.trace" \
-					git -C "$worktree" "$@" \
+					git -C "$worktree" \
+						-c protocol.version=2 \
+						-c fetch.uriprotocols=https \
+						-c http.https://example.invalid.extraHeader=header \
+						-c http.https://example.invalid.proactiveAuth=basic \
+						-c http.https://example.invalid.sslVerify=true \
+						"$@" \
 						>"$gitdir/pull" &&
 				if test "$mode" != ff
 				then
@@ -2987,6 +3011,12 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				! test_trace2_data fsmonitor \
 					semantic/manifest-scan-count 1 \
 					<"$gitdir/pull.trace" &&
+				if test "$mode" = ff
+				then
+					test_trace2_data fsmonitor \
+						history/untracked-paired-new-directory-invalidated \
+						"$invalidated" <"$gitdir/pull.trace"
+				fi &&
 				perl "$PWD/.git/check-pull-proof.pl" \
 					<"$gitdir/index" &&
 				cp "$gitdir/index" "$gitdir/readonly.index" &&
@@ -5295,9 +5325,12 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 			if test "$branch" = alternate
 			then
 				test_trace2_data fsmonitor \
-					history/untracked-paired-new-directory-deferred 1 \
+					history/untracked-paired-new-directory-invalidated 2 \
 					<".git/switch-$branch.trace" &&
-				test_grep ! FSUC .git/index &&
+				test_trace2_data fsmonitor \
+					history/untracked-paired-transfer 1 \
+					<".git/switch-$branch.trace" &&
+				test_grep FSUC .git/index &&
 				test_grep FSCF .git/index
 			else
 				test_trace2_data fsmonitor \
@@ -5331,11 +5364,9 @@ test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHO
 				test "$visited_dirs" -lt 12
 			elif test "$branch" = alternate
 			then
-				test_trace2_data fsmonitor \
+				! test_trace2_data fsmonitor \
 					history/external-untracked-restored 1 \
 					<".git/status-$branch.trace" &&
-				test_region index do_write_index \
-					".git/status-$branch.trace" &&
 				test_grep FSUC .git/index &&
 				visited_dirs=$(sed -n \
 					"s/.*directories-visited:\\([0-9][0-9]*\\).*/\\1/p" \

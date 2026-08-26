@@ -1914,6 +1914,50 @@ static int checkout_introduces_new_indexed_directory(
 	return 0;
 }
 
+static unsigned int checkout_invalidate_new_index_entries(
+	struct index_state *source, struct index_state *result)
+{
+	unsigned int invalidated = 0, source_pos = 0;
+
+	for (unsigned int result_pos = 0;
+	     result_pos < result->cache_nr; result_pos++) {
+		const struct cache_entry *entry = result->cache[result_pos];
+		int cmp;
+
+		while (source_pos < source->cache_nr) {
+			const struct cache_entry *source_entry =
+				source->cache[source_pos];
+
+			cmp = strcmp(source_entry->name, entry->name);
+			if (!cmp)
+				cmp = ce_stage(source_entry) - ce_stage(entry);
+			if (cmp >= 0)
+				break;
+			source_pos++;
+		}
+		if (source_pos < source->cache_nr) {
+			const struct cache_entry *source_entry =
+				source->cache[source_pos];
+
+			cmp = strcmp(source_entry->name, entry->name);
+			if (!cmp)
+				cmp = ce_stage(source_entry) - ce_stage(entry);
+		} else {
+			cmp = 1;
+		}
+		if (!cmp)
+			continue;
+		/*
+		 * The result receives the source untracked cache after its entries
+		 * are built. Replay additions now so a newly tracked directory is
+		 * represented by invalid cache nodes rather than dropping FSUC.
+		 */
+		untracked_cache_invalidate_path(result, entry->name, 0);
+		invalidated++;
+	}
+	return invalidated;
+}
+
 /*
  * N-way merge "len" trees.  Returns 0 on success, -1 on failure to manipulate the
  * resulting index, -2 on failure to reflect the changes to the work tree.
@@ -2142,7 +2186,6 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 				o->internal.backoff_transfer,
 				&o->internal.result, o->src_index);
 		if (!ret && o->preserve_semantic_history && history_transferred &&
-		    !new_indexed_directory &&
 		    !o->src_index->sparse_index &&
 		    !o->internal.result.sparse_index &&
 		    !o->src_index->split_index &&
@@ -2169,6 +2212,13 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 			o->internal.result.untracked->use_fsmonitor = 1;
 			trace2_data_intmax("fsmonitor", repo,
 					   "history/untracked-paired-transfer", 1);
+			if (new_indexed_directory)
+				trace2_data_intmax(
+					"fsmonitor", repo,
+					"history/untracked-paired-new-directory-invalidated",
+					checkout_invalidate_new_index_entries(
+						o->src_index,
+						&o->internal.result));
 		} else if (new_indexed_directory) {
 			trace2_data_intmax(
 				"fsmonitor", repo,

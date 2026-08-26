@@ -38,6 +38,9 @@ int clean_status_manifest_end_directory_delta(struct index_state *istate);
 /* Recheck one path's attribute ancestry for suspended backoff history. */
 int clean_status_manifest_path_attributes_unchanged(
 	const struct index_state *istate, const char *path);
+/* Recheck each distinct attribute source below an indexed directory. */
+int clean_status_manifest_directory_sources_unchanged(
+	const struct index_state *istate, const char *directory);
 int clean_status_manifest_directory_unchanged(
 	struct index_state *istate, const char *directory);
 int clean_status_manifest_reconcile_deleted_attribute(

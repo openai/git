@@ -3243,6 +3243,68 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'large directory events authenticate distinct attribute sources once' '
+	test_when_finished "rm -rf large-directory-event" &&
+	test_create_repo large-directory-event &&
+	(
+		cd large-directory-event &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p bulk/nested siblings &&
+		for file in $(test_seq 1 96)
+		do
+			test_write_lines "bulk-$file" >"bulk/nested/$file" ||
+				return 1
+		done &&
+		for file in $(test_seq 1 128)
+		do
+			test_write_lines "sibling-$file" >"siblings/$file" ||
+				return 1
+		done &&
+		git add bulk siblings &&
+		git commit -qm base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=bulk/ \
+		GIT_TRACE2_EVENT="$PWD/.git/bulk.trace" \
+			git status --porcelain=v2 >.git/bulk.actual &&
+		test_must_be_empty .git/bulk.actual &&
+		test_trace2_data fsmonitor \
+			semantic/authenticated-restored-directory 1 \
+			<.git/bulk.trace &&
+		test_trace2_data index refresh/sum_lstat 96 \
+			<.git/bulk.trace &&
+		! have_t2_data_event fsmonitor semantic/attributes-cone \
+			<.git/bulk.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/bulk.trace &&
+
+		test_write_lines "*.txt text" >bulk/nested/.gitattributes &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/attributes.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=bulk/ \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes.actual &&
+		test_cmp .git/attributes.expect .git/attributes.actual &&
+		test_trace2_data fsmonitor semantic/attributes-cone 96 \
+			<.git/attributes.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/attributes.trace &&
+		! have_t2_data_event fsmonitor \
+			semantic/authenticated-restored-directory \
+			<.git/attributes.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'deleted staged directories never discard nested attribute sources' '
 	test_when_finished \
 		"rm -rf deleted-staged-attrs-tracked deleted-staged-attrs-untracked" &&

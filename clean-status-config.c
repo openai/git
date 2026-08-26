@@ -90,6 +90,10 @@ static int config_is_command_transport(const char *key,
 
 	if (!ctx || !ctx->kvi || ctx->kvi->scope != CONFIG_SCOPE_COMMAND)
 		return 0;
+	if (!strcmp(key, "protocol.version") ||
+	    !strcmp(key, "fetch.uriprotocols") ||
+	    starts_with(key, "http."))
+		return 1;
 	if (starts_with(key, "credential."))
 		return 1;
 	if (parse_config_key(key, "url", &subsection, &subsection_len,

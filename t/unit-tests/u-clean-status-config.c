@@ -70,6 +70,11 @@ void test_clean_status_config__origin_only_affects_full_hash(void)
 void test_clean_status_config__command_transport_config_does_not_change_proof(void)
 {
 	static const char *const ignored_keys[] = {
+		"protocol.version",
+		"fetch.uriprotocols",
+		"http.https://Example.Invalid.extraheader",
+		"http.https://Example.Invalid.proactiveauth",
+		"http.https://Example.Invalid.sslverify",
 		"credential.helper",
 		"credential.https://Example/Team.helper",
 		"url.https://Proxy.Example/Team/.insteadof",
