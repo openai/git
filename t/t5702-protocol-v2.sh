@@ -1321,6 +1321,7 @@ test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
 	GIT_TEST_SIDEBAND_ALL=1 \
 	git -c protocol.version=2 -c fetch.uriprotocols=http \
 		-c fetch.packfileUriJobs=2 \
+		-c pack.threads=1 \
 		clone "$HTTPD_URL/smart/http_parent" http_child-no-ref &&
 
 	test_grep "> no-ref-delta" no-ref-packet.trace &&
@@ -1330,6 +1331,176 @@ test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
 	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=1" \
 		no-ref-index.trace >no-ref-uri-indexers &&
 	test_line_count = 3 no-ref-uri-indexers
+'
+
+test_expect_success 'setup packfile URI worker tuning' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_tuning" &&
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	git -C "$P" config uploadpack.allowNoRefDelta true &&
+	for i in $(test_seq 10)
+	do
+		echo "$i" >"$P/blob-$i" &&
+		git -C "$P" add "blob-$i" || return 1
+	done &&
+	git -C "$P" commit -m objects &&
+	for i in $(test_seq 10)
+	do
+		configure_exclusion "$P" "blob-$i" >/dev/null || return 1
+	done &&
+	uri_cpus=$(test-tool online-cpus)
+'
+
+clone_uri_tuning () {
+	local repository="$1" destination="$2" &&
+	shift 2 &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/$destination.trace" \
+	GIT_TRACE_PACKET="$TRASH_DIRECTORY/$destination.packet" \
+	GIT_TEST_SIDEBAND_ALL=1 \
+	git -c protocol.version=2 -c fetch.uriprotocols=http "$@" \
+		clone "$HTTPD_URL/smart/$repository" "$destination" &&
+	git -C "$destination" fsck --no-reflogs
+}
+
+# Count outstanding URI children in their parent's Trace2 events. Indexers
+# have their own child IDs, so pair each ID with its parent's session ID.
+test_uri_fetch_jobs () {
+	awk -v expected="$2" '
+	function child_key(    fields, sid, id) {
+		split($0, fields, "\"sid\":\"");
+		split(fields[2], sid, "\"");
+		split($0, fields, "\"child_id\":");
+		id = fields[2] + 0;
+		return sid[1] ":" id;
+	}
+	/"event":"child_start".*"http-fetch","--packfile=/ {
+		active[child_key()] = 1;
+		running++;
+		if (running > maximum)
+			maximum = running;
+	}
+	/"event":"child_exit"/ {
+		key = child_key();
+		if (active[key]) {
+			delete active[key];
+			running--;
+		}
+	}
+	END {
+		if (running != 0 || maximum != expected) {
+			printf "URI workers: maximum %d, expected %d, outstanding %d\n",
+				maximum, expected, running;
+			exit 1;
+		}
+	}
+	' "$1"
+}
+
+test_expect_success 'packfile URI defaults bound workers and indexer threads' '
+	jobs=$uri_cpus &&
+	if test "$jobs" -gt 8
+	then
+		jobs=8
+	fi &&
+	clone_uri_tuning http_tuning uri-default &&
+	test_uri_fetch_jobs uri-default.trace "$jobs" &&
+	if test "$jobs" -gt 1
+	then
+		threads=$((uri_cpus / jobs)) &&
+		if test "$threads" -gt 4
+		then
+			threads=4
+		fi &&
+		test_grep "> no-ref-delta" uri-default.packet &&
+		grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=$threads\"" \
+			uri-default.trace >uri-default.indexers &&
+		test_line_count = 10 uri-default.indexers
+	else
+		test_grep ! "> no-ref-delta" uri-default.packet
+	fi
+'
+
+for threads in 1 2 4 8
+do
+	test_expect_success "parallel URI indexers honor pack.threads=$threads" '
+		clone_uri_tuning http_tuning uri-threads-$threads \
+			-c fetch.packfileUriJobs=2 -c pack.threads=$threads &&
+		test_uri_fetch_jobs uri-threads-$threads.trace 2 &&
+		grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=$threads\"" \
+			uri-threads-$threads.trace >uri-indexers &&
+		test_line_count = 10 uri-indexers
+	'
+done
+
+test_expect_success 'automatic URI threads use the actual worker count' '
+	# More requested jobs than URI packs must not dilute the CPU budget.
+	threads=$((uri_cpus / 3)) &&
+	if test "$threads" -lt 1
+	then
+		threads=1
+	elif test "$threads" -gt 4
+	then
+		threads=4
+	fi &&
+	clone_uri_tuning http_parent uri-auto-threads \
+		-c fetch.packfileUriJobs=100 -c pack.threads=0 &&
+	test_uri_fetch_jobs uri-auto-threads.trace 3 &&
+	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=$threads\"" \
+		uri-auto-threads.trace >uri-indexers &&
+	test_line_count = 3 uri-indexers
+'
+
+test_expect_success 'explicit URI jobs can exceed the automatic limit' '
+	clone_uri_tuning http_tuning uri-many-jobs \
+		-c fetch.packfileUriJobs=100 -c pack.threads=1 &&
+	test_uri_fetch_jobs uri-many-jobs.trace 10
+'
+
+test_expect_success 'fetch honors packfile URI worker tuning' '
+	git init uri-fetch &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/uri-fetch.trace" \
+	GIT_TEST_SIDEBAND_ALL=1 \
+	git -C uri-fetch -c protocol.version=2 -c fetch.uriprotocols=http \
+		-c fetch.packfileUriJobs=2 -c pack.threads=2 \
+		fetch "$HTTPD_URL/smart/http_tuning" &&
+	test_uri_fetch_jobs uri-fetch.trace 2 &&
+	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=2\"" \
+		uri-fetch.trace >uri-indexers &&
+	test_line_count = 10 uri-indexers &&
+	git -C uri-fetch fsck --no-reflogs
+'
+
+for jobs in 0 1 -1
+do
+	test_expect_success "fetch.packfileUriJobs=$jobs retains serial indexing" '
+		clone_uri_tuning http_tuning uri-serial-$jobs \
+			-c fetch.packfileUriJobs=$jobs -c pack.threads=2 &&
+		test_uri_fetch_jobs uri-serial-$jobs.trace 1 &&
+		test_grep ! "> no-ref-delta" uri-serial-$jobs.packet &&
+		test_grep ! -e "--threads=" uri-serial-$jobs.trace
+	'
+done
+
+test_expect_success 'parallel URI defaults require the server promise' '
+	test_config -C "$P" uploadpack.allowNoRefDelta false &&
+	clone_uri_tuning http_tuning uri-no-promise &&
+	test_uri_fetch_jobs uri-no-promise.trace 1 &&
+	test_grep ! "> no-ref-delta" uri-no-promise.packet &&
+	test_grep ! -e "--threads=" uri-no-promise.trace
+'
+
+test_expect_success 'single URI retains ordinary indexer thread selection' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_single_uri" &&
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	git -C "$P" config uploadpack.allowNoRefDelta true &&
+	test_commit -C "$P" one &&
+	configure_exclusion "$P" one.t >/dev/null &&
+	clone_uri_tuning http_single_uri uri-single \
+		-c fetch.packfileUriJobs=8 -c pack.threads=2 &&
+	test_uri_fetch_jobs uri-single.trace 1 &&
+	test_grep "> no-ref-delta" uri-single.packet &&
+	test_grep ! -e "--threads=" uri-single.trace
 '
 
 test_expect_success 'packfile URIs with fetch instead of clone' '
