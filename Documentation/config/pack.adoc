@@ -81,6 +81,11 @@ pack.threads::
 	is however multiplied by the number of threads.
 	Specifying 0 will cause Git to auto-detect the number of CPUs
 	and set the number of threads accordingly.
++
+This also sets the number of threads used to resolve deltas in
+linkgit:git-index-pack[1]. Parallel packfile URI indexers share the online
+CPUs when this is unset or zero; see `fetch.packfileUriJobs` for their
+automatic limits. A positive value applies to each indexer independently.
 
 pack.indexVersion::
 	Specify the default pack index version.  Valid values are 1 for

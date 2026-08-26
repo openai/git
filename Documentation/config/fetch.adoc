@@ -96,13 +96,21 @@ config setting.
 
 `fetch.packfileUriJobs`::
 	Specifies the maximum number of packfile URI downloads and indexers
-	to run at once. The default is 1, which preserves advertised URI
-	order.
+	to run at once. If unset, defaults to the number of online CPUs,
+	capped at 8. Values of 1 or less preserve advertised URI order.
+	An explicit value greater than 8 is permitted. The number of URI
+	packs in the response also limits the number of jobs.
 +
 Values greater than 1 are used only when the server advertises and the
 client requests the `no-ref-delta` promise. Each URI pack is then checked
 with `index-pack --no-ref-delta` before it is accepted.
 Responses with one URI retain the serial path.
++
+When `pack.threads` is unset or zero, each parallel URI indexer uses the
+number of online CPUs divided by the actual number of jobs, rounded down,
+with a minimum of 1 thread and a maximum of 4. A positive `pack.threads`
+value overrides this per-indexer default, including values greater than 4.
+Increasing both settings can increase CPU and memory use substantially.
 
 `fetch.writeCommitGraph`::
 	Set to true to write a commit-graph after every `git fetch` command

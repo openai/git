@@ -37,6 +37,7 @@
 #include "mergesort.h"
 #include "prio-queue.h"
 #include "promisor-remote.h"
+#include "thread-utils.h"
 
 static int transfer_unpack_limit = -1;
 static int fetch_unpack_limit = -1;
@@ -49,7 +50,7 @@ static int fetch_fsck_objects = -1;
 static int transfer_fsck_objects = -1;
 static int agent_supported;
 static int server_supports_filtering;
-static int fetch_packfile_uri_jobs = 1;
+static int fetch_packfile_uri_jobs;
 static struct shallow_lock shallow_lock;
 static const char *alternate_shallow_file;
 static struct strbuf fsck_msg_types = STRBUF_INIT;
@@ -1778,10 +1779,23 @@ static void fetch_packfile_uris_parallel(
 	struct packfile_uri_task *tasks;
 	struct pollfd *pollfds;
 	int precreate_keeps = index_pack_args_have_keep(index_pack_args);
+	int threads = 0;
 	size_t next = 0, running = 0;
 
 	if (task_nr > (size_t)fetch_packfile_uri_jobs)
 		task_nr = fetch_packfile_uri_jobs;
+
+	/* Share CPUs across active packs unless the caller chose a thread count. */
+	repo_config_get_int(the_repository, "pack.threads", &threads);
+	if (!threads) {
+		threads = online_cpus() / (int)task_nr;
+		if (threads < 1)
+			threads = 1;
+		else if (threads > 4)
+			threads = 4;
+	}
+	strvec_pushf(index_pack_args, "--threads=%d", threads);
+
 	CALLOC_ARRAY(tasks, task_nr);
 	CALLOC_ARRAY(pollfds, task_nr);
 
@@ -2036,12 +2050,6 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 		fetch_packfile_uri_jobs > 1 &&
 		packfile_uris.nr > 1;
 	if (parallel_uri_indexing) {
-		/*
-		 * Bound total indexer threads by the number of URI jobs. The
-		 * URI packs are independent, so each indexer can stay single
-		 * threaded while several indexers run at once.
-		 */
-		strvec_push(&index_pack_args, "--threads=1");
 		fetch_packfile_uris_parallel(&packfile_uris, &index_pack_args,
 					    pack_lockfiles,
 					    &fsck_options.gitmodules_found);
@@ -2166,6 +2174,9 @@ static int fetch_pack_config_cb(const char *var, const char *value,
 
 static void fetch_pack_config(void)
 {
+	fetch_packfile_uri_jobs = online_cpus();
+	if (fetch_packfile_uri_jobs > 8)
+		fetch_packfile_uri_jobs = 8;
 	repo_config_get_int(the_repository, "fetch.unpacklimit", &fetch_unpack_limit);
 	repo_config_get_int(the_repository, "transfer.unpacklimit", &transfer_unpack_limit);
 	repo_config_get_bool(the_repository, "repack.usedeltabaseoffset", &prefer_ofs_delta);
