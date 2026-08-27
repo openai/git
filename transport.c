@@ -487,6 +487,7 @@ static int fetch_refs_via_pack(struct transport *transport,
 
 	memset(&args, 0, sizeof(args));
 	args.uploadpack = data->options.uploadpack;
+	args.url = transport->url;
 	args.keep_pack = data->options.keep;
 	args.lock_pack = 1;
 	args.use_thin_pack = data->options.thin;

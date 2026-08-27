@@ -119,6 +119,9 @@ struct upload_pack_data {
 	unsigned allow_ref_in_want : 1;				/* v2 only */
 	unsigned allow_sideband_all : 1;			/* v2 only */
 	unsigned seen_haves : 1;				/* v2 only */
+	/* At least one uploadpack.blobPackfileUri uses an absolute-path reference. */
+	unsigned require_absolute_path_uris : 1;		/* v2 only */
+	unsigned client_supports_absolute_path_uris : 1;	/* v2 only */
 	unsigned allow_packfile_uris : 1;			/* v2 only */
 	unsigned advertise_sid : 1;
 	unsigned sent_capabilities : 1;
@@ -1364,8 +1367,16 @@ static int upload_pack_config(const char *var, const char *value,
 	} else if (!strcmp("uploadpack.allowsidebandall", var)) {
 		data->allow_sideband_all = git_config_bool(var, value);
 	} else if (!strcmp("uploadpack.blobpackfileuri", var)) {
-		if (value)
+		if (value) {
+			struct object_id oid;
+			const char *uri;
+
 			data->allow_packfile_uris = 1;
+			if (!parse_oid_hex(value, &oid, &uri) && *uri == ' ' &&
+			    !parse_oid_hex(uri + 1, &oid, &uri) && *uri == ' ' &&
+			    uri[1] == '/' && uri[2] != '/')
+				data->require_absolute_path_uris = 1;
+		}
 	} else if (!strcmp("core.precomposeunicode", var)) {
 		cfg->precomposed_unicode = git_config_bool(var, value);
 	} else if (!strcmp("transfer.advertisesid", var)) {
@@ -1660,6 +1671,12 @@ static void process_args(struct packet_reader *request,
 			continue;
 		}
 
+		if (data->require_absolute_path_uris &&
+		    !strcmp(arg, "packfile-uris-absolute-path")) {
+			data->client_supports_absolute_path_uris = 1;
+			continue;
+		}
+
 		if (data->allow_packfile_uris &&
 		    skip_prefix(arg, "packfile-uris ", &p)) {
 			if (data->uri_protocols.nr)
@@ -1678,6 +1695,11 @@ static void process_args(struct packet_reader *request,
 
 	if (request->status != PACKET_READ_FLUSH)
 		die(_("expected flush after fetch arguments"));
+
+	if (data->uri_protocols.nr && data->require_absolute_path_uris &&
+	    !data->client_supports_absolute_path_uris)
+		send_err_and_die(data,
+				 "client does not support absolute-path packfile URIs");
 
 	if (trace2_is_enabled())
 		trace2_fetch_info(data);
@@ -1851,6 +1873,9 @@ int upload_pack_advertise(struct repository *r,
 
 		if (data.allow_sideband_all)
 			strbuf_addstr(value, " sideband-all");
+
+		if (data.require_absolute_path_uris)
+			strbuf_addstr(value, " packfile-uris-absolute-path");
 
 		if (data.allow_packfile_uris)
 			strbuf_addstr(value, " packfile-uris");

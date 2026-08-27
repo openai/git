@@ -384,6 +384,18 @@ can be included in the client's request.
 	should wait for the client to say "done" before sending the
 	packfile.
 
+If the 'packfile-uris-absolute-path' feature is advertised, the following
+argument can be included in the client's request:
+
+    packfile-uris-absolute-path
+	Indicates that the client can resolve absolute-path references in
+	the 'packfile-uris' section. The client MUST only send this argument
+	when the remote uses an HTTP or HTTPS scheme accepted in its
+	'packfile-uris' request. This declares client support; it does not
+	request that the server change which URIs it sends. A server that
+	requires this support MAY reject a packfile-URI request that omits
+	this argument.
+
 The response of `fetch` is broken into a number of sections separated by
 delimiter packets (0001), with each section beginning with its section
 header. Most sections are sent only when the packfile is sent.
@@ -492,6 +504,16 @@ header. Most sections are sent only when the packfile is sent.
 
 	* For each URI the server sends, it sends a hash of the pack's
 	  contents (as output by git index-pack) followed by the URI.
+
+	* If the client sent `packfile-uris-absolute-path`, the server may
+	  send references beginning with a single `/`. These references
+	  inherit the remote URL's scheme and authority, replacing its
+	  path, query, and fragment. For example, `/foo.pack` from
+	  `https://example.com/repo.git` resolves to
+	  `https://example.com/foo.pack`. The server MUST NOT send these
+	  references unless the client sent `packfile-uris-absolute-path`.
+	  References beginning with `//` and relative paths without a
+	  leading `/` are not supported.
 
 	* The hashes are 40 hex characters long. When Git upgrades to a new
 	  hash algorithm, this might need to be updated. (It should match

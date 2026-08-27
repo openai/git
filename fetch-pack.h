@@ -10,6 +10,8 @@ struct oid_array;
 
 struct fetch_pack_args {
 	const char *uploadpack;
+	/* Remote URL used to resolve absolute-path packfile URIs. */
+	const char *url;
 	int unpacklimit;
 	int depth;
 	const char *deepen_since;
