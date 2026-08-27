@@ -2875,7 +2875,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'configured pulls preserve authenticated worktree proofs' '
-	test_when_finished "rm -rf pull-proof-origin.git pull-proof-seed pull-proof-ff pull-proof-ff-linked pull-proof-rebase pull-proof-rebase-linked pull-proof-autostash pull-proof-autostash-linked" &&
+	test_when_finished "rm -rf pull-proof-origin.git pull-proof-seed pull-proof-ff pull-proof-ff-linked pull-proof-rebase pull-proof-rebase-linked pull-proof-autostash pull-proof-autostash-linked pull-proof-filter" &&
 	git init --bare pull-proof-origin.git &&
 	test_create_repo pull-proof-seed &&
 	(
@@ -2934,11 +2934,11 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				case "$role" in
 				main)
 					worktree="$repo" &&
-					invalidated=96
+					invalidated=98
 					;;
 				linked)
 					worktree="$linked" &&
-					invalidated=192
+					invalidated=194
 					;;
 				esac &&
 				if test "$mode" != ff
@@ -2969,9 +2969,14 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 					do
 						test_write_lines "$mode-$role-$file" \
 							>"upstream-$mode-$role/nested/$file" ||
-							return 1
+								return 1
 					done &&
-					git add "upstream-$mode-$role"
+					test_write_lines "# $mode-$role" \
+						>.gitattributes &&
+					test_write_lines "*.ignored" "# $mode-$role" \
+						>.gitignore &&
+					git add "upstream-$mode-$role" \
+						.gitattributes .gitignore
 				else
 					test_write_lines "$mode-$role" \
 						>"upstream-$mode-$role" &&
@@ -3008,14 +3013,21 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 					<"$gitdir/pull.trace" &&
 				! test_trace2_data fsmonitor untracked/proof-missing 1 \
 					<"$gitdir/pull.trace" &&
-				! test_trace2_data fsmonitor \
-					semantic/manifest-scan-count 1 \
-					<"$gitdir/pull.trace" &&
 				if test "$mode" = ff
 				then
 					test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/pull.trace" &&
+					test_trace2_data fsmonitor \
+						history/checkout-manifest-refreshed 1 \
+						<"$gitdir/pull.trace" &&
+					test_trace2_data fsmonitor \
 						history/untracked-paired-new-directory-invalidated \
 						"$invalidated" <"$gitdir/pull.trace"
+				else
+					! test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/pull.trace"
 				fi &&
 				perl "$PWD/.git/check-pull-proof.pl" \
 					<"$gitdir/index" &&
@@ -3041,7 +3053,51 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 					semantic/manifest-scan-count 1 \
 					<"$gitdir/status.trace" || return 1
 			done || return 1
-		done
+		done &&
+		git clone --quiet "$PWD/../pull-proof-origin.git" \
+			"$PWD/../pull-proof-filter" &&
+		filter="$PWD/../pull-proof-filter" &&
+		git -C "$filter" config pull.ff only &&
+		git -C "$filter" config core.untrackedCache true &&
+		git -C "$filter" config core.fsmonitor true &&
+		git -C "$filter" config filter.pullproof.clean false &&
+		git -C "$filter" config filter.pullproof.required true &&
+		filter_gitdir=$(git -C "$filter" rev-parse --absolute-git-dir) &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git -C "$filter" update-index --fsmonitor &&
+		GIT_INDEX_FILE="$filter_gitdir/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git -C "$filter" status --porcelain=v2 \
+				>"$filter_gitdir/prime" &&
+		test_must_be_empty "$filter_gitdir/prime" &&
+		test_write_lines "tracked filter=pullproof" >.gitattributes &&
+		git add .gitattributes &&
+		git commit -qm "upstream-filter" &&
+		git push --quiet origin main &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+		GIT_TRACE2_EVENT="$filter_gitdir/pull.trace" \
+			git -C "$filter" pull --quiet &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<"$filter_gitdir/pull.trace" &&
+		test_trace2_data fsmonitor history/checkout-manifest-refreshed 1 \
+			<"$filter_gitdir/pull.trace" &&
+		test_trace2_data fsmonitor semantic/manifest-invalidated 1 \
+			<"$filter_gitdir/pull.trace" &&
+		test_trace2_data fsmonitor history/untracked-paired-transfer 1 \
+			<"$filter_gitdir/pull.trace" &&
+		cp "$filter_gitdir/index" "$filter_gitdir/status.before" &&
+		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			GIT_TRACE2_EVENT="$filter_gitdir/status.trace" \
+			git -C "$filter" status --porcelain=v2 \
+				--untracked-files=no -- tracked \
+				>"$filter_gitdir/status" \
+				2>"$filter_gitdir/status.err" &&
+		test_grep "clean filter .pullproof. failed" \
+			"$filter_gitdir/status.err" &&
+		test_cmp_bin "$filter_gitdir/status.before" \
+			"$filter_gitdir/index"
 	)
 '
 

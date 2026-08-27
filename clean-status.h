@@ -162,6 +162,9 @@ int clean_status_transfer_current_proof_if_same_index(
 	struct index_state *dst, const struct index_state *src);
 int clean_status_transfer_current_proof_if_semantically_same_index(
 	struct index_state *dst, const struct index_state *src);
+int clean_status_transfer_current_proof_after_checkout(
+	struct index_state *dst, const struct index_state *src,
+	int *manifest_refresh_required);
 
 /*
  * A canonical main-index source may lend suspended historical state to an

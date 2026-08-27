@@ -2018,13 +2018,64 @@ int clean_status_transfer_current_proof_if_same_index(
 	return replace_current_fsmonitor_proof(dst, src);
 }
 
-int clean_status_transfer_current_proof_if_semantically_same_index(
-	struct index_state *dst, const struct index_state *src)
+enum checkout_policy_change {
+	CHECKOUT_POLICY_NONE = 0,
+	CHECKOUT_POLICY_IGNORE = 1 << 0,
+	CHECKOUT_POLICY_ATTRIBUTES = 1 << 1,
+};
+
+static enum checkout_policy_change checkout_policy_change_kind(
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	const struct cache_entry *entry = old ? old : new_entry;
+	const char *base;
+
+	if (!entry ||
+	    (old && (!S_ISREG(old->ce_mode) || ce_stage(old) ||
+		     ce_skip_worktree(old) || ce_intent_to_add(old) ||
+		     (old->ce_flags & CE_VALID))) ||
+	    (new_entry && (!S_ISREG(new_entry->ce_mode) || ce_stage(new_entry) ||
+			    ce_skip_worktree(new_entry) ||
+			    ce_intent_to_add(new_entry) ||
+			    (new_entry->ce_flags & CE_VALID))) ||
+	    (old && new_entry &&
+	     (strcmp(old->name, new_entry->name) || old->ce_mode != new_entry->ce_mode)))
+		return CHECKOUT_POLICY_NONE;
+	base = strrchr(entry->name, '/');
+	base = base ? base + 1 : entry->name;
+	if (!fspathcmp(base, GITATTRIBUTES_FILE))
+		return CHECKOUT_POLICY_ATTRIBUTES;
+	if (!fspathcmp(base, ".gitignore"))
+		return CHECKOUT_POLICY_IGNORE;
+	return CHECKOUT_POLICY_NONE;
+}
+
+static int record_checkout_policy_change(
+	enum checkout_policy_change *policy_changes,
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	enum checkout_policy_change change =
+		checkout_policy_change_kind(old, new_entry);
+
+	if (!change)
+		return 0;
+	*policy_changes |= change;
+	return 1;
+}
+
+static int transfer_current_proof_if_semantically_same_index(
+	struct index_state *dst, const struct index_state *src,
+	int allow_checkout_policy_changes,
+	int *manifest_refresh_required)
 {
 	const unsigned int semantic_flags =
 		CE_STAGEMASK | CE_VALID | CE_EXTENDED_FLAGS;
 	unsigned int src_pos = 0, dst_pos = 0;
+	enum checkout_policy_change policy_changes = CHECKOUT_POLICY_NONE;
 	int transferred;
+
+	if (manifest_refresh_required)
+		*manifest_refresh_required = 0;
 
 	if (!current_proof_is_writable(src) ||
 	    src->repo != dst->repo || src->split_index || dst->split_index ||
@@ -2050,12 +2101,18 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 			cmp = strcmp(old->name, new_entry->name);
 		if (cmp < 0) {
 			if (!clean_status_index_entry_is_semantically_safe(
-				    src, old, NULL))
+				    src, old, NULL) &&
+			    (!allow_checkout_policy_changes ||
+			     !record_checkout_policy_change(&policy_changes,
+							    old, NULL)))
 				return 0;
 			src_pos++;
 		} else if (cmp > 0) {
 			if (!clean_status_index_entry_is_semantically_safe(
-				    src, NULL, new_entry))
+				    src, NULL, new_entry) &&
+			    (!allow_checkout_policy_changes ||
+			     !record_checkout_policy_change(&policy_changes,
+							    NULL, new_entry)))
 				return 0;
 			dst_pos++;
 		} else {
@@ -2063,12 +2120,18 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 			     !oideq(&old->oid, &new_entry->oid) ||
 			     ((old->ce_flags ^ new_entry->ce_flags) & semantic_flags)) &&
 			    !clean_status_index_entry_is_semantically_safe(
-				    src, old, new_entry))
+				    src, old, new_entry) &&
+			    (!allow_checkout_policy_changes ||
+			     !record_checkout_policy_change(&policy_changes,
+							    old, new_entry)))
 				return 0;
 			src_pos++;
 			dst_pos++;
 		}
 	}
+	if (manifest_refresh_required &&
+	    (policy_changes & CHECKOUT_POLICY_ATTRIBUTES))
+		*manifest_refresh_required = 1;
 
 	if (current_proof_is_writable(dst)) {
 		const struct clean_status_state *src_state = src->clean_status;
@@ -2100,6 +2163,26 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 				   "history/semantic-transferred", 1);
 
 	return transferred;
+}
+
+int clean_status_transfer_current_proof_if_semantically_same_index(
+	struct index_state *dst, const struct index_state *src)
+{
+	return transfer_current_proof_if_semantically_same_index(
+		dst, src, 0, NULL);
+}
+
+int clean_status_transfer_current_proof_after_checkout(
+	struct index_state *dst, const struct index_state *src,
+	int *manifest_refresh_required)
+{
+	/*
+	 * A successful checkout owns these worktree writes.  It may therefore
+	 * retain history across policy-file changes, but the caller must refresh
+	 * changed attribute sources before pairing the transferred proof.
+	 */
+	return transfer_current_proof_if_semantically_same_index(
+		dst, src, 1, manifest_refresh_required);
 }
 
 struct clean_status_commit_checkpoint {

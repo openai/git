@@ -2165,6 +2165,7 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 	ret = check_updates(o, &o->internal.result) ? (-2) : 0;
 	if (o->dst_index) {
 		int history_transferred = 0;
+		int manifest_refresh_required = 0;
 		int new_indexed_directory = 0;
 
 		if (!ret) {
@@ -2173,14 +2174,44 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 					&o->internal.result, o->src_index);
 			if (!history_transferred && o->preserve_semantic_history)
 				history_transferred =
-					clean_status_transfer_current_proof_if_semantically_same_index(
-						&o->internal.result, o->src_index);
+					clean_status_transfer_current_proof_after_checkout(
+						&o->internal.result, o->src_index,
+						&manifest_refresh_required);
 			if (history_transferred && o->preserve_semantic_history)
 				new_indexed_directory =
 					checkout_introduces_new_indexed_directory(
 						o->src_index, &o->internal.result);
 		}
 		move_index_extensions(&o->internal.result, o->src_index);
+		if (!ret && history_transferred && manifest_refresh_required) {
+			int manifest_refreshed = 0;
+
+			/*
+			 * The checkout has installed the new attribute sources.  Refresh
+			 * them before allowing the old provider boundary to authenticate
+			 * the resulting index and paired untracked cache.
+			 */
+			if (clean_status_refresh_worktree_manifest(
+				    &o->internal.result) < 0 ||
+			    clean_status_manifest_global_fallback(
+				    &o->internal.result)) {
+				clean_status_invalidate_current_proof(
+					&o->internal.result);
+				history_transferred = 0;
+			} else {
+				manifest_refreshed = 1;
+				clean_status_mark_fsmonitor_config_valid(
+					&o->internal.result,
+					o->internal.result.fsmonitor_last_update);
+				history_transferred =
+					clean_status_has_current_full_fsmonitor_proof(
+						&o->internal.result);
+			}
+			trace2_data_intmax(
+				"fsmonitor", repo,
+				"history/checkout-manifest-refreshed",
+				manifest_refreshed);
+		}
 		if (!ret && o->internal.backoff_transfer)
 			clean_status_transfer_backoff_history(
 				o->internal.backoff_transfer,
