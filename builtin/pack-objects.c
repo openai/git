@@ -1823,6 +1823,10 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 		const char *p;
 
 		if (ex) {
+			if (ex->uri[0] == '/' && ex->uri[1] != '/') {
+				oidset_insert(&excluded_by_config, oid);
+				return 0;
+			}
 			for (i = 0; i < uri_protocols.nr; i++) {
 				if (skip_prefix(ex->uri,
 						uri_protocols.items[i].string,
