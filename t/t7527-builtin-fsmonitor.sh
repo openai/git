@@ -4948,7 +4948,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'dirty stash push drops closed semantic history' '
+	'dirty stash push preserves closed semantic history' '
 	test_when_finished "rm -rf stash-dirty-history" &&
 	test_create_repo stash-dirty-history &&
 	(
@@ -4970,17 +4970,19 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 			git stash push >.git/stash &&
 		test_grep "Saved working directory" .git/stash &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "nothing to commit, working tree clean" .git/actual &&
-		test_trace2_data fsmonitor config/coherent 0 \
+		test_trace2_data fsmonitor config/coherent 1 \
 			<.git/status.trace
 	)
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
-	'dirty stash cannot resurrect an invalidated external checkpoint' '
+	'dirty stash preserves current proof without restoring a checkpoint' '
 	test_when_finished "rm -rf stash-checkpoint-history" &&
 	test_create_repo stash-checkpoint-history &&
 	(
@@ -5008,13 +5010,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 			git stash push >.git/stash &&
 		test_grep "Saved working directory" .git/stash &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "nothing to commit, working tree clean" .git/actual &&
-		test_trace2_data fsmonitor history/external-proof-invalidated 1 \
-			<.git/status.trace &&
-		test_trace2_data fsmonitor config/coherent 0 \
+		test_trace2_data fsmonitor config/coherent 1 \
 			<.git/status.trace &&
 		! test_trace2_data fsmonitor history/external-restored 1 \
 			<.git/status.trace
@@ -6405,7 +6407,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'hard reset to a different tree drops closed semantic history' '
+	'hard reset to a different tree preserves closed semantic history' '
 	test_when_finished "rm -rf reset-hard-changed" &&
 	test_create_repo reset-hard-changed &&
 	(
@@ -6431,8 +6433,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "nothing to commit, working tree clean" .git/actual &&
-		test_trace2_data fsmonitor config/coherent 0 \
-			<.git/status.trace
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index
 	)
 '
 

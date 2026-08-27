@@ -340,6 +340,7 @@ int is_index_unborn(struct index_state *);
 /* For use with `write_locked_index()`. */
 #define COMMIT_LOCK		(1 << 0)
 #define SKIP_IF_UNCHANGED	(1 << 1)
+#define PROVISIONAL_LOCK	(1 << 2)
 
 /*
  * Write the index while holding an already-taken lock. Close the lock,
@@ -359,6 +360,8 @@ int is_index_unborn(struct index_state *);
  *
  * If `SKIP_IF_UNCHANGED` is given and the index is unchanged, nothing
  * is written (and the lock is rolled back if `COMMIT_LOCK` is given).
+ * `PROVISIONAL_LOCK` writes a close-only witness which the lock owner will
+ * reopen and replace before commit; it therefore defers post-index-change.
  */
 int write_locked_index(struct index_state *, struct lock_file *lock, unsigned flags);
 

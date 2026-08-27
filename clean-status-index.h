@@ -71,12 +71,18 @@ int clean_status_index_snapshot_pin(
 int clean_status_index_snapshot_pin_proof_epoch(
 	struct clean_status_index_snapshot *snapshot,
 	struct index_state *istate);
+int clean_status_index_snapshot_pin_path_proof_epoch(
+	struct clean_status_index_snapshot *snapshot,
+	struct index_state *istate, const char *path);
 int clean_status_index_snapshot_still_matches(
 	const struct clean_status_index_snapshot *snapshot,
 	const struct index_state *istate);
 int clean_status_index_snapshot_still_matches_proof_epoch(
 	const struct clean_status_index_snapshot *snapshot,
 	const struct index_state *istate);
+int clean_status_index_snapshot_still_matches_path_proof_epoch(
+	const struct clean_status_index_snapshot *snapshot,
+	const struct index_state *istate, const char *path);
 void clean_status_index_snapshot_release(
 	struct clean_status_index_snapshot *snapshot);
 int clean_status_index_entries_are_certifiable(

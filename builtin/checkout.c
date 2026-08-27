@@ -554,6 +554,7 @@ static int checkout_paths(const struct checkout_opts *opts,
 	int checkout_index;
 	int preserve_source_tree_history = 0;
 	int source_tree_index_changed = 0;
+	int repair_after_checkout = 0;
 
 	trace2_cmd_mode(opts->patch_mode ? "patch" : "path");
 
@@ -678,6 +679,9 @@ static int checkout_paths(const struct checkout_opts *opts,
 	}
 	if (repo_read_index_preload(the_repository, &opts->pathspec, 0) < 0)
 		return error(_("index file corrupt"));
+	repair_after_checkout = opts->checkout_worktree &&
+		clean_status_has_current_full_fsmonitor_proof(
+			the_repository->index);
 
 	if (preserve_source_tree_history &&
 	    (the_repository->index->split_index ||
@@ -764,6 +768,10 @@ static int checkout_paths(const struct checkout_opts *opts,
 		if (!the_repository->index->cache_changed &&
 		    !hook_exists(the_repository, "post-index-change"))
 			flags |= SKIP_IF_UNCHANGED;
+		if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+			    the_repository, &lock_file,
+			    repair_after_checkout) < 0)
+			die(_("unable to repair new index file"));
 		if (write_locked_index(the_repository->index, &lock_file, flags))
 			die(_("unable to write new index file"));
 	} else {
@@ -836,6 +844,9 @@ static int reset_tree(struct tree *tree, const struct checkout_opts *o,
 	opts.verbose_update = o->show_progress;
 	opts.src_index = the_repository->index;
 	opts.dst_index = the_repository->index;
+	opts.preserve_semantic_history = worktree &&
+		clean_status_revalidated_token_matches(the_repository->index);
+	opts.preserve_untracked_history = opts.preserve_semantic_history;
 	init_checkout_metadata(&opts.meta, info->refname,
 			       info->commit ? &info->commit->object.oid : null_oid(the_hash_algo),
 			       NULL);
@@ -907,7 +918,7 @@ static int merge_working_tree(const struct checkout_opts *opts,
 			      bool quiet,
 			      int *writeout_error)
 {
-	int ret;
+	int ret, repair_after_checkout;
 	struct lock_file lock_file = LOCK_INIT;
 	struct tree *new_tree;
 
@@ -927,6 +938,9 @@ static int merge_working_tree(const struct checkout_opts *opts,
 		rollback_lock_file(&lock_file);
 		return error(_("index file corrupt"));
 	}
+	repair_after_checkout =
+		clean_status_has_current_full_fsmonitor_proof(
+			the_repository->index);
 
 	resolve_undo_clear_index(the_repository->index);
 	if (opts->new_orphan_branch && opts->orphan_from_empty_tree) {
@@ -969,6 +983,7 @@ static int merge_working_tree(const struct checkout_opts *opts,
 		init_topts(&topts, opts->show_progress,
 			   opts->overwrite_ignore, quiet);
 		topts.preserve_semantic_history = 1;
+		topts.preserve_untracked_history = 1;
 		init_checkout_metadata(&topts.meta, new_branch_info->refname,
 				       new_branch_info->commit ?
 				       &new_branch_info->commit->object.oid :
@@ -1001,6 +1016,9 @@ static int merge_working_tree(const struct checkout_opts *opts,
 
 	if (!cache_tree_fully_valid(the_repository->index->cache_tree))
 		cache_tree_update(the_repository->index, WRITE_TREE_SILENT | WRITE_TREE_REPAIR);
+	if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    the_repository, &lock_file, repair_after_checkout) < 0)
+		die(_("unable to repair new index file"));
 
 	if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))
 		die(_("unable to write new index file"));

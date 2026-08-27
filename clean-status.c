@@ -832,6 +832,16 @@ int clean_status_worktree_manifest_needs_refresh(
 		state->manifest.current_invalidated;
 }
 
+int clean_status_changed_worktree_manifest_has_filters(
+	const struct index_state *istate)
+{
+	const struct clean_status_state *state = istate->clean_status;
+
+	return state && state->config_enforced && state->filter_configured &&
+		state->manifest.current_valid && state->manifest.checked &&
+		state->manifest.changed;
+}
+
 void clean_status_invalidate_current_manifest(struct index_state *istate)
 {
 	if (!istate->clean_status)

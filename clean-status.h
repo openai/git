@@ -46,6 +46,10 @@ struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
 	struct index_state *istate,
 	const struct attr_source_snapshot *attrs,
 	int validate_filter_scope);
+struct clean_status_proof_epoch *clean_status_capture_proof_epoch_at_path(
+	struct index_state *istate,
+	const struct attr_source_snapshot *attrs,
+	int validate_filter_scope, const char *index_path);
 int clean_status_proof_epoch_start_token_matches(
 	struct index_state *istate,
 	const struct clean_status_proof_epoch *epoch);
@@ -95,6 +99,8 @@ int clean_status_has_authenticated_worktree_manifest(
 int clean_status_has_authenticated_bootstrap_manifest(
 	const struct index_state *istate);
 int clean_status_worktree_manifest_needs_refresh(
+	const struct index_state *istate);
+int clean_status_changed_worktree_manifest_has_filters(
 	const struct index_state *istate);
 void clean_status_invalidate_current_manifest(struct index_state *istate);
 void clean_status_mark_fsmonitor_config_valid(

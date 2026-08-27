@@ -11,6 +11,7 @@
 #include "tree.h"
 #include "unpack-trees.h"
 #include "hook.h"
+#include "wt-status.h"
 
 static int update_refs(struct repository *repo,
 		       const struct reset_working_tree_options *opts,
@@ -104,7 +105,7 @@ int reset_working_tree(struct repository *r,
 	struct index_state scratch_index = INDEX_STATE_INIT(r);
 	struct index_state *istate;
 	const char *action;
-	int ret = 0, nr = 0;
+	int ret = 0, nr = 0, repair_after_reset = 0;
 
 	if (switch_to_branch && !starts_with(switch_to_branch, "refs/"))
 		BUG("Not a fully qualified branch: '%s'", switch_to_branch);
@@ -171,7 +172,11 @@ int reset_working_tree(struct repository *r,
 		!dry_run &&
 		(!reset_hard ||
 		 (opts->flags & RESET_WORKING_TREE_PRESERVE_SEMANTIC_HISTORY)) &&
-		clean_status_revalidated_token_matches(istate);
+		 clean_status_revalidated_token_matches(istate);
+	unpack_tree_opts.preserve_untracked_history =
+		unpack_tree_opts.preserve_semantic_history;
+	repair_after_reset = unpack_tree_opts.update &&
+		clean_status_has_current_full_fsmonitor_proof(istate);
 	unpack_tree_opts.preserve_ignored = 0; /* FIXME: !overwrite_ignore */
 	init_checkout_metadata(&unpack_tree_opts.meta, switch_to_branch, oid, NULL);
 	if (reset_hard) {
@@ -206,6 +211,12 @@ int reset_working_tree(struct repository *r,
 
 	if (reset_hard)
 		prime_cache_tree(r, r->index, tree);
+	if (unpack_tree_opts.update &&
+	    wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    r, &lock, repair_after_reset) < 0) {
+		ret = error(_("could not repair index"));
+		goto leave_reset_head;
+	}
 
 	if (write_locked_index(r->index, &lock, COMMIT_LOCK) < 0) {
 		ret = error(_("could not write index"));

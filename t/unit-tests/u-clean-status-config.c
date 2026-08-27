@@ -72,13 +72,22 @@ void test_clean_status_config__command_transport_config_does_not_change_proof(vo
 	static const char *const ignored_keys[] = {
 		"protocol.version",
 		"fetch.uriprotocols",
+		"push.negotiate",
 		"http.https://Example.Invalid.extraheader",
 		"http.https://Example.Invalid.proactiveauth",
 		"http.https://Example.Invalid.sslverify",
 		"credential.helper",
 		"credential.https://Example/Team.helper",
+		"remote.origin.pushurl",
+		"remote.MixedCase.pushurl",
 		"url.https://Proxy.Example/Team/.insteadof",
 		"url.https://Proxy.Example/Team/.pushinsteadof",
+	};
+	static const char *const retained_command_keys[] = {
+		"push.default",
+		"remote.origin.url",
+		"remote.pushurl",
+		"remote.origin.fetch",
 	};
 	static const enum config_scope persistent_scopes[] = {
 		CONFIG_SCOPE_GLOBAL,
@@ -110,6 +119,11 @@ void test_clean_status_config__command_transport_config_does_not_change_proof(vo
 		}
 		kvi.scope = CONFIG_SCOPE_COMMAND;
 		digest_one(&digest, ignored_keys[i], "transport", NULL);
+		cl_assert(!hashes_equal(digest.hash, baseline.hash));
+	}
+
+	for (size_t i = 0; i < ARRAY_SIZE(retained_command_keys); i++) {
+		digest_one(&digest, retained_command_keys[i], "transport", &ctx);
 		cl_assert(!hashes_equal(digest.hash, baseline.hash));
 	}
 }

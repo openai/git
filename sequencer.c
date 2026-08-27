@@ -22,6 +22,7 @@
 #include "hook.h"
 #include "utf8.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "diff.h"
 #include "path.h"
 #include "revision.h"
@@ -752,7 +753,7 @@ static int do_recursive_merge(struct repository *r,
 	struct merge_options o;
 	struct merge_result result;
 	struct tree *next_tree, *base_tree, *head_tree;
-	int clean, show_output;
+	int clean, show_output, repair_after_merge;
 	int i;
 	struct lock_file index_lock = LOCK_INIT;
 
@@ -760,6 +761,8 @@ static int do_recursive_merge(struct repository *r,
 		return -1;
 
 	repo_read_index(r);
+	repair_after_merge =
+		clean_status_has_current_full_fsmonitor_proof(r->index);
 
 	init_ui_merge_options(&o, r);
 	o.ancestor = base ? base_label : "(empty tree)";
@@ -794,6 +797,12 @@ static int do_recursive_merge(struct repository *r,
 	if (clean < 0) {
 		rollback_lock_file(&index_lock);
 		return clean;
+	}
+	if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    r, &index_lock, repair_after_merge) < 0) {
+		rollback_lock_file(&index_lock);
+		return error(_("%s: Unable to repair new index file"),
+			     _(action_name(opts)));
 	}
 
 	if (write_locked_index(r->index, &index_lock,

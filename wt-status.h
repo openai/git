@@ -8,6 +8,7 @@
 
 struct repository;
 struct stat;
+struct lock_file;
 struct attr_source_snapshot;
 struct exclude_source_proof;
 struct wt_status_exclude_context;
@@ -151,6 +152,7 @@ struct wt_status {
 	unsigned untracked_from_preload : 1;
 	unsigned bulk_update_index_stat : 1;
 	const char *index_file;
+	const char *proof_index_path;
 	FILE *fp;
 	const char *prefix;
 	struct string_list change;
@@ -182,6 +184,16 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s);
 int wt_status_refresh_index(struct wt_status *s,
 			    unsigned int refresh_flags,
 			    int require_untracked);
+/*
+ * Re-establish a complete, writable fsmonitor proof after a provider reset or
+ * an owned worktree update invalidates part of an authenticated proof.
+ */
+int wt_status_repair_fsmonitor_proof(struct repository *repo);
+int wt_status_repair_fsmonitor_proof_at_path(
+	struct repository *repo, const char *index_path);
+int wt_status_fsmonitor_proof_needs_repair(struct repository *repo);
+int wt_status_repair_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof);
 void wt_status_invalidate_refresh(struct wt_status *s);
 int wt_status_certified_excludes_digest(
 	struct wt_status *s, struct object_id *digest,

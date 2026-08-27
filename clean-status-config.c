@@ -92,9 +92,14 @@ static int config_is_command_transport(const char *key,
 		return 0;
 	if (!strcmp(key, "protocol.version") ||
 	    !strcmp(key, "fetch.uriprotocols") ||
+	    !strcmp(key, "push.negotiate") ||
 	    starts_with(key, "http."))
 		return 1;
 	if (starts_with(key, "credential."))
+		return 1;
+	if (!parse_config_key(key, "remote", &subsection, &subsection_len,
+			      &subkey) && subsection && subsection_len &&
+	    !strcmp(subkey, "pushurl"))
 		return 1;
 	if (parse_config_key(key, "url", &subsection, &subsection_len,
 			     &subkey) || !subsection || !subsection_len)

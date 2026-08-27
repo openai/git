@@ -215,11 +215,12 @@ static int snapshot_matches_index_state(
 			snapshot, state, istate->repo->hash_algo);
 }
 
-static int snapshot_pin(
+static int snapshot_pin_path(
 	struct clean_status_index_snapshot *snapshot,
-	struct index_state *istate, int allow_process_local_source)
+	struct index_state *istate, const char *path,
+	int allow_process_local_source)
 {
-	if (snapshot_open(snapshot, istate->repo->index_file,
+	if (snapshot_open(snapshot, path,
 			  istate->repo->hash_algo, 1))
 		return -1;
 	if (snapshot_matches_index_state(
@@ -233,7 +234,8 @@ int clean_status_index_snapshot_pin(
 	struct clean_status_index_snapshot *snapshot,
 	struct index_state *istate)
 {
-	return snapshot_pin(snapshot, istate, 0);
+	return snapshot_pin_path(
+		snapshot, istate, istate->repo->index_file, 0);
 }
 
 int clean_status_index_snapshot_pin_proof_epoch(
@@ -245,7 +247,15 @@ int clean_status_index_snapshot_pin_proof_epoch(
 	 * therefore use the descriptor for the file which populated that state.
 	 * Persisted history and sidecars continue to use the generic pin above.
 	 */
-	return snapshot_pin(snapshot, istate, 1);
+	return snapshot_pin_path(
+		snapshot, istate, istate->repo->index_file, 1);
+}
+
+int clean_status_index_snapshot_pin_path_proof_epoch(
+	struct clean_status_index_snapshot *snapshot,
+	struct index_state *istate, const char *path)
+{
+	return snapshot_pin_path(snapshot, istate, path, 1);
 }
 
 static int snapshot_still_matches(
@@ -271,6 +281,15 @@ int clean_status_index_snapshot_still_matches_proof_epoch(
 	const struct index_state *istate)
 {
 	return snapshot_still_matches(snapshot, istate, 1);
+}
+
+int clean_status_index_snapshot_still_matches_path_proof_epoch(
+	const struct clean_status_index_snapshot *snapshot,
+	const struct index_state *istate, const char *path)
+{
+	return snapshot_matches_index_state(snapshot, istate, 1) &&
+		clean_status_index_snapshot_still_matches_path(
+			snapshot, path, istate->repo->hash_algo);
 }
 
 void clean_status_index_snapshot_release(

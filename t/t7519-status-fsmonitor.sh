@@ -1377,7 +1377,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'index writers report missing authenticated untracked proofs' '
+	'index writers preserve authenticated untracked proofs' '
 	test_when_finished "rm -rf missing-untracked-proof" &&
 	test_create_repo missing-untracked-proof &&
 	(
@@ -1407,19 +1407,24 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TRACE2_EVENT="$PWD/.git/reset.trace" \
 			git reset --hard HEAD >.git/reset.out &&
 		test_region index do_write_index .git/reset.trace &&
-		test_trace2_data fsmonitor untracked/proof-missing 1 \
+		! test_trace2_data fsmonitor untracked/proof-missing 1 \
 			<.git/reset.trace &&
 		test_grep FSMN .git/index &&
 		test_grep UNTR .git/index &&
-		test_grep ! FSUC .git/index &&
+		test_grep FSUC .git/index &&
+		test_fsmonitor_full_proof .git/index paired &&
 
+		cp .git/index .git/reset.index &&
+		GIT_OPTIONAL_LOCKS=0 \
 		GIT_INDEX_FILE="$PWD/.git/index" \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
-		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
-			git status --porcelain=v2 >.git/repair &&
-		test_must_be_empty .git/repair &&
-		test_grep FSMN .git/index &&
-		test_grep FSUC .git/index &&
+		GIT_TRACE2_EVENT="$PWD/.git/reset-status.trace" \
+			git status --porcelain=v2 >.git/reset-status &&
+		test_must_be_empty .git/reset-status &&
+		test_cmp_bin .git/reset.index .git/index &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/reset-status.trace &&
+		! test_region index do_write_index .git/reset-status.trace &&
 
 		cp .git/index .git/alternate.index &&
 		GIT_INDEX_FILE="$PWD/.git/alternate.index" \
@@ -1443,11 +1448,12 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TRACE2_EVENT="$PWD/.git/stash.trace" \
 			git stash push -m proof-missing >.git/stash.out &&
 		test_region index do_write_index .git/stash.trace &&
-		test_trace2_data fsmonitor untracked/proof-missing 1 \
+		! test_trace2_data fsmonitor untracked/proof-missing 1 \
 			<.git/stash.trace &&
 		test_grep FSMN .git/index &&
 		test_grep UNTR .git/index &&
-		test_grep ! FSUC .git/index
+		test_grep FSUC .git/index &&
+		test_fsmonitor_full_proof .git/index paired
 	)
 '
 
@@ -2875,7 +2881,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'configured pulls preserve authenticated worktree proofs' '
-	test_when_finished "rm -rf pull-proof-origin.git pull-proof-seed pull-proof-ff pull-proof-ff-linked pull-proof-rebase pull-proof-rebase-linked pull-proof-autostash pull-proof-autostash-linked pull-proof-filter" &&
+	test_when_finished "rm -rf pull-proof-origin.git pull-proof-seed pull-proof-ff pull-proof-ff-linked pull-proof-rebase pull-proof-rebase-linked pull-proof-autostash pull-proof-autostash-linked pull-proof-delete pull-proof-delete-linked pull-proof-filter" &&
 	git init --bare pull-proof-origin.git &&
 	test_create_repo pull-proof-seed &&
 	(
@@ -2938,7 +2944,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 					;;
 				linked)
 					worktree="$linked" &&
-					invalidated=194
+					invalidated=196
 					;;
 				esac &&
 				if test "$mode" != ff
@@ -2972,11 +2978,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 								return 1
 					done &&
 					test_write_lines "# $mode-$role" \
-						>.gitattributes &&
+						>"upstream-$mode-$role/nested/.gitattributes" &&
 					test_write_lines "*.ignored" "# $mode-$role" \
-						>.gitignore &&
-					git add "upstream-$mode-$role" \
-						.gitattributes .gitignore
+						>"upstream-$mode-$role/nested/.gitignore" &&
+					git add "upstream-$mode-$role"
 				else
 					test_write_lines "$mode-$role" \
 						>"upstream-$mode-$role" &&
@@ -3031,27 +3036,100 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 				fi &&
 				perl "$PWD/.git/check-pull-proof.pl" \
 					<"$gitdir/index" &&
-				cp "$gitdir/index" "$gitdir/readonly.index" &&
+				for pass in first second
+				do
+					cp "$gitdir/index" \
+						"$gitdir/readonly-$pass.index" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+					GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+					GIT_TRACE2_EVENT="$gitdir/status-$pass.trace" \
+						git -C "$worktree" status --porcelain=v2 \
+							>"$gitdir/status-$pass" &&
+					if test "$mode" = autostash
+					then
+						test_grep "^1 \\.M .* tracked$" \
+							"$gitdir/status-$pass" || return 1
+					else
+						test_must_be_empty \
+							"$gitdir/status-$pass" || return 1
+					fi &&
+					test_cmp_bin "$gitdir/readonly-$pass.index" \
+						"$gitdir/index" &&
+					test_trace2_data fsmonitor config/coherent 1 \
+						<"$gitdir/status-$pass.trace" &&
+					! test_trace2_data fsmonitor \
+						semantic/manifest-scan-count 1 \
+						<"$gitdir/status-$pass.trace" &&
+					! test_region index do_write_index \
+						"$gitdir/status-$pass.trace" || return 1
+				done || return 1
+			done || return 1
+		done &&
+		git clone --quiet "$PWD/../pull-proof-origin.git" \
+			"$PWD/../pull-proof-delete" &&
+		delete_repo="$PWD/../pull-proof-delete" &&
+		delete_linked="$PWD/../pull-proof-delete-linked" &&
+		git -C "$delete_repo" worktree add --quiet -b linked-delete \
+			"$delete_linked" origin/main &&
+		git -C "$delete_linked" branch --quiet \
+			--set-upstream-to=origin/main &&
+		git -C "$delete_repo" config pull.ff only &&
+		git -C "$delete_repo" config core.untrackedCache true &&
+		git -C "$delete_repo" config core.fsmonitor true &&
+		for worktree in "$delete_repo" "$delete_linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			perl "$PWD/.git/check-pull-proof.pl" \
+				<"$gitdir/index" || return 1
+		done &&
+		test_write_lines "# root attributes" >.gitattributes &&
+		test_write_lines "# root ignore" >.gitignore &&
+		git rm --quiet \
+			upstream-ff-main/nested/.gitattributes \
+			upstream-ff-main/nested/.gitignore &&
+		git add .gitattributes .gitignore &&
+		git commit -qm "change policy sources" &&
+		git push --quiet origin main &&
+		for worktree in "$delete_repo" "$delete_linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
+			GIT_TRACE2_EVENT="$gitdir/pull.trace" \
+				git -C "$worktree" pull --quiet &&
+			! test_trace2_data fsmonitor untracked/proof-missing 1 \
+				<"$gitdir/pull.trace" &&
+			perl "$PWD/.git/check-pull-proof.pl" \
+				<"$gitdir/index" &&
+			for pass in first second
+			do
+				cp "$gitdir/index" \
+					"$gitdir/delete-$pass.index" &&
 				GIT_OPTIONAL_LOCKS=0 \
-				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
-				GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
-				GIT_TRACE2_EVENT="$gitdir/status.trace" \
+				GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+				GIT_TRACE2_EVENT="$gitdir/delete-$pass.trace" \
 					git -C "$worktree" status --porcelain=v2 \
-						>"$gitdir/status" &&
-				if test "$mode" = autostash
-				then
-					test_grep "^1 \\.M .* tracked$" \
-						"$gitdir/status" || return 1
-				else
-					test_must_be_empty "$gitdir/status" || return 1
-				fi &&
-				test_cmp_bin "$gitdir/readonly.index" \
+						>"$gitdir/delete-$pass" &&
+				test_must_be_empty "$gitdir/delete-$pass" &&
+				test_cmp_bin "$gitdir/delete-$pass.index" \
 					"$gitdir/index" &&
 				test_trace2_data fsmonitor config/coherent 1 \
-					<"$gitdir/status.trace" &&
+					<"$gitdir/delete-$pass.trace" &&
 				! test_trace2_data fsmonitor \
 					semantic/manifest-scan-count 1 \
-					<"$gitdir/status.trace" || return 1
+					<"$gitdir/delete-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/delete-$pass.trace" || return 1
 			done || return 1
 		done &&
 		git clone --quiet "$PWD/../pull-proof-origin.git" \
@@ -3098,6 +3176,348 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			"$filter_gitdir/status.err" &&
 		test_cmp_bin "$filter_gitdir/status.before" \
 			"$filter_gitdir/index"
+	)
+'
+
+test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider restarts preserve authenticated pull proofs' '
+	test_when_finished "rm -rf daemon-pull-origin.git daemon-pull-seed daemon-pull-fast daemon-pull daemon-pull-linked daemon-pull-root daemon-pull-root-linked daemon-pull-filter" &&
+	test_when_finished \
+		"git -C daemon-pull-fast fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-pull fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-pull-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-pull-root fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-pull-root-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-pull-filter fsmonitor--daemon stop 2>/dev/null || :" &&
+	git init --bare daemon-pull-origin.git &&
+	test_create_repo daemon-pull-seed &&
+	(
+		cd daemon-pull-seed &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir stable &&
+		mkdir -p policy-main/nested policy-linked/nested &&
+		for file in $(test_seq 1 128)
+		do
+			test_write_lines "stable-$file" >"stable/$file" ||
+				return 1
+		done &&
+		test_write_lines "# base main" \
+			>policy-main/nested/.gitattributes &&
+		test_write_lines "# base main" \
+			>policy-main/nested/.gitignore &&
+		test_write_lines "# base linked" \
+			>policy-linked/nested/.gitattributes &&
+		test_write_lines "# base linked" \
+			>policy-linked/nested/.gitignore &&
+		git add stable policy-main policy-linked &&
+		test_commit base tracked &&
+		git branch -M main &&
+		git remote add origin "$PWD/../daemon-pull-origin.git" &&
+		git push --quiet -u origin main &&
+		git --git-dir="$PWD/../daemon-pull-origin.git" \
+			symbolic-ref HEAD refs/heads/main &&
+		git clone --quiet "$PWD/../daemon-pull-origin.git" \
+			"$PWD/../daemon-pull-fast" &&
+		fast="$PWD/../daemon-pull-fast" &&
+		fast_gitdir=$(git -C "$fast" rev-parse --absolute-git-dir) &&
+		git -C "$fast" config pull.ff only &&
+		git -C "$fast" config core.untrackedCache true &&
+		git -C "$fast" config core.fsmonitor true &&
+		git -C "$fast" fsmonitor--daemon start --start-timeout=10 &&
+		git -C "$fast" update-index --fsmonitor &&
+		GIT_INDEX_FILE="$fast_gitdir/index" \
+			git -C "$fast" status --porcelain=v2 \
+				>"$fast_gitdir/prime" &&
+		test_must_be_empty "$fast_gitdir/prime" &&
+		test_write_lines normal >normal-fast-path &&
+		git add normal-fast-path &&
+		git commit -qm "normal fast path" &&
+		git push --quiet origin main &&
+		GIT_TRACE2_EVENT="$fast_gitdir/pull.trace" \
+			git -C "$fast" pull --quiet &&
+		test_trace2_data fsmonitor history/post-worktree-refresh 1 \
+			<"$fast_gitdir/pull.trace" &&
+		test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+			<"$fast_gitdir/pull.trace" &&
+		test_trace2_data index refresh/sum_lstat 1 \
+			<"$fast_gitdir/pull.trace" &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<"$fast_gitdir/pull.trace" &&
+		test_fsmonitor_full_proof "$fast_gitdir/index" paired &&
+		git -C "$fast" fsmonitor--daemon stop &&
+		git clone --quiet "$PWD/../daemon-pull-origin.git" \
+			"$PWD/../daemon-pull" &&
+		repo="$PWD/../daemon-pull" &&
+		linked="$PWD/../daemon-pull-linked" &&
+		git -C "$repo" worktree add --quiet -b daemon-linked \
+			"$linked" origin/main &&
+		git -C "$linked" branch --quiet \
+			--set-upstream-to=origin/main &&
+		git -C "$repo" config pull.ff only &&
+		git -C "$repo" config core.untrackedCache true &&
+		git -C "$repo" config core.fsmonitor true &&
+		write_script "$repo/.git/hooks/post-index-change" <<-\EOF &&
+			gitdir=$(git rev-parse --absolute-git-dir) || exit 1
+			test ! -f "$gitdir/index.lock" || exit 1
+			test -f "$gitdir/index" || exit 1
+			printf "%s %s\n" "$1" "$2" >>"$gitdir/post-index-change.log"
+		EOF
+		for role in main linked
+		do
+			if test "$role" = main
+			then
+				worktree="$repo" &&
+				affected=98 &&
+				total=230
+			else
+				worktree="$linked" &&
+				affected=196 &&
+				total=326
+			fi &&
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			git -C "$worktree" fsmonitor--daemon stop &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			rm -f "$gitdir/post-index-change.log" &&
+			mkdir -p "policy-$role/nested/new" &&
+			for file in $(test_seq 1 96)
+			do
+				test_write_lines "$role-$file" \
+					>"policy-$role/nested/new/$file" || return 1
+			done &&
+			if test "$role" = main
+			then
+				test_write_lines "# changed main" \
+					>policy-main/nested/.gitattributes &&
+				test_write_lines "*.ignored" "# changed main" \
+					>policy-main/nested/.gitignore
+			else
+				test_write_lines "* text" \
+					>policy-linked/nested/.gitattributes &&
+				test_write_lines "*.ignored" "!keep.ignored" \
+					>policy-linked/nested/.gitignore
+			fi &&
+			git add "policy-$role" &&
+			git commit -qm "upstream-$role" &&
+			git push --quiet origin main &&
+			GIT_TRACE2_EVENT="$gitdir/pull.trace" \
+				git -C "$worktree" \
+					-c protocol.version=2 \
+					-c fetch.uriprotocols=https \
+					-c http.https://example.invalid.extraHeader=header \
+					-c http.https://example.invalid.proactiveAuth=basic \
+					-c http.https://example.invalid.sslVerify=true \
+					pull --quiet >"$gitdir/pull" &&
+			! test_trace2_data fsmonitor untracked/proof-missing 1 \
+				<"$gitdir/pull.trace" &&
+			test_trace2_data index refresh/sum_lstat "$affected" \
+				<"$gitdir/pull.trace" &&
+			! test_trace2_data index refresh/sum_lstat "$total" \
+				<"$gitdir/pull.trace" &&
+			test_write_lines "1 0" \
+				>"$gitdir/post-index-change.expect" &&
+			test_cmp "$gitdir/post-index-change.expect" \
+				"$gitdir/post-index-change.log" &&
+			test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+				<"$gitdir/pull.trace" &&
+			! test_trace2_data fsmonitor history/writer-proof-repaired 0 \
+				<"$gitdir/pull.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			for pass in first second
+			do
+				cp "$gitdir/index" "$gitdir/readonly-$pass.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TRACE2_EVENT="$gitdir/readonly-$pass.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/readonly-$pass" &&
+				test_must_be_empty "$gitdir/readonly-$pass" &&
+				test_cmp_bin "$gitdir/readonly-$pass.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data fsmonitor untracked/proof-missing 1 \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data read_directory \
+					directories-visited "[1-9][0-9]*" \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data read_directory paths-visited \
+					"[1-9][0-9]*" \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data read_directory opendir \
+					"[1-9][0-9]*" \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_trace2_data index preload/sum_lstat \
+					"[1-9][0-9]*" \
+					<"$gitdir/readonly-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/readonly-$pass.trace" || return 1
+			done &&
+			git -C "$worktree" fsmonitor--daemon stop || return 1
+		done &&
+		mkdir -p root-tree &&
+		for file in $(test_seq 1 96)
+		do
+			mkdir -p "root-tree/$file/nested" &&
+			test_write_lines "root-$file" \
+				>"root-tree/$file/nested/tracked.txt" || return 1
+		done &&
+		test_write_lines "*.ignored" "# root ignore base" \
+			>.gitignore &&
+		test_write_lines "*.txt text" "# root attributes base" \
+			>.gitattributes &&
+		git add root-tree .gitignore .gitattributes &&
+		git commit -qm "root policy base" &&
+		git push --quiet origin main &&
+		git clone --quiet "$PWD/../daemon-pull-origin.git" \
+			"$PWD/../daemon-pull-root" &&
+		root_repo="$PWD/../daemon-pull-root" &&
+		root_linked="$PWD/../daemon-pull-root-linked" &&
+		git -C "$root_repo" worktree add --quiet -b daemon-root-linked \
+			"$root_linked" origin/main &&
+		git -C "$root_linked" branch --quiet \
+			--set-upstream-to=origin/main &&
+		git -C "$root_repo" config pull.ff only &&
+		git -C "$root_repo" config core.untrackedCache true &&
+		git -C "$root_repo" config core.fsmonitor true &&
+		for worktree in "$root_repo" "$root_linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/root-prime" &&
+			test_must_be_empty "$gitdir/root-prime" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired || return 1
+		done &&
+		for role in main linked
+		do
+			if test "$role" = main
+			then
+				worktree="$root_repo" &&
+				policy_dir=1
+			else
+				worktree="$root_linked" &&
+				policy_dir=2
+			fi &&
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			test_write_lines "*.ignored" \
+				"# root ignore $role" >.gitignore &&
+			test_write_lines "*.txt text" \
+				"# root attributes $role" >.gitattributes &&
+			test_write_lines "*.ignored" \
+				"# nested ignore $role" \
+				>"root-tree/$policy_dir/nested/.gitignore" &&
+			test_write_lines "*.txt text" \
+				"# nested attributes $role" \
+				>"root-tree/$policy_dir/nested/.gitattributes" &&
+			git add .gitignore .gitattributes \
+				"root-tree/$policy_dir/nested/.gitignore" \
+				"root-tree/$policy_dir/nested/.gitattributes" &&
+			git commit -qm "root policy $role" &&
+			git push --quiet origin main &&
+			GIT_TRACE2_EVENT="$gitdir/root-pull.trace" \
+				git -C "$worktree" pull --quiet &&
+			test_trace2_data fsmonitor \
+				checkout/untracked-policy-targeted 1 \
+				<"$gitdir/root-pull.trace" &&
+			test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+				<"$gitdir/root-pull.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false ls-files --debug -- \
+				.gitattributes .gitignore \
+				"root-tree/$policy_dir/nested/.gitattributes" \
+				"root-tree/$policy_dir/nested/.gitignore" \
+					>"$gitdir/root-policy-stat" &&
+			test_grep ! "ctime: 0:0" "$gitdir/root-policy-stat" &&
+			test_grep ! "mtime: 0:0" "$gitdir/root-policy-stat" &&
+			test_grep ! "size: 0" "$gitdir/root-policy-stat" &&
+			for pass in first second
+			do
+				cp "$gitdir/index" "$gitdir/root-$pass.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TRACE2_EVENT="$gitdir/root-$pass.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/root-$pass" &&
+				test_must_be_empty "$gitdir/root-$pass" &&
+				test_cmp_bin "$gitdir/root-$pass.index" \
+					"$gitdir/index" &&
+				! test_trace2_data fsmonitor \
+					semantic/manifest-scan-count 1 \
+					<"$gitdir/root-$pass.trace" &&
+				! test_trace2_data read_directory directories-visited \
+					"[1-9][0-9]*" <"$gitdir/root-$pass.trace" &&
+				! test_trace2_data read_directory opendir \
+					"[1-9][0-9]*" <"$gitdir/root-$pass.trace" &&
+				! test_trace2_data index preload/sum_lstat \
+					"[1-9][0-9]*" <"$gitdir/root-$pass.trace" &&
+				! test_trace2_data index refresh/sum_lstat \
+					"[1-9][0-9]*" <"$gitdir/root-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/root-$pass.trace" || return 1
+			done &&
+			git -C "$worktree" fsmonitor--daemon stop || return 1
+		done &&
+		git clone --quiet "$PWD/../daemon-pull-origin.git" \
+			"$PWD/../daemon-pull-filter" &&
+		filter="$PWD/../daemon-pull-filter" &&
+		filter_gitdir=$(git -C "$filter" rev-parse --absolute-git-dir) &&
+		git -C "$filter" config pull.ff only &&
+		git -C "$filter" config core.untrackedCache true &&
+		git -C "$filter" config core.fsmonitor true &&
+		git -C "$filter" config filter.daemonpull.clean false &&
+		git -C "$filter" config filter.daemonpull.required true &&
+		git -C "$filter" fsmonitor--daemon start --start-timeout=10 &&
+		git -C "$filter" update-index --fsmonitor &&
+		GIT_INDEX_FILE="$filter_gitdir/index" \
+			git -C "$filter" status --porcelain=v2 \
+				>"$filter_gitdir/prime" &&
+		test_must_be_empty "$filter_gitdir/prime" &&
+		git -C "$filter" fsmonitor--daemon stop &&
+		git -C "$filter" fsmonitor--daemon start --start-timeout=10 &&
+		test_write_lines "tracked filter=daemonpull" >.gitattributes &&
+		git add .gitattributes &&
+		git commit -qm "require unavailable filter" &&
+		git push --quiet origin main &&
+		GIT_TRACE2_EVENT="$filter_gitdir/pull.trace" \
+			git -C "$filter" pull --quiet &&
+		test_trace2_data fsmonitor semantic/manifest-invalidated 1 \
+			<"$filter_gitdir/pull.trace" &&
+		! test_trace2_data fsmonitor history/post-worktree-refresh 1 \
+			<"$filter_gitdir/pull.trace" &&
+		cp "$filter_gitdir/index" "$filter_gitdir/status.before" &&
+		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$filter_gitdir/status.trace" \
+			git -C "$filter" status --porcelain=v2 \
+				--untracked-files=no -- tracked \
+				>"$filter_gitdir/status" \
+				2>"$filter_gitdir/status.err" &&
+		test_grep "clean filter .daemonpull. failed" \
+			"$filter_gitdir/status.err" &&
+		test_cmp_bin "$filter_gitdir/status.before" \
+			"$filter_gitdir/index" &&
+		git -C "$filter" fsmonitor--daemon stop
 	)
 '
 
@@ -3178,6 +3598,262 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
 			git status --porcelain=v2 >.git/conflict &&
 		test_grep "^u UU .* tracked$" .git/conflict
+	)
+'
+
+test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'routed push and owned writers preserve authenticated clean proofs' '
+	test_when_finished "rm -rf daemon-writers daemon-writers-linked" &&
+	test_when_finished \
+		"git -C daemon-writers fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C daemon-writers-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo daemon-writers &&
+	(
+		cd daemon-writers &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir stable &&
+		for file in $(test_seq 1 16)
+		do
+			test_write_lines "stable-$file" >"stable/$file" ||
+				return 1
+		done &&
+		test_write_lines base >stable/anchor &&
+		git add stable &&
+		git commit -qm base &&
+		base=$(git rev-parse HEAD) &&
+		git checkout -q -b upstream &&
+		for file in $(test_seq 1 16)
+		do
+			mkdir -p "incoming/package-$file/nested" &&
+			test_write_lines "incoming-$file" \
+				>"incoming/package-$file/nested/tracked" ||
+				return 1
+		done &&
+		git add incoming &&
+		git commit -qm upstream &&
+		git checkout -q -b owned-main "$base" &&
+		test_write_lines base topic >stable/anchor &&
+		git add stable/anchor &&
+		git commit -qm topic &&
+		git branch owned-linked &&
+		git worktree add -q ../daemon-writers-linked owned-linked &&
+		repo=$PWD &&
+		linked=$PWD/../daemon-writers-linked &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config filter.lfs.clean "git-lfs clean -- %f" &&
+		git config filter.lfs.smudge "git-lfs smudge -- %f" &&
+		git config filter.lfs.process "git-lfs filter-process" &&
+		git config filter.lfs.required true &&
+
+		assert_no_full_worktree_scan () {
+			trace=$1 &&
+			! test_trace2_data fsmonitor \
+				semantic/manifest-scan-count 1 <"$trace" &&
+			! test_trace2_data read_directory directories-visited \
+				"[1-9][0-9]*" <"$trace" &&
+			! test_trace2_data read_directory opendir \
+				"[1-9][0-9]*" <"$trace" &&
+			! test_trace2_data index preload/sum_lstat \
+				"[1-9][0-9]*" <"$trace" &&
+			! test_trace2_data index refresh/sum_lstat \
+				"[1-9][0-9]*" <"$trace" &&
+			! test_region index do_write_index "$trace"
+		} &&
+
+		assert_clean_status_fast () {
+			trace=$1 &&
+			{
+				test_trace2_data status clean-proof/hit 1 \
+					<"$trace" ||
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$trace"
+			}
+		} &&
+
+		assert_owned_writer_clean () {
+			worktree=$1 &&
+			label=$2 &&
+			shift 2 &&
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			git --no-optional-locks -C "$worktree" \
+				-c core.fsmonitor=false ls-files --debug -- "$@" \
+					>"$gitdir/$label-stat" &&
+			test_grep ! "ctime: 0:0" "$gitdir/$label-stat" &&
+			test_grep ! "mtime: 0:0" "$gitdir/$label-stat" &&
+			test_grep ! "size: 0" "$gitdir/$label-stat" &&
+			for pass in first second
+			do
+				cp "$gitdir/index" \
+					"$gitdir/$label-$pass.index" &&
+				GIT_OPTIONAL_LOCKS=0 \
+				GIT_TRACE2_EVENT="$gitdir/$label-$pass.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/$label-$pass" &&
+				test_must_be_empty "$gitdir/$label-$pass" &&
+				test_cmp_bin "$gitdir/$label-$pass.index" \
+					"$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/$label-$pass.trace" &&
+				! test_trace2_data fsmonitor untracked/proof-missing 1 \
+					<"$gitdir/$label-$pass.trace" &&
+				assert_no_full_worktree_scan \
+					"$gitdir/$label-$pass.trace" || return 1
+			done
+		} &&
+
+		assert_routed_push_fast () {
+			worktree=$1 &&
+			label=$2 &&
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			for route in https ssh
+			do
+				case "$route" in
+				https)
+					pushurl_key=remote.https.pushurl &&
+					pushurl=https://example.invalid/repository.git
+					;;
+				ssh)
+					pushurl_key=remote.origin.pushurl &&
+					pushurl=ssh://git@example.invalid/repository.git
+					;;
+				esac &&
+				for pass in first second
+				do
+					prefix="$gitdir/$label-$route-$pass" &&
+					cp "$gitdir/index" "$prefix.index" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TRACE2_EVENT="$prefix.diff.trace" \
+						git -C "$worktree" \
+							-c push.negotiate=true \
+							-c "$pushurl_key=$pushurl" \
+							diff --quiet --no-ext-diff \
+								--no-textconv --ignore-submodules &&
+					test_cmp_bin "$prefix.index" "$gitdir/index" &&
+					test_trace2_data fsmonitor config/coherent 1 \
+						<"$prefix.diff.trace" &&
+					assert_no_full_worktree_scan \
+						"$prefix.diff.trace" &&
+					GIT_TRACE2_EVENT="$prefix.write-tree.trace" \
+						git -C "$worktree" \
+							-c push.negotiate=true \
+							-c "$pushurl_key=$pushurl" \
+							write-tree >"$prefix.tree" &&
+					test_file_not_empty "$prefix.tree" &&
+					test_cmp_bin "$prefix.index" "$gitdir/index" &&
+					assert_no_full_worktree_scan \
+						"$prefix.write-tree.trace" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TRACE2_EVENT="$prefix.status.trace" \
+						git -C "$worktree" \
+							-c push.negotiate=true \
+							-c "$pushurl_key=$pushurl" \
+							status --porcelain=v2 \
+								>"$prefix.status" &&
+					test_must_be_empty "$prefix.status" &&
+					test_cmp_bin "$prefix.index" "$gitdir/index" &&
+					assert_clean_status_fast \
+						"$prefix.status.trace" &&
+					assert_no_full_worktree_scan \
+						"$prefix.status.trace" || return 1
+				done &&
+				prefix="$gitdir/$label-$route-writable" &&
+				cp "$gitdir/index" "$prefix.index" &&
+				GIT_TRACE2_EVENT="$prefix.status.trace" \
+					git -C "$worktree" \
+						-c push.negotiate=true \
+						-c "$pushurl_key=$pushurl" \
+						status --porcelain=v2 >"$prefix.status" &&
+				test_must_be_empty "$prefix.status" &&
+				assert_clean_status_fast \
+					"$prefix.status.trace" &&
+				assert_no_full_worktree_scan \
+					"$prefix.status.trace" &&
+				GIT_TRACE2_EVENT="$prefix.tracked.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						--untracked-files=no >"$prefix.tracked" &&
+				test_must_be_empty "$prefix.tracked" &&
+				test_cmp_bin "$prefix.index" "$gitdir/index" &&
+				assert_clean_status_fast \
+					"$prefix.tracked.trace" &&
+				assert_no_full_worktree_scan \
+					"$prefix.tracked.trace" &&
+				test_fsmonitor_full_proof "$gitdir/index" paired ||
+					return 1
+			done
+		} &&
+
+		for worktree in "$repo" "$linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			test-tool chmtime =-60 "$worktree"/stable/* &&
+			git -C "$worktree" -c core.fsmonitor=false \
+				update-index --refresh &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired ||
+				return 1
+		done &&
+		assert_routed_push_fast "$repo" main &&
+		assert_routed_push_fast "$linked" linked &&
+
+		for worktree in "$repo" "$linked"
+		do
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			GIT_TRACE2_EVENT="$gitdir/rebase.trace" \
+				git -C "$worktree" rebase upstream &&
+			test_trace2_data fsmonitor \
+				history/writer-proof-repaired 1 \
+				<"$gitdir/rebase.trace" &&
+			! test_trace2_data fsmonitor \
+				history/writer-proof-repaired 0 \
+				<"$gitdir/rebase.trace" &&
+			assert_owned_writer_clean "$worktree" rebase incoming ||
+				return 1
+		done &&
+
+		rebased=$(git rev-parse HEAD) &&
+		gitdir=$(git rev-parse --absolute-git-dir) &&
+		GIT_TRACE2_EVENT="$gitdir/reset.trace" \
+			git reset --hard -q upstream &&
+		test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+			<"$gitdir/reset.trace" &&
+		assert_owned_writer_clean "$repo" reset incoming &&
+		GIT_TRACE2_EVENT="$gitdir/reset-back.trace" \
+			git reset --hard -q "$rebased" &&
+		test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+			<"$gitdir/reset-back.trace" &&
+		assert_owned_writer_clean "$repo" reset-back incoming &&
+
+		test_write_lines base topic stashed >stable/anchor &&
+		GIT_TRACE2_EVENT="$gitdir/stash.trace" \
+			git stash push -qm writer-proof &&
+		test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+			<"$gitdir/stash.trace" &&
+		assert_owned_writer_clean "$repo" stash incoming &&
+
+		GIT_TRACE2_EVENT="$gitdir/checkout-upstream.trace" \
+			git checkout -q upstream &&
+		assert_owned_writer_clean "$repo" checkout-upstream incoming &&
+		GIT_TRACE2_EVENT="$gitdir/checkout-topic.trace" \
+			git checkout -q owned-main &&
+		test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+			<"$gitdir/checkout-topic.trace" &&
+		assert_owned_writer_clean "$repo" checkout-topic incoming &&
+
+		git -C "$repo" fsmonitor--daemon stop &&
+		git -C "$linked" fsmonitor--daemon stop
 	)
 '
 

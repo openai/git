@@ -3931,11 +3931,13 @@ static int do_write_locked_index(
 	if (!ret && checkpoint && !(flags & COMMIT_LOCK))
 		clean_status_record_commit_checkpoint(checkpoint, istate, lock);
 
-	run_hooks_l(the_repository, "post-index-change",
-		    istate->updated_workdir ? "1" : "0",
-		    istate->updated_skipworktree ? "1" : "0", NULL);
-	istate->updated_workdir = 0;
-	istate->updated_skipworktree = 0;
+	if (!(flags & PROVISIONAL_LOCK)) {
+		run_hooks_l(the_repository, "post-index-change",
+			    istate->updated_workdir ? "1" : "0",
+			    istate->updated_skipworktree ? "1" : "0", NULL);
+		istate->updated_workdir = 0;
+		istate->updated_skipworktree = 0;
+	}
 
 	return ret;
 }

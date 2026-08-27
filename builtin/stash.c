@@ -1804,12 +1804,6 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 			printf_ln(_("No local changes to save"));
 		goto done;
 	}
-	if (preserve_clean_history && !(patch_mode || only_staged)) {
-		clean_status_invalidate_current_proof(the_repository->index);
-		if (clean_status_should_write_fsmonitor_config(
-			    the_repository->index))
-			the_repository->index->cache_changed |= FSMONITOR_CHANGED;
-	}
 	if (write_locked_index(the_repository->index, &index_lock,
 			       COMMIT_LOCK | SKIP_IF_UNCHANGED)) {
 		ret = error(_("could not write index"));

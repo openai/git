@@ -1795,6 +1795,24 @@ apply_results:
 	}
 }
 
+void fsmonitor_refresh_after_worktree_update(struct index_state *istate)
+{
+	if (!istate->fsmonitor_has_run_once ||
+	    fsm_settings__get_mode(istate->repo) != FSMONITOR_MODE_IPC ||
+	    !istate->fsmonitor_token_valid || !istate->fsmonitor_last_update)
+		return;
+
+	/*
+	 * refresh_fsmonitor() is normally once-per-process.  An owned checkout
+	 * performed after that query creates a new event interval, so consume it
+	 * before a writer closes and persists the repaired proof.
+	 */
+	istate->fsmonitor_has_run_once = 0;
+	refresh_fsmonitor(istate);
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/post-worktree-refresh", 1);
+}
+
 int fsmonitor_has_pending_token(const struct index_state *istate)
 {
 	return !!istate->fsmonitor_last_update_pending;
