@@ -3228,6 +3228,7 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		git -C "$fast" config pull.ff only &&
 		git -C "$fast" config core.untrackedCache true &&
 		git -C "$fast" config core.fsmonitor true &&
+		git -C "$fast" config core.preloadIndexBulk true &&
 		git -C "$fast" fsmonitor--daemon start --start-timeout=10 &&
 		git -C "$fast" update-index --fsmonitor &&
 		GIT_INDEX_FILE="$fast_gitdir/index" \
@@ -3261,6 +3262,7 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		git -C "$repo" config pull.ff only &&
 		git -C "$repo" config core.untrackedCache true &&
 		git -C "$repo" config core.fsmonitor true &&
+		git -C "$repo" config core.preloadIndexBulk true &&
 		write_script "$repo/.git/hooks/post-index-change" <<-\EOF &&
 			gitdir=$(git rev-parse --absolute-git-dir) || exit 1
 			test ! -f "$gitdir/index.lock" || exit 1
@@ -3396,6 +3398,7 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		git -C "$root_repo" config pull.ff only &&
 		git -C "$root_repo" config core.untrackedCache true &&
 		git -C "$root_repo" config core.fsmonitor true &&
+		git -C "$root_repo" config core.preloadIndexBulk true &&
 		for worktree in "$root_repo" "$root_linked"
 		do
 			gitdir=$(git -C "$worktree" \
@@ -3486,6 +3489,7 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		git -C "$filter" config pull.ff only &&
 		git -C "$filter" config core.untrackedCache true &&
 		git -C "$filter" config core.fsmonitor true &&
+		git -C "$filter" config core.preloadIndexBulk true &&
 		git -C "$filter" config filter.daemonpull.clean false &&
 		git -C "$filter" config filter.daemonpull.required true &&
 		git -C "$filter" fsmonitor--daemon start --start-timeout=10 &&
@@ -3537,6 +3541,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		git worktree add --detach ../sequencer-linked HEAD &&
 		git config core.untrackedCache true &&
 		git config core.fsmonitor true &&
+		git config core.preloadIndexBulk true &&
 		for worktree in "$PWD" "$PWD/../sequencer-linked"
 		do
 			gitdir=$(git -C "$worktree" \

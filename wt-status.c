@@ -2500,9 +2500,10 @@ static int repair_fsmonitor_proof(
 	status.allow_clean_status_shortcuts = 1;
 	status.certify_clean_status = 1;
 	wt_status_start_untracked_cache_preload(&status);
+	/* There is no subsequent diff to consume deferred bulk results. */
 	wt_status_refresh_index(
 		&status,
-		REFRESH_QUIET | REFRESH_UNMERGED | REFRESH_DEFER_BULK_DIRTY,
+		REFRESH_QUIET | REFRESH_UNMERGED,
 		1);
 	untracked_cache_recompute_fsmonitor_valid_recursive(istate->untracked);
 	no_pending = !fsmonitor_has_pending_token(istate);
