@@ -115,6 +115,8 @@ static int snapshot_open(
 
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->fd = -1;
+	if (!path || !*path)
+		return -1;
 #ifdef O_NONBLOCK
 	flags |= O_NONBLOCK;
 #endif
