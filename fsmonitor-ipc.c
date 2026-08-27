@@ -450,9 +450,12 @@ static int server_supports_required_capabilities(void)
 		has_capability(&answer,
 			       FSMONITOR_IPC_HARDLINK_QUERY_VERSION) &&
 		has_capability(&answer,
-			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY) &&
-		has_capability(&answer,
 			       FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY);
+#endif
+#if FSMONITOR_IPC_HAS_DIR_METADATA
+	ret = ret &&
+		has_capability(&answer,
+			       FSMONITOR_IPC_DIR_METADATA_CAPABILITY);
 #endif
 	strbuf_release(&answer);
 	return ret;
@@ -463,9 +466,7 @@ static int response_identifies_cookie_retiring_daemon(
 {
 	static const char prefix[] =
 		"builtin:"
-#ifdef __APPLE__
-		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
-#endif
+		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
 		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX;
 	const char *end = memchr(answer->buf, '\0', answer->len);
 

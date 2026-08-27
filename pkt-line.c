@@ -353,6 +353,9 @@ static int get_packet_data(int fd, char **src_buf, size_t *src_size,
 	} else {
 		ssize_t ret = read_in_full(fd, dst, size);
 		if (ret < 0) {
+			if ((options & PACKET_READ_GENTLE_ON_READ_ERROR) &&
+			    (options & PACKET_READ_SILENT_ON_READ_ERROR))
+				return -1;
 			if (options & PACKET_READ_GENTLE_ON_READ_ERROR)
 				return error_errno(_("read error"));
 			die_errno(_("read error"));

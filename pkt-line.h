@@ -78,6 +78,10 @@ void packet_fflush(FILE *f);
  * If options contains PACKET_READ_GENTLE_ON_READ_ERROR, we will not die
  * on read errors, but instead return -1.  However, we may still die on an
  * ERR packet (if requested).
+ *
+ * If options also contains PACKET_READ_SILENT_ON_READ_ERROR, an operating
+ * system read error is returned without first reporting it.  This is useful
+ * when a caller expects a peer to disappear and will reconnect.
  */
 #define PACKET_READ_GENTLE_ON_EOF        (1u<<0)
 #define PACKET_READ_CHOMP_NEWLINE        (1u<<1)
@@ -85,6 +89,7 @@ void packet_fflush(FILE *f);
 #define PACKET_READ_GENTLE_ON_READ_ERROR (1u<<3)
 #define PACKET_READ_REDACT_URI_PATH      (1u<<4)
 #define PACKET_READ_USE_SIDEBAND         (1u<<5)
+#define PACKET_READ_SILENT_ON_READ_ERROR (1u<<6)
 int packet_read(int fd, char *buffer, unsigned size, int options);
 
 /*

@@ -1,5 +1,6 @@
 #include "git-compat-util.h"
 #include "dir.h"
+#include "fsmonitor.h"
 #include "fsmonitor-ipc.h"
 #include "fsmonitor-ll.h"
 #include "fsm-listen.h"
@@ -490,7 +491,6 @@ static int process_event(const char *path,
 			 struct string_list *cookie_list,
 			 struct fsmonitor_daemon_state *state)
 {
-	const char *rel;
 	const char *last_sep;
 
 	switch (fsmonitor_classify_path_absolute(state, path)) {
@@ -529,11 +529,22 @@ static int process_event(const char *path,
 		if (trace_pass_fl(&trace_fsmonitor))
 			log_mask_set(path, event->mask);
 
-		if (!*batch)
-			*batch = fsmonitor_batch__new();
+		{
+			struct strbuf paths = STRBUF_INIT;
 
-		rel = path + state->path_worktree_watch.len + 1;
-		fsmonitor_batch__add_path(*batch, rel);
+			fsmonitor_format_worktree_paths(
+				&paths, path, state->path_worktree_watch.len,
+				!(event->mask & IN_ISDIR),
+				!!(event->mask & IN_ISDIR));
+			for (const char *relative = paths.buf;
+			     relative < paths.buf + paths.len;
+			     relative += strlen(relative) + 1) {
+				if (!*batch)
+					*batch = fsmonitor_batch__new();
+				fsmonitor_batch__add_path(*batch, relative);
+			}
+			strbuf_release(&paths);
+		}
 
 		if (em_dir_deleted(event->mask))
 			break;

@@ -457,10 +457,8 @@ static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
 	if (test_env_value < 0)
 		test_env_value = git_env_bool("GIT_TEST_FSMONITOR_TOKEN", 0);
 
-#ifdef __APPLE__
 	strbuf_addstr(&token->token_id,
-		      FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX);
-#endif
+		      FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX);
 	strbuf_addstr(&token->token_id,
 		      FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX);
 
@@ -919,7 +917,11 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
 #ifdef __APPLE__
 			FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+#endif
+#if FSMONITOR_IPC_HAS_DIR_METADATA
 			FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+#endif
+#ifdef __APPLE__
 			FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
 #endif
 			;

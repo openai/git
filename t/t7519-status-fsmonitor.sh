@@ -3655,6 +3655,10 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 				"[1-9][0-9]*" <"$trace" &&
 			! test_trace2_data read_directory opendir \
 				"[1-9][0-9]*" <"$trace" &&
+			! test_trace2_data index preload/bulk_dirs \
+				"[1-9][0-9]*" <"$trace" &&
+			! test_trace2_data index preload/bulk_entries \
+				"[1-9][0-9]*" <"$trace" &&
 			! test_trace2_data index preload/sum_lstat \
 				"[1-9][0-9]*" <"$trace" &&
 			! test_trace2_data index refresh/sum_lstat \
@@ -3685,13 +3689,16 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 			test_grep ! "ctime: 0:0" "$gitdir/$label-stat" &&
 			test_grep ! "mtime: 0:0" "$gitdir/$label-stat" &&
 			test_grep ! "size: 0" "$gitdir/$label-stat" &&
-			for pass in first second
+			for bulk in false true
 			do
+				pass=bulk-$bulk &&
 				cp "$gitdir/index" \
 					"$gitdir/$label-$pass.index" &&
 				GIT_OPTIONAL_LOCKS=0 \
 				GIT_TRACE2_EVENT="$gitdir/$label-$pass.trace" \
-					git -C "$worktree" status --porcelain=v2 \
+					git -C "$worktree" \
+						-c core.preloadIndexBulk=$bulk \
+						status --porcelain=v2 \
 						>"$gitdir/$label-$pass" &&
 				test_must_be_empty "$gitdir/$label-$pass" &&
 				test_cmp_bin "$gitdir/$label-$pass.index" \

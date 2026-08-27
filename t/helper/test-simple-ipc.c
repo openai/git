@@ -179,8 +179,10 @@ static int app__fsmonitor_capability_superset(
 		FSMONITOR_IPC_QUERY_VERSION "\n"
 		FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
 		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
-#ifdef __APPLE__
+#if FSMONITOR_IPC_HAS_DIR_METADATA
 		FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+#endif
+#ifdef __APPLE__
 		FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
 #endif
 		;
@@ -188,7 +190,11 @@ static int app__fsmonitor_capability_superset(
 		FSMONITOR_IPC_QUERY_VERSION "\n"
 #ifdef __APPLE__
 		FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+#endif
+#if FSMONITOR_IPC_HAS_DIR_METADATA
 		FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+#endif
+#ifdef __APPLE__
 		FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
 #endif
 		;
@@ -196,15 +202,19 @@ static int app__fsmonitor_capability_superset(
 		FSMONITOR_IPC_QUERY_VERSION "\n";
 	static const char current_token[] =
 		"builtin:"
-#ifdef __APPLE__
-		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
-#endif
+		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
 		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX "test-capable:0";
+	static const char pre_dir_metadata_token[] =
+		"builtin:"
+#ifdef __linux__
+		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX
+#else
+		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
+#endif
+		"test-pre-dir:0";
 	static const char old_token[] =
 		"builtin:"
-#ifdef __APPLE__
-		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
-#endif
+		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
 		"test-pre-cookie:0";
 	const char *token;
 	const char *query;
@@ -227,9 +237,12 @@ static int app__fsmonitor_capability_superset(
 				sizeof(capabilities) - 1);
 	}
 
-	token = fsmonitor_pre_dir_metadata ||
-		fsmonitor_pre_cookie_retirement || fsmonitor_unmarked_response ?
-		old_token : current_token;
+	if (fsmonitor_pre_dir_metadata)
+		token = pre_dir_metadata_token;
+	else if (fsmonitor_pre_cookie_retirement || fsmonitor_unmarked_response)
+		token = old_token;
+	else
+		token = current_token;
 	token_len = strlen(token);
 	query = memchr(command, '\n', command_len);
 	query_len = query ? command_len - (query + 1 - command) : 0;

@@ -240,7 +240,12 @@ static int ipc_client_send_command_to_connection_1(
 	const char *message, size_t message_len,
 	struct strbuf *answer, int gentle)
 {
+	int read_options = PACKET_READ_GENTLE_ON_EOF |
+		PACKET_READ_GENTLE_ON_READ_ERROR;
 	int ret = 0;
+
+	if (gentle)
+		read_options |= PACKET_READ_SILENT_ON_READ_ERROR;
 
 	strbuf_setlen(answer, 0);
 
@@ -256,8 +261,7 @@ static int ipc_client_send_command_to_connection_1(
 	FlushFileBuffers((HANDLE)_get_osfhandle(connection->fd));
 
 	if (read_packetized_to_strbuf(
-		    connection->fd, answer,
-		    PACKET_READ_GENTLE_ON_EOF | PACKET_READ_GENTLE_ON_READ_ERROR) < 0) {
+		    connection->fd, answer, read_options) < 0) {
 		ret = gentle ? -1 : error(_("could not read IPC response"));
 		goto done;
 	}

@@ -59,6 +59,10 @@ test_lazy_prereq HARDLINKS '
 	ln hardlink-a hardlink-b
 '
 
+test_lazy_prereq FSMONITOR_DIR_METADATA '
+	test "$uname_s" = Darwin || test "$uname_s" = Linux
+'
+
 test_lazy_prereq FOREIGN_FSMONITOR_GIT '
 	test -x /opt/homebrew/bin/git &&
 	/opt/homebrew/bin/git version
@@ -74,12 +78,17 @@ then
 	test_done
 fi
 
-if test_have_prereq MACOS
-then
+case "$uname_s" in
+Darwin)
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.inode-v1.
-else
+	;;
+Linux)
+	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.
+	;;
+*)
 	fsmonitor_pre_cookie_token_prefix=
-fi
+	;;
+esac
 fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
 
 stop_daemon_delete_repo () {
@@ -2171,7 +2180,8 @@ test_expect_success MACOS \
 		linked.fsmonitor
 '
 
-test_expect_success MACOS 'bound query upgrades stale directory event daemon' '
+test_expect_success FSMONITOR_DIR_METADATA \
+	'bound query upgrades stale directory event daemon' '
 	test_when_finished \
 		"stop_daemon_delete_repo directory-daemon-upgrade" &&
 	test_create_repo directory-daemon-upgrade &&
@@ -2451,7 +2461,7 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 	)
 '
 
-test_expect_success MACOS,UNTRACKED_CACHE \
+test_expect_success FSMONITOR_DIR_METADATA,UNTRACKED_CACHE \
 	'concurrent clients share one stale directory daemon upgrade' '
 	test_when_finished \
 		"stop_daemon_delete_repo concurrent-directory-daemon-upgrade" &&

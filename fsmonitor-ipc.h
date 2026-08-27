@@ -21,6 +21,19 @@ struct repository;
 #define FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX "cookie-v1."
 #define FSMONITOR_IPC_WORKTREE_ID_HEX 64
 
+#ifdef __APPLE__
+#define FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX \
+	FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
+#define FSMONITOR_IPC_HAS_DIR_METADATA 1
+#elif defined(__linux__)
+#define FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX \
+	FSMONITOR_IPC_DIR_METADATA_TOKEN_PREFIX
+#define FSMONITOR_IPC_HAS_DIR_METADATA 1
+#else
+#define FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX ""
+#define FSMONITOR_IPC_HAS_DIR_METADATA 0
+#endif
+
 /* Hash the canonical worktree root and its stable filesystem identity. */
 int fsmonitor_ipc__get_worktree_identity(struct repository *r,
 					 struct strbuf *identity);
