@@ -46,6 +46,7 @@ struct fsmonitor_daemon_state {
 	int nr_paths_watching;
 
 	struct fsmonitor_token_data *current_token_data;
+	uint64_t token_generation;
 
 	struct strbuf path_cookie_prefix;
 	pthread_cond_t cookies_cond;
@@ -160,6 +161,15 @@ enum fsmonitor_path_type fsmonitor_classify_path_absolute(
 void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 		       struct fsmonitor_batch *batch,
 		       const struct string_list *cookie_names);
+
+/*
+ * Publish a delayed batch only if it still belongs to the named token
+ * generation.  The batch is consumed in either case.
+ */
+int fsmonitor_publish_if_current_generation(
+	struct fsmonitor_daemon_state *state,
+	struct fsmonitor_batch *batch,
+	uint64_t token_generation);
 
 /*
  * If the platform-specific layer loses sync with the filesystem,

@@ -450,7 +450,9 @@ static int server_supports_required_capabilities(void)
 		has_capability(&answer,
 			       FSMONITOR_IPC_HARDLINK_QUERY_VERSION) &&
 		has_capability(&answer,
-			       FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY);
+			       FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY) &&
+		has_capability(&answer,
+			       FSMONITOR_IPC_DARWIN_PROVIDER_FENCE_CAPABILITY);
 #endif
 #if FSMONITOR_IPC_HAS_DIR_METADATA
 	ret = ret &&
@@ -958,6 +960,7 @@ try_again:
 			goto try_again;
 		}
 		if (!ret && is_trivial_response(answer) &&
+		    !response_identifies_cookie_retiring_daemon(answer) &&
 		    !server_supports_bound_queries()) {
 			if (!try_send_attested_legacy_query(
 				    tok, &identity, answer)) {

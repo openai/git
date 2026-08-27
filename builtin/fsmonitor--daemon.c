@@ -157,6 +157,7 @@ static int do_as_client__status(void)
 }
 
 enum fsmonitor_cookie_item_result {
+	FCIR_TIMEOUT = -2,
 	FCIR_ERROR = -1, /* could not create cookie file ? */
 	FCIR_INIT,
 	FCIR_SEEN,
@@ -166,6 +167,7 @@ enum fsmonitor_cookie_item_result {
 struct fsmonitor_cookie_item {
 	struct hashmap_entry entry;
 	char *name;
+	uint64_t token_generation;
 	enum fsmonitor_cookie_item_result result;
 };
 
@@ -192,6 +194,10 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	struct strbuf cookie_filename = STRBUF_INIT;
 	enum fsmonitor_cookie_item_result result;
 	int my_cookie_seq;
+#ifdef __APPLE__
+	uint64_t cookie_token_generation;
+	enum fsm_listen_flush_result flush_result;
+#endif
 
 	CALLOC_ARRAY(cookie, 1);
 
@@ -203,6 +209,7 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	strbuf_addbuf(&cookie_pathname, &cookie_filename);
 
 	cookie->name = strbuf_detach(&cookie_filename, NULL);
+	cookie->token_generation = state->token_generation;
 	cookie->result = FCIR_INIT;
 	hashmap_entry_init(&cookie->entry, strhash(cookie->name));
 
@@ -233,11 +240,10 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	unlink(cookie_pathname.buf);
 
 	/*
-	 * Wait for the listener thread to observe the cookie file.
-	 * Time out after a short interval so that the client
-	 * does not hang forever if the filesystem does not deliver
-	 * events (e.g., on certain container/overlay filesystems
-	 * where inotify watches succeed but events never arrive).
+	 * Wait for the provider to observe the cookie.  On Darwin this is the
+	 * first half of the boundary: a later synchronous provider fence is
+	 * still required because FSEvents may report the cookie before a later
+	 * callback containing logically older worktree events.
 	 */
 	{
 		struct timeval now;
@@ -253,42 +259,48 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 						     &state->main_lock,
 						     &ts);
 		if (err == ETIMEDOUT && cookie->result == FCIR_INIT) {
-#ifdef __APPLE__
-			struct timeval rescue_now;
-
-			/*
-			 * FSEvents may be healthy but late enough that its normal
-			 * delivery misses our bounded wait.  Flush only after that
-			 * wait expires, so successful queries pay no extra cost.
-			 * The asynchronous flush cannot block on the listener callback,
-			 * which needs main_lock to publish the cookie.
-			 */
-			trace_printf_key(&trace_fsmonitor,
-					 "cookie_wait: requesting FSEvents flush after initial timeout");
-			fsm_listen__flush_async(state);
-
-			/*
-			 * Give the listener one more bounded interval to deliver and
-			 * publish the cookie rather than falling back to a full index
-			 * scan.  A broken provider still reaches the existing error
-			 * path instead of hanging a client indefinitely.
-			 */
-			gettimeofday(&rescue_now, NULL);
-			ts.tv_sec = rescue_now.tv_sec + 1;
-			ts.tv_nsec = rescue_now.tv_usec * 1000;
-			err = 0;
-			while (cookie->result == FCIR_INIT && !err)
-				err = pthread_cond_timedwait(&state->cookies_cond,
-							     &state->main_lock,
-							     &ts);
-#endif
-		}
-		if (err == ETIMEDOUT && cookie->result == FCIR_INIT) {
 			trace_printf_key(&trace_fsmonitor,
 					 "cookie_wait timed out");
+#ifndef __APPLE__
+			cookie->result = FCIR_ERROR;
+#endif
+		}
+	}
+
+#ifdef __APPLE__
+	/*
+	 * A delivered Darwin cookie is not a completeness boundary.  Once the
+	 * cookie is visible (or its ordinary wait expires), request the stronger
+	 * provider fence without holding main_lock so callbacks can publish every
+	 * event that preceded the fence.  A successful fence may also rescue a
+	 * late cookie, but is accepted only if that cookie is then SEEN.
+	 */
+	if (cookie->result == FCIR_INIT || cookie->result == FCIR_SEEN) {
+		cookie_token_generation = cookie->token_generation;
+		trace_printf_key(&trace_fsmonitor,
+				 "cookie_wait: requesting Darwin provider fence after cookie wait");
+		pthread_mutex_unlock(&state->main_lock);
+		flush_result = fsm_listen__flush_sync(state);
+		pthread_mutex_lock(&state->main_lock);
+
+		if (flush_result == FSM_LISTEN_FLUSH_TIMEOUT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: synchronous flush timed out");
+			cookie->result = FCIR_TIMEOUT;
+		} else if (flush_result != FSM_LISTEN_FLUSH_OK) {
+			cookie->result = FCIR_ABORT;
+		} else if (state->token_generation !=
+			   cookie_token_generation) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: provider fence crossed token generation");
+			cookie->result = FCIR_ABORT;
+		} else if (cookie->result == FCIR_INIT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: synchronous flush missed cookie");
 			cookie->result = FCIR_ERROR;
 		}
 	}
+#endif
 
 done:
 	hashmap_remove(&state->cookies, &cookie->entry, NULL);
@@ -321,10 +333,17 @@ static void with_lock__mark_cookies_seen(struct fsmonitor_daemon_state *state,
 		hashmap_entry_init(&key.entry, strhash(key.name));
 
 		cookie = hashmap_get_entry(&state->cookies, &key, entry, NULL);
-		if (cookie) {
+		if (cookie && cookie->result == FCIR_INIT &&
+		    cookie->token_generation == state->token_generation) {
 			trace_printf_key(&trace_fsmonitor, "cookie-seen: '%s'",
 					 cookie->name);
 			cookie->result = FCIR_SEEN;
+			nr_seen++;
+		} else if (cookie && cookie->result == FCIR_INIT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie-abort-generation: '%s'",
+					 cookie->name);
+			cookie->result = FCIR_ABORT;
 			nr_seen++;
 		}
 	}
@@ -778,6 +797,9 @@ static void with_lock__do_force_resync(struct fsmonitor_daemon_state *state)
 	if (state->current_token_data->client_ref_count == 0)
 		free_me = state->current_token_data;
 	state->current_token_data = new_one;
+	state->token_generation++;
+	if (!state->token_generation)
+		state->token_generation++;
 
 	fsmonitor_free_token_data(free_me);
 
@@ -867,6 +889,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	int do_trivial = 0;
 	int do_flush = 0;
 	int do_cookie = 0;
+	int stop_after_response = 0;
 	int invalid_binding = 0;
 	int hardlink_aware_query = 0;
 	enum fsmonitor_cookie_item_result cookie_result;
@@ -915,6 +938,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
 #ifdef __APPLE__
 			FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+			FSMONITOR_IPC_DARWIN_PROVIDER_FENCE_CAPABILITY "\n"
 #endif
 #if FSMONITOR_IPC_HAS_DIR_METADATA
 			FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
@@ -1022,6 +1046,10 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			 */
 			if (cookie_result == FCIR_ERROR)
 				do_flush = 1;
+			else if (cookie_result == FCIR_TIMEOUT) {
+				do_flush = 1;
+				stop_after_response = 1;
+			}
 		}
 	}
 
@@ -1221,8 +1249,7 @@ cleanup:
 	strbuf_release(&response_token);
 	strbuf_release(&requested_token_id);
 	strbuf_release(&payload);
-
-	return 0;
+	return stop_after_response ? SIMPLE_IPC_QUIT : 0;
 }
 
 static void fsmonitor_reply_overflow_paths(
@@ -1401,14 +1428,11 @@ enum fsmonitor_path_type fsmonitor_classify_path_absolute(
  */
 #define MY_COMBINE_LIMIT (1024)
 
-void fsmonitor_publish(struct fsmonitor_daemon_state *state,
-		       struct fsmonitor_batch *batch,
-		       const struct string_list *cookie_names)
+static void with_lock__publish(struct fsmonitor_daemon_state *state,
+			       struct fsmonitor_batch *batch,
+			       const struct string_list *cookie_names)
 {
-	if (!batch && !cookie_names->nr)
-		return;
-
-	pthread_mutex_lock(&state->main_lock);
+	/* assert current thread holding state->main_lock */
 
 	if (batch) {
 		struct fsmonitor_batch *head;
@@ -1466,8 +1490,40 @@ void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 
 	if (cookie_names->nr)
 		with_lock__mark_cookies_seen(state, cookie_names);
+}
 
+void fsmonitor_publish(struct fsmonitor_daemon_state *state,
+		       struct fsmonitor_batch *batch,
+		       const struct string_list *cookie_names)
+{
+	if (!batch && !cookie_names->nr)
+		return;
+
+	pthread_mutex_lock(&state->main_lock);
+	with_lock__publish(state, batch, cookie_names);
 	pthread_mutex_unlock(&state->main_lock);
+}
+
+int fsmonitor_publish_if_current_generation(
+	struct fsmonitor_daemon_state *state,
+	struct fsmonitor_batch *batch,
+	uint64_t token_generation)
+{
+	struct string_list no_cookies = STRING_LIST_INIT_NODUP;
+	int current;
+
+	if (!batch)
+		return 1;
+
+	pthread_mutex_lock(&state->main_lock);
+	current = state->token_generation == token_generation;
+	if (current)
+		with_lock__publish(state, batch, &no_cookies);
+	pthread_mutex_unlock(&state->main_lock);
+
+	if (!current)
+		fsmonitor_batch__free_list(batch);
+	return current;
 }
 
 static void *fsm_health__thread_proc(void *_state)
@@ -1496,12 +1552,14 @@ static void *fsm_listen__thread_proc(void *_state)
 
 	fsm_listen__loop(state);
 
-	pthread_mutex_lock(&state->main_lock);
-	if (state->current_token_data &&
-	    state->current_token_data->client_ref_count == 0)
-		fsmonitor_free_token_data(state->current_token_data);
-	state->current_token_data = NULL;
-	pthread_mutex_unlock(&state->main_lock);
+	/*
+	 * Leave token-data teardown to the main thread.  The listener can
+	 * initiate IPC shutdown while an existing client is still waiting for
+	 * a filesystem boundary and has not taken a token-data reference yet.
+	 * ipc_server_await() joins every IPC worker before the main thread
+	 * reaches final state cleanup, so that is the first point where it is
+	 * safe to release the current token unconditionally.
+	 */
 
 	trace2_thread_exit();
 	return NULL;
@@ -1553,6 +1611,12 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 */
 	if (pthread_create(&state->health_thread, NULL,
 			   fsm_health__thread_proc, state)) {
+		/*
+		 * The listener may still be starting the provider and IPC pool.
+		 * Publish its stop request before stopping IPC so that it cannot
+		 * subsequently start an already-stopped server.
+		 */
+		fsm_listen__stop_async(state);
 		ipc_server_stop_async(state->ipc_server_data);
 		err = error(_("could not start fsmonitor health thread"));
 		goto cleanup;
@@ -1571,6 +1635,20 @@ cleanup:
 	 */
 	ipc_server_await(state->ipc_server_data);
 
+#ifdef __APPLE__
+	/*
+	 * FlushSync has no cancellation API.  If its bounded client wait
+	 * expired, the client received a conservative response and stopped
+	 * the IPC pool.  Fail-stop before stream teardown can race the
+	 * provider worker.  Leave the socket pathname alone: a replacement
+	 * daemon may already own it, and normal startup can steal a stale
+	 * non-listening pathname after this process exits.
+	 */
+	if (fsm_listen__flush_failed(state)) {
+		_exit(1);
+	}
+#endif
+
 	/*
 	 * The fsmonitor listener thread may have received a shutdown
 	 * event from the IPC thread pool, but it doesn't hurt to tell
@@ -1578,6 +1656,17 @@ cleanup:
 	 */
 	if (listener_started) {
 		fsm_listen__stop_async(state);
+#ifdef __APPLE__
+		/*
+		 * Normal shutdown can race a provider fence which started after
+		 * the first check above.  Do not join or tear down an uncancellable
+		 * FlushSync worker; the client has already received a conservative
+		 * response or the IPC pool has otherwise stopped accepting work.
+		 */
+		if (fsm_listen__flush_failed(state)) {
+			_exit(1);
+		}
+#endif
 		pthread_join(state->listener_thread, NULL);
 	}
 
@@ -1612,6 +1701,7 @@ static int fsmonitor_run_daemon(void)
 	state.listen_error_code = 0;
 	state.health_error_code = 0;
 	state.current_token_data = fsmonitor_new_token_data();
+	state.token_generation = 1;
 
 	/* Prepare to (recursively) watch the <worktree-root> directory. */
 	strbuf_init(&state.path_worktree_watch, 0);
@@ -1730,6 +1820,9 @@ static int fsmonitor_run_daemon(void)
 	err = fsmonitor_run_daemon_1(&state);
 
 done:
+	/* Stop provider callbacks before releasing the state they publish to. */
+	fsm_listen__dtor(&state);
+
 	fsmonitor_free_token_data(state.current_token_data);
 	state.current_token_data = NULL;
 	pthread_cond_destroy(&state.cookies_cond);
@@ -1743,7 +1836,6 @@ done:
 		hashmap_clear_and_free(&state.cookies,
 				       struct fsmonitor_cookie_item, entry);
 	}
-	fsm_listen__dtor(&state);
 	fsm_health__dtor(&state);
 
 	ipc_server_free(state.ipc_server_data);

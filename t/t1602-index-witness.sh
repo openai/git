@@ -381,7 +381,7 @@ test_index_witness_full_proof () {
 			if $token ne $expected_token;
 	} else {
 		die "not a real builtin token in $path\n"
-			if $token !~ /^builtin:dirmeta-v1\.inode-v1\./;
+			if $token !~ /^builtin:dirmeta-v1\.inode-v1\.cookie-v1\.fence-v1\./;
 	}
 	for my $name (qw(FSMN FSUC)) {
 		my $body = $ext{$name} // die "missing $name in $path\n";
@@ -615,7 +615,7 @@ test_lazy_prereq INDEX_WITNESS_SCRIPTED_IPC '
 # before starting it, and keep all later fixture writes inside .git.
 if test_have_prereq MACOS
 then
-	index_witness_scripted_token=builtin:dirmeta-v1.inode-v1.cookie-v1.test-capable:0
+	index_witness_scripted_token=builtin:dirmeta-v1.inode-v1.cookie-v1.fence-v1.test-capable:0
 else
 	index_witness_scripted_token=builtin:cookie-v1.test-capable:0
 fi

@@ -33,9 +33,13 @@
 #include "simple-ipc.h"
 #include "string-list.h"
 #include "trace.h"
+#include "trace2.h"
+
+#define FSMONITOR_FLUSH_TIMEOUT_MS 1000
 
 struct fsm_listen_data
 {
+	struct fsmonitor_daemon_state *state;
 	CFStringRef cfsr_worktree_path;
 	CFStringRef cfsr_gitdir_path;
 	CFStringRef cfsr_event_path_key;
@@ -50,6 +54,27 @@ struct fsm_listen_data
 	pthread_cond_t dq_finished;
 	pthread_mutex_t dq_lock;
 
+	pthread_t flush_thread;
+	pthread_cond_t flush_requested_cond;
+	pthread_cond_t flush_finished_cond;
+	pthread_mutex_t flush_lock;
+	uint64_t flush_requested;
+	uint64_t flush_finished;
+	enum flush_worker_state {
+		FLUSH_WORKER_NOT_STARTED = 0,
+		FLUSH_WORKER_RUNNING,
+		FLUSH_WORKER_STOPPING,
+		FLUSH_WORKER_FAILED,
+		FLUSH_WORKER_STOPPED,
+	} flush_state;
+	unsigned long flush_timeout_ms;
+	unsigned long test_flush_delay_ms;
+	unsigned long test_flush_coalesce_delay_ms;
+	char *test_defer_path;
+	struct fsmonitor_batch *test_deferred_batch;
+	uint64_t test_deferred_generation;
+	unsigned long test_defer_delay_ms;
+
 	enum shutdown_style {
 		SHUTDOWN_EVENT = 0,
 		FORCE_SHUTDOWN,
@@ -58,9 +83,193 @@ struct fsm_listen_data
 
 	unsigned int stream_scheduled:1;
 	unsigned int stream_started:1;
+	unsigned int dq_sync_initialized:1;
+	unsigned int shutdown_requested:1;
+	unsigned int flush_sync_initialized:1;
+	unsigned int flush_thread_created:1;
+	unsigned int test_deferred_published:1;
+	unsigned int test_flush_bypass:1;
 	unsigned int test_cookie_delayed:1;
 	unsigned long test_cookie_delay_ms;
 };
+
+static void publish_test_deferred_batch(struct fsm_listen_data *data)
+{
+	struct fsmonitor_batch *batch;
+	uint64_t generation;
+
+	if (data->test_defer_delay_ms)
+		sleep_millisec(data->test_defer_delay_ms);
+
+	pthread_mutex_lock(&data->flush_lock);
+	batch = data->test_deferred_batch;
+	generation = data->test_deferred_generation;
+	data->test_deferred_batch = NULL;
+	data->test_deferred_generation = 0;
+	if (batch)
+		data->test_deferred_published = 1;
+	pthread_mutex_unlock(&data->flush_lock);
+
+	if (!batch)
+		return;
+
+	trace_printf_key(&trace_fsmonitor,
+			 "test-publish-deferred-path-at-provider-fence");
+	if (!fsmonitor_publish_if_current_generation(data->state, batch,
+						     generation))
+		trace_printf_key(&trace_fsmonitor,
+				 "test-discard-deferred-path-after-token-reset");
+}
+
+static void discard_test_deferred_batch(struct fsm_listen_data *data)
+{
+	struct fsmonitor_batch *batch;
+
+	pthread_mutex_lock(&data->flush_lock);
+	batch = data->test_deferred_batch;
+	data->test_deferred_batch = NULL;
+	data->test_deferred_generation = 0;
+	pthread_mutex_unlock(&data->flush_lock);
+
+	fsmonitor_batch__free_list(batch);
+}
+
+static void drain_dispatch_queue(void *ctx UNUSED)
+{
+}
+
+static void *flush_worker_proc(void *ctx)
+{
+	struct fsm_listen_data *data = ctx;
+
+	trace2_thread_start("fsm-flush");
+	pthread_mutex_lock(&data->flush_lock);
+	for (;;) {
+		uint64_t requested;
+		uint64_t previously_finished;
+
+		while (data->flush_requested == data->flush_finished &&
+		       data->flush_state == FLUSH_WORKER_RUNNING)
+			pthread_cond_wait(&data->flush_requested_cond,
+					  &data->flush_lock);
+		if (data->flush_state != FLUSH_WORKER_RUNNING)
+			break;
+		if (data->test_flush_coalesce_delay_ms) {
+			pthread_mutex_unlock(&data->flush_lock);
+			sleep_millisec(data->test_flush_coalesce_delay_ms);
+			pthread_mutex_lock(&data->flush_lock);
+			if (data->flush_state != FLUSH_WORKER_RUNNING)
+				break;
+		}
+
+		requested = data->flush_requested;
+		previously_finished = data->flush_finished;
+		pthread_mutex_unlock(&data->flush_lock);
+
+		trace_printf_key(&trace_fsmonitor,
+				 "Darwin provider fence begin request=%"PRIu64
+				 " coalesced=%"PRIu64,
+				 requested, requested - previously_finished);
+		trace2_data_intmax("fsmonitor", NULL,
+				   "darwin-fence/coalesced",
+				   requested - previously_finished);
+		trace2_data_intmax("fsmonitor", NULL,
+				   "darwin-fence/count", 1);
+		trace2_region_enter("fsmonitor", "darwin-flush-sync",
+				    NULL);
+		if (data->test_flush_delay_ms)
+			sleep_millisec(data->test_flush_delay_ms);
+		FSEventStreamFlushSync(data->stream);
+		/*
+		 * FlushSync guarantees that callbacks for earlier provider events
+		 * have been invoked, but a callback dispatched onto our serial queue
+		 * may still be running.  Queue a synchronous no-op behind those
+		 * callbacks so that their batches are published before the fence is
+		 * reported complete.
+		 */
+		dispatch_sync_f(data->dq, NULL, drain_dispatch_queue);
+		trace2_region_leave("fsmonitor", "darwin-flush-sync",
+				    NULL);
+		publish_test_deferred_batch(data);
+		trace_printf_key(&trace_fsmonitor,
+				 "Darwin provider fence complete request=%"PRIu64,
+				 requested);
+
+		pthread_mutex_lock(&data->flush_lock);
+		if (data->flush_finished < requested)
+			data->flush_finished = requested;
+		pthread_cond_broadcast(&data->flush_finished_cond);
+	}
+	if (data->flush_state == FLUSH_WORKER_STOPPING)
+		data->flush_state = FLUSH_WORKER_STOPPED;
+	pthread_cond_broadcast(&data->flush_finished_cond);
+	pthread_mutex_unlock(&data->flush_lock);
+	trace2_thread_exit();
+	return NULL;
+}
+
+static int start_flush_worker(struct fsm_listen_data *data)
+{
+	pthread_mutex_lock(&data->flush_lock);
+	if (data->flush_state != FLUSH_WORKER_NOT_STARTED)
+		BUG("unexpected Darwin provider fence worker state");
+	data->flush_state = FLUSH_WORKER_RUNNING;
+	pthread_mutex_unlock(&data->flush_lock);
+
+	if (pthread_create(&data->flush_thread, NULL,
+			   flush_worker_proc, data)) {
+		pthread_mutex_lock(&data->flush_lock);
+		data->flush_state = FLUSH_WORKER_STOPPED;
+		pthread_mutex_unlock(&data->flush_lock);
+		return -1;
+	}
+	data->flush_thread_created = 1;
+	return 0;
+}
+
+static int begin_flush_shutdown(struct fsm_listen_data *data)
+{
+	int in_flight;
+
+	if (!data || !data->flush_sync_initialized)
+		return 0;
+
+	pthread_mutex_lock(&data->flush_lock);
+	in_flight = data->flush_state == FLUSH_WORKER_FAILED;
+	if (data->flush_state == FLUSH_WORKER_RUNNING) {
+		in_flight = data->flush_finished < data->flush_requested;
+		data->flush_state = in_flight ? FLUSH_WORKER_FAILED :
+			FLUSH_WORKER_STOPPING;
+	}
+	pthread_cond_broadcast(&data->flush_requested_cond);
+	pthread_cond_broadcast(&data->flush_finished_cond);
+	pthread_mutex_unlock(&data->flush_lock);
+	return in_flight;
+}
+
+static void stop_flush_worker(struct fsm_listen_data *data)
+{
+	if (!data->flush_thread_created)
+		return;
+
+	/*
+	 * FlushSync has no cancellation API.  If shutdown races an in-flight
+	 * fence, let the main thread fail-stop the process rather than joining
+	 * a provider call which may never return or tearing down beneath it.
+	 */
+	if (begin_flush_shutdown(data)) {
+		trace_printf_key(&trace_fsmonitor,
+				 "Darwin provider fence abandoned during shutdown");
+		return;
+	}
+
+	pthread_join(data->flush_thread, NULL);
+	data->flush_thread_created = 0;
+	pthread_mutex_lock(&data->flush_lock);
+	if (data->flush_state != FLUSH_WORKER_STOPPED)
+		BUG("Darwin provider fence worker did not stop cleanly");
+	pthread_mutex_unlock(&data->flush_lock);
+}
 
 static void log_flags_set(const char *path, const FSEventStreamEventFlags flag)
 {
@@ -301,6 +510,7 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 
 			fsmonitor_force_resync(state);
 			fsmonitor_batch__free_list(batch);
+			discard_test_deferred_batch(data);
 			string_list_clear(&cookie_list, 0);
 			batch = NULL;
 
@@ -433,9 +643,45 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 			for (const char *relative = tmp.buf;
 			     relative < tmp.buf + tmp.len;
 			     relative += strlen(relative) + 1) {
-				if (!batch)
-					batch = fsmonitor_batch__new();
-				my_add_path(batch, relative);
+				int defer_for_test = 0;
+
+				if (data->test_defer_path &&
+				    !strcmp(relative, data->test_defer_path)) {
+					uint64_t generation;
+
+					pthread_mutex_lock(&state->main_lock);
+					generation = state->token_generation;
+					pthread_mutex_unlock(&state->main_lock);
+					pthread_mutex_lock(&data->flush_lock);
+					if (!data->test_deferred_published) {
+						if (data->test_deferred_batch &&
+						    data->test_deferred_generation !=
+							generation) {
+							fsmonitor_batch__free_list(
+								data->test_deferred_batch);
+							data->test_deferred_batch = NULL;
+						}
+						if (!data->test_deferred_batch) {
+							data->test_deferred_batch =
+								fsmonitor_batch__new();
+							data->test_deferred_generation =
+								generation;
+						}
+						my_add_path(data->test_deferred_batch,
+							    relative);
+						defer_for_test = 1;
+					}
+					pthread_mutex_unlock(&data->flush_lock);
+				}
+				if (defer_for_test) {
+					trace_printf_key(&trace_fsmonitor,
+							 "test-defer-path: '%s'",
+							 relative);
+				} else {
+					if (!batch)
+						batch = fsmonitor_batch__new();
+					my_add_path(batch, relative);
+				}
 			}
 
 			break;
@@ -451,6 +697,7 @@ static void fsevent_callback(ConstFSEventStreamRef streamRef UNUSED,
 invalid_event:
 		fsmonitor_force_resync(state);
 		fsmonitor_batch__free_list(batch);
+		discard_test_deferred_batch(data);
 		string_list_clear(&cookie_list, 0);
 		batch = NULL;
 	}
@@ -470,12 +717,14 @@ invalid_event:
 force_shutdown:
 	free(resolved);
 	fsmonitor_batch__free_list(batch);
+	discard_test_deferred_batch(data);
 	string_list_clear(&cookie_list, 0);
 	strbuf_release(&tmp);
 	strbuf_release(&event_path);
 
 	pthread_mutex_lock(&data->dq_lock);
 	data->shutdown_style = FORCE_SHUTDOWN;
+	data->shutdown_requested = 1;
 	pthread_cond_broadcast(&data->dq_finished);
 	pthread_mutex_unlock(&data->dq_lock);
 
@@ -519,8 +768,22 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 
 	CALLOC_ARRAY(data, 1);
 	state->listen_data = data;
+	data->state = state;
 	data->test_cookie_delay_ms = git_env_ulong(
 		"GIT_TEST_FSMONITOR_COOKIE_DELAY_MS", 0);
+	data->test_flush_delay_ms = git_env_ulong(
+		"GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS", 0);
+	data->test_flush_coalesce_delay_ms = git_env_ulong(
+		"GIT_TEST_FSMONITOR_FLUSH_COALESCE_DELAY_MS", 0);
+	data->test_flush_bypass = git_env_bool(
+		"GIT_TEST_FSMONITOR_FLUSH_SYNC_BYPASS", 0);
+	data->flush_timeout_ms = git_env_ulong(
+		"GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS",
+		FSMONITOR_FLUSH_TIMEOUT_MS);
+	data->test_defer_path = xstrdup_or_null(getenv(
+		"GIT_TEST_FSMONITOR_DEFER_PATH"));
+	data->test_defer_delay_ms = git_env_ulong(
+		"GIT_TEST_FSMONITOR_DEFER_PATH_DELAY_MS", 0);
 
 	data->cfsr_event_path_key = CFStringCreateWithCString(
 		NULL, "path", kCFStringEncodingUTF8);
@@ -550,11 +813,20 @@ int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 	if (!data->stream)
 		goto failed;
 
+	pthread_mutex_init(&data->flush_lock, NULL);
+	pthread_cond_init(&data->flush_requested_cond, NULL);
+	pthread_cond_init(&data->flush_finished_cond, NULL);
+	data->flush_sync_initialized = 1;
+	pthread_mutex_init(&data->dq_lock, NULL);
+	pthread_cond_init(&data->dq_finished, NULL);
+	data->dq_sync_initialized = 1;
+
 	return 0;
 
 failed:
 	error(_("Unable to create FSEventStream."));
 
+	free(data->test_defer_path);
 	FREE_AND_NULL(state->listen_data);
 	return -1;
 }
@@ -568,18 +840,37 @@ void fsm_listen__dtor(struct fsmonitor_daemon_state *state)
 
 	data = state->listen_data;
 
+	if (data->flush_thread_created)
+		BUG("releasing FSEventStream with provider fence worker alive");
 	if (data->stream) {
 		if (data->stream_started)
 			FSEventStreamStop(data->stream);
 		if (data->stream_scheduled)
 			FSEventStreamInvalidate(data->stream);
+		/*
+		 * Invalidation prevents new callbacks from being submitted.  A
+		 * synchronous no-op on our serial queue then waits for every
+		 * callback that was already submitted to finish before state owned
+		 * by the daemon is released.
+		 */
+		if (data->dq)
+			dispatch_sync_f(data->dq, NULL, drain_dispatch_queue);
 		FSEventStreamRelease(data->stream);
 	}
 
 	if (data->dq)
 		dispatch_release(data->dq);
-	pthread_cond_destroy(&data->dq_finished);
-	pthread_mutex_destroy(&data->dq_lock);
+	fsmonitor_batch__free_list(data->test_deferred_batch);
+	free(data->test_defer_path);
+	if (data->flush_sync_initialized) {
+		pthread_cond_destroy(&data->flush_finished_cond);
+		pthread_cond_destroy(&data->flush_requested_cond);
+		pthread_mutex_destroy(&data->flush_lock);
+	}
+	if (data->dq_sync_initialized) {
+		pthread_cond_destroy(&data->dq_finished);
+		pthread_mutex_destroy(&data->dq_lock);
+	}
 
 	FREE_AND_NULL(state->listen_data);
 }
@@ -592,13 +883,99 @@ void fsm_listen__stop_async(struct fsmonitor_daemon_state *state)
 
 	pthread_mutex_lock(&data->dq_lock);
 	data->shutdown_style = SHUTDOWN_EVENT;
+	data->shutdown_requested = 1;
 	pthread_cond_broadcast(&data->dq_finished);
 	pthread_mutex_unlock(&data->dq_lock);
+	begin_flush_shutdown(data);
 }
 
-void fsm_listen__flush_async(struct fsmonitor_daemon_state *state)
+enum fsm_listen_flush_result fsm_listen__flush_sync(
+	struct fsmonitor_daemon_state *state)
 {
-	FSEventStreamFlushAsync(state->listen_data->stream);
+	struct fsm_listen_data *data;
+	struct timeval now;
+	struct timespec deadline;
+	uint64_t requested;
+	int err = 0;
+	enum fsm_listen_flush_result result = FSM_LISTEN_FLUSH_OK;
+
+	if (!state || !(data = state->listen_data) ||
+	    !data->flush_sync_initialized)
+		return FSM_LISTEN_FLUSH_SHUTDOWN;
+
+	if (data->test_flush_bypass) {
+		trace_printf_key(&trace_fsmonitor,
+				 "test-bypass-darwin-flush-sync");
+		return FSM_LISTEN_FLUSH_OK;
+	}
+
+	pthread_mutex_lock(&data->flush_lock);
+	if (data->flush_state == FLUSH_WORKER_FAILED) {
+		result = FSM_LISTEN_FLUSH_TIMEOUT;
+		goto done;
+	}
+	if (data->flush_state != FLUSH_WORKER_RUNNING) {
+		result = FSM_LISTEN_FLUSH_SHUTDOWN;
+		goto done;
+	}
+
+	requested = ++data->flush_requested;
+	trace_printf_key(&trace_fsmonitor,
+			 "Darwin provider fence requested request=%"PRIu64,
+			 requested);
+	trace2_data_intmax("fsmonitor", NULL,
+			   "darwin-fence/request", requested);
+	pthread_cond_signal(&data->flush_requested_cond);
+
+	gettimeofday(&now, NULL);
+	deadline.tv_sec = now.tv_sec + data->flush_timeout_ms / 1000;
+	deadline.tv_nsec = now.tv_usec * 1000 +
+		(data->flush_timeout_ms % 1000) * 1000000;
+	if (deadline.tv_nsec >= 1000000000) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000;
+	}
+
+	trace2_region_enter("fsmonitor", "darwin-fence-wait", NULL);
+	while (data->flush_finished < requested &&
+	       data->flush_state == FLUSH_WORKER_RUNNING && !err)
+		err = pthread_cond_timedwait(&data->flush_finished_cond,
+					     &data->flush_lock, &deadline);
+	trace2_region_leave("fsmonitor", "darwin-fence-wait", NULL);
+
+	if (data->flush_state == FLUSH_WORKER_FAILED) {
+		result = FSM_LISTEN_FLUSH_TIMEOUT;
+	} else if (data->flush_state != FLUSH_WORKER_RUNNING) {
+		result = FSM_LISTEN_FLUSH_SHUTDOWN;
+	} else if (data->flush_finished >= requested) {
+		result = FSM_LISTEN_FLUSH_OK;
+	} else if (err) {
+		data->flush_state = FLUSH_WORKER_FAILED;
+		pthread_cond_broadcast(&data->flush_requested_cond);
+		pthread_cond_broadcast(&data->flush_finished_cond);
+		trace2_data_intmax("fsmonitor", NULL,
+				   "darwin-fence/timeout", 1);
+		result = FSM_LISTEN_FLUSH_TIMEOUT;
+	}
+
+done:
+	pthread_mutex_unlock(&data->flush_lock);
+	return result;
+}
+
+int fsm_listen__flush_failed(struct fsmonitor_daemon_state *state)
+{
+	struct fsm_listen_data *data;
+	int timed_out;
+
+	if (!state || !(data = state->listen_data) ||
+	    !data->flush_sync_initialized)
+		return 0;
+
+	pthread_mutex_lock(&data->flush_lock);
+	timed_out = data->flush_state == FLUSH_WORKER_FAILED;
+	pthread_mutex_unlock(&data->flush_lock);
+	return timed_out;
 }
 
 void fsm_listen__loop(struct fsmonitor_daemon_state *state)
@@ -607,18 +984,28 @@ void fsm_listen__loop(struct fsmonitor_daemon_state *state)
 
 	data = state->listen_data;
 
-	pthread_mutex_init(&data->dq_lock, NULL);
-	pthread_cond_init(&data->dq_finished, NULL);
 	data->dq = dispatch_queue_create("FSMonitor", NULL);
 
 	FSEventStreamSetDispatchQueue(data->stream, data->dq);
 	data->stream_scheduled = 1;
 
+	pthread_mutex_lock(&data->dq_lock);
+	if (data->shutdown_requested) {
+		pthread_mutex_unlock(&data->dq_lock);
+		return;
+	}
+
 	if (!FSEventStreamStart(data->stream)) {
+		pthread_mutex_unlock(&data->dq_lock);
 		error(_("Failed to start the FSEventStream"));
 		goto force_error_stop_without_loop;
 	}
 	data->stream_started = 1;
+	if (start_flush_worker(data)) {
+		pthread_mutex_unlock(&data->dq_lock);
+		error(_("Failed to start the FSEvents flush worker"));
+		goto force_error_stop_without_loop;
+	}
 
 	/*
 	 * Our fs event listener is now running, so it's safe to start
@@ -626,9 +1013,11 @@ void fsm_listen__loop(struct fsmonitor_daemon_state *state)
 	 */
 	ipc_server_start_async(state->ipc_server_data);
 
-	pthread_mutex_lock(&data->dq_lock);
-	pthread_cond_wait(&data->dq_finished, &data->dq_lock);
+	while (!data->shutdown_requested)
+		pthread_cond_wait(&data->dq_finished, &data->dq_lock);
 	pthread_mutex_unlock(&data->dq_lock);
+
+	stop_flush_worker(data);
 
 	switch (data->shutdown_style) {
 	case FORCE_ERROR_STOP:

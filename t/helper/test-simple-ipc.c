@@ -167,6 +167,7 @@ static int fsmonitor_legacy;
 static int fsmonitor_capability_superset;
 static int fsmonitor_pre_dir_metadata;
 static int fsmonitor_pre_cookie_retirement;
+static int fsmonitor_pre_provider_fence;
 static int fsmonitor_unmarked_response;
 static int fsmonitor_disconnect_first;
 
@@ -187,8 +188,15 @@ static int app__fsmonitor_capability_superset(
 #endif
 #ifdef __APPLE__
 		FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
+		FSMONITOR_IPC_DARWIN_PROVIDER_FENCE_CAPABILITY "\n"
 #endif
 		;
+	static const char pre_provider_fence_capabilities[] =
+		FSMONITOR_IPC_QUERY_VERSION "\n"
+		FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
+		FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+		FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n";
 	static const char pre_cookie_capabilities[] =
 		FSMONITOR_IPC_QUERY_VERSION "\n"
 #ifdef __APPLE__
@@ -216,8 +224,17 @@ static int app__fsmonitor_capability_superset(
 		"test-pre-dir:0";
 	static const char old_token[] =
 		"builtin:"
+#ifdef __APPLE__
+		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
+#else
 		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
+#endif
 		"test-pre-cookie:0";
+	static const char pre_provider_fence_token[] =
+		"builtin:"
+		FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX
+		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX
+		"test-pre-fence:0";
 	const char *token;
 	const char *query;
 	size_t token_len, query_len;
@@ -235,12 +252,18 @@ static int app__fsmonitor_capability_superset(
 			return reply_cb(reply_data,
 					pre_cookie_capabilities,
 					sizeof(pre_cookie_capabilities) - 1);
+		if (fsmonitor_pre_provider_fence)
+			return reply_cb(reply_data,
+					pre_provider_fence_capabilities,
+					sizeof(pre_provider_fence_capabilities) - 1);
 		return reply_cb(reply_data, capabilities,
 				sizeof(capabilities) - 1);
 	}
 
 	if (fsmonitor_pre_dir_metadata)
 		token = pre_dir_metadata_token;
+	else if (fsmonitor_pre_provider_fence)
+		token = pre_provider_fence_token;
 	else if (fsmonitor_pre_cookie_retirement || fsmonitor_unmarked_response)
 		token = old_token;
 	else
@@ -304,7 +327,8 @@ static int test_app_cb(void *application_data,
 	}
 
 	if (fsmonitor_capability_superset || fsmonitor_pre_dir_metadata ||
-	    fsmonitor_pre_cookie_retirement || fsmonitor_unmarked_response)
+	    fsmonitor_pre_cookie_retirement ||
+	    fsmonitor_pre_provider_fence || fsmonitor_unmarked_response)
 		return app__fsmonitor_capability_superset(
 			command, command_len, reply_cb, reply_data);
 
@@ -457,6 +481,8 @@ static int daemon__start_server(void)
 		strvec_push(&cp.args, "--fsmonitor-pre-dir-metadata");
 	if (fsmonitor_pre_cookie_retirement)
 		strvec_push(&cp.args, "--fsmonitor-pre-cookie-retirement");
+	if (fsmonitor_pre_provider_fence)
+		strvec_push(&cp.args, "--fsmonitor-pre-provider-fence");
 	if (fsmonitor_unmarked_response)
 		strvec_push(&cp.args, "--fsmonitor-unmarked-response");
 	if (fsmonitor_disconnect_first)
@@ -994,6 +1020,9 @@ int cmd__simple_ipc(int argc, const char **argv)
 		OPT_BOOL(0, "fsmonitor-pre-cookie-retirement",
 			 &fsmonitor_pre_cookie_retirement,
 			 N_("emulate a daemon without failed-cookie token retirement")),
+		OPT_BOOL(0, "fsmonitor-pre-provider-fence",
+			 &fsmonitor_pre_provider_fence,
+			 N_("emulate a Darwin daemon without provider fencing")),
 		OPT_BOOL(0, "fsmonitor-unmarked-response",
 			 &fsmonitor_unmarked_response,
 			 N_("advertise token retirement but return an unmarked token")),

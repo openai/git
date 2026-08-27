@@ -477,6 +477,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 	scoped_stash_setup scoped-stash-whole &&
 	(
 		cd scoped-stash-whole &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
 		test_write_lines dirty >tracked &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCCCCCC \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \

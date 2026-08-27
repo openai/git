@@ -98,6 +98,7 @@ extern CFStringRef kCFRunLoopDefaultMode;
 void FSEventStreamSetDispatchQueue(FSEventStreamRef stream, dispatch_queue_t q);
 unsigned char FSEventStreamStart(FSEventStreamRef stream);
 FSEventStreamEventId FSEventStreamFlushAsync(FSEventStreamRef stream);
+void FSEventStreamFlushSync(FSEventStreamRef stream);
 void FSEventStreamStop(FSEventStreamRef stream);
 void FSEventStreamInvalidate(FSEventStreamRef stream);
 void FSEventStreamRelease(FSEventStreamRef stream);

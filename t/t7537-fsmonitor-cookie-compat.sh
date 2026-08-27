@@ -13,7 +13,7 @@ fi
 if test_have_prereq MACOS
 then
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.inode-v1.
-	fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
+	fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.fence-v1.
 elif test "$uname_s" = Linux
 then
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.
