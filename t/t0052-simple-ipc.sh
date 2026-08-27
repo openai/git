@@ -13,6 +13,17 @@ stop_simple_IPC_server () {
 	test-tool simple-ipc stop-daemon
 }
 
+test_expect_success !WINDOWS \
+	'pre-start IPC shutdown is one-shot and prevents late start' '
+	test-tool simple-ipc stop-before-start --threads=2 &&
+	test_must_fail test-tool simple-ipc is-active
+'
+
+test_expect_success !WINDOWS 'gentle write survives a closed peer' '
+	test-tool simple-ipc gentle-write-failure 2>actual &&
+	test_must_be_empty actual
+'
+
 test_expect_success 'start simple command server' '
 	test_atexit stop_simple_IPC_server &&
 	test-tool simple-ipc start-daemon --threads=8 &&

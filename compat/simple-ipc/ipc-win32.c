@@ -242,6 +242,8 @@ static int ipc_client_send_command_to_connection_1(
 {
 	int read_options = PACKET_READ_GENTLE_ON_EOF |
 		PACKET_READ_GENTLE_ON_READ_ERROR;
+	unsigned write_options = gentle ?
+		PACKET_WRITE_SILENT_ON_WRITE_ERROR : 0;
 	int ret = 0;
 
 	if (gentle)
@@ -251,9 +253,10 @@ static int ipc_client_send_command_to_connection_1(
 
 	trace2_region_enter("ipc-client", "send-command", NULL);
 
-	if (write_packetized_from_buf_no_flush(message, message_len,
-					       connection->fd) < 0 ||
-	    packet_flush_gently(connection->fd) < 0) {
+	if (write_packetized_from_buf_no_flush_with_options(
+		    message, message_len, connection->fd, write_options) < 0 ||
+	    packet_flush_gently_with_options(
+		    connection->fd, write_options) < 0) {
 		ret = gentle ? -1 : error(_("could not send IPC command"));
 		goto done;
 	}

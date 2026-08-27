@@ -100,6 +100,18 @@ static enum ipc_active_state connect_to_server(
 		int fd = unix_stream_connect(path, options->uds_disallow_chdir);
 
 		if (fd != -1) {
+#ifdef SO_NOSIGPIPE
+			int value = 1;
+
+			if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,
+				       &value, sizeof(value)) < 0) {
+				int saved_errno = errno;
+
+				close(fd);
+				errno = saved_errno;
+				return IPC_STATE__OTHER_ERROR;
+			}
+#endif
 			*pfd = fd;
 			return IPC_STATE__LISTENING;
 		}
@@ -189,6 +201,75 @@ void ipc_client_close_connection(struct ipc_client_connection *connection)
 	free(connection);
 }
 
+/*
+ * A server can close a connection after accept() but before the client has
+ * finished writing its request.  Keep SIGPIPE local to this write sequence so
+ * that the caller can recover from the resulting EPIPE.
+ */
+static int ipc_client_write_command(struct ipc_client_connection *connection,
+				    const char *message, size_t message_len,
+				    int gentle)
+{
+	unsigned write_options = gentle ?
+		PACKET_WRITE_SILENT_ON_WRITE_ERROR : 0;
+#ifndef SO_NOSIGPIPE
+	sigset_t old_set, pending, sigpipe;
+	int mask_error, saved_errno, was_pending;
+#endif
+	int ret = -1;
+
+#ifndef SO_NOSIGPIPE
+	sigemptyset(&sigpipe);
+	sigaddset(&sigpipe, SIGPIPE);
+	mask_error = pthread_sigmask(SIG_BLOCK, &sigpipe, &old_set);
+	if (mask_error) {
+		errno = mask_error;
+		return -1;
+	}
+
+	if (sigpending(&pending) < 0) {
+		saved_errno = errno;
+		goto restore;
+	}
+	was_pending = sigismember(&pending, SIGPIPE) == 1;
+#endif
+
+	ret = write_packetized_from_buf_no_flush_with_options(
+		message, message_len, connection->fd, write_options);
+	if (!ret)
+		ret = packet_flush_gently_with_options(
+			connection->fd, write_options);
+#ifndef SO_NOSIGPIPE
+	saved_errno = errno;
+
+	/*
+	 * Consume only a SIGPIPE raised by this write sequence.  Otherwise,
+	 * restoring an unblocked caller mask would deliver the pending signal
+	 * after we had already translated the failure into EPIPE.
+	 */
+	if (ret < 0 && saved_errno == EPIPE && !was_pending &&
+	    !sigpending(&pending) &&
+	    sigismember(&pending, SIGPIPE) == 1) {
+		int received;
+
+		mask_error = sigwait(&sigpipe, &received);
+		if (mask_error) {
+			saved_errno = mask_error;
+			ret = -1;
+		}
+	}
+
+restore:
+	mask_error = pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+	if (mask_error) {
+		saved_errno = mask_error;
+		ret = -1;
+	}
+	errno = saved_errno;
+#endif
+	return ret;
+}
+
 static int ipc_client_send_command_to_connection_1(
 	struct ipc_client_connection *connection,
 	const char *message, size_t message_len,
@@ -205,9 +286,8 @@ static int ipc_client_send_command_to_connection_1(
 
 	trace2_region_enter("ipc-client", "send-command", NULL);
 
-	if (write_packetized_from_buf_no_flush(message, message_len,
-					       connection->fd) < 0 ||
-	    packet_flush_gently(connection->fd) < 0) {
+	if (ipc_client_write_command(
+		    connection, message, message_len, gentle) < 0) {
 		ret = gentle ? -1 : error(_("could not send IPC command"));
 		goto done;
 	}
@@ -339,6 +419,7 @@ struct ipc_server_data {
 
 	pthread_mutex_t work_available_mutex;
 	pthread_cond_t work_available_cond;
+	pthread_mutex_t lifecycle_mutex;
 
 	/*
 	 * Accepted but not yet processed client connections are kept
@@ -899,6 +980,7 @@ int ipc_server_init_async(struct ipc_server_data **returned_server_data,
 
 	pthread_mutex_init(&server_data->work_available_mutex, NULL);
 	pthread_cond_init(&server_data->work_available_cond, NULL);
+	pthread_mutex_init(&server_data->lifecycle_mutex, NULL);
 
 	server_data->queue_size = nr_threads * FIFO_SCALE;
 	CALLOC_ARRAY(server_data->fifo_fds, server_data->queue_size);
@@ -949,11 +1031,15 @@ int ipc_server_init_async(struct ipc_server_data **returned_server_data,
 
 void ipc_server_start_async(struct ipc_server_data *server_data)
 {
-	if (!server_data || server_data->started)
+	if (!server_data)
 		return;
 
-	server_data->started = 1;
-	pthread_mutex_unlock(&server_data->work_available_mutex);
+	pthread_mutex_lock(&server_data->lifecycle_mutex);
+	if (!server_data->started && !server_data->shutdown_requested) {
+		server_data->started = 1;
+		pthread_mutex_unlock(&server_data->work_available_mutex);
+	}
+	pthread_mutex_unlock(&server_data->lifecycle_mutex);
 }
 
 /*
@@ -970,19 +1056,28 @@ int ipc_server_stop_async(struct ipc_server_data *server_data)
 		return 0;
 
 	trace2_region_enter("ipc-server", "server-stop-async", NULL);
+	pthread_mutex_lock(&server_data->lifecycle_mutex);
+	if (server_data->shutdown_requested) {
+		pthread_mutex_unlock(&server_data->lifecycle_mutex);
+		trace2_region_leave("ipc-server", "server-stop-async", NULL);
+		return 0;
+	}
 
 	/* If we haven't started yet, we are already holding lock. */
 	if (server_data->started)
 		pthread_mutex_lock(&server_data->work_available_mutex);
 
-	server_data->shutdown_requested = 1;
-
 	/*
 	 * Write a byte to the shutdown socket pair to wake up the
-	 * accept-thread.
+	 * accept-thread.  Do not publish the shutdown transition until the
+	 * byte has been queued: a failed write must leave a later caller able
+	 * to retry it.
 	 */
-	if (write(server_data->accept_thread->fd_send_shutdown, "Q", 1) < 0)
-		error_errno("could not write to fd_send_shutdown");
+	if (write_in_full(server_data->accept_thread->fd_send_shutdown,
+			  "Q", 1) < 0)
+		die_errno(_("could not write to fd_send_shutdown"));
+
+	server_data->shutdown_requested = 1;
 
 	/*
 	 * Drain the queue of existing connections.
@@ -997,6 +1092,7 @@ int ipc_server_stop_async(struct ipc_server_data *server_data)
 	pthread_cond_broadcast(&server_data->work_available_cond);
 
 	pthread_mutex_unlock(&server_data->work_available_mutex);
+	pthread_mutex_unlock(&server_data->lifecycle_mutex);
 
 	trace2_region_leave("ipc-server", "server-stop-async", NULL);
 
@@ -1062,6 +1158,7 @@ void ipc_server_free(struct ipc_server_data *server_data)
 
 	pthread_cond_destroy(&server_data->work_available_cond);
 	pthread_mutex_destroy(&server_data->work_available_mutex);
+	pthread_mutex_destroy(&server_data->lifecycle_mutex);
 
 	strbuf_release(&server_data->buf_path);
 

@@ -111,12 +111,20 @@ void packet_response_end(int fd)
 		die_errno(_("unable to write response end packet"));
 }
 
-int packet_flush_gently(int fd)
+int packet_flush_gently_with_options(int fd, unsigned options)
 {
 	packet_trace("0000", 4, 1);
-	if (write_in_full(fd, "0000", 4) < 0)
+	if (write_in_full(fd, "0000", 4) < 0) {
+		if (options & PACKET_WRITE_SILENT_ON_WRITE_ERROR)
+			return -1;
 		return error(_("flush packet write failed"));
+	}
 	return 0;
+}
+
+int packet_flush_gently(int fd)
+{
+	return packet_flush_gently_with_options(fd, 0);
 }
 
 void packet_buf_flush(struct strbuf *buf)
@@ -230,12 +238,17 @@ static int do_packet_write(const int fd_out, const char *buf, size_t size,
 	return 0;
 }
 
-static int packet_write_gently(const int fd_out, const char *buf, size_t size)
+static int packet_write_gently(const int fd_out, const char *buf, size_t size,
+			       unsigned options)
 {
 	struct strbuf err = STRBUF_INIT;
 	if (do_packet_write(fd_out, buf, size, &err)) {
-		error("%s", err.buf);
+		int saved_errno = errno;
+
+		if (!(options & PACKET_WRITE_SILENT_ON_WRITE_ERROR))
+			error("%s", err.buf);
 		strbuf_release(&err);
+		errno = saved_errno;
 		return -1;
 	}
 	return 0;
@@ -308,14 +321,15 @@ int write_packetized_from_fd_no_flush(int fd_in, int fd_out)
 		}
 		if (bytes_to_write == 0)
 			break;
-		err = packet_write_gently(fd_out, buf, bytes_to_write);
+		err = packet_write_gently(fd_out, buf, bytes_to_write, 0);
 	}
 	free(buf);
 	return err;
 }
 
-int write_packetized_from_buf_no_flush_count(const char *src_in, size_t len,
-					     int fd_out, int *packet_counter)
+static int write_packetized_from_buf_no_flush_1(const char *src_in, size_t len,
+						int fd_out, int *packet_counter,
+						unsigned options)
 {
 	int err = 0;
 	size_t bytes_written = 0;
@@ -328,12 +342,28 @@ int write_packetized_from_buf_no_flush_count(const char *src_in, size_t len,
 			bytes_to_write = len - bytes_written;
 		if (bytes_to_write == 0)
 			break;
-		err = packet_write_gently(fd_out, src_in + bytes_written, bytes_to_write);
+		err = packet_write_gently(fd_out, src_in + bytes_written,
+					  bytes_to_write, options);
 		bytes_written += bytes_to_write;
 		if (packet_counter)
 			(*packet_counter)++;
 	}
 	return err;
+}
+
+int write_packetized_from_buf_no_flush_count(const char *src_in, size_t len,
+					     int fd_out, int *packet_counter)
+{
+	return write_packetized_from_buf_no_flush_1(
+		src_in, len, fd_out, packet_counter, 0);
+}
+
+int write_packetized_from_buf_no_flush_with_options(const char *src_in,
+						    size_t len, int fd_out,
+						    unsigned options)
+{
+	return write_packetized_from_buf_no_flush_1(
+		src_in, len, fd_out, NULL, options);
 }
 
 static int get_packet_data(int fd, char **src_buf, size_t *src_size,

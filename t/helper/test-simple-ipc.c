@@ -11,6 +11,9 @@
 #include "strvec.h"
 #include "run-command.h"
 #include "trace2.h"
+#ifndef GIT_WINDOWS_NATIVE
+#include "unix-stream-server.h"
+#endif
 
 #ifndef SUPPORTS_SIMPLE_IPC
 int cmd__simple_ipc(int argc, const char **argv)
@@ -389,6 +392,28 @@ static int daemon__run_server(void)
 	return ret;
 }
 
+static int daemon__stop_before_start(void)
+{
+	struct ipc_server_data *server_data;
+	struct ipc_server_opts opts = {
+		.nr_threads = cl_args.nr_threads,
+	};
+	int ret;
+
+	ret = ipc_server_init_async(&server_data, cl_args.path, &opts,
+				    test_app_cb, (void *)&my_app_data);
+	if (ret)
+		return ret;
+
+	/* A failed owner and its cleanup path may race before startup. */
+	ipc_server_stop_async(server_data);
+	ipc_server_stop_async(server_data);
+	ipc_server_start_async(server_data);
+	ipc_server_await(server_data);
+	ipc_server_free(server_data);
+	return 0;
+}
+
 static start_bg_wait_cb bg_wait_cb;
 
 static int bg_wait_cb(const struct child_process *cp UNUSED,
@@ -524,6 +549,234 @@ static int client__send_ipc(void)
 
 	return error("failed to send '%s' to '%s'", command, cl_args.path);
 }
+
+#ifndef GIT_WINDOWS_NATIVE
+/*
+ * Close accepted connections before the client writes its request.  This is
+ * deliberately below the simple-IPC server layer so that the peer cannot
+ * consume any part of the request first.
+ */
+struct close_peer_server_data {
+	struct unix_ss_socket *server_socket;
+	int nr_connections;
+	int error;
+};
+
+static void *close_peer_server_proc(void *data)
+{
+	struct close_peer_server_data *d = data;
+	int i;
+
+	for (i = 0; i < d->nr_connections; i++) {
+		int fd;
+
+		do {
+			fd = accept(d->server_socket->fd_socket, NULL, NULL);
+		} while (fd < 0 && errno == EINTR);
+		if (fd < 0) {
+			d->error = errno;
+			break;
+		}
+		close(fd);
+	}
+	return NULL;
+}
+
+struct closed_peer_client_data {
+	struct ipc_client_connection **connections;
+	int nr_connections;
+	int preserve_pending_sigpipe;
+	int errors;
+};
+
+static void *closed_peer_client_proc(void *data)
+{
+	struct closed_peer_client_data *d = data;
+	sigset_t original, pending, sigpipe;
+	int expected_blocked, expected_pending, i, mask_error;
+
+	sigemptyset(&sigpipe);
+	sigaddset(&sigpipe, SIGPIPE);
+	mask_error = pthread_sigmask(SIG_SETMASK, NULL, &original);
+	if (mask_error) {
+		error("could not read initial signal mask: %s",
+		      strerror(mask_error));
+		d->errors++;
+		return NULL;
+	}
+	if (sigpending(&pending) < 0) {
+		error_errno("could not read initial pending signals");
+		d->errors++;
+		return NULL;
+	}
+	expected_blocked = sigismember(&original, SIGPIPE);
+	expected_pending = sigismember(&pending, SIGPIPE) == 1;
+
+	if (d->preserve_pending_sigpipe) {
+		mask_error = pthread_sigmask(SIG_BLOCK, &sigpipe, NULL);
+		if (mask_error || raise(SIGPIPE) || sigpending(&pending) < 0 ||
+		    sigismember(&pending, SIGPIPE) != 1) {
+			error("could not establish pending SIGPIPE state");
+			d->errors++;
+			return NULL;
+		}
+		expected_blocked = 1;
+		expected_pending = 1;
+	}
+
+	for (i = 0; i < d->nr_connections; i++) {
+		struct strbuf answer = STRBUF_INIT;
+		sigset_t current;
+#ifdef SO_NOSIGPIPE
+		int no_sigpipe;
+		socklen_t no_sigpipe_len = sizeof(no_sigpipe);
+
+		if (getsockopt(d->connections[i]->fd, SOL_SOCKET,
+			       SO_NOSIGPIPE, &no_sigpipe,
+			       &no_sigpipe_len) < 0) {
+			error_errno("connection %d does not suppress SIGPIPE", i);
+			d->errors++;
+			ipc_client_close_connection(d->connections[i]);
+			strbuf_release(&answer);
+			continue;
+		}
+		if (!no_sigpipe) {
+			error("connection %d does not suppress SIGPIPE", i);
+			d->errors++;
+			ipc_client_close_connection(d->connections[i]);
+			strbuf_release(&answer);
+			continue;
+		}
+#endif
+
+		if (ipc_client_send_command_to_connection_gently(
+			    d->connections[i], "ping", strlen("ping"),
+			    &answer) >= 0) {
+			error("connection %d unexpectedly succeeded", i);
+			d->errors++;
+		}
+		ipc_client_close_connection(d->connections[i]);
+		strbuf_release(&answer);
+
+		mask_error = pthread_sigmask(SIG_SETMASK, NULL, &current);
+		if (mask_error ||
+		    sigismember(&current, SIGPIPE) != expected_blocked ||
+		    sigpending(&pending) < 0 ||
+		    (sigismember(&pending, SIGPIPE) == 1) !=
+			expected_pending) {
+			error("connection %d changed SIGPIPE state", i);
+			d->errors++;
+		}
+	}
+
+	if (d->preserve_pending_sigpipe) {
+		int received;
+
+		mask_error = sigwait(&sigpipe, &received);
+		if (mask_error || received != SIGPIPE) {
+			error("could not consume preserved SIGPIPE state");
+			d->errors++;
+		}
+	}
+	mask_error = pthread_sigmask(SIG_SETMASK, &original, NULL);
+	if (mask_error) {
+		error("could not restore signal mask: %s", strerror(mask_error));
+		d->errors++;
+	}
+
+	return NULL;
+}
+
+/*
+ * Verify concurrently that a gentle client write reports a closed peer rather
+ * than dying from SIGPIPE, and that it preserves the caller's signal state.
+ */
+static int client__gentle_write_failure(void)
+{
+	struct unix_stream_listen_opts listen_opts =
+		UNIX_STREAM_LISTEN_OPTS_INIT;
+	struct ipc_client_connect_options connect_opts =
+		IPC_CLIENT_CONNECT_OPTIONS_INIT;
+	struct unix_ss_socket *server_socket = NULL;
+	struct close_peer_server_data server_data;
+	struct closed_peer_client_data pending_client;
+	struct ipc_client_connection *pending_connection;
+	pthread_t server_thread;
+	enum { NR_THREADS = 8, CONNECTIONS_PER_THREAD = 8 };
+	struct closed_peer_client_data clients[NR_THREADS];
+	pthread_t client_threads[NR_THREADS];
+	int i, j, ret;
+
+	listen_opts.listen_backlog_size =
+		NR_THREADS * CONNECTIONS_PER_THREAD + 1;
+	ret = unix_ss_create(cl_args.path, &listen_opts, -1,
+			     &server_socket);
+	if (ret)
+		return error_errno("could not create close-peer server");
+
+	server_data.server_socket = server_socket;
+	server_data.nr_connections =
+		NR_THREADS * CONNECTIONS_PER_THREAD + 1;
+	server_data.error = 0;
+	connect_opts.wait_if_busy = 1;
+	if (ipc_client_try_connect(cl_args.path, &connect_opts,
+				   &pending_connection) != IPC_STATE__LISTENING)
+		die("could not connect pending-signal client");
+	for (i = 0; i < NR_THREADS; i++) {
+		CALLOC_ARRAY(clients[i].connections, CONNECTIONS_PER_THREAD);
+		clients[i].nr_connections = CONNECTIONS_PER_THREAD;
+		clients[i].preserve_pending_sigpipe = 0;
+		clients[i].errors = 0;
+		for (j = 0; j < CONNECTIONS_PER_THREAD; j++)
+			if (ipc_client_try_connect(
+				    cl_args.path, &connect_opts,
+				    &clients[i].connections[j]) !=
+				IPC_STATE__LISTENING)
+				die("could not connect to close-peer server");
+	}
+
+	/*
+	 * Queue every connection before accepting any of them so the client
+	 * completes its post-connect socket setup before the peer closes.
+	 */
+	if (pthread_create(&server_thread, NULL, close_peer_server_proc,
+			   &server_data))
+		return error("could not start close-peer server");
+
+	if (pthread_join(server_thread, NULL))
+		return error("could not join close-peer server");
+	unix_ss_free(server_socket);
+	if (server_data.error) {
+		errno = server_data.error;
+		return error_errno("close-peer server failed");
+	}
+
+	/*
+	 * Check preservation of an existing pending SIGPIPE without another
+	 * thread racing to accept the process-directed signal on Darwin.
+	 */
+	pending_client.connections = &pending_connection;
+	pending_client.nr_connections = 1;
+	pending_client.preserve_pending_sigpipe = 1;
+	pending_client.errors = 0;
+	closed_peer_client_proc(&pending_client);
+
+	for (i = 0; i < NR_THREADS; i++)
+		if (pthread_create(&client_threads[i], NULL,
+				   closed_peer_client_proc, &clients[i]))
+			return error("could not start closed-peer client");
+	for (i = 0; i < NR_THREADS; i++)
+		if (pthread_join(client_threads[i], NULL))
+			return error("could not join closed-peer client");
+
+	ret = pending_client.errors;
+	for (i = 0; i < NR_THREADS; i++) {
+		ret += clients[i].errors;
+		free(clients[i].connections);
+	}
+	return ret ? error("closed-peer clients had %d errors", ret) : 0;
+}
+#endif
 
 /*
  * Send an IPC command to an already-running server and ask it to
@@ -707,9 +960,11 @@ int cmd__simple_ipc(int argc, const char **argv)
 	const char * const simple_ipc_usage[] = {
 		N_("test-helper simple-ipc is-active    [<name>] [<options>]"),
 		N_("test-helper simple-ipc run-daemon   [<name>] [<threads>]"),
+		N_("test-helper simple-ipc stop-before-start [<name>] [<threads>]"),
 		N_("test-helper simple-ipc start-daemon [<name>] [<threads>] [<max-wait>]"),
 		N_("test-helper simple-ipc stop-daemon  [<name>] [<max-wait>]"),
 		N_("test-helper simple-ipc send         [<name>] [<token>]"),
+		N_("test-helper simple-ipc gentle-write-failure"),
 		N_("test-helper simple-ipc sendbytes    [<name>] [<bytecount>] [<byte>]"),
 		N_("test-helper simple-ipc multiple     [<name>] [<threads>] [<bytecount>] [<batchsize>]"),
 		NULL
@@ -797,8 +1052,16 @@ int cmd__simple_ipc(int argc, const char **argv)
 	if (!strcmp(cl_args.subcommand, "run-daemon"))
 		return !!daemon__run_server();
 
+	if (!strcmp(cl_args.subcommand, "stop-before-start"))
+		return !!daemon__stop_before_start();
+
 	if (!strcmp(cl_args.subcommand, "start-daemon"))
 		return !!daemon__start_server();
+
+#ifndef GIT_WINDOWS_NATIVE
+	if (!strcmp(cl_args.subcommand, "gentle-write-failure"))
+		return !!client__gentle_write_failure();
+#endif
 
 	/*
 	 * Client commands follow.  Ensure a server is running before
