@@ -7,6 +7,7 @@
 #include "config.h"
 #include "copy.h"
 #include "environment.h"
+#include "fsmonitor-ll.h"
 #include "gettext.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -5357,6 +5358,47 @@ static int continue_single_pick(struct repository *r, struct replay_opts *opts)
 	return run_command(&cmd);
 }
 
+static int reload_index_after_commit(struct repository *r,
+				     int repair_fsmonitor_proof)
+{
+	struct lock_file lock = LOCK_INIT;
+	int repaired;
+
+	/* git commit may have rewritten the index in the child process. */
+	discard_index(r->index);
+	if (repo_read_index(r) < 0)
+		return error(_("could not read index"));
+	if (!repair_fsmonitor_proof ||
+	    (clean_status_has_current_full_fsmonitor_proof(r->index) &&
+	     !wt_status_fsmonitor_proof_needs_repair(r)))
+		return 0;
+
+	if (repo_hold_locked_index(r, &lock, LOCK_REPORT_ON_ERROR) < 0)
+		return error(_("could not write index"));
+
+	/* Recheck the child result while holding the canonical index lock. */
+	discard_index(r->index);
+	if (repo_read_index(r) < 0) {
+		rollback_lock_file(&lock);
+		return error(_("could not read index"));
+	}
+	if (!r->index->fsmonitor_token_valid) {
+		r->index->fsmonitor_has_run_once = 0;
+		refresh_fsmonitor(r->index);
+	}
+	repaired = wt_status_repair_fsmonitor_proof_after_index_update(
+		r, &lock, repair_fsmonitor_proof);
+	if (repaired < 0) {
+		rollback_lock_file(&lock);
+		return error(_("could not repair index"));
+	}
+	if (write_locked_index(r->index, &lock,
+			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+		return error(_("could not write index"));
+
+	return 0;
+}
+
 static int commit_staged_changes(struct repository *r,
 				 struct replay_opts *opts,
 				 struct todo_list *todo_list)
@@ -5366,6 +5408,9 @@ static int commit_staged_changes(struct repository *r,
 	unsigned int final_fixup = 0, is_clean;
 	struct strbuf rev = STRBUF_INIT;
 	const char *reflog_action = reflog_message(opts, "continue", NULL);
+	int repair_fsmonitor_proof =
+		clean_status_has_persistent_fsmonitor_semantic_history(r->index) ||
+		clean_status_has_worktree_manifest_history(r->index);
 	int ret;
 
 	if (has_unstaged_changes(r, 1)) {
@@ -5533,6 +5578,10 @@ static int commit_staged_changes(struct repository *r,
 	if (run_git_commit(final_fixup ? NULL : rebase_path_message(),
 			   reflog_action, opts, flags)) {
 		ret = error(_("could not commit staged changes."));
+		goto out;
+	}
+	if (reload_index_after_commit(r, repair_fsmonitor_proof)) {
+		ret = -1;
 		goto out;
 	}
 

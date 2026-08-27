@@ -651,7 +651,23 @@ static void handle_events(struct fsmonitor_daemon_state *state)
 			}
 
 			strbuf_reset(&path);
-			strbuf_addf(&path, "%s/%s", w->dir, event->name);
+			strbuf_addstr(&path, w->dir);
+			if (event->len) {
+				size_t name_len =
+					strnlen(event->name, event->len);
+
+				if (name_len == event->len) {
+					error(_("unterminated inotify event name"));
+					state->listen_data->shutdown =
+						SHUTDOWN_ERROR;
+					goto done;
+				}
+				if (name_len) {
+					strbuf_addch(&path, '/');
+					strbuf_add(&path, event->name,
+						   name_len);
+				}
+			}
 
 			p = fsmonitor__resolve_alias(path.buf, &state->alias);
 			if (!p)

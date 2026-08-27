@@ -100,8 +100,6 @@ int clean_status_has_authenticated_bootstrap_manifest(
 	const struct index_state *istate);
 int clean_status_worktree_manifest_needs_refresh(
 	const struct index_state *istate);
-int clean_status_changed_worktree_manifest_has_filters(
-	const struct index_state *istate);
 void clean_status_invalidate_current_manifest(struct index_state *istate);
 void clean_status_mark_fsmonitor_config_valid(
 	struct index_state *istate, const char *closed_token);
@@ -130,6 +128,10 @@ void clean_status_prepare_fsmonitor_config(struct index_state *istate);
 int clean_status_probe_fsmonitor_config(struct index_state *istate);
 void clean_status_invalidate_current_proof(struct index_state *istate);
 int clean_status_index_entry_is_semantically_safe(
+	const struct index_state *istate,
+	const struct cache_entry *old,
+	const struct cache_entry *new_entry);
+int clean_status_intent_to_add_change_is_semantically_safe(
 	const struct index_state *istate,
 	const struct cache_entry *old,
 	const struct cache_entry *new_entry);

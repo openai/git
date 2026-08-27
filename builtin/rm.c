@@ -423,9 +423,12 @@ int cmd_rm(int argc,
 				     path, strlen(path));
 		if (preserve_clean_history &&
 		    (pos < 0 ||
-		     !clean_status_index_entry_is_semantically_safe(
-			     the_repository->index,
-			     the_repository->index->cache[pos], NULL)))
+		     (!clean_status_index_entry_is_semantically_safe(
+			      the_repository->index,
+			      the_repository->index->cache[pos], NULL) &&
+		      !clean_status_intent_to_add_change_is_semantically_safe(
+			      the_repository->index,
+			      the_repository->index->cache[pos], NULL))))
 			clean_status_invalidate_current_proof(the_repository->index);
 
 		if (remove_file_from_index(the_repository->index, path))

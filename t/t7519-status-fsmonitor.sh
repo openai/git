@@ -793,6 +793,16 @@ test_fsmonitor_full_proof () {
 	EOF
 }
 
+test_fsmonitor_clean_bitmap () {
+	bitmap=$(test-tool -C "$1" dump-fsmonitor | tail -n 1) &&
+	case "$bitmap" in
+	""|*[!-]*)
+		echo "dirty fsmonitor bitmap: $bitmap" >&2 &&
+		return 1
+		;;
+	esac
+}
+
 wait_for_fsmonitor_query_barrier () {
 	for attempt in $(test_seq 1 500)
 	do
@@ -3399,6 +3409,13 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		git -C "$root_repo" config core.untrackedCache true &&
 		git -C "$root_repo" config core.fsmonitor true &&
 		git -C "$root_repo" config core.preloadIndexBulk true &&
+		git -C "$root_repo" config filter.lfs.clean \
+			"git-lfs clean -- %f" &&
+		git -C "$root_repo" config filter.lfs.smudge \
+			"git-lfs smudge -- %f" &&
+		git -C "$root_repo" config filter.lfs.process \
+			"git-lfs filter-process" &&
+		git -C "$root_repo" config filter.lfs.required true &&
 		for worktree in "$root_repo" "$root_linked"
 		do
 			gitdir=$(git -C "$worktree" \
@@ -3456,6 +3473,13 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 			test_grep ! "ctime: 0:0" "$gitdir/root-policy-stat" &&
 			test_grep ! "mtime: 0:0" "$gitdir/root-policy-stat" &&
 			test_grep ! "size: 0" "$gitdir/root-policy-stat" &&
+			sleep 2 &&
+			GIT_TRACE2_EVENT="$gitdir/root-delayed.trace" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/root-delayed" &&
+			test_must_be_empty "$gitdir/root-delayed" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
 			for pass in first second
 			do
 				cp "$gitdir/index" "$gitdir/root-$pass.index" &&
@@ -3508,8 +3532,13 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 			git -C "$filter" pull --quiet &&
 		test_trace2_data fsmonitor semantic/manifest-invalidated 1 \
 			<"$filter_gitdir/pull.trace" &&
-		! test_trace2_data fsmonitor history/post-worktree-refresh 1 \
+		test_trace2_data status \
+			semantic_verify/writer-repair-filtered 1 \
 			<"$filter_gitdir/pull.trace" &&
+		! test_fsmonitor_full_proof "$filter_gitdir/index" paired \
+			2>"$filter_gitdir/proof.err" &&
+		test_grep "missing FSUC extension" \
+			"$filter_gitdir/proof.err" &&
 		cp "$filter_gitdir/index" "$filter_gitdir/status.before" &&
 		test_must_fail env GIT_OPTIONAL_LOCKS=0 \
 			GIT_TRACE2_EVENT="$filter_gitdir/status.trace" \
@@ -3522,6 +3551,141 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 		test_cmp_bin "$filter_gitdir/status.before" \
 			"$filter_gitdir/index" &&
 		git -C "$filter" fsmonitor--daemon stop
+	)
+'
+
+test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'index writers preserve authenticated policy and intent-to-add proofs' '
+	test_when_finished "rm -rf writer-proof writer-proof-linked" &&
+	test_when_finished \
+		"git -C writer-proof fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_when_finished \
+		"git -C writer-proof-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo writer-proof &&
+	(
+		cd writer-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p policy/nested &&
+		test_write_lines "*.txt text" "# root base" \
+			>.gitattributes &&
+		test_write_lines "*.ignored" "# root base" >.gitignore &&
+		test_write_lines "*.txt text" "# nested base" \
+			>policy/nested/.gitattributes &&
+		test_write_lines "*.ignored" "# nested base" \
+			>policy/nested/.gitignore &&
+		test_write_lines tracked >tracked.txt &&
+		git add . &&
+		git commit -qm base &&
+		git worktree add --quiet --detach ../writer-proof-linked HEAD &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config core.preloadIndexBulk true &&
+		git config filter.lfs.clean "git-lfs clean -- %f" &&
+		git config filter.lfs.smudge "git-lfs smudge -- %f" &&
+		git config filter.lfs.process "git-lfs filter-process" &&
+		git config filter.lfs.required true &&
+		for role in main linked
+		do
+			if test "$role" = main
+			then
+				worktree=$PWD
+			else
+				worktree=$PWD/../writer-proof-linked
+			fi &&
+			gitdir=$(git -C "$worktree" \
+				rev-parse --absolute-git-dir) &&
+			commondir=$(git -C "$worktree" \
+				rev-parse --path-format=absolute --git-common-dir) &&
+			git -C "$worktree" fsmonitor--daemon start \
+				--start-timeout=10 &&
+			git -C "$worktree" update-index --fsmonitor &&
+			GIT_INDEX_FILE="$gitdir/index" \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/prime" &&
+			test_must_be_empty "$gitdir/prime" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
+
+			test_write_lines ordinary >"$worktree/ordinary-$role.txt" &&
+			GIT_TRACE2_EVENT="$gitdir/ordinary-add.trace" \
+				git -C "$worktree" add "ordinary-$role.txt" &&
+			! test_trace2_data fsmonitor history/writer-proof-repaired \
+				<"$gitdir/ordinary-add.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
+			git -C "$worktree" commit -qm ordinary &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+
+			test_write_lines "*.txt text" "# root staged $role" \
+				>"$worktree/.gitattributes" &&
+			test_write_lines "*.ignored" "# nested staged $role" \
+				>"$worktree/policy/nested/.gitignore" &&
+			GIT_TRACE2_EVENT="$gitdir/policy-add.trace" \
+				git -C "$worktree" add .gitattributes \
+					policy/nested/.gitignore &&
+			test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+				<"$gitdir/policy-add.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
+			git -C "$worktree" commit -qm "staged policy" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+
+			write_script "$commondir/hooks/pre-commit" <<-\EOF &&
+				gitdir=$(git rev-parse --absolute-git-dir) || exit 1
+				test -n "${GIT_INDEX_FILE-}" || exit 1
+				printf "%s\n" "$GIT_INDEX_FILE" >"$gitdir/hook-index"
+				git status --porcelain=v2 >/dev/null || exit 1
+			EOF
+			test_write_lines "*.ignored" "# root partial $role" \
+				>"$worktree/.gitignore" &&
+			test_write_lines "*.txt text" "# nested partial $role" \
+				>"$worktree/policy/nested/.gitattributes" &&
+			git -C "$worktree" add .gitignore \
+				policy/nested/.gitattributes &&
+			git -C "$worktree" commit --only \
+				.gitignore policy/nested/.gitattributes \
+				-m "partial policy" >/dev/null &&
+			test_grep "next-index.*\\.lock$" "$gitdir/hook-index" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
+
+			test_write_lines intent >"$worktree/intent-$role.txt" &&
+			GIT_TRACE2_EVENT="$gitdir/intent-add.trace" \
+				git -C "$worktree" add --intent-to-add \
+					"intent-$role.txt" &&
+			! test_trace2_data fsmonitor history/writer-proof-repaired \
+				<"$gitdir/intent-add.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
+			cp "$gitdir/index" "$gitdir/intent.before" &&
+			GIT_OPTIONAL_LOCKS=0 \
+				git -C "$worktree" status --porcelain=v2 \
+					>"$gitdir/intent" &&
+			test_grep "intent-$role\\.txt$" "$gitdir/intent" &&
+			test_cmp_bin "$gitdir/intent.before" "$gitdir/index" &&
+			git -C "$worktree" rm --cached "intent-$role.txt" \
+				>/dev/null &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			test_fsmonitor_clean_bitmap "$worktree" &&
+			cp "$gitdir/index" "$gitdir/removed.before" &&
+			for pass in first second
+			do
+				GIT_OPTIONAL_LOCKS=0 \
+					GIT_TRACE2_EVENT="$gitdir/removed-$pass.trace" \
+					git -C "$worktree" status --porcelain=v2 \
+						>"$gitdir/removed-$pass" &&
+				test_grep "^? intent-$role\\.txt$" \
+					"$gitdir/removed-$pass" &&
+				test_cmp_bin "$gitdir/removed.before" \
+					"$gitdir/index" &&
+				! test_trace2_data fsmonitor untracked/proof-missing 1 \
+					<"$gitdir/removed-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/removed-$pass.trace" || return 1
+			done &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			git -C "$worktree" fsmonitor--daemon stop || return 1
+		done
 	)
 '
 

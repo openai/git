@@ -383,6 +383,60 @@ void test_attr_manifest__falls_back_to_index_source(void)
 #endif
 }
 
+void test_attr_manifest__ignores_unmerged_non_attribute_entries(void)
+{
+#if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	cl_skip();
+#else
+	const struct git_hash_algo *algo = &hash_algos[GIT_HASH_SHA1];
+	char *worktree = create_worktree();
+	char source[] = "*.dat text\n";
+	struct repository repo = { .worktree = worktree, .hash_algo = algo };
+	struct index_state istate = INDEX_STATE_INIT(&repo);
+	struct worktree_attr_manifest_stats stats;
+	struct attr_manifest_cursor cursor;
+	struct attr_manifest_entry entry;
+	struct cache_entry *attributes;
+	struct strbuf manifest = STRBUF_INIT;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int have_repository, ret;
+
+	init_object_store(&repo, worktree);
+	CALLOC_ARRAY(istate.cache, 5);
+	istate.cache_alloc = istate.cache_nr = 5;
+	attributes = add_index_path(&istate, 0, GITATTRIBUTES_FILE, 0);
+	add_index_path(&istate, 1, "conflict", 1);
+	add_index_path(&istate, 2, "conflict", 2);
+	add_index_path(&istate, 3, "conflict", 3);
+	add_index_path(&istate, 4, "nested/file", 0);
+	cl_must_pass(odb_pretend_object(
+		repo.objects, source, strlen(source), OBJ_BLOB,
+		&attributes->oid));
+
+	have_repository = startup_info->have_repository;
+	startup_info->have_repository = 1;
+	ret = worktree_attr_manifest_build(
+		&istate, &manifest, hash, &stats);
+	startup_info->have_repository = have_repository;
+	cl_assert_equal_i(ret, 0);
+	cl_assert_equal_i(stats.candidates, 2);
+	cl_assert_equal_i(stats.worktree_sources, 0);
+	cl_assert_equal_i(stats.index_sources, 1);
+	cl_assert_equal_i(attr_manifest_cursor_init(
+		&cursor, manifest.buf, manifest.len, algo), 0);
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 1);
+	cl_assert_equal_i(entry.source, ATTR_MANIFEST_INDEX);
+	cl_assert_equal_i(entry.path_len, strlen(GITATTRIBUTES_FILE));
+	cl_assert(!memcmp(entry.path, GITATTRIBUTES_FILE, entry.path_len));
+	cl_assert_equal_i(attr_manifest_cursor_next(&cursor, &entry), 0);
+
+	strbuf_release(&manifest);
+	release_index(&istate);
+	odb_free(repo.objects);
+	remove_worktree(worktree);
+#endif
+}
+
 void test_attr_manifest__rejects_hardlinked_source_over_index(void)
 {
 #if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
@@ -803,7 +857,7 @@ void test_attr_manifest__thread_failure_completes_remaining_ranges(void)
 #endif
 }
 
-void test_attr_manifest__builder_rejects_structural_indexes(void)
+void test_attr_manifest__builder_accepts_unmerged_but_rejects_sparse_indexes(void)
 {
 #if !SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
 	cl_skip();
@@ -820,8 +874,8 @@ void test_attr_manifest__builder_rejects_structural_indexes(void)
 	istate.cache_alloc = istate.cache_nr = 1;
 	add_index_path(&istate, 0, "file", 1);
 	cl_assert_equal_i(worktree_attr_manifest_build(
-		&istate, &manifest, hash, &stats), -1);
-	cl_assert_equal_i(manifest.len, 0);
+		&istate, &manifest, hash, &stats), 0);
+	cl_assert(attr_manifest_valid(manifest.buf, manifest.len, algo));
 	istate.cache[0]->ce_flags = create_ce_flags(0);
 	istate.sparse_index = INDEX_COLLAPSED;
 	cl_assert_equal_i(worktree_attr_manifest_build(

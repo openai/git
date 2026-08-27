@@ -1707,6 +1707,7 @@ static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
 	options.require_proof_epoch = 1;
 	options.validate_filter_scope =
 		clean_status_filter_scope_needs_validation(istate);
+	options.index_path = s->proof_index_path;
 	options.attr_snapshot = s->attr_source_snapshot;
 	trace2_region_enter("status", "semantic_verify", s->repo);
 	ret = semantic_verify_prepare(istate, &options, &proof);
@@ -2135,7 +2136,8 @@ wt_status_close_semantic_fsmonitor_token(
 		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 	}
 	closure->refresh_result |= refresh_index(
-		istate, closure->refresh_flags, &s->pathspec, NULL, NULL);
+		istate, closure->refresh_flags | REFRESH_IN_PROOF_EPOCH,
+		&s->pathspec, NULL, NULL);
 	trace2_data_intmax("status", s->repo,
 			   "fsmonitor_token/semantic-closed", 1);
 	if (!semantic_verify_proof_is_current(istate, *proof)) {
@@ -2146,8 +2148,6 @@ wt_status_close_semantic_fsmonitor_token(
 	}
 
 	if (defer_untracked) {
-		int directory_delta_reused;
-
 		closure->untracked_ready =
 			wt_status_stage_untracked(closure);
 		closure->untracked_proof_complete =
@@ -2160,13 +2160,19 @@ wt_status_close_semantic_fsmonitor_token(
 		    closure->queries >= FSMONITOR_TOKEN_MAX_QUERIES)
 			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 
-		/* A second query closes the subsequent untracked scan. */
-		closure->queries++;
+	}
+
+	/* A second query closes the ordinary refresh tail and untracked scan. */
+	closure->queries++;
+	if (defer_untracked)
 		clean_status_manifest_begin_directory_delta(istate, *proof);
-		result = wt_status_query_pending_token(
-			closure, wt_status_untracked_cache_valid(closure));
-		directory_delta_reused =
+	result = wt_status_query_pending_token(
+		closure, defer_untracked ?
+		wt_status_untracked_cache_valid(closure) : 0);
+	if (defer_untracked) {
+		int directory_delta_reused =
 			clean_status_manifest_end_directory_delta(istate);
+
 		if (result != FSMONITOR_TOKEN_CLEAN) {
 			/* Only directory reuse adds an unobserved exclude risk. */
 			int reuse_semantic_subtrees =
@@ -2199,12 +2205,20 @@ wt_status_close_semantic_fsmonitor_token(
 				return WT_STATUS_TOKEN_CLOSURE_RETRY;
 			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 		}
-		if (!semantic_verify_proof_is_current(istate, *proof)) {
-			wt_status_reset_attr_snapshot_if_changed(s);
-			wt_status_discard_semantic_verify(
-				s, proof, "closure-drift");
-			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
-		}
+	} else if (result != FSMONITOR_TOKEN_CLEAN) {
+		closure->untracked_ready = 0;
+		closure->untracked_proof_complete = !closure->require_untracked;
+		wt_status_discard_semantic_verify(
+			s, proof, "token-reset");
+		if (fsmonitor_token_requires_rescan(result))
+			return WT_STATUS_TOKEN_CLOSURE_RETRY;
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+	if (!semantic_verify_proof_is_current(istate, *proof)) {
+		wt_status_reset_attr_snapshot_if_changed(s);
+		wt_status_discard_semantic_verify(
+			s, proof, "closure-drift");
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 	}
 	if (semantic_verify_accept_filter_scope(istate, *proof) < 0) {
 		wt_status_discard_semantic_verify(
@@ -2407,6 +2421,22 @@ int wt_status_refresh_index(struct wt_status *s,
 	wt_status_begin_attr_snapshot(s);
 	refresh_fsmonitor(istate);
 	proof = wt_status_prepare_semantic_verify(s, refresh_flags);
+	if (proof && s->proof_index_path) {
+		struct semantic_verify_stats stats;
+
+		semantic_verify_get_stats(proof, &stats);
+		if (stats.active_filters) {
+			s->certify_active_filter_found = 1;
+			trace2_data_intmax(
+				"status", s->repo,
+				"semantic_verify/writer-repair-filtered", 1);
+			semantic_verify_proof_clear(proof);
+			git_attr_invalidate_all();
+			if (fsmonitor_has_pending_token(istate))
+				fsmonitor_reject_pending_token(istate);
+			return 0;
+		}
+	}
 	ret = wt_status_close_fsmonitor_token(
 		s, proof, refresh_flags, require_untracked, 0);
 	istate->preload_bulk_recovery_requested = 0;
@@ -2433,7 +2463,8 @@ static int fsmonitor_proof_repair_is_eligible(struct repository *repo)
 	    istate->sparse_index != INDEX_EXPANDED ||
 	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
 	    !istate->untracked || !istate->untracked->root ||
-	    !istate->fsmonitor_token_valid)
+	    (!istate->fsmonitor_token_valid &&
+	     !fsmonitor_pending_token_from_provider(istate)))
 		return 0;
 	return 1;
 }
@@ -2488,7 +2519,7 @@ static int repair_fsmonitor_proof(
 	struct index_state *istate = repo->index;
 	struct wt_status status;
 	int no_pending, paired_untracked, valid_root, certifiable_index;
-	int full_proof, repaired;
+	int full_proof, repaired = 0;
 
 	if (!fsmonitor_proof_repair_is_eligible(repo))
 		return 0;
@@ -2505,6 +2536,18 @@ static int repair_fsmonitor_proof(
 		&status,
 		REFRESH_QUIET | REFRESH_UNMERGED,
 		1);
+	if (status.certify_active_filter_found)
+		goto done;
+	/* A policy-file update can invalidate the cache during token closure. */
+	wt_status_collect_untracked(&status);
+	/* Bind the rebuilt cache and refreshed entries to a fresh token. */
+	if (fsmonitor_reopen_token(istate))
+		wt_status_refresh_index(
+			&status,
+			REFRESH_QUIET | REFRESH_UNMERGED,
+			1);
+	if (status.certify_active_filter_found)
+		goto done;
 	untracked_cache_recompute_fsmonitor_valid_recursive(istate->untracked);
 	no_pending = !fsmonitor_has_pending_token(istate);
 	paired_untracked = istate->fsmonitor_untracked_valid &&
@@ -2519,6 +2562,7 @@ static int repair_fsmonitor_proof(
 	repaired = !status.certify_untracked_scan_failed && no_pending &&
 		paired_untracked && valid_root && certifiable_index && full_proof;
 
+done:
 	wt_status_collect_free_buffers(&status);
 	string_list_clear(&status.change, 1);
 	string_list_clear(&status.untracked, 0);
@@ -2542,16 +2586,16 @@ int wt_status_repair_fsmonitor_proof_at_path(
 	return repair_fsmonitor_proof(repo, index_path, 0);
 }
 
-int wt_status_repair_fsmonitor_proof_after_worktree_update(
-	struct repository *repo, struct lock_file *lock, int had_full_proof)
+static int repair_fsmonitor_proof_after_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof,
+	int allow_manifest_refresh)
 {
 	const char *proof_index_path;
 	int repaired;
 
 	if (!had_full_proof || !fsmonitor_proof_repair_is_eligible(repo) ||
-	    clean_status_worktree_manifest_needs_refresh(repo->index) ||
-	    clean_status_filter_scope_needs_validation(repo->index) ||
-	    clean_status_changed_worktree_manifest_has_filters(repo->index))
+	    (!allow_manifest_refresh &&
+	     clean_status_worktree_manifest_needs_refresh(repo->index)))
 		return 0;
 	if (!wt_status_fsmonitor_proof_needs_repair(repo) &&
 	    clean_status_has_current_full_fsmonitor_proof(repo->index) &&
@@ -2567,6 +2611,20 @@ int wt_status_repair_fsmonitor_proof_after_worktree_update(
 	if (reopen_lock_file(lock) < 0)
 		return -1;
 	return repaired;
+}
+
+int wt_status_repair_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof)
+{
+	return repair_fsmonitor_proof_after_update(
+		repo, lock, had_full_proof, 0);
+}
+
+int wt_status_repair_fsmonitor_proof_after_index_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof)
+{
+	return repair_fsmonitor_proof_after_update(
+		repo, lock, had_full_proof, 1);
 }
 
 static void wt_status_release_attr_snapshot(struct wt_status *s)

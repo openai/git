@@ -458,9 +458,7 @@ static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
 		test_env_value = git_env_bool("GIT_TEST_FSMONITOR_TOKEN", 0);
 
 	strbuf_addstr(&token->token_id,
-		      FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX);
-	strbuf_addstr(&token->token_id,
-		      FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX);
+		      FSMONITOR_IPC_COOKIE_TOKEN_PREFIX);
 
 	if (!test_env_value) {
 		struct timeval tv;

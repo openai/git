@@ -65,7 +65,7 @@ static int collect_candidates(struct index_state *istate,
 		const char *slash = ce->name;
 		const char *basename = ce->name;
 
-		if (ce_stage(ce) || S_ISSPARSEDIR(ce->ce_mode))
+		if (S_ISSPARSEDIR(ce->ce_mode))
 			goto done;
 		while ((slash = strchr(slash, '/')) != NULL) {
 			size_t len = slash - ce->name;
@@ -87,7 +87,14 @@ static int collect_candidates(struct index_state *istate,
 			}
 			basename = ++slash;
 		}
-		if (!fspathcmp(basename, GITATTRIBUTES_FILE)) {
+		/*
+		 * Unmerged entries still identify every ancestor directory that
+		 * can contain an attribute source. Do not use an unmerged
+		 * .gitattributes entry as the index source; callers separately
+		 * reject an unmerged index when deciding whether to issue a proof.
+		 */
+		if (!ce_stage(ce) &&
+		    !fspathcmp(basename, GITATTRIBUTES_FILE)) {
 			strbuf_reset(&candidate);
 			strbuf_add(&candidate, ce->name, basename - ce->name);
 			strbuf_addstr(&candidate, GITATTRIBUTES_FILE);

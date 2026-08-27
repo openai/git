@@ -63,6 +63,10 @@ test_lazy_prereq FSMONITOR_DIR_METADATA '
 	test "$uname_s" = Darwin || test "$uname_s" = Linux
 '
 
+test_lazy_prereq FSMONITOR_LINUX '
+	test "$uname_s" = Linux
+'
+
 test_lazy_prereq FOREIGN_FSMONITOR_GIT '
 	test -x /opt/homebrew/bin/git &&
 	/opt/homebrew/bin/git version
@@ -81,15 +85,17 @@ fi
 case "$uname_s" in
 Darwin)
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.inode-v1.
+	fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
 	;;
 Linux)
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.
+	fsmonitor_cookie_token_prefix=cookie-v1.dirmeta-v1.
 	;;
 *)
 	fsmonitor_pre_cookie_token_prefix=
+	fsmonitor_cookie_token_prefix=cookie-v1.
 	;;
 esac
-fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
 
 stop_daemon_delete_repo () {
 	r=$1 &&
@@ -168,6 +174,63 @@ have_t2_data_event () {
 	k=$2 &&
 
 	grep -e '"event":"data".*"category":"'"$c"'".*"key":"'"$k"'"'
+}
+
+native_stash_full_proof () {
+	perl - "$1" <<-\EOF
+	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
+	binmode $input;
+	local $/;
+	my $index = <$input>;
+	my %tokens;
+	for my $name ("FSMN", "FSUC", "FSCF") {
+		my $offset = index($index, $name);
+		die "missing $name extension\n" if $offset < 0;
+		my $size = unpack("N", substr($index, $offset + 4, 4));
+		my $payload = substr($index, $offset + 8, $size);
+		if ($name eq "FSCF") {
+			my $flags = unpack("N", substr($payload, 8, 4));
+			die "unbound FSCF flags $flags\n" if $flags != 15;
+			my $length = unpack("N", substr($payload, 12, 4));
+			$tokens{$name} = substr($payload, 20, $length);
+		} else {
+			my $end = index($payload, "\0", 4);
+			die "invalid $name token\n" if $end < 0;
+			$tokens{$name} = substr($payload, 4, $end - 4);
+		}
+	}
+	die "mismatched provider tokens\n" unless
+		$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+		$tokens{"FSMN"} eq $tokens{"FSCF"};
+	EOF
+}
+
+native_tracked_full_proof () {
+	perl - "$1" <<-\EOF
+	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
+	binmode $input;
+	local $/;
+	my $index = <$input>;
+	my %tokens;
+	for my $name ("FSMN", "FSCF") {
+		my $offset = index($index, $name);
+		die "missing $name extension\n" if $offset < 0;
+		my $size = unpack("N", substr($index, $offset + 4, 4));
+		my $payload = substr($index, $offset + 8, $size);
+		if ($name eq "FSCF") {
+			my $flags = unpack("N", substr($payload, 8, 4));
+			die "unbound FSCF flags $flags\n" if $flags != 15;
+			my $length = unpack("N", substr($payload, 12, 4));
+			$tokens{$name} = substr($payload, 20, $length);
+		} else {
+			my $end = index($payload, "\0", 4);
+			die "invalid $name token\n" if $end < 0;
+			$tokens{$name} = substr($payload, 4, $end - 4);
+		}
+	}
+	die "mismatched provider tokens\n" unless
+		$tokens{"FSMN"} eq $tokens{"FSCF"};
+	EOF
 }
 
 test_expect_success 'explicit daemon start and stop' '
@@ -1957,6 +2020,32 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 	)
 '
 
+test_expect_success FSMONITOR_LINUX \
+	'nameless inotify events use the watched directory' '
+	test_when_finished \
+		"git -C inotify-nameless fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo inotify-nameless &&
+	(
+		cd inotify-nameless &&
+		mkdir -p existing/inner &&
+		test_write_lines tracked >existing/inner/tracked &&
+		git add existing/inner/tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		start_daemon --tf "$PWD/.git/daemon.trace" &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		chmod 750 existing/inner &&
+		test-tool fsmonitor-client query >.git/chmod.raw &&
+		nul_to_q <.git/chmod.raw >.git/chmod.response &&
+		test_grep "Qexisting/inner/Q" .git/chmod.response &&
+		test_grep ! "Qexisting/inner/[^Q][^Q]*Q" \
+			.git/chmod.response &&
+		chmod 755 existing/inner
+	)
+'
+
 test_expect_success MACOS 'implicit daemon reuses the invoking Git executable' '
 	test_create_repo same-executable-spawn &&
 	mkdir fake-exec-path &&
@@ -2210,7 +2299,7 @@ test_expect_success FSMONITOR_DIR_METADATA \
 			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
 			.git/upgrade.trace &&
 		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep "fsmonitor last update builtin:dirmeta-v1\\." \
+		test_grep "fsmonitor last update builtin:${fsmonitor_cookie_token_prefix}" \
 			.git/fsmonitor &&
 
 		GIT_TRACE2_EVENT="$PWD/.git/repeat.trace" \
@@ -2443,7 +2532,7 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 		! test_trace2_data fsm_client query/worktree-mismatch 1 \
 			<.git/reconnect.trace &&
 		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep "fsmonitor last update builtin:dirmeta-v1\\." \
+		test_grep "fsmonitor last update builtin:${fsmonitor_cookie_token_prefix}" \
 			.git/fsmonitor &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index &&
@@ -2517,7 +2606,7 @@ test_expect_success FSMONITOR_DIR_METADATA,UNTRACKED_CACHE \
 			.git/client-*.trace >.git/daemon-spawns &&
 		test_line_count = 1 .git/daemon-spawns &&
 		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep "fsmonitor last update builtin:dirmeta-v1\\." \
+		test_grep "fsmonitor last update builtin:${fsmonitor_cookie_token_prefix}" \
 			.git/fsmonitor &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index &&
@@ -2553,6 +2642,12 @@ test_expect_success 'bound daemon also serves legacy token queries' '
 		token=$(sed -n "s/^fsmonitor last update //p" \
 			.git/fsmonitor) &&
 		test -n "$token" &&
+		if test_have_prereq FSMONITOR_LINUX
+		then
+			test_grep \
+				"^fsmonitor last update builtin:cookie-v1\\.dirmeta-v1\\." \
+				.git/fsmonitor || return 1
+		fi &&
 		ipc_path=$(git rev-parse --path-format=absolute \
 			--git-path fsmonitor--daemon.ipc) &&
 		test-tool simple-ipc send --name="$ipc_path" \
@@ -4919,6 +5014,317 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! test_trace2_data status semantic_verify/prepared 1 \
 			<.git/status.trace
 	)
+'
+
+native_stash_setup () {
+	repo=$1 &&
+	mode=$2 &&
+	test_create_repo "$repo" &&
+	(
+		cd "$repo" &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines base >tracked &&
+		test_write_lines sibling >sibling &&
+		test_write_lines "# baseline" >.gitattributes &&
+		test_write_lines "# baseline" >.gitignore &&
+		git add tracked sibling .gitattributes .gitignore &&
+		git commit -qm base &&
+		test-tool chmtime -120 tracked sibling \
+			.gitattributes .gitignore &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.trustctime true &&
+		git config core.checkStat default &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		if test "$mode" = lfs
+		then
+			git config filter.lfs.clean "git-lfs clean -- %f" &&
+			git config filter.lfs.smudge "git-lfs smudge -- %f" &&
+			git config filter.lfs.process "git-lfs filter-process" &&
+			git config filter.lfs.required true
+		fi &&
+		start_daemon &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		native_stash_full_proof .git/index
+	)
+}
+
+native_stash_reset () {
+	git reset --hard -q HEAD &&
+	git clean -fdq &&
+	git stash clear &&
+	git status --porcelain=v2 >.git/stash.reset &&
+	test_must_be_empty .git/stash.reset &&
+	native_stash_full_proof .git/index
+}
+
+native_stash_create_policy_file () {
+	source=$1 &&
+	test_write_lines staged >tracked &&
+	git add -- tracked &&
+	native_stash_full_proof .git/index &&
+	test_write_lines "# baseline" "# harmless" >"$source" &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/create.before &&
+	git stash create >.git/create.oid &&
+	test_file_not_empty .git/create.oid &&
+	git cat-file -e "$(cat .git/create.oid)^{commit}" &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/create.after &&
+	test_cmp .git/create.before .git/create.after &&
+	test_grep "^1 M\\. .* tracked$" .git/create.after &&
+	test_grep "^1 \\.M .* $source$" .git/create.after &&
+	test_must_fail git rev-parse --verify refs/stash
+}
+
+native_stash_staged_existing () {
+	test_write_lines staged >tracked &&
+	git add -- tracked &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/staged.before &&
+	git stash push --staged -q -m staged &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/staged.pushed &&
+	test_must_be_empty .git/staged.pushed &&
+	git stash apply --index -q stash@{0} &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/staged.after &&
+	test_cmp .git/staged.before .git/staged.after
+}
+
+native_stash_staged_new () {
+	test_write_lines staged >new-file &&
+	git add -- new-file &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/indexed.expect &&
+	git stash push --staged -q -m indexed &&
+	native_stash_full_proof .git/index &&
+	git status --porcelain=v2 >.git/indexed.clean &&
+	test_must_be_empty .git/indexed.clean &&
+	git stash apply --index -q stash@{0} &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/indexed.actual &&
+	test_cmp .git/indexed.expect .git/indexed.actual &&
+	test_write_lines new-file >.git/indexed.expect-paths &&
+	git diff --cached --name-only >.git/indexed.actual-paths &&
+	test_cmp .git/indexed.expect-paths .git/indexed.actual-paths
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'native stash updates retain a full proof' '
+	for mode in plain lfs
+	do
+		repo="native-stash-$mode" &&
+		test_when_finished "stop_daemon_delete_repo $repo" &&
+		native_stash_setup "$repo" "$mode" &&
+		(
+			cd "$repo" &&
+			native_stash_create_policy_file .gitattributes &&
+			native_stash_reset &&
+			native_stash_create_policy_file .gitignore &&
+			native_stash_reset &&
+			native_stash_staged_existing &&
+			native_stash_reset &&
+			native_stash_staged_new
+		) || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS,!MINGW \
+	'completed native replay retains a full proof' '
+	for mode in plain lfs
+	do
+		for location in primary linked
+		do
+			repo="native-replay-$mode-$location" &&
+			linked="$repo-linked" &&
+			if test "$location" = linked
+			then
+				test_when_finished \
+					"stop_daemon_delete_linked_repo $repo $linked"
+			else
+				test_when_finished "stop_daemon_delete_repo $repo"
+			fi &&
+			test_create_repo "$repo" &&
+			(
+				cd "$repo" &&
+				sane_unset GIT_TEST_SPLIT_INDEX &&
+				mkdir unrelated &&
+				for i in $(test_seq 1 96)
+				do
+					d=$(( (i - 1) % 32 + 1 )) &&
+					mkdir -p "unrelated/d$d" &&
+					test_write_lines "stable-$i" \
+						>"unrelated/d$d/file-$i" || return 1
+				done &&
+				test_write_lines base >conflict &&
+				test_write_lines "# baseline" >.gitattributes &&
+				test_write_lines "# baseline" >.gitignore &&
+				git add unrelated conflict .gitattributes .gitignore &&
+				git commit -qm base &&
+				base=$(git rev-parse HEAD) &&
+				git switch -qc upstream &&
+				test_write_lines upstream >conflict &&
+				git add conflict &&
+				git commit -qm upstream &&
+				git switch -qc topic "$base" &&
+				test_write_lines topic >conflict &&
+				git add conflict &&
+				git commit -qm topic &&
+				git config core.autocrlf false &&
+				git config core.trustctime true &&
+				git config core.checkStat default &&
+				git config core.untrackedCache true &&
+				git config core.fsmonitor true &&
+				git config core.preloadIndex true &&
+				git config core.preloadIndexBulk true &&
+				if test "$mode" = lfs
+				then
+					git config filter.lfs.clean \
+						"git-lfs clean -- %f" &&
+					git config filter.lfs.smudge \
+						"git-lfs smudge -- %f" &&
+					git config filter.lfs.process \
+						"git-lfs filter-process" &&
+					git config filter.lfs.required true
+				fi &&
+				if test "$location" = linked
+				then
+					git switch -q upstream &&
+					git worktree add -q "../$linked" topic
+				fi
+			) &&
+			if test "$location" = linked
+			then
+				worktree="$linked"
+			else
+				worktree="$repo"
+			fi &&
+			(
+				cd "$worktree" &&
+				git fsmonitor--daemon status >/dev/null 2>&1 ||
+				start_daemon &&
+				index=$(git rev-parse --git-path index) &&
+				scratch=$(git rev-parse --path-format=absolute \
+					--git-path replay-test) &&
+				mkdir -p "$scratch" &&
+				topic=$(git rev-parse topic) &&
+				upstream=$(git rev-parse upstream) &&
+				test-tool chmtime -120 $(git ls-files) &&
+				git -c core.fsmonitor=false update-index --refresh &&
+				git update-index --fsmonitor &&
+				git status --porcelain=v2 >"$scratch/prime.actual" &&
+				test_must_be_empty "$scratch/prime.actual" &&
+				native_stash_full_proof "$index" &&
+				for replay in rebase rebase-merges cherry-pick
+				do
+					artifact="$scratch/$replay" &&
+					if test "$replay" = cherry-pick
+					then
+						git reset --hard -q "$upstream"
+					else
+						git reset --hard -q "$topic"
+					fi &&
+					git status --porcelain=v2 \
+						>"$artifact.prime" &&
+					test_must_be_empty "$artifact.prime" &&
+					native_stash_full_proof "$index" &&
+					case "$replay" in
+					rebase)
+						test_must_fail git rebase upstream
+						;;
+					rebase-merges)
+						test_must_fail git rebase \
+							--rebase-merges upstream
+						;;
+					cherry-pick)
+						test_must_fail git cherry-pick "$topic"
+						;;
+					esac &&
+					test -n "$(git ls-files -u)" &&
+					test_grep ! FSUC "$index" &&
+					test_write_lines resolved >conflict &&
+					GIT_TRACE2_EVENT="$artifact.add.trace" \
+						git add conflict &&
+					! have_t2_data_event fsmonitor \
+						semantic/manifest-scan-failed \
+						<"$artifact.add.trace" &&
+					! test_trace2_data index refresh/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.add.trace" &&
+					! test_trace2_data index preload/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.add.trace" &&
+					if test "$replay" = cherry-pick
+					then
+						GIT_EDITOR=true git cherry-pick --continue
+					else
+						GIT_EDITOR=true git rebase --continue
+					fi &&
+					if test "$replay" = cherry-pick
+					then
+						native_tracked_full_proof "$index" &&
+						test_grep ! FSUC "$index"
+					else
+						native_stash_full_proof "$index"
+					fi &&
+					cp "$index" "$artifact.index.before" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TRACE2_EVENT="$artifact.status.trace" \
+						git status --porcelain=v2 \
+						>"$artifact.status" &&
+					test_must_be_empty "$artifact.status" &&
+					test_cmp "$artifact.index.before" "$index" &&
+					test-tool dump-fsmonitor | tail -n 1 \
+						>"$artifact.bitmap" &&
+					test_grep ! + "$artifact.bitmap" &&
+					! test_trace2_data index refresh/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.status.trace" &&
+					! test_trace2_data index preload/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.status.trace" &&
+					if test "$replay" = cherry-pick
+					then
+						test_trace2_data read_directory \
+							directories-visited \
+							"[1-9][0-9]*" \
+							<"$artifact.status.trace"
+					else
+						! test_trace2_data read_directory \
+							directories-visited "[2-9]" \
+							<"$artifact.status.trace" &&
+						! test_trace2_data read_directory \
+							directories-visited \
+							"[1-9][0-9][0-9]*" \
+							<"$artifact.status.trace"
+					fi || return 1
+				done
+			) || return 1
+		done
+	done
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
@@ -7635,7 +8041,7 @@ test_expect_success UNTRACKED_CACHE,!MINGW,!CYGWIN \
 		test-tool chmtime =$mtime cached/hook-tracked
 		EOF
 		GIT_EDITOR=: \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCDC \
 		GIT_TEST_FSMONITOR_QUERY_PATH=cached/hook-tracked \
 		GIT_TRACE2_EVENT="$PWD/.git/commit.trace" \
 			git commit --allow-empty --edit -m adoption &&

@@ -466,8 +466,7 @@ static int response_identifies_cookie_retiring_daemon(
 {
 	static const char prefix[] =
 		"builtin:"
-		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
-		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX;
+		FSMONITOR_IPC_COOKIE_TOKEN_PREFIX;
 	const char *end = memchr(answer->buf, '\0', answer->len);
 
 	return end &&
@@ -854,7 +853,7 @@ done:
 	return ret;
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
 static int spawn_daemon_serialized(void)
 {
 	struct strbuf lock_path = STRBUF_INIT;
@@ -992,7 +991,7 @@ try_again:
 		if (lifecycle_attempts++ >= FSMONITOR_RESTART_ATTEMPTS)
 			goto done;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
 		if (spawn_daemon_serialized())
 #else
 		if (spawn_daemon())

@@ -520,6 +520,50 @@ int clean_status_index_entry_is_semantically_safe(
 		old->ce_mode == new_entry->ce_mode;
 }
 
+int clean_status_intent_to_add_change_is_semantically_safe(
+	const struct index_state *istate,
+	const struct cache_entry *old,
+	const struct cache_entry *new_entry)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	const struct cache_entry *entry = old ? old : new_entry;
+	struct conv_attrs attrs;
+	const char *base;
+
+	/*
+	 * An intent-to-add entry is deliberately dirty, so adding or removing
+	 * one does not invalidate the clean bits of unrelated tracked entries.
+	 * Keep the paired untracked cache after invalidating this path, but do
+	 * not retain a proof when the placeholder can affect policy semantics.
+	 */
+	if (!state || !!old == !!new_entry || !entry ||
+	    (old && !ce_intent_to_add(old)) ||
+	    (new_entry && !ce_intent_to_add(new_entry)) ||
+	    !S_ISREG(entry->ce_mode) || ce_stage(entry) ||
+	    ce_skip_worktree(entry) || (entry->ce_flags & CE_VALID) ||
+	    !clean_status_has_current_full_fsmonitor_proof(istate) ||
+	    !istate->fsmonitor_untracked_valid ||
+	    !istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_extension_invalid ||
+	    !istate->fsmonitor_last_update ||
+	    !istate->fsmonitor_untracked_token ||
+	    strcmp(istate->fsmonitor_last_update,
+		   istate->fsmonitor_untracked_token))
+		return 0;
+	base = strrchr(entry->name, '/');
+	base = base ? base + 1 : entry->name;
+	if (!fspathcmp(base, ".gitattributes") ||
+	    !fspathcmp(base, ".gitignore"))
+		return 0;
+	if (state->filter_configured) {
+		convert_attrs((struct index_state *)istate, &attrs, entry->name);
+		if (convert_attrs_has_clean_filter(&attrs))
+			return 0;
+	}
+	return path_has_no_new_attribute_sources(
+		istate, entry->name, old && !new_entry);
+}
+
 void clean_status_clear_authenticated_new_directories(
 	struct index_state *istate)
 {
@@ -830,16 +874,6 @@ int clean_status_worktree_manifest_needs_refresh(
 
 	return state && state->config_enforced &&
 		state->manifest.current_invalidated;
-}
-
-int clean_status_changed_worktree_manifest_has_filters(
-	const struct index_state *istate)
-{
-	const struct clean_status_state *state = istate->clean_status;
-
-	return state && state->config_enforced && state->filter_configured &&
-		state->manifest.current_valid && state->manifest.checked &&
-		state->manifest.changed;
 }
 
 void clean_status_invalidate_current_manifest(struct index_state *istate)

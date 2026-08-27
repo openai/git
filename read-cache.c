@@ -945,7 +945,10 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 		    ce->ce_mode == alias->ce_mode);
 	logical_same = same_persistent_add_entry(alias, ce);
 	semantic_same = clean_status_index_entry_is_semantically_safe(
-		istate, alias, ce);
+		istate, alias, ce) ||
+		(intent_only &&
+		 clean_status_intent_to_add_change_is_semantically_safe(
+			 istate, alias, ce));
 
 	if (!pretend && (flags & ADD_CACHE_TRACK_CLEAN_HISTORY) &&
 	    !logical_same && !semantic_same)

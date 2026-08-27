@@ -29,6 +29,7 @@
 #include "submodule.h"
 #include "add-interactive.h"
 #include "merge-ll.h"
+#include "wt-status.h"
 
 static const char * const builtin_add_usage[] = {
 	N_("git add [<options>] [--] <pathspec>..."),
@@ -467,6 +468,7 @@ int cmd_add(int argc,
 	struct dir_struct dir = DIR_INIT;
 	int flags;
 	int add_new_files;
+	int had_full_proof = 0;
 	int preserve_add_history = 0;
 	int require_pathspec;
 	char *seen = NULL;
@@ -591,7 +593,7 @@ int cmd_add(int argc,
 	if (refresh_only) {
 		clean_status_enable_external_history(repo);
 		clean_status_set_config_digest(repo, &clean_digest);
-	} else if (!show_only && !intent_to_add && !add_renormalize &&
+	} else if (!show_only && !add_renormalize &&
 		   !chmod_arg && !include_sparse && !ignore_add_errors) {
 		preserve_add_history = 1;
 		flags |= ADD_CACHE_TRACK_CLEAN_HISTORY;
@@ -601,6 +603,8 @@ int cmd_add(int argc,
 
 	if (repo_read_index_preload(repo, &pathspec, 0) < 0)
 		die(_("index file corrupt"));
+	had_full_proof =
+		clean_status_has_persistent_fsmonitor_semantic_history(repo->index);
 	if (preserve_add_history &&
 	    (repo->index->split_index || repo->index->sparse_index))
 		clean_status_invalidate_current_proof(repo->index);
@@ -717,6 +721,12 @@ int cmd_add(int argc,
 finish:
 	if (preserve_add_history && exit_status)
 		clean_status_invalidate_current_proof(repo->index);
+	else if (preserve_add_history && !show_only && !intent_to_add &&
+		 (!clean_status_has_current_full_fsmonitor_proof(repo->index) ||
+		  !repo->index->fsmonitor_untracked_valid) &&
+		 wt_status_repair_fsmonitor_proof_after_index_update(
+			 repo, &lock_file, had_full_proof) < 0)
+		die(_("unable to repair new index file"));
 	if (show_only)
 		rollback_lock_file(&lock_file);
 	else if (write_locked_index(repo->index, &lock_file,

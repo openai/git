@@ -202,8 +202,7 @@ static int app__fsmonitor_capability_superset(
 		FSMONITOR_IPC_QUERY_VERSION "\n";
 	static const char current_token[] =
 		"builtin:"
-		FSMONITOR_IPC_PLATFORM_TOKEN_PREFIX
-		FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX "test-capable:0";
+		FSMONITOR_IPC_COOKIE_TOKEN_PREFIX "test-capable:0";
 	static const char pre_dir_metadata_token[] =
 		"builtin:"
 #ifdef __linux__
