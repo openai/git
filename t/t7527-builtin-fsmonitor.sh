@@ -2797,6 +2797,34 @@ test_expect_success FSMONITOR_LINUX \
 	)
 '
 
+test_expect_success FSMONITOR_LINUX \
+	'nested Git directory events remain valid' '
+	test_when_finished \
+		"git -C nested-dotgit fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo nested-dotgit &&
+	(
+		cd nested-dotgit &&
+		test_write_lines tracked >tracked &&
+		git add tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		start_daemon &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		mkdir -p scratch/.git &&
+		test_write_lines nested >scratch/.git/file &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			status --porcelain=v2 >.git/expect &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		! test_trace2_data fsm_client query/invalid-response 1 \
+			<.git/status.trace
+	)
+'
+
 test_expect_success MACOS 'implicit daemon reuses the invoking Git executable' '
 	test_create_repo same-executable-spawn &&
 	mkdir fake-exec-path &&

@@ -943,21 +943,29 @@ void fsmonitor_format_worktree_paths(
 
 static int fsmonitor_valid_worktree_path(const char *path, size_t len)
 {
-	struct strbuf copy = STRBUF_INIT;
-	int valid = 0;
+	size_t component = 0, i;
 
 	if (!len || is_dir_sep(path[0]) || has_dos_drive_prefix(path))
 		return 0;
-	strbuf_add(&copy, path, len);
-	if (is_dir_sep(copy.buf[copy.len - 1]))
-		strbuf_setlen(&copy, copy.len - 1);
-	if (!copy.len || is_dir_sep(copy.buf[copy.len - 1]))
-		goto done;
-	valid = verify_path(copy.buf, 0);
+	if (is_dir_sep(path[len - 1]) &&
+	    (!--len || is_dir_sep(path[len - 1])))
+		return 0;
 
-done:
-	strbuf_release(&copy);
-	return valid;
+	for (i = 0; i <= len; i++) {
+		size_t component_len;
+
+		if (i < len && !is_dir_sep(path[i]))
+			continue;
+		component_len = i - component;
+		if (!component_len ||
+		    (component_len == 1 && path[component] == '.') ||
+		    (component_len == 2 && path[component] == '.' &&
+		     path[component + 1] == '.'))
+			return 0;
+		component = i + 1;
+	}
+
+	return 1;
 }
 
 static int fsmonitor_parse_hardlink_inode(const char *path, size_t len,
