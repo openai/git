@@ -4429,6 +4429,48 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'stash proof repair replaces authenticated untracked output' '
+	test_when_finished "rm -rf stash-reopened-untracked" &&
+	test_create_repo stash-reopened-untracked &&
+	(
+		cd stash-reopened-untracked &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines tracked >tracked &&
+		test_write_lines baseline >state &&
+		git add tracked state &&
+		git commit -m base &&
+		git config feature.manyFiles true &&
+		git config index.version 4 &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_fsmonitor_full_proof .git/index paired &&
+		test_write_lines visible >visible &&
+		test_write_lines temporary >state &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=state \
+			git stash push -qm diagnostic -- state &&
+		test_fsmonitor_full_proof .git/index paired &&
+		GIT_TEST_FSMONITOR_ALLOW_PROOF_REPAIR_SEQUENCE=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CDCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=state \
+		GIT_TRACE2_EVENT="$PWD/.git/stash-pop.trace" \
+			git stash pop >.git/stash-pop &&
+		test_grep "visible" .git/stash-pop &&
+		test_write_lines temporary >.git/state.expect &&
+		test_cmp .git/state.expect state &&
+		test_trace2_data status \
+			untracked/replaced-authenticated-snapshot 1 \
+			<.git/stash-pop.trace
+	)
+'
+
 test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'builtin initial trivial response anchors a closure' '
 	test_when_finished "rm -rf builtin-initial-trivial" &&

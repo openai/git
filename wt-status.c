@@ -1731,6 +1731,18 @@ static int wt_status_collect_untracked(struct wt_status *s)
 		s, &s->untracked, &s->ignored);
 }
 
+static int wt_status_clear_authenticated_untracked(struct wt_status *s)
+{
+	if (!s->untracked_from_token_closure && !s->untracked_from_preload)
+		return 0;
+
+	string_list_clear(&s->untracked, 0);
+	string_list_clear(&s->ignored, 0);
+	s->untracked_from_token_closure = 0;
+	s->untracked_from_preload = 0;
+	return 1;
+}
+
 #define FSMONITOR_TOKEN_MAX_QUERIES 3
 
 struct wt_status_token_closure {
@@ -2273,6 +2285,11 @@ static int wt_status_close_fsmonitor_token(
 	int preserve_untracked, token_accepted = 0;
 
 	refresh_fsmonitor(istate);
+	if (require_untracked && fsmonitor_has_pending_token(istate) &&
+	    wt_status_clear_authenticated_untracked(s))
+		trace2_data_intmax(
+			"status", s->repo,
+			"untracked/replaced-authenticated-snapshot", 1);
 	preserve_untracked = !require_untracked &&
 		s->show_untracked_files == SHOW_NO_UNTRACKED_FILES &&
 		!s->show_ignored_mode && !s->pathspec.nr &&
@@ -2455,7 +2472,9 @@ static int fsmonitor_proof_repair_is_eligible(struct repository *repo)
 	const char *test_sequence =
 		getenv("GIT_TEST_FSMONITOR_QUERY_SEQUENCE");
 
-	if ((test_sequence && *test_sequence) || !fstat_is_reliable() ||
+	if ((test_sequence && *test_sequence &&
+	     !getenv("GIT_TEST_FSMONITOR_ALLOW_PROOF_REPAIR_SEQUENCE")) ||
+	    !fstat_is_reliable() ||
 	    getenv(INDEX_ENVIRONMENT) ||
 	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
 	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
@@ -2641,11 +2660,7 @@ void wt_status_invalidate_refresh(struct wt_status *s)
 	struct index_state *istate = s->repo->index;
 
 	s->tracked_from_fsmonitor = 0;
-	if (s->untracked_from_token_closure) {
-		string_list_clear(&s->untracked, 0);
-		string_list_clear(&s->ignored, 0);
-		s->untracked_from_token_closure = 0;
-	}
+	wt_status_clear_authenticated_untracked(s);
 	wt_status_release_exclude_proof(s);
 	wt_status_release_attr_snapshot(s);
 	if (!s->pathspec.nr && !istate->split_index &&
