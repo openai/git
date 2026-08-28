@@ -2521,6 +2521,64 @@ static int locked_index_entries_have_stat_data(
 	return 1;
 }
 
+static void prepare_uncertified_index_entries_for_refresh(
+	struct index_state *istate)
+{
+	const struct stat_data empty = { 0 };
+	int changed = 0;
+	size_t refreshes = 0;
+
+	/*
+	 * An owned worktree update can leave new entries process-locally
+	 * up-to-date without a provider-valid bit, or transfer provider-valid
+	 * bits to entries without stat data. A provider reset has no prior event
+	 * interval from which to report those writes. Force the repair refresh
+	 * to stat only those entries before certifying them.
+	 */
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		struct cache_entry *ce = istate->cache[i];
+		int zero_stat =
+			!memcmp(&ce->ce_stat_data, &empty, sizeof(empty));
+
+		if (!zero_stat && (ce->ce_flags & CE_FSMONITOR_VALID))
+			continue;
+		refreshes++;
+		if (zero_stat && (ce->ce_flags & CE_FSMONITOR_VALID)) {
+			changed = 1;
+			ce->ce_flags &= ~CE_FSMONITOR_VALID;
+		}
+		ce->ce_flags &= ~CE_UPTODATE;
+	}
+	if (changed)
+		istate->cache_changed |= FSMONITOR_CHANGED;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/writer-entry-refreshes", refreshes);
+}
+
+static int has_repairable_fsmonitor_proof_candidate(
+	struct repository *repo)
+{
+	struct index_state *istate = repo->index;
+
+	if (clean_status_has_current_full_fsmonitor_proof(istate))
+		return 1;
+	/*
+	 * A provider reset can arrive while the index is being read. The live
+	 * proof is then deliberately invalid, but a complete persistent proof
+	 * and its paired untracked cache remain authenticated candidates for a
+	 * full refresh. Preserve that pre-reset authority across an owned
+	 * worktree update; the repair path still revalidates every component
+	 * before publishing a new proof.
+	 */
+	return clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		clean_status_fsmonitor_semantic_baseline_pending(istate) &&
+		!clean_status_fsmonitor_strong_mismatch(istate) &&
+		!clean_status_filter_scope_needs_validation(istate) &&
+		!clean_status_manifest_global_fallback(istate) &&
+		istate->untracked && istate->untracked->root &&
+		istate->untracked->fsmonitor_revalidation;
+}
+
 int wt_status_fsmonitor_proof_needs_repair(struct repository *repo)
 {
 	struct index_state *istate = repo->index;
@@ -2597,6 +2655,19 @@ int wt_status_repair_fsmonitor_proof(struct repository *repo)
 	return repair_fsmonitor_proof(repo, NULL, 0);
 }
 
+int wt_status_prepare_fsmonitor_proof_for_worktree_update(
+	struct repository *repo)
+{
+	if (!has_repairable_fsmonitor_proof_candidate(repo))
+		return 0;
+	if (clean_status_has_current_full_fsmonitor_proof(repo->index))
+		return 1;
+	if (!wt_status_fsmonitor_proof_needs_repair(repo) ||
+	    !wt_status_repair_fsmonitor_proof(repo))
+		return 0;
+	return clean_status_has_current_full_fsmonitor_proof(repo->index);
+}
+
 int wt_status_repair_fsmonitor_proof_at_path(
 	struct repository *repo, const char *index_path)
 {
@@ -2623,6 +2694,7 @@ static int repair_fsmonitor_proof_after_update(
 
 	/* Consume paths written by this process before publishing its index. */
 	fsmonitor_refresh_after_worktree_update(repo->index);
+	prepare_uncertified_index_entries_for_refresh(repo->index);
 	if (write_locked_index(repo->index, lock, PROVISIONAL_LOCK))
 		return -1;
 	proof_index_path = get_lock_file_path(lock);

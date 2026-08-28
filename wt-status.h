@@ -192,6 +192,8 @@ int wt_status_refresh_index(struct wt_status *s,
 int wt_status_repair_fsmonitor_proof(struct repository *repo);
 int wt_status_repair_fsmonitor_proof_at_path(
 	struct repository *repo, const char *index_path);
+int wt_status_prepare_fsmonitor_proof_for_worktree_update(
+	struct repository *repo);
 int wt_status_fsmonitor_proof_needs_repair(struct repository *repo);
 int wt_status_repair_fsmonitor_proof_after_worktree_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof);

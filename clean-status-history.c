@@ -2186,10 +2186,14 @@ static int transfer_current_proof_if_semantically_same_index(
 	if (manifest_refresh_required)
 		*manifest_refresh_required = 0;
 
+	/*
+	 * Clearing resolve-undo changes only its optional index extension.
+	 * A live resolve-undo map is still rejected below, but its removal does
+	 * not change tracked entries or the worktree state certified here.
+	 */
 	if (!current_proof_is_writable(src) ||
 	    src->repo != dst->repo || src->split_index || dst->split_index ||
 	    src->sparse_index || dst->sparse_index ||
-	    (src->cache_changed & RESOLVE_UNDO_CHANGED) ||
 	    src->resolve_undo ||
 	    !src->fsmonitor_last_update || !dst->fsmonitor_last_update ||
 	    strcmp(src->fsmonitor_last_update, dst->fsmonitor_last_update))

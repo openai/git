@@ -3690,6 +3690,179 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'no-ff merges repair proof after provider reset' '
+	test_when_finished "rm -rf merge-proof-* merge-proof-linked-*" &&
+	for mode in ort ort-resolve-undo multistrategy-decline \
+		multistrategy-conflict \
+		resolve-trivial resolve-content
+	do
+		case "$mode" in
+		ort)
+			set -- -s ort &&
+			expect_refreshes=1 &&
+			merge_queries=TCCCCCCCCCCCCCCCCCCCCCCCC
+			;;
+		ort-resolve-undo)
+			set -- -s ort &&
+			expect_refreshes=1 &&
+			merge_queries=CCCCCCCCCCCCCCCCCCCCCCCC
+			;;
+		multistrategy-decline)
+			set -- -s decline -s ort &&
+			expect_refreshes=1 &&
+			merge_queries=TCCCCCCCCCCCCCCCCCCCCCCCC
+			;;
+		multistrategy-conflict)
+			set -- -s pollute -s ort &&
+			expect_refreshes=1 &&
+			merge_queries=TCCCCCCCCCCCCCCCCCCCCCCCC
+			;;
+		resolve-trivial)
+			set -- -s resolve &&
+			expect_refreshes=1 &&
+			merge_queries=TCCCCCCCCCCCCCCCCCCCCCCCC
+			;;
+		resolve-content)
+			set -- -s resolve &&
+			expect_refreshes=4 &&
+			merge_queries=TCCCCCCCCCCCCCCCCCCCCCCCC
+			;;
+		esac &&
+		test_create_repo "merge-proof-$mode" &&
+		(
+			cd "merge-proof-$mode" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			mkdir -p .qualification &&
+			test_write_lines one two three >tracked &&
+			test_write_lines resolved >resolved &&
+			test_write_lines ready >.qualification/workflow-state &&
+			git -c core.fsmonitor=false add . &&
+			git -c core.fsmonitor=false commit -qm base &&
+			git branch review &&
+			git -c core.fsmonitor=false worktree add --quiet \
+				"../merge-proof-linked-$mode" review &&
+			if test "$mode" = resolve-content
+			then
+				test_write_lines main two three >tracked &&
+				git -c core.fsmonitor=false add tracked &&
+				git -c core.fsmonitor=false commit -qm main &&
+				test_write_lines one two review \
+					>"../merge-proof-linked-$mode/tracked"
+			fi &&
+			test_write_lines reviewed \
+				>"../merge-proof-linked-$mode/.qualification/review-attestation" &&
+			git -C "../merge-proof-linked-$mode" \
+				-c core.fsmonitor=false add \
+				.qualification/review-attestation tracked &&
+			git -C "../merge-proof-linked-$mode" \
+				-c core.fsmonitor=false \
+				commit -qm review &&
+			git config feature.manyFiles true &&
+			git config index.version 4 &&
+			git config core.untrackedCache true &&
+			git config core.fsmonitor true &&
+			if test "$mode" = ort-resolve-undo
+			then
+				base_oid=$(git rev-parse HEAD:resolved) &&
+				ours_oid=$(printf "%s\n" ours |
+					git hash-object -w --stdin) &&
+				theirs_oid=$(printf "%s\n" theirs |
+					git hash-object -w --stdin) &&
+				git update-index --force-remove resolved &&
+				{
+					printf "100644 %s 1\tresolved\n" "$base_oid" &&
+					printf "100644 %s 2\tresolved\n" "$ours_oid" &&
+					printf "100644 %s 3\tresolved\n" "$theirs_oid"
+				} | git update-index --index-info &&
+				test_write_lines resolved >resolved &&
+				git add resolved &&
+				git ls-files --resolve-undo >resolve-undo &&
+				test_file_not_empty resolve-undo &&
+				rm resolve-undo
+			else
+				:
+			fi &&
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+				git update-index --fsmonitor &&
+			gitdir=$(git rev-parse --absolute-git-dir) &&
+			if test "$mode" = multistrategy-decline
+			then
+				mkdir -p "$gitdir/test-bin" &&
+				write_script "$gitdir/test-bin/git-merge-decline" <<-\EOF
+				exit 2
+				EOF
+			elif test "$mode" = multistrategy-conflict
+			then
+				mkdir -p "$gitdir/test-bin" &&
+				write_script "$gitdir/test-bin/git-merge-pollute" <<-\EOF
+				base_oid=$(git rev-parse HEAD:tracked)
+				ours_oid=$(printf "%s\n" polluted-ours | git hash-object -w --stdin)
+				theirs_oid=$(printf "%s\n" polluted-theirs | git hash-object -w --stdin)
+				git update-index --force-remove tracked
+				{
+					printf "100644 %s 1\ttracked\n" "$base_oid"
+					printf "100644 %s 2\ttracked\n" "$ours_oid"
+					printf "100644 %s 3\ttracked\n" "$theirs_oid"
+				} | git update-index --index-info
+				printf "%s\n" "<<<<<<< ours" polluted-ours ======= \
+					polluted-theirs ">>>>>>> theirs" >tracked
+				exit 1
+				EOF
+			else
+				:
+			fi &&
+			for pass in first second third
+			do
+				GIT_INDEX_FILE="$gitdir/index" \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					git status --porcelain=v2 >"$gitdir/prime-$pass" &&
+				test_must_be_empty "$gitdir/prime-$pass" || return 1
+			done &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			GIT_TEST_FSMONITOR_ALLOW_PROOF_REPAIR_SEQUENCE=1 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE="$merge_queries" \
+			GIT_TRACE2_EVENT="$gitdir/merge.trace" \
+			PATH="$gitdir/test-bin:$PATH" \
+				git merge --no-ff "$@" -m merge review &&
+			git ls-files --resolve-undo >"$gitdir/resolve-undo-after" &&
+			test_must_be_empty "$gitdir/resolve-undo-after" &&
+			if test "$mode" != ort-resolve-undo
+			then
+				test_trace2_data fsm_client query/trivial-response 1 \
+					<"$gitdir/merge.trace"
+			else
+				:
+			fi &&
+			test_trace2_data fsmonitor history/writer-proof-repaired 1 \
+				<"$gitdir/merge.trace" &&
+			! test_trace2_data fsmonitor history/writer-proof-repaired 0 \
+				<"$gitdir/merge.trace" &&
+			test_trace2_data fsmonitor history/writer-entry-refreshes \
+				"$expect_refreshes" <"$gitdir/merge.trace" &&
+			test_fsmonitor_full_proof "$gitdir/index" paired &&
+			cp "$gitdir/index" "$gitdir/merge.before" &&
+			for pass in first second
+			do
+				GIT_INDEX_FILE="$gitdir/index" \
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+					GIT_TRACE2_EVENT="$gitdir/status-$pass.trace" \
+					git status --porcelain=v2 \
+						>"$gitdir/status-$pass" &&
+				test_must_be_empty "$gitdir/status-$pass" &&
+				test_cmp_bin "$gitdir/merge.before" "$gitdir/index" &&
+				test_trace2_data fsmonitor config/coherent 1 \
+					<"$gitdir/status-$pass.trace" &&
+				! test_trace2_data fsmonitor untracked/proof-missing 1 \
+					<"$gitdir/status-$pass.trace" &&
+				! test_region index do_write_index \
+					"$gitdir/status-$pass.trace" || return 1
+			done
+		) || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'clean sequencer operations preserve authenticated worktree proofs' '
 	test_when_finished "rm -rf sequencer-proof sequencer-linked" &&
 	test_create_repo sequencer-proof &&
