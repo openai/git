@@ -3535,7 +3535,14 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	f = hashfd(the_repository->hash_algo, tempfile->fd, tempfile->filename.buf);
 
 	prepare_repo_settings(r);
-	f->skip_hash = r->settings.index_skip_hash;
+	/*
+	 * A provisional lock is a proof witness for the current in-memory
+	 * index.  Its fresh file identity cannot authenticate a null trailer,
+	 * so give only that witness a checksum.  The final index write still
+	 * honors index.skipHash.
+	 */
+	f->skip_hash = r->settings.index_skip_hash &&
+		!(flags & PROVISIONAL_LOCK);
 
 	for (i = removed = extended = 0; i < entries; i++) {
 		if (cache[i]->ce_flags & CE_REMOVE)

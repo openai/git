@@ -5933,7 +5933,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS,!MINGW \
-	'completed native replay retains a full proof' '
+	'completed native replay retains a full proof with skip-hash index' '
 	for mode in plain lfs
 	do
 		for location in primary linked
@@ -5970,6 +5970,9 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 				git add conflict &&
 				git commit -qm upstream &&
 				git switch -qc topic "$base" &&
+				test_write_lines prefix >prefix &&
+				git add prefix &&
+				git commit -qm prefix &&
 				test_write_lines topic >conflict &&
 				git add conflict &&
 				git commit -qm topic &&
@@ -5978,6 +5981,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 				git config core.checkStat default &&
 				git config core.untrackedCache true &&
 				git config core.fsmonitor true &&
+				git config index.skipHash true &&
 				git config core.preloadIndex true &&
 				git config core.preloadIndexBulk true &&
 				if test "$mode" = lfs
@@ -6044,6 +6048,11 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 						test_must_fail git cherry-pick "$topic"
 						;;
 					esac &&
+					if test "$replay" != cherry-pick
+					then
+						test_path_is_file prefix &&
+						test "$(git log -1 --format=%s)" = prefix
+					fi &&
 					test -n "$(git ls-files -u)" &&
 					test_grep ! FSUC "$index" &&
 					test_write_lines resolved >conflict &&
@@ -6060,16 +6069,24 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 						<"$artifact.add.trace" &&
 					if test "$replay" = cherry-pick
 					then
-						GIT_EDITOR=true git cherry-pick --continue
+						GIT_TRACE2_EVENT="$artifact.continue.trace" \
+							GIT_EDITOR=true git cherry-pick --continue
 					else
-						GIT_EDITOR=true git rebase --continue
+						GIT_TRACE2_EVENT="$artifact.continue.trace" \
+							GIT_EDITOR=true git rebase --continue
 					fi &&
 					if test "$replay" = cherry-pick
 					then
 						native_tracked_full_proof "$index" &&
 						test_grep ! FSUC "$index"
 					else
-						native_stash_full_proof "$index"
+						native_stash_full_proof "$index" &&
+						test_trace2_data fsmonitor \
+							history/writer-proof-repaired 1 \
+							<"$artifact.continue.trace" &&
+						! test_trace2_data fsmonitor \
+							history/writer-proof-repaired 0 \
+							<"$artifact.continue.trace"
 					fi &&
 					cp "$index" "$artifact.index.before" &&
 					GIT_OPTIONAL_LOCKS=0 \

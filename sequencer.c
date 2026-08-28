@@ -434,6 +434,11 @@ int sequencer_remove_state(struct replay_opts *opts)
 	int ret = 0;
 
 	if (is_rebase_i(opts) &&
+	    refs_delete_ref(get_main_ref_store(the_repository), NULL,
+			    "REBASE_HEAD", NULL, REF_NO_DEREF))
+		ret = -1;
+
+	if (is_rebase_i(opts) &&
 	    strbuf_read_file(&buf, rebase_path_refs_to_delete(), 0) > 0) {
 		char *p = buf.buf;
 		while (*p) {
