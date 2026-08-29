@@ -1517,6 +1517,51 @@ test_expect_success 'packfile-uri with transfer.fsckobjects fails when .gitmodul
 	test_grep "disallowed submodule name" err
 '
 
+test_expect_success 'parallel packfile URIs defer valid .gitattributes fsck' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child &&
+
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	git -C "$P" config uploadpack.allowNoRefDelta true &&
+
+	echo "*.txt text" >"$P/.gitattributes" &&
+	echo other >"$P/other" &&
+	git -C "$P" add .gitattributes other &&
+	git -C "$P" commit -m x &&
+	configure_exclusion "$P" .gitattributes >/dev/null &&
+	configure_exclusion "$P" other >/dev/null &&
+
+	sane_unset GIT_TEST_SIDEBAND_ALL &&
+	git -c protocol.version=2 -c transfer.fsckobjects=1 \
+		-c fetch.uriprotocols=http,https \
+		-c fetch.packfileUriJobs=2 \
+		clone "$HTTPD_URL/smart/http_parent" http_child
+'
+
+test_expect_success 'parallel packfile URIs reject invalid .gitattributes' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child err &&
+
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	git -C "$P" config uploadpack.allowNoRefDelta true &&
+
+	printf "pattern %02048d" 1 >"$P/.gitattributes" &&
+	echo other >"$P/other" &&
+	git -C "$P" add .gitattributes other &&
+	git -C "$P" commit -m x &&
+	configure_exclusion "$P" .gitattributes >/dev/null &&
+	configure_exclusion "$P" other >/dev/null &&
+
+	sane_unset GIT_TEST_SIDEBAND_ALL &&
+	test_must_fail git -c protocol.version=2 -c transfer.fsckobjects=1 \
+		-c fetch.uriprotocols=http,https \
+		-c fetch.packfileUriJobs=2 \
+		clone "$HTTPD_URL/smart/http_parent" http_child 2>err &&
+	test_grep "gitattributes has too long lines" err
+'
+
 test_expect_success 'packfile-uri path redacted in trace' '
 	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
 	rm -rf "$P" http_child log &&

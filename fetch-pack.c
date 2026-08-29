@@ -923,24 +923,29 @@ static void create_promisor_file(const char *keep_name,
 	strbuf_release(&promisor_name);
 }
 
-static void parse_gitmodules_oids(int fd, struct oidset *gitmodules_oids)
+static void parse_deferred_fsck_oids(int fd, struct fsck_options *options)
 {
-	int len = the_hash_algo->hexsz + 1; /* hash + NL */
+	struct strbuf line = STRBUF_INIT;
 
-	do {
-		char hex_hash[GIT_MAX_HEXSZ + 1];
-		int read_len = read_in_full(fd, hex_hash, len);
+	while (1) {
 		struct object_id oid;
-		const char *end;
+		const char *end, *hex;
+		struct oidset *found = &options->gitmodules_found;
+		int ret = strbuf_getwholeline_fd(&line, fd, '\n');
 
-		if (!read_len)
-			return;
-		if (read_len != len)
-			die("invalid length read %d", read_len);
-		if (parse_oid_hex(hex_hash, &oid, &end) || *end != '\n')
+		if (ret == EOF) {
+			if (!line.len)
+				break;
+			die("invalid fsck object ID");
+		}
+		hex = line.buf;
+		if (skip_prefix(hex, "gitattributes ", &hex))
+			found = &options->gitattributes_found;
+		if (parse_oid_hex(hex, &oid, &end) || *end != '\n')
 			die("invalid hash");
-		oidset_insert(gitmodules_oids, &oid);
-	} while (1);
+		oidset_insert(found, &oid);
+	}
+	strbuf_release(&line);
 }
 
 static void add_index_pack_keep_option(struct strvec *args)
@@ -963,7 +968,7 @@ static int get_pack(struct fetch_pack_args *args,
 		    struct strvec *index_pack_args,
 		    int no_ref_delta,
 		    struct ref **sought, int nr_sought,
-		    struct oidset *gitmodules_oids)
+		    struct fsck_options *fsck_options)
 {
 	struct async demux;
 	int do_keep = args->keep_pack;
@@ -1091,7 +1096,7 @@ static int get_pack(struct fetch_pack_args *args,
 			string_list_append_nodup(pack_lockfiles, pack_lockfile);
 		else
 			free(pack_lockfile);
-		parse_gitmodules_oids(cmd.out, gitmodules_oids);
+		parse_deferred_fsck_oids(cmd.out, fsck_options);
 		close(cmd.out);
 	}
 
@@ -1269,9 +1274,10 @@ static struct ref *do_fetch_pack(struct fetch_pack_args *args,
 	} else
 		alternate_shallow_file = NULL;
 
-	fsck_options_init(&fsck_options, the_repository, FSCK_OPTIONS_MISSING_GITMODULES);
+	fsck_options_init(&fsck_options, the_repository,
+			  FSCK_OPTIONS_MISSING_GITMODULES_AND_GITATTRIBUTES);
 	if (get_pack(args, fd, pack_lockfiles, NULL, 0, sought, nr_sought,
-		     &fsck_options.gitmodules_found))
+		     &fsck_options))
 		die(_("git fetch-pack: fetch failed."));
 	if (fsck_finish(&fsck_options))
 		die("fsck failed");
@@ -1743,7 +1749,7 @@ static void start_packfile_uri_task(
 }
 
 static void finish_packfile_uri_task(struct packfile_uri_task *task,
-				     struct oidset *gitmodules_oids)
+				     struct fsck_options *fsck_options)
 {
 	char packhash[GIT_MAX_HEXSZ + 1];
 	struct object_id oid;
@@ -1759,7 +1765,7 @@ static void finish_packfile_uri_task(struct packfile_uri_task *task,
 	if (get_oid_hex(packhash, &oid))
 		die("fetch-pack: expected hash then LF in http-fetch output");
 
-	parse_gitmodules_oids(task->cmd.out, gitmodules_oids);
+	parse_deferred_fsck_oids(task->cmd.out, fsck_options);
 	close(task->cmd.out);
 	task->cmd.out = -1;
 
@@ -1772,7 +1778,7 @@ static void finish_packfile_uri_task(struct packfile_uri_task *task,
 
 static void fetch_packfile_uris_parallel(
 	struct string_list *uris, struct strvec *index_pack_args,
-	struct string_list *pack_lockfiles, struct oidset *gitmodules_oids)
+	struct string_list *pack_lockfiles, struct fsck_options *fsck_options)
 {
 	size_t task_nr = uris->nr;
 	struct packfile_uri_task *tasks;
@@ -1813,7 +1819,7 @@ static void fetch_packfile_uris_parallel(
 		if (ready == task_nr)
 			BUG("poll returned without a ready http-fetch");
 
-		finish_packfile_uri_task(&tasks[ready], gitmodules_oids);
+		finish_packfile_uri_task(&tasks[ready], fsck_options);
 		if (next < uris->nr) {
 			start_packfile_uri_task(&tasks[ready],
 						uris->items[next].string,
@@ -1872,7 +1878,8 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 	struct strvec index_pack_args = STRVEC_INIT;
 	const char *promisor_remote_config;
 
-	fsck_options_init(&fsck_options, the_repository, FSCK_OPTIONS_MISSING_GITMODULES);
+	fsck_options_init(&fsck_options, the_repository,
+			  FSCK_OPTIONS_MISSING_GITMODULES_AND_GITATTRIBUTES);
 
 	if (server_feature_v2("promisor-remote", &promisor_remote_config))
 		promisor_remote_reply(promisor_remote_config, NULL);
@@ -2020,7 +2027,7 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 			if (get_pack(args, fd, pack_lockfiles,
 				     packfile_uris.nr ? &index_pack_args : NULL,
 				     no_ref_delta,
-				     sought, nr_sought, &fsck_options.gitmodules_found))
+				     sought, nr_sought, &fsck_options))
 				die(_("git fetch-pack: fetch failed."));
 			do_check_stateless_delimiter(args->stateless_rpc, &reader);
 
@@ -2044,7 +2051,7 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 		strvec_push(&index_pack_args, "--threads=1");
 		fetch_packfile_uris_parallel(&packfile_uris, &index_pack_args,
 					    pack_lockfiles,
-					    &fsck_options.gitmodules_found);
+					    &fsck_options);
 		goto packfile_uris_done;
 	}
 
@@ -2081,7 +2088,7 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 			die("fetch-pack: expected hash then LF in http-fetch output");
 		packhash[the_hash_algo->hexsz] = '\0';
 
-		parse_gitmodules_oids(cmd.out, &fsck_options.gitmodules_found);
+		parse_deferred_fsck_oids(cmd.out, &fsck_options);
 
 		close(cmd.out);
 
