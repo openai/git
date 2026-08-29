@@ -4545,6 +4545,220 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider delta loads a previously unused tracked exclude' '
+	test_when_finished "rm -rf builtin-delta-ignored" &&
+	test_create_repo builtin-delta-ignored &&
+	(
+		cd builtin-delta-ignored &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines ignored >cached/.gitignore &&
+		test_write_lines tracked >cached/tracked &&
+		git add cached/.gitignore cached/tracked &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config status.showUntrackedFiles all &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 --untracked-files=all \
+				>.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_write_lines generated >cached/ignored &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 --untracked-files=all \
+				>.git/expect &&
+		test_must_be_empty .git/expect &&
+		for pass in first second
+		do
+			cp .git/index ".git/$pass.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=cached/ignored \
+			GIT_TRACE2_EVENT="$PWD/.git/$pass.trace" \
+				git status --porcelain=v2 --untracked-files=all \
+					>".git/$pass.actual" &&
+			test_cmp .git/expect ".git/$pass.actual" &&
+			test_cmp_bin ".git/$pass.index" .git/index &&
+			test_trace2_data fsmonitor untracked/targeted-refresh 1 \
+				<".git/$pass.trace" &&
+			# The provider path and its newly needed exclude source. \
+			test_trace2_data read_directory paths-visited 2 \
+				<".git/$pass.trace" &&
+			test_trace2_data read_directory opendir 0 \
+				<".git/$pass.trace" &&
+			test_trace2_data read_directory gitignore-invalidation 0 \
+				<".git/$pass.trace" &&
+			! test_region index do_write_index ".git/$pass.trace" ||
+				return 1
+		done
+	)
+'
+
+test_expect_success CASE_INSENSITIVE_FS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'provider delta loads a case-folded tracked exclude' '
+	test_when_finished "rm -rf builtin-delta-ignored-icase" &&
+	test_create_repo builtin-delta-ignored-icase &&
+	(
+		cd builtin-delta-ignored-icase &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir cached &&
+		test_write_lines ignored >cached/.GitIgnore &&
+		test_write_lines tracked >cached/tracked &&
+		git add cached/.GitIgnore cached/tracked &&
+		git commit -m base &&
+		git config core.ignoreCase true &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		git config status.showUntrackedFiles all &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_INDEX_FILE="$PWD/.git/index" \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+			git status --porcelain=v2 --untracked-files=all \
+				>.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_write_lines generated >cached/ignored &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 --untracked-files=all \
+				>.git/expect &&
+		test_must_be_empty .git/expect &&
+		for pass in first second
+		do
+			cp .git/index ".git/$pass.index" &&
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+			GIT_TEST_FSMONITOR_QUERY_PATH=cached/ignored \
+			GIT_TRACE2_EVENT="$PWD/.git/$pass.trace" \
+				git status --porcelain=v2 --untracked-files=all \
+					>".git/$pass.actual" &&
+			test_cmp .git/expect ".git/$pass.actual" &&
+			test_cmp_bin ".git/$pass.index" .git/index &&
+			test_trace2_data fsmonitor untracked/targeted-refresh 1 \
+				<".git/$pass.trace" &&
+			test_trace2_data read_directory paths-visited 2 \
+				<".git/$pass.trace" &&
+			test_trace2_data read_directory opendir 0 \
+				<".git/$pass.trace" &&
+			test_trace2_data read_directory gitignore-invalidation 0 \
+				<".git/$pass.trace" &&
+			! test_region index do_write_index ".git/$pass.trace" ||
+				return 1
+		done &&
+		mtime=$(test-tool chmtime --get cached/.GitIgnore) &&
+		test_write_lines visible >cached/.GitIgnore &&
+		test-tool chmtime =$mtime cached/.GitIgnore &&
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 --untracked-files=all \
+				>.git/changed.expect &&
+		cp .git/index .git/changed.index &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=cached/ \
+		GIT_TRACE2_EVENT="$PWD/.git/changed.trace" \
+			git status --porcelain=v2 --untracked-files=all \
+				>.git/changed.actual &&
+		test_cmp .git/changed.expect .git/changed.actual &&
+		test_cmp_bin .git/changed.index .git/index &&
+		test_trace2_data read_directory gitignore-invalidation 1 \
+			<.git/changed.trace &&
+		! test_region index do_write_index .git/changed.trace
+	)
+'
+
+test_expect_success CASE_INSENSITIVE_FS,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'case-folded excludes preserve sparse-index fallback boundaries' '
+	test_when_finished "rm -rf sparse-casefold-source sparse-casefold" &&
+	test_create_repo sparse-casefold-source &&
+	(
+		cd sparse-casefold-source &&
+		mkdir -p in/cached out/cached &&
+		test_write_lines ignored >in/cached/.GitIgnore &&
+		test_write_lines inside >in/cached/tracked &&
+		test_write_lines ignored >out/cached/.GitIgnore &&
+		test_write_lines outside >out/cached/tracked &&
+		git add . &&
+		git commit -m base
+	) &&
+	git clone --quiet --sparse sparse-casefold-source sparse-casefold &&
+	git -C sparse-casefold sparse-checkout init --cone --sparse-index &&
+	git -C sparse-casefold sparse-checkout set in &&
+	git -C sparse-casefold config core.ignoreCase true &&
+	git -C sparse-casefold config core.untrackedCache true &&
+	git -C sparse-casefold config core.fsmonitor true &&
+	git -C sparse-casefold config status.showUntrackedFiles all &&
+	git -C sparse-casefold config advice.sparseIndexExpanded false &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		git -C sparse-casefold update-index --fsmonitor &&
+	GIT_INDEX_FILE="$PWD/sparse-casefold/.git/index" \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCC \
+		git -C sparse-casefold status --porcelain=v2 \
+			--untracked-files=all >sparse-casefold/.git/prime &&
+	test_must_be_empty sparse-casefold/.git/prime &&
+	git -C sparse-casefold ls-files --sparse -t \
+		>sparse-casefold/.git/sparse-index &&
+	test_grep "^S out/$" sparse-casefold/.git/sparse-index &&
+	test_write_lines generated >sparse-casefold/in/cached/ignored &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -C sparse-casefold -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			--untracked-files=all >sparse-casefold/.git/in.expect &&
+	test_must_be_empty sparse-casefold/.git/in.expect &&
+	cp sparse-casefold/.git/index sparse-casefold/.git/in.index &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+	GIT_TEST_FSMONITOR_QUERY_PATH=in/cached/ignored \
+	GIT_TRACE2_EVENT="$PWD/sparse-casefold/.git/in.trace" \
+		git -C sparse-casefold status --porcelain=v2 \
+			--untracked-files=all >sparse-casefold/.git/in.actual &&
+	test_cmp sparse-casefold/.git/in.expect \
+		sparse-casefold/.git/in.actual &&
+	test_cmp_bin sparse-casefold/.git/in.index \
+		sparse-casefold/.git/index &&
+	test_trace2_data fsmonitor untracked/targeted-refresh 1 \
+		<sparse-casefold/.git/in.trace &&
+	test_trace2_data read_directory paths-visited 3 \
+		<sparse-casefold/.git/in.trace &&
+	test_trace2_data read_directory opendir 0 \
+		<sparse-casefold/.git/in.trace &&
+	test_trace2_data read_directory gitignore-invalidation 0 \
+		<sparse-casefold/.git/in.trace &&
+	! test_region index ensure_full_index \
+		sparse-casefold/.git/in.trace &&
+	! test_region index do_write_index sparse-casefold/.git/in.trace &&
+	mkdir -p sparse-casefold/out/cached &&
+	git -C sparse-casefold show HEAD:out/cached/.GitIgnore \
+		>sparse-casefold/out/cached/.GitIgnore &&
+	test_write_lines generated >sparse-casefold/out/cached/ignored &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -C sparse-casefold -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			--untracked-files=all >sparse-casefold/.git/out.expect &&
+	test_must_be_empty sparse-casefold/.git/out.expect &&
+	cp sparse-casefold/.git/index sparse-casefold/.git/out.index &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCC \
+	GIT_TEST_FSMONITOR_QUERY_PATH=out/cached/ignored \
+	GIT_TRACE2_EVENT="$PWD/sparse-casefold/.git/out.trace" \
+		git -C sparse-casefold status --porcelain=v2 \
+			--untracked-files=all >sparse-casefold/.git/out.actual &&
+	test_cmp sparse-casefold/.git/out.expect \
+		sparse-casefold/.git/out.actual &&
+	test_cmp_bin sparse-casefold/.git/out.index \
+		sparse-casefold/.git/index &&
+	! test_trace2_data fsmonitor untracked/targeted-refresh 1 \
+		<sparse-casefold/.git/out.trace &&
+	# A vivified outside-cone source takes the existing fallback. \
+	test_region index ensure_full_index sparse-casefold/.git/out.trace &&
+	! test_region index do_write_index sparse-casefold/.git/out.trace
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'global provider invalidation never preserves untracked snapshots' '
 	test_when_finished "rm -rf builtin-reset-global" &&
 	test_create_repo builtin-reset-global &&
