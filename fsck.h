@@ -145,11 +145,10 @@ int fsck_objects_error_function(struct fsck_options *o,
 				void *fsck_report,
 				enum fsck_msg_type msg_type, enum fsck_msg_id msg_id,
 				const char *message);
-int fsck_objects_error_cb_print_missing_gitmodules(struct fsck_options *o,
-						   void *fsck_report,
-						   enum fsck_msg_type msg_type,
-						   enum fsck_msg_id msg_id,
-						   const char *message);
+int fsck_objects_error_cb_print_missing_gitmodules_and_gitattributes(
+	struct fsck_options *o, void *fsck_report,
+	enum fsck_msg_type msg_type, enum fsck_msg_id msg_id,
+	const char *message);
 
 int fsck_refs_error_function(struct fsck_options *options,
 			     void *fsck_report,
@@ -233,7 +232,7 @@ bool fsck_has_queued_checks(struct fsck_options *options);
 enum fsck_options_type {
 	FSCK_OPTIONS_DEFAULT,
 	FSCK_OPTIONS_STRICT,
-	FSCK_OPTIONS_MISSING_GITMODULES,
+	FSCK_OPTIONS_MISSING_GITMODULES_AND_GITATTRIBUTES,
 	FSCK_OPTIONS_REFS,
 };
 

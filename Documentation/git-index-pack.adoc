@@ -107,9 +107,11 @@ default and "Indexing objects" when `--stdin` is specified.
 --fsck-objects[=<msg-id>=<severity>...]::
 	Die if the pack contains broken objects, but unlike `--strict`, don't
 	choke on broken links. If the pack contains a tree pointing to a
-	.gitmodules blob that does not exist, prints the hash of that blob
-	(for the caller to check) after the hash that goes into the name of the
-	pack/idx file (see "Notes").
+	.gitmodules or .gitattributes blob that does not exist, prints a record
+	for that blob (for the caller to check) after the hash that goes into
+	the name of the pack/idx file (see "Notes"). The record for a
+	.gitmodules blob is its hash. The record for a .gitattributes blob is
+	`gitattributes` followed by a space and its hash.
 +
 An optional comma-separated list of `<msg-id>=<severity>` can be passed to
 change the severity of some possible issues, e.g.,

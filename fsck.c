@@ -1399,13 +1399,14 @@ void fsck_options_init(struct fsck_options *options,
 			.gitattributes_done = OIDSET_INIT,
 			.error_func = fsck_objects_error_function,
 		},
-		[FSCK_OPTIONS_MISSING_GITMODULES] = {
+		[FSCK_OPTIONS_MISSING_GITMODULES_AND_GITATTRIBUTES] = {
 			.strict = 1,
 			.gitmodules_found = OIDSET_INIT,
 			.gitmodules_done = OIDSET_INIT,
 			.gitattributes_found = OIDSET_INIT,
 			.gitattributes_done = OIDSET_INIT,
-			.error_func = fsck_objects_error_cb_print_missing_gitmodules,
+			.error_func =
+				fsck_objects_error_cb_print_missing_gitmodules_and_gitattributes,
 		},
 		[FSCK_OPTIONS_REFS] = {
 			.error_func = fsck_refs_error_function,
@@ -1415,7 +1416,7 @@ void fsck_options_init(struct fsck_options *options,
 	switch (type) {
 	case FSCK_OPTIONS_DEFAULT:
 	case FSCK_OPTIONS_STRICT:
-	case FSCK_OPTIONS_MISSING_GITMODULES:
+	case FSCK_OPTIONS_MISSING_GITMODULES_AND_GITATTRIBUTES:
 	case FSCK_OPTIONS_REFS:
 		memcpy(options, &defaults[type], sizeof(*options));
 		break;
@@ -1472,15 +1473,19 @@ int git_fsck_config(const char *var, const char *value,
  * Custom error callbacks that are used in more than one place.
  */
 
-int fsck_objects_error_cb_print_missing_gitmodules(struct fsck_options *o,
-						   void *fsck_report,
-						   enum fsck_msg_type msg_type,
-						   enum fsck_msg_id msg_id,
-						   const char *message)
+int fsck_objects_error_cb_print_missing_gitmodules_and_gitattributes(
+	struct fsck_options *o, void *fsck_report,
+	enum fsck_msg_type msg_type, enum fsck_msg_id msg_id,
+	const char *message)
 {
+	struct fsck_object_report *report = fsck_report;
+
 	if (msg_id == FSCK_MSG_GITMODULES_MISSING) {
-		struct fsck_object_report *report = fsck_report;
 		puts(oid_to_hex(report->oid));
+		return 0;
+	}
+	if (msg_id == FSCK_MSG_GITATTRIBUTES_MISSING) {
+		printf("gitattributes %s\n", oid_to_hex(report->oid));
 		return 0;
 	}
 	return fsck_objects_error_function(o, fsck_report,
