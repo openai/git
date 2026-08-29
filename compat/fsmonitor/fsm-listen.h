@@ -52,7 +52,7 @@ enum fsm_listen_flush_result {
 enum fsm_listen_flush_result fsm_listen__flush_sync(
 	struct fsmonitor_daemon_state *state);
 
-/* True when a provider fence cannot be joined safely during teardown. */
+/* True when provider-fence failure requires fail-stop IPC teardown. */
 int fsm_listen__flush_failed(struct fsmonitor_daemon_state *state);
 #endif
 

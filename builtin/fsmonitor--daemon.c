@@ -1637,11 +1637,10 @@ cleanup:
 
 #ifdef __APPLE__
 	/*
-	 * FlushSync has no cancellation API.  If its bounded client wait
-	 * expired, the client received a conservative response and stopped
-	 * the IPC pool.  Fail-stop before stream teardown can race the
-	 * provider worker.  Leave the socket pathname alone: a replacement
-	 * daemon may already own it, and normal startup can steal a stale
+	 * If the bounded provider-fence wait expired, the client received a
+	 * conservative response and stopped the IPC pool.  Fail-stop rather
+	 * than running normal IPC cleanup: a replacement daemon may already
+	 * own the socket pathname.  Normal startup can steal a stale,
 	 * non-listening pathname after this process exits.
 	 */
 	if (fsm_listen__flush_failed(state)) {
@@ -1658,10 +1657,9 @@ cleanup:
 		fsm_listen__stop_async(state);
 #ifdef __APPLE__
 		/*
-		 * Normal shutdown can race a provider fence which started after
-		 * the first check above.  Do not join or tear down an uncancellable
-		 * FlushSync worker; the client has already received a conservative
-		 * response or the IPC pool has otherwise stopped accepting work.
+		 * Normal shutdown can cancel a provider fence which started after
+		 * the first check above.  Preserve the same fail-stop IPC teardown
+		 * so a replacement daemon cannot lose its socket pathname.
 		 */
 		if (fsm_listen__flush_failed(state)) {
 			_exit(1);
