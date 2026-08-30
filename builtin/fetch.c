@@ -21,6 +21,7 @@
 #include "string-list.h"
 #include "remote.h"
 #include "transport.h"
+#include "tempfile.h"
 #include "run-command.h"
 #include "parse-options.h"
 #include "sigchain.h"
@@ -2491,6 +2492,11 @@ static int fetch_one(struct remote *remote, int argc, const char **argv,
 	if (server_options.nr)
 		gtransport->server_options = &server_options;
 
+	/*
+	 * Initialize tempfile cleanup before ignoring SIGPIPE, so creating
+	 * temporary files cannot override SIG_IGN.
+	 */
+	tempfile_init();
 	sigchain_push_common(unlock_pack_on_signal);
 	atexit(unlock_pack_atexit);
 	sigchain_push(SIGPIPE, SIG_IGN);

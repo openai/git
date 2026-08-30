@@ -87,6 +87,13 @@ struct tempfile {
 };
 
 /*
+ * Initialize the tempfile API's signal and exit handlers. This is called
+ * automatically when the first tempfile becomes active, but callers can
+ * invoke it earlier to control the ordering of signal handlers.
+ */
+void tempfile_init(void);
+
+/*
  * Attempt to create a temporary file at the specified `path`. Return
  * a tempfile (whose "fd" member can be used for writing to it), or
  * NULL on error. It is an error if a file already exists at that path.

@@ -109,7 +109,7 @@ static struct tempfile *new_tempfile(void)
 	return tempfile;
 }
 
-static void activate_tempfile(struct tempfile *tempfile)
+void tempfile_init(void)
 {
 	static int initialized;
 
@@ -118,6 +118,11 @@ static void activate_tempfile(struct tempfile *tempfile)
 		atexit(remove_tempfiles_on_exit);
 		initialized = 1;
 	}
+}
+
+static void activate_tempfile(struct tempfile *tempfile)
+{
+	tempfile_init();
 
 	volatile_list_add(&tempfile->list, &tempfile_list);
 	tempfile->owner = getpid();

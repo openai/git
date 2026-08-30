@@ -670,6 +670,45 @@ test_expect_success REFFILES 'fetch --atomic fails transaction if reference lock
 	test_must_fail git -C repo fetch --atomic origin
 '
 
+# The async-process fallback installs its own SIGPIPE handler after fetch
+# ignores the signal, independently of tempfile cleanup.
+for refspec in HEAD HEAD:refs/heads/fetched
+do
+	test_expect_success PTHREADS,!MINGW "fetch $refspec restores SIGPIPE before automatic maintenance" '
+		test_when_finished "rm -rf sigpipe-source sigpipe-target" &&
+		git init sigpipe-source &&
+		test_commit -C sigpipe-source --no-tag source &&
+		git init sigpipe-target &&
+		test_commit -C sigpipe-target --no-tag target &&
+		git -C sigpipe-target repack -ad &&
+		test_hook -C sigpipe-target pre-auto-gc <<-\EOF &&
+			read fetch_pid <fetch.pid &&
+			>maintenance-reached &&
+			kill -PIPE "$fetch_pid"
+			exit 1
+		EOF
+		# Record the fetch PID, not the maintenance or hook process.
+		write_script sigpipe-target/fetch-with-pid <<-\EOF &&
+			echo "$$" >fetch.pid &&
+			exec git "$@"
+		EOF
+		(
+			cd sigpipe-target &&
+			{
+				./fetch-with-pid \
+					-c gc.auto=1 -c gc.autoPackLimit=1 \
+					-c maintenance.auto=true -c maintenance.autoDetach=false \
+					-c gc.autoDetach=false \
+					fetch --keep --no-tags --no-recurse-submodules \
+					"file://$TRASH_DIRECTORY/sigpipe-source" "$refspec";
+				ret=$?
+			} &&
+			test_match_signal 13 "$ret"
+		) &&
+		test_path_is_file sigpipe-target/maintenance-reached
+	'
+done
+
 test_expect_success '--refmap="" ignores configured refspec' '
 	git clone . remote-refs &&
 	git -C remote-refs rev-parse remotes/origin/main >old &&
