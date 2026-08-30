@@ -1898,8 +1898,13 @@ struct repository *repo UNUSED)
 	int default_status_command = argc == 1 && (!prefix || !*prefix);
 	int exact_clean_command = argc == 2 &&
 		!strcmp(argv[1], "--porcelain=v2") && (!prefix || !*prefix);
+	int short_clean_command = argc == 2 &&
+		(!strcmp(argv[1], "--short") || !strcmp(argv[1], "-s")) &&
+		(!prefix || !*prefix);
 	int exact_clean_query;
 	int normal_clean_query;
+	int short_clean_query;
+	int certifying_clean_query;
 	int reusable_clean_query;
 	int normal_has_head;
 	int reissue_clean_sidecar = 0;
@@ -1907,6 +1912,8 @@ struct repository *repo UNUSED)
 	int sidecar_provider_reset = 0;
 	int reissue_after_write = 0;
 	int issue_exact_after_write = 0;
+	int issue_certifying_after_write = 0;
+	int reload_racy_after_write = 0;
 	int exact_after_write_candidate = 0;
 	int save_history_after_write = 0;
 	int deferred_scoped_history = 0;
@@ -2020,6 +2027,14 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
+	short_clean_query = short_clean_command &&
+		status_format == STATUS_FORMAT_SHORT && normal_has_head &&
+		!s.pathspec.nr && !s.show_branch && !s.show_stash &&
+		!s.show_ignored_mode && !s.null_termination && !s.verbose &&
+		!s.submodule_summary &&
+		s.show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
+		!repo_config_values(the_repository)->apply_sparse_checkout;
+	certifying_clean_query = normal_clean_query || short_clean_query;
 	reusable_clean_query = normal_has_head &&
 		!s.show_ignored_mode && !s.submodule_summary &&
 		/* A clean merge still prints a staged-changes header with -vv. */
@@ -2030,7 +2045,7 @@ struct repository *repo UNUSED)
 		!s.submodule_summary &&
 		!repo_config_values(the_repository)->apply_sparse_checkout;
 	clean_status_enable_external_history(the_repository);
-	s.certify_clean_status = exact_clean_query;
+	s.certify_clean_status = exact_clean_query || short_clean_query;
 	if (reusable_clean_query &&
 	    clean_status_try_sidecar(the_repository, &clean_digest,
 				     &repository_inputs_changed,
@@ -2041,7 +2056,7 @@ struct repository *repo UNUSED)
 			return 0;
 		}
 	}
-	if (normal_clean_query && optional_status_writes &&
+	if (certifying_clean_query && optional_status_writes &&
 	    clean_status_identity_is_durable())
 		reissue_clean_sidecar =
 			clean_status_sidecar_needs_reissue(
@@ -2091,7 +2106,7 @@ struct repository *repo UNUSED)
 			clean_status_capture_external_history_source(
 				the_repository->index);
 	}
-	if (normal_clean_query && optional_status_writes &&
+	if (certifying_clean_query && optional_status_writes &&
 	    clean_status_identity_is_durable() &&
 	    (reissue_clean_sidecar ||
 	     clean_status_external_history_was_restored(
@@ -2165,6 +2180,8 @@ struct repository *repo UNUSED)
 				the_repository->index);
 		int external_saved = 0;
 		int persist_restored_boundary = 0;
+		int racy_fresh_history = !external_restored &&
+			has_racy_timestamp(the_repository->index);
 		int preserve_entry_changes =
 			(!external_restored &&
 			 (the_repository->index->cache_changed & CE_ENTRY_CHANGED)) ||
@@ -2194,6 +2211,11 @@ struct repository *repo UNUSED)
 		else if (deferred_history &&
 			 !hook_exists(the_repository, "post-index-change"))
 			save_history_after_write = 1;
+		if (certifying_clean_query && racy_fresh_history &&
+		    !s.change.nr && !s.untracked.nr && !s.ignored.nr &&
+		    !external_saved &&
+		    !hook_exists(the_repository, "post-index-change"))
+			save_history_after_write = reload_racy_after_write = 1;
 		if (external_restored && !external_saved &&
 		    clean_status_external_history_owns_index(
 			    the_repository->index) &&
@@ -2202,7 +2224,7 @@ struct repository *repo UNUSED)
 			trace2_data_intmax("fsmonitor", the_repository,
 					   "history/external-racy-index-persisted", 1);
 		}
-		reissue_after_write = normal_clean_query &&
+		reissue_after_write = certifying_clean_query &&
 			reissue_clean_sidecar && preserve_entry_changes &&
 			!external_restored && !persist_restored_boundary &&
 			!hook_exists(the_repository, "post-index-change");
@@ -2235,7 +2257,7 @@ struct repository *repo UNUSED)
 			}
 		} else if (!preserve_entry_changes &&
 			   !persist_restored_boundary &&
-			   normal_clean_query &&
+			   certifying_clean_query &&
 			   (external_restored || reissue_clean_sidecar) &&
 			   clean_status_issue_sidecar(
 				   &s, &clean_digest, &index_lock, 1)) {
@@ -2260,6 +2282,16 @@ struct repository *repo UNUSED)
 						      &written_index);
 		clean_status_index_adopt_write_receipt(the_repository->index,
 						      &written_index);
+		if (reload_racy_after_write) {
+			/*
+			 * Re-read the committed index before checkpointing a fresh racy
+			 * checkout. The old in-memory epoch cannot authenticate the new
+			 * file even though this status established its clean contents.
+			 */
+			discard_index(the_repository->index);
+			if (repo_read_index(the_repository) < 0)
+				save_history_after_write = 0;
+		}
 		if (save_history_after_write &&
 		    !hook_exists(the_repository, "post-index-change") &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
@@ -2269,14 +2301,18 @@ struct repository *repo UNUSED)
 						   "history/external-postwrite-stored", 1);
 				if (exact_after_write_candidate)
 					issue_exact_after_write = 1;
+				else if (certifying_clean_query)
+					issue_certifying_after_write = 1;
 			}
 			rollback_lock_file(&index_lock);
 		}
-		if ((reissue_after_write || issue_exact_after_write) &&
+		if ((reissue_after_write || issue_exact_after_write ||
+		     issue_certifying_after_write) &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
 			if (clean_status_issue_sidecar(
 				    &s, &clean_digest, &index_lock,
-				    reissue_after_write))
+				    reissue_after_write ||
+				    issue_certifying_after_write))
 				trace2_data_intmax("status", the_repository,
 						   reissue_after_write ?
 						   "clean-proof/postwrite-reissued" :

@@ -3607,4 +3607,55 @@ test_expect_success DURABLE_FSMONITOR \
 		sidecar-rebase-continue rebase-continue-after
 '
 
+test_expect_success DURABLE_FSMONITOR \
+	'a registered linked worktree can issue and consume a clean sidecar' '
+	test_when_finished "stop_daemon sidecar-linked-review" &&
+	test_when_finished "stop_daemon sidecar-linked-main" &&
+	setup_repo sidecar-linked-main &&
+	git -C sidecar-linked-main config core.autocrlf false &&
+	git -C sidecar-linked-main config core.untrackedCache true &&
+	git -C sidecar-linked-main worktree add -q \
+		-b sidecar-linked-topic ../sidecar-linked-review &&
+	linked_gitdir=$(git -C sidecar-linked-review \
+		rev-parse --absolute-git-dir) &&
+	linked_index=$linked_gitdir/index &&
+	test_path_is_missing "$linked_index.csts" &&
+	test_env GIT_TRACE2_EVENT="$PWD/linked-short.trace" \
+		bulk_status -C sidecar-linked-review status --short \
+		>linked-short.actual &&
+	test_must_be_empty linked-short.actual &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<linked-short.trace &&
+	test_path_is_file "$linked_index.csts" &&
+	cp "$linked_index" linked.index &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false -C sidecar-linked-review \
+		status --porcelain=v2 >linked.expect &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/linked-hit.trace" \
+		git -C sidecar-linked-review status --porcelain=v2 \
+		>linked.actual &&
+	test_cmp linked.expect linked.actual &&
+	test_cmp_bin linked.index "$linked_index" &&
+	test_trace2_data status clean-proof/hit 1 <linked-hit.trace &&
+	test_region ! index do_read_index linked-hit.trace &&
+	mkdir sidecar-linked-impostor &&
+	cp sidecar-linked-review/tracked sidecar-linked-impostor/tracked &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false --git-dir="$linked_gitdir" \
+		--work-tree="$PWD/sidecar-linked-impostor" \
+		status --porcelain=v2 >linked-impostor.expect &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/linked-impostor.trace" \
+		git --git-dir="$linked_gitdir" \
+		--work-tree="$PWD/sidecar-linked-impostor" \
+		status --porcelain=v2 >linked-impostor.actual &&
+	test_cmp linked-impostor.expect linked-impostor.actual &&
+	test_cmp_bin linked.index "$linked_index" &&
+	test_trace2_data status clean-proof/miss fast-repository-shape \
+		<linked-impostor.trace &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" \
+		linked-impostor.trace
+'
+
 test_done

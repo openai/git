@@ -14,7 +14,6 @@
 #include "repository.h"
 #include "semantic-verify-internal.h"
 #include "trace2.h"
-#include "worktree.h"
 #include "wrapper.h"
 
 #if !EXCLUDE_SOURCE_PROOF_HAS_ANCHORED_OPEN
@@ -188,15 +187,6 @@ static int fast_path_test_barrier(void)
 	return ret;
 }
 
-static int current_worktree_is_main(struct repository *repo)
-{
-	struct worktree *worktree = get_current_worktree(repo);
-	int ret = worktree && is_main_worktree(worktree);
-
-	free_worktree(worktree);
-	return ret;
-}
-
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config,
@@ -222,7 +212,7 @@ int clean_status_try_sidecar(
 	    (config->filter_configured && config->normalized_filter_disable) ||
 	    getenv(INDEX_ENVIRONMENT) || is_bare_repository(repo) ||
 	    !repo_get_work_tree(repo) ||
-	    !current_worktree_is_main(repo) ||
+	    !clean_status_worktree_shape_supported(repo) ||
 	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC) {
 		trace_miss(repo, "fast-repository-shape");
 		goto done;

@@ -1646,6 +1646,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 				test_must_be_empty "$gitdir/$mode.checkpoint" &&
 				test_trace2_data fsmonitor history/external-stored 1 \
 					<"$gitdir/$mode.checkpoint.trace" &&
+				test_path_is_file "$gitdir/index.csts" &&
+				rm "$gitdir/index.csts" &&
 				find "$gitdir" -maxdepth 1 -type f \
 					-name "index.csh1.*" >"$gitdir/$mode.csh" &&
 				test_line_count = 1 "$gitdir/$mode.csh" &&
@@ -1822,7 +1824,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 						extension/fsmn/read/token builtin:test:3 \
 						<"$gitdir/$mode.checkout.trace" &&
 					test_trace2_data index \
-						extension/fsmn/read/token builtin:test:1 \
+						extension/fsmn/read/token builtin:test:2 \
 						<"$gitdir/$mode.checkout.trace" &&
 					test_region ! index do_write_index \
 						"$gitdir/$mode.checkout.trace" &&

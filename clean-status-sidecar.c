@@ -8,6 +8,7 @@
 #include "attr-fingerprint.h"
 #include "clean-status-index.h"
 #include "clean-status-sidecar.h"
+#include "dir.h"
 #include "fsmonitor-clean-proof.h"
 #include "hash-framing.h"
 #include "lockfile.h"
@@ -430,12 +431,32 @@ done:
 	return ret;
 }
 
-static int current_worktree_is_main(struct repository *repo)
+int clean_status_worktree_shape_supported(struct repository *repo)
 {
-	struct worktree *worktree = get_current_worktree(repo);
-	int ret = worktree && is_main_worktree(worktree);
+	struct worktree *current = get_current_worktree(repo);
+	struct worktree *registered = NULL;
+	int ret = 0;
 
-	free_worktree(worktree);
+	if (!current)
+		goto done;
+	if (is_main_worktree(current)) {
+		ret = 1;
+		goto done;
+	}
+	if (!current->id)
+		goto done;
+	/*
+	 * A linked worktree has its own index and sidecar. Accept it only when
+	 * both repository paths still name the worktree registered in the common
+	 * directory; an ad-hoc GIT_DIR/GIT_WORK_TREE pairing must fall back.
+	 */
+	registered = get_linked_worktree(repo, current->id, 1);
+	ret = registered && registered->is_current &&
+		!fspathcmp(current->path, registered->path);
+
+done:
+	free_worktree(registered);
+	free_worktree(current);
 	return ret;
 }
 
@@ -479,7 +500,7 @@ int clean_status_repository_fingerprint(
 	    !index || index->fd < 0 || !scanned_worktree ||
 	    is_bare_repository(repo) ||
 	    !repo_get_work_tree(repo) ||
-	    !current_worktree_is_main(repo) ||
+	    !clean_status_worktree_shape_supported(repo) ||
 	    repo_has_replace_refs_uncached(repo))
 		goto done;
 

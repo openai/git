@@ -44,13 +44,15 @@ static int issue_test_barrier(void)
 }
 
 static int output_is_certifiable(const struct wt_status *status,
-				 int normal_clean_query)
+				 int certifying_clean_query)
 {
 	return (status->status_format == STATUS_FORMAT_PORCELAIN_V2 ||
-		(normal_clean_query &&
-		 status->status_format == STATUS_FORMAT_NONE)) &&
+		(certifying_clean_query &&
+		 (status->status_format == STATUS_FORMAT_NONE ||
+		  status->status_format == STATUS_FORMAT_SHORT))) &&
 		!status->pathspec.nr && !status->show_branch &&
-		(!status->show_stash || normal_clean_query) &&
+		(!status->show_stash ||
+		 status->status_format == STATUS_FORMAT_NONE) &&
 		!status->show_ignored_mode &&
 		!status->null_termination && !status->verbose &&
 		status->show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
@@ -215,7 +217,7 @@ int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
 	struct lock_file *index_lock,
-	int normal_clean_query)
+	int certifying_clean_query)
 {
 	struct repository *repo = status->repo;
 	struct index_state *istate = repo->index;
@@ -230,7 +232,7 @@ int clean_status_issue_sidecar(
 
 	if (!is_lock_file_locked(index_lock) ||
 	    !config->finalized ||
-	    !output_is_certifiable(status, normal_clean_query)) {
+	    !output_is_certifiable(status, certifying_clean_query)) {
 		trace_miss(repo, "issue-command-or-output");
 		goto done;
 	}
