@@ -670,6 +670,87 @@ test_expect_success REFFILES 'fetch --atomic fails transaction if reference lock
 	test_must_fail git -C repo fetch --atomic origin
 '
 
+setup_fetch_pack_lock_test () {
+	test_when_finished "rm -rf pack-lock-source pack-lock-target" &&
+	git init pack-lock-source &&
+	test_commit -C pack-lock-source --no-tag initial &&
+	git init pack-lock-target &&
+	test_config -C pack-lock-target fetch.unpackLimit 1 &&
+	test_hook -C pack-lock-target reference-transaction <<-\EOF
+		test "$1" = prepared || exit 0
+		cat >prepared-refs &&
+		git repack -ad &&
+		while read old new ref
+		do
+			git cat-file -e "$new" || exit 1
+		done <prepared-refs &&
+		>protected &&
+		test ! -f reject
+	EOF
+}
+
+for atomic in --no-atomic --atomic
+do
+	test_expect_success "fetch $atomic protects packs until refs are committed" '
+		setup_fetch_pack_lock_test &&
+		git -C pack-lock-target fetch "$atomic" --no-tags \
+			"file://$PWD/pack-lock-source" HEAD:refs/heads/fetched &&
+		test_path_is_file pack-lock-target/protected &&
+		git -C pack-lock-source rev-parse HEAD >expect &&
+		git -C pack-lock-target rev-parse refs/heads/fetched >actual &&
+		test_cmp expect actual &&
+		git -C pack-lock-target fsck --no-dangling &&
+		find pack-lock-target/.git/objects/pack -name "*.keep" >kept &&
+		test_must_be_empty kept
+	'
+
+	test_expect_success "fetch $atomic releases packs after rejecting ref updates" '
+		setup_fetch_pack_lock_test &&
+		>pack-lock-target/reject &&
+		test_must_fail git -C pack-lock-target fetch "$atomic" --no-tags \
+			"file://$PWD/pack-lock-source" HEAD:refs/heads/fetched &&
+		test_path_is_file pack-lock-target/protected &&
+		test_ref_missing -C pack-lock-target refs/heads/fetched &&
+		find pack-lock-target/.git/objects/pack -name "*.keep" >kept &&
+		test_must_be_empty kept
+	'
+
+	for backfill_transport in reused secondary
+	do
+		case "$backfill_transport" in
+		reused)
+			backfill_options=
+			;;
+		secondary)
+			backfill_options=--shallow-since=2000-01-01
+			;;
+		esac
+
+		test_expect_success "fetch $atomic protects tag backfill packs with $backfill_transport transport" '
+			setup_fetch_pack_lock_test &&
+			git -C pack-lock-source tag -a -m backfill backfill &&
+			test_commit -C pack-lock-source --no-tag newer &&
+			# Omit annotated tags from the first pack to force backfilling.
+			write_script pack-lock-source/.git/pack-objects-no-tags <<-\EOF &&
+				echo pack >>pack-objects-calls &&
+				exec "$@" --no-include-tag
+			EOF
+			test_config_global uploadpack.packObjectsHook ./pack-objects-no-tags &&
+			# --shallow-since forces backfilling to use a new transport.
+			git -C pack-lock-target fetch "$atomic" $backfill_options \
+				"file://$PWD/pack-lock-source" HEAD:refs/heads/fetched &&
+			test_line_count = 2 pack-lock-source/.git/pack-objects-calls &&
+			test_path_is_file pack-lock-target/protected &&
+			git -C pack-lock-source rev-parse HEAD refs/tags/backfill >expect &&
+			git -C pack-lock-target rev-parse refs/heads/fetched refs/tags/backfill >actual &&
+			test_cmp expect actual &&
+			git -C pack-lock-target fsck --no-dangling &&
+			find pack-lock-target/.git/objects/pack -name "*.keep" >kept &&
+			test_must_be_empty kept
+		'
+	done
+done
+
 # The async-process fallback installs its own SIGPIPE handler after fetch
 # ignores the signal, independently of tempfile cleanup.
 for refspec in HEAD HEAD:refs/heads/fetched

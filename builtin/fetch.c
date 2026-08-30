@@ -1429,11 +1429,13 @@ static int check_exist_and_connected(struct ref *ref_map)
 static int fetch_and_consume_refs(struct display_state *display_state,
 				  struct transport *transport,
 				  struct ref_transaction *transaction,
+				  struct string_list *pack_lockfiles,
 				  struct ref *ref_map,
 				  struct fetch_head *fetch_head,
 				  const struct fetch_config *config,
 				  struct ref_update_display_info_array *display_array)
 {
+	struct string_list_item *item;
 	int connectivity_checked = 1;
 	int ret;
 
@@ -1459,7 +1461,17 @@ static int fetch_and_consume_refs(struct display_state *display_state,
 	trace2_region_leave("fetch", "consume_refs", the_repository);
 
 out:
-	transport_unlock_pack(transport, 0);
+	/*
+	 * The ref updates are only queued at this point. Keep the packs until
+	 * the transaction finishes, even if tag backfilling reuses or destroys
+	 * this transport.
+	 */
+	for_each_string_list_item(item, &transport->pack_lockfiles) {
+		struct tempfile *tempfile = register_tempfile(item->string);
+
+		string_list_append(pack_lockfiles, item->string)->util = tempfile;
+	}
+	string_list_clear(&transport->pack_lockfiles, 0);
 	return ret;
 }
 
@@ -1673,6 +1685,7 @@ static struct transport *prepare_transport(struct remote *remote, int deepen,
 static int backfill_tags(struct display_state *display_state,
 			 struct transport *transport,
 			 struct ref_transaction *transaction,
+			 struct string_list *pack_lockfiles,
 			 struct ref *ref_map,
 			 struct fetch_head *fetch_head,
 			 const struct fetch_config *config,
@@ -1698,8 +1711,9 @@ static int backfill_tags(struct display_state *display_state,
 	transport_set_option(transport, TRANS_OPT_FOLLOWTAGS, NULL);
 	transport_set_option(transport, TRANS_OPT_DEPTH, "0");
 	transport_set_option(transport, TRANS_OPT_DEEPEN_RELATIVE, NULL);
-	retcode = fetch_and_consume_refs(display_state, transport, transaction, ref_map,
-					 fetch_head, config, display_array);
+	retcode = fetch_and_consume_refs(display_state, transport, transaction,
+					 pack_lockfiles, ref_map, fetch_head,
+					 config, display_array);
 
 	if (gsecondary) {
 		transport_disconnect(gsecondary);
@@ -1910,6 +1924,7 @@ static int do_fetch(struct transport *transport,
 		    struct list_objects_filter_options *filter_options)
 {
 	struct ref_transaction *transaction = NULL;
+	struct string_list pack_lockfiles = STRING_LIST_INIT_DUP;
 	struct ref *ref_map = NULL;
 	struct display_state display_state = { 0 };
 	int autotags = (transport->remote->fetch_tags == 1);
@@ -2063,8 +2078,9 @@ static int do_fetch(struct transport *transport,
 		}
 	}
 
-	if (fetch_and_consume_refs(&display_state, transport, transaction, ref_map,
-				   &fetch_head, config, &display_array)) {
+	if (fetch_and_consume_refs(&display_state, transport, transaction,
+				   &pack_lockfiles, ref_map, &fetch_head, config,
+				   &display_array)) {
 		retcode = 1;
 		goto cleanup;
 	}
@@ -2086,8 +2102,9 @@ static int do_fetch(struct transport *transport,
 			 * when `--atomic` is passed: in that case we'll abort
 			 * the transaction and don't commit anything.
 			 */
-			if (backfill_tags(&display_state, transport, transaction, tags_ref_map,
-					  &fetch_head, config, &display_array, filter_options))
+			if (backfill_tags(&display_state, transport, transaction,
+					  &pack_lockfiles, tags_ref_map, &fetch_head,
+					  config, &display_array, filter_options))
 				retcode = 1;
 		}
 
@@ -2210,6 +2227,12 @@ cleanup:
 	strmap_clear(&rejected_refs, 0);
 	display_state_release(&display_state);
 	close_fetch_head(&fetch_head);
+	for (size_t i = 0; i < pack_lockfiles.nr; i++) {
+		struct tempfile *tempfile = pack_lockfiles.items[i].util;
+
+		delete_tempfile(&tempfile);
+	}
+	string_list_clear(&pack_lockfiles, 0);
 	strbuf_release(&err);
 	free_refs(ref_map);
 	return retcode;
