@@ -116,7 +116,9 @@ int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
 	struct lock_file *index_lock,
+	const struct clean_status_index_snapshot *scanned_index,
 	int certifying_clean_query);
+int clean_status_sidecar_postwrite_test_barrier(void);
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config,

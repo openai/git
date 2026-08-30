@@ -1916,10 +1916,15 @@ struct repository *repo UNUSED)
 	int reload_racy_after_write = 0;
 	int exact_after_write_candidate = 0;
 	int save_history_after_write = 0;
+	int postwrite_sidecar_candidate = 0;
+	int postwrite_sidecar_pinned = 0;
 	int deferred_scoped_history = 0;
 	int guarded_scoped_history_source = 0;
 	int optional_status_writes;
 	struct clean_status_index_snapshot scoped_history_source = {
+		.fd = -1,
+	};
+	struct clean_status_index_snapshot postwrite_sidecar_source = {
 		.fd = -1,
 	};
 	struct clean_status_index_write_receipt written_index =
@@ -2247,7 +2252,7 @@ struct repository *repo UNUSED)
 		} else if (exact_clean_query) {
 			if (!preserve_entry_changes && external_saved &&
 			    clean_status_issue_sidecar(
-				    &s, &clean_digest, &index_lock, 0))
+				    &s, &clean_digest, &index_lock, NULL, 0))
 				fd = -1;
 			else if (!preserve_entry_changes &&
 				 !persist_restored_boundary &&
@@ -2260,7 +2265,7 @@ struct repository *repo UNUSED)
 			   certifying_clean_query &&
 			   (external_restored || reissue_clean_sidecar) &&
 			   clean_status_issue_sidecar(
-				   &s, &clean_digest, &index_lock, 1)) {
+				   &s, &clean_digest, &index_lock, NULL, 1)) {
 			fd = -1;
 		} else if (!preserve_entry_changes &&
 			   !persist_restored_boundary &&
@@ -2278,10 +2283,25 @@ struct repository *repo UNUSED)
 				   "history/scoped-source-epoch-mismatch", 1);
 	}
 	if (0 <= fd) {
+		postwrite_sidecar_candidate =
+			reissue_after_write || issue_exact_after_write ||
+			save_history_after_write;
 		repo_update_index_if_able_with_receipt(the_repository, &index_lock,
 						      &written_index);
+		if (postwrite_sidecar_candidate)
+			postwrite_sidecar_pinned =
+				!clean_status_sidecar_postwrite_test_barrier();
 		clean_status_index_adopt_write_receipt(the_repository->index,
 						      &written_index);
+		if (postwrite_sidecar_pinned &&
+		    clean_status_index_snapshot_pin(
+			    &postwrite_sidecar_source,
+			    the_repository->index)) {
+			postwrite_sidecar_pinned = 0;
+			trace2_data_string("status", the_repository,
+					   "clean-proof/miss",
+					   "postwrite-index-raced");
+		}
 		if (reload_racy_after_write) {
 			/*
 			 * Re-read the committed index before checkpointing a fresh racy
@@ -2306,11 +2326,13 @@ struct repository *repo UNUSED)
 			}
 			rollback_lock_file(&index_lock);
 		}
-		if ((reissue_after_write || issue_exact_after_write ||
+		if (postwrite_sidecar_pinned &&
+		    (reissue_after_write || issue_exact_after_write ||
 		     issue_certifying_after_write) &&
 		    repo_hold_locked_index(the_repository, &index_lock, 0) >= 0) {
 			if (clean_status_issue_sidecar(
 				    &s, &clean_digest, &index_lock,
+				    &postwrite_sidecar_source,
 				    reissue_after_write ||
 				    issue_certifying_after_write))
 				trace2_data_intmax("status", the_repository,
@@ -2322,6 +2344,7 @@ struct repository *repo UNUSED)
 		}
 	}
 	clean_status_index_write_receipt_release(&written_index);
+	clean_status_index_snapshot_release(&postwrite_sidecar_source);
 	clean_status_index_snapshot_release(&scoped_history_source);
 
 	if (s.relative_paths)

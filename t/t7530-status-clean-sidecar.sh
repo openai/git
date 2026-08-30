@@ -233,6 +233,50 @@ start_issue_raced_status () {
 	wait_for_fast_ready
 }
 
+start_postwrite_raced_stash () {
+	repo=$1 &&
+	ready=$TRASH_DIRECTORY/$repo.postwrite-ready &&
+	resume=$TRASH_DIRECTORY/$repo.postwrite-resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.postwrite-trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	: >"$ready" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		test_env \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_READY="$ready" \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			git -C "$repo" stash push -q --keep-index -- tracked \
+			>raced.actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_fast_ready
+}
+
+start_postwrite_raced_status () {
+	repo=$1 &&
+	ready=$TRASH_DIRECTORY/$repo.postwrite-ready &&
+	resume=$TRASH_DIRECTORY/$repo.postwrite-resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.postwrite-trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	: >"$ready" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		test_env \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_READY="$ready" \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			bulk_status -C "$repo" status --porcelain=v2 \
+			>raced.actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_fast_ready
+}
+
 stop_after_fast_fallback () {
 	for i in $(test_seq 1 1000)
 	do
@@ -3605,6 +3649,123 @@ test_expect_success DURABLE_FSMONITOR \
 	test_path_is_file sidecar-rebase-continue/.git/index.csts &&
 	assert_clean_sidecar_hit sidecar-rebase-continue \
 		sidecar-rebase-continue rebase-continue-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'scoped stash ignores optional sidecar lock contention' '
+	test_when_finished "stop_daemon sidecar-scoped-stash-lock" &&
+	test_when_finished "rm -f sidecar-scoped-stash-lock/.git/index.lock" &&
+	setup_repo sidecar-scoped-stash-lock &&
+	git -C sidecar-scoped-stash-lock config core.autocrlf false &&
+	issue_sidecar sidecar-scoped-stash-lock &&
+	assert_clean_sidecar_hit sidecar-scoped-stash-lock \
+		sidecar-scoped-stash-lock scoped-stash-lock-before &&
+	cp sidecar-scoped-stash-lock/tracked scoped-stash-lock.expect &&
+	write_script sidecar-scoped-stash-lock/.git/hooks/post-checkout <<-\EOF &&
+	: >.git/index.lock
+	EOF
+	test_write_lines changed >sidecar-scoped-stash-lock/tracked &&
+	GIT_TRACE2_EVENT="$PWD/scoped-stash-lock.trace" \
+		git -C sidecar-scoped-stash-lock stash push -q \
+			--keep-index -- tracked 2>scoped-stash-lock.err &&
+	test_trace2_data status clean-proof/writer-sidecar-skip index-lock \
+		<scoped-stash-lock.trace &&
+	test_grep ! "Unable to create .*index.lock" \
+		scoped-stash-lock.err &&
+	test_grep ! "could not write index" scoped-stash-lock.err &&
+	test_path_is_missing sidecar-scoped-stash-lock/.git/refs/stash.lock &&
+	git -C sidecar-scoped-stash-lock rev-parse --verify refs/stash &&
+	test_cmp scoped-stash-lock.expect sidecar-scoped-stash-lock/tracked &&
+	rm -f sidecar-scoped-stash-lock/.git/index.lock &&
+	assert_clean_sidecar_fallback sidecar-scoped-stash-lock \
+		sidecar-scoped-stash-lock scoped-stash-lock-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'rebase --continue ignores optional sidecar lock contention' '
+	test_when_finished "stop_daemon sidecar-rebase-lock" &&
+	test_when_finished "rm -f sidecar-rebase-lock/.git/index.lock" &&
+	setup_repo sidecar-rebase-lock &&
+	git -C sidecar-rebase-lock config core.autocrlf false &&
+	issue_sidecar sidecar-rebase-lock &&
+	git -C sidecar-rebase-lock branch topic &&
+	git -C sidecar-rebase-lock checkout -q -b upstream &&
+	test_write_lines upstream >sidecar-rebase-lock/tracked &&
+	git -C sidecar-rebase-lock add tracked &&
+	git -C sidecar-rebase-lock commit -m upstream &&
+	git -C sidecar-rebase-lock checkout -q topic &&
+	test_write_lines topic >sidecar-rebase-lock/tracked &&
+	git -C sidecar-rebase-lock add tracked &&
+	git -C sidecar-rebase-lock commit -m topic &&
+	test_must_fail git -C sidecar-rebase-lock rebase upstream &&
+	test_write_lines resolved >rebase-lock.expect &&
+	cp rebase-lock.expect sidecar-rebase-lock/tracked &&
+	git -C sidecar-rebase-lock add tracked &&
+	write_script sidecar-rebase-lock/.git/hooks/post-rewrite <<-\EOF &&
+	: >.git/index.lock
+	EOF
+	GIT_EDITOR=true \
+	GIT_TRACE2_EVENT="$PWD/rebase-lock.trace" \
+		git -C sidecar-rebase-lock rebase --continue \
+			2>rebase-lock.err &&
+	test_trace2_data status clean-proof/writer-sidecar-skip index-lock \
+		<rebase-lock.trace &&
+	test_grep ! "Unable to create .*index.lock" rebase-lock.err &&
+	test_grep ! "could not write index" rebase-lock.err &&
+	test_path_is_missing sidecar-rebase-lock/.git/rebase-merge &&
+	test_cmp rebase-lock.expect sidecar-rebase-lock/tracked &&
+	rm -f sidecar-rebase-lock/.git/index.lock &&
+	assert_clean_sidecar_fallback sidecar-rebase-lock \
+		sidecar-rebase-lock rebase-lock-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a postwrite index replacement cannot inherit an earlier clean scan' '
+	test_when_finished "stop_daemon sidecar-postwrite-race" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-postwrite-race &&
+	git -C sidecar-postwrite-race config core.autocrlf false &&
+	issue_sidecar sidecar-postwrite-race &&
+	test_write_lines stashed >sidecar-postwrite-race/tracked &&
+	start_postwrite_raced_stash sidecar-postwrite-race &&
+	test_write_lines concurrent >sidecar-postwrite-race/tracked &&
+	git -C sidecar-postwrite-race add tracked &&
+	GIT_OPTIONAL_LOCKS=1 git -C sidecar-postwrite-race \
+		status --porcelain=v2 >postwrite-race.expect &&
+	test_file_not_empty postwrite-race.expect &&
+	finish_fast_raced_status &&
+	test_must_be_empty raced.actual &&
+	test_trace2_data status clean-proof/writer-sidecar 0 \
+		<"$race_trace" &&
+	assert_clean_sidecar_fallback sidecar-postwrite-race \
+		sidecar-postwrite-race postwrite-race-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'status cannot bind a clean scan to a replaced postwrite index' '
+	test_when_finished "stop_daemon sidecar-status-postwrite-race" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-status-postwrite-race &&
+	git -C sidecar-status-postwrite-race config core.autocrlf false &&
+	prime_semantic_history sidecar-status-postwrite-race &&
+	test-tool chmtime -60 sidecar-status-postwrite-race/tracked &&
+	test-tool -C sidecar-status-postwrite-race \
+		fsmonitor-client flush >status-postwrite-race.flush &&
+	start_postwrite_raced_status sidecar-status-postwrite-race &&
+	test_write_lines concurrent >sidecar-status-postwrite-race/tracked &&
+	git -C sidecar-status-postwrite-race add tracked &&
+	GIT_OPTIONAL_LOCKS=1 git -C sidecar-status-postwrite-race \
+		status --porcelain=v2 >status-postwrite-race.expect &&
+	test_file_not_empty status-postwrite-race.expect &&
+	finish_fast_raced_status &&
+	test_must_be_empty raced.actual &&
+	test_trace2_data status clean-proof/miss postwrite-index-raced \
+		<"$race_trace" &&
+	assert_clean_sidecar_fallback sidecar-status-postwrite-race \
+		sidecar-status-postwrite-race status-postwrite-race-after \
+		--porcelain=v2 &&
+	test_cmp status-postwrite-race.expect \
+		status-postwrite-race-after.actual
 '
 
 test_expect_success DURABLE_FSMONITOR \

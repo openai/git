@@ -3384,7 +3384,7 @@ int has_racy_timestamp(struct index_state *istate)
 	return 0;
 }
 
-static int write_locked_index_with_receipt(
+static int write_locked_index_with_receipt_and_checkpoint(
 	struct index_state *istate, struct lock_file *lock,
 	unsigned flags, struct clean_status_index_write_receipt *receipt,
 	struct clean_status_commit_checkpoint *checkpoint);
@@ -3398,8 +3398,8 @@ void repo_update_index_if_able_with_receipt(
 	if ((repo->index->cache_changed ||
 	     has_racy_timestamp(repo->index)) &&
 	    repo_verify_index(repo))
-		write_locked_index_with_receipt(repo->index, lockfile,
-					COMMIT_LOCK, receipt, NULL);
+		write_locked_index_with_receipt_and_checkpoint(
+			repo->index, lockfile, COMMIT_LOCK, receipt, NULL);
 	else
 		rollback_lock_file(lockfile);
 }
@@ -4101,7 +4101,7 @@ static int too_many_not_shared_entries(struct index_state *istate)
 	return (int64_t)istate->cache_nr * max_split < (int64_t)not_shared * 100;
 }
 
-static int write_locked_index_with_receipt(
+static int write_locked_index_with_receipt_and_checkpoint(
 	struct index_state *istate, struct lock_file *lock,
 	unsigned flags, struct clean_status_index_write_receipt *receipt,
 	struct clean_status_commit_checkpoint *checkpoint)
@@ -4201,7 +4201,16 @@ out:
 int write_locked_index(struct index_state *istate, struct lock_file *lock,
 		       unsigned flags)
 {
-	return write_locked_index_with_receipt(istate, lock, flags, NULL, NULL);
+	return write_locked_index_with_receipt_and_checkpoint(
+		istate, lock, flags, NULL, NULL);
+}
+
+int write_locked_index_with_receipt(
+	struct index_state *istate, struct lock_file *lock, unsigned flags,
+	struct clean_status_index_write_receipt *receipt)
+{
+	return write_locked_index_with_receipt_and_checkpoint(
+		istate, lock, flags, receipt, NULL);
 }
 
 int write_locked_index_for_commit(
@@ -4214,7 +4223,8 @@ int write_locked_index_for_commit(
 	clean_status_release_commit_checkpoint(*checkpoint);
 	*checkpoint = NULL;
 	candidate = clean_status_capture_commit_checkpoint(istate, lock);
-	ret = write_locked_index_with_receipt(istate, lock, 0, NULL, candidate);
+	ret = write_locked_index_with_receipt_and_checkpoint(
+		istate, lock, 0, NULL, candidate);
 	if (ret)
 		clean_status_release_commit_checkpoint(candidate);
 	else

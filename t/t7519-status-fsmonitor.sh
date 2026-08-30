@@ -2752,6 +2752,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 			$tokens{"FSMN"} eq $tokens{"FSCF"};
 		EOF
 		perl .git/check-mixed-writer-proof.pl <.git/index &&
+		rm -f .git/index.csts &&
 		for run in first second
 		do
 			cp .git/index ".git/readonly-$run.index" &&

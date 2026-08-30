@@ -2760,29 +2760,42 @@ int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 	const struct clean_status_config_digest *config)
 {
 	struct wt_status status = { 0 };
+	struct clean_status_index_snapshot scanned_index = { .fd = -1 };
+	struct clean_status_index_write_receipt written_index =
+		CLEAN_STATUS_INDEX_WRITE_RECEIPT_INIT;
 	int installed = 0;
 	int repaired = repair_fsmonitor_proof_after_update(
 		repo, lock, had_full_proof, 1, &status);
 
 	if (repaired <= 0)
 		return repaired;
-	if (write_locked_index(
-		    repo->index, lock, COMMIT_LOCK | SKIP_IF_UNCHANGED)) {
+	if (write_locked_index_with_receipt(
+		    repo->index, lock, COMMIT_LOCK | SKIP_IF_UNCHANGED,
+		    &written_index)) {
+		clean_status_index_write_receipt_release(&written_index);
 		release_repair_status(&status);
 		return -1;
 	}
+	if (clean_status_sidecar_postwrite_test_barrier())
+		goto done;
+	clean_status_index_adopt_write_receipt(repo->index, &written_index);
+	if (clean_status_index_snapshot_pin(&scanned_index, repo->index))
+		goto done;
 	/* Rebind the repaired proof to the index inode just committed. */
 	discard_index(repo->index);
 	if (repo_read_index(repo) < 0)
 		goto done;
 	if (repo_hold_locked_index(repo, lock, 0) < 0)
 		goto done;
-	if (clean_status_issue_sidecar(&status, config, lock, 1))
+	if (clean_status_issue_sidecar(
+		    &status, config, lock, &scanned_index, 1))
 		installed = 1;
 	else
 		rollback_lock_file(lock);
 
 done:
+	clean_status_index_write_receipt_release(&written_index);
+	clean_status_index_snapshot_release(&scanned_index);
 	release_repair_status(&status);
 	trace2_data_intmax("status", repo,
 			   "clean-proof/writer-sidecar", installed);

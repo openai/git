@@ -20,6 +20,7 @@
 #include "unpack-trees.h"
 #include "merge-ort-wrappers.h"
 #include "strvec.h"
+#include "trace2.h"
 #include "run-command.h"
 #include "dir.h"
 #include "entry.h"
@@ -405,18 +406,33 @@ static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
 						      int reissue_sidecar)
 {
 	struct lock_file lock = LOCK_INIT;
+	int optional_reissue = worktree_updated && reissue_sidecar;
+	int lock_flags = optional_reissue ? 0 : LOCK_REPORT_ON_ERROR;
 	int repaired;
 
 	if (!had_full_proof)
 		return 0;
-	if (repo_hold_locked_index(the_repository, &lock,
-				   LOCK_REPORT_ON_ERROR) < 0)
+	/* A failed cache reissue must not change a completed stash result. */
+	if (repo_hold_locked_index(the_repository, &lock, lock_flags) < 0) {
+		if (optional_reissue) {
+			trace2_data_string("status", the_repository,
+					   "clean-proof/writer-sidecar-skip",
+					   "index-lock");
+			return 0;
+		}
 		return error(_("could not write index"));
+	}
 
 	/* Child commands and canonical publications may have replaced the inode. */
 	discard_index(the_repository->index);
 	if (repo_read_index(the_repository) < 0) {
 		rollback_lock_file(&lock);
+		if (optional_reissue) {
+			trace2_data_string("status", the_repository,
+					   "clean-proof/writer-sidecar-skip",
+					   "index-read");
+			return 0;
+		}
 		return error(_("could not read index"));
 	}
 	if (!the_repository->index->fsmonitor_token_valid) {
@@ -433,10 +449,19 @@ static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
 			the_repository, &lock, had_full_proof);
 	if (repaired < 0) {
 		rollback_lock_file(&lock);
+		if (optional_reissue) {
+			trace2_data_string("status", the_repository,
+					   "clean-proof/writer-sidecar-skip",
+					   "proof-repair");
+			return 0;
+		}
 		return error(_("could not repair index"));
 	}
-	if (reissue_sidecar && worktree_updated && repaired > 0)
+	if (optional_reissue) {
+		if (!repaired)
+			rollback_lock_file(&lock);
 		return 0;
+	}
 	if (write_locked_index(the_repository->index, &lock,
 			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
 		return error(_("could not write index"));

@@ -24,12 +24,11 @@ static void trace_miss(struct repository *repo, const char *reason)
 	trace2_data_string("status", repo, "clean-proof/miss", reason);
 }
 
-static int issue_test_barrier(void)
+static int sidecar_test_barrier(const char *ready_name,
+				const char *resume_name)
 {
-	const char *ready =
-		getenv("GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_READY");
-	const char *resume =
-		getenv("GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_RESUME");
+	const char *ready = getenv(ready_name);
+	const char *resume = getenv(resume_name);
 	struct strbuf buf = STRBUF_INIT;
 	int ret;
 
@@ -41,6 +40,20 @@ static int issue_test_barrier(void)
 	ret = strbuf_read_file(&buf, resume, 1) > 0 ? 0 : -1;
 	strbuf_release(&buf);
 	return ret;
+}
+
+static int issue_test_barrier(void)
+{
+	return sidecar_test_barrier(
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_READY",
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_RESUME");
+}
+
+int clean_status_sidecar_postwrite_test_barrier(void)
+{
+	return sidecar_test_barrier(
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_READY",
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_RESUME");
 }
 
 static int output_is_certifiable(const struct wt_status *status,
@@ -217,6 +230,7 @@ int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
 	struct lock_file *index_lock,
+	const struct clean_status_index_snapshot *scanned_index,
 	int certifying_clean_query)
 {
 	struct repository *repo = status->repo;
@@ -249,6 +263,12 @@ int clean_status_issue_sidecar(
 	}
 	if (issue_test_barrier()) {
 		trace_miss(repo, "issue-test-barrier");
+		goto done;
+	}
+	if (scanned_index &&
+	    !clean_status_index_snapshot_still_matches(
+		    scanned_index, istate)) {
+		trace_miss(repo, "issue-index-raced");
 		goto done;
 	}
 	if (!status->attr_source_snapshot ||

@@ -364,6 +364,10 @@ int is_index_unborn(struct index_state *);
  * reopen and replace before commit; it therefore defers post-index-change.
  */
 int write_locked_index(struct index_state *, struct lock_file *lock, unsigned flags);
+/* Also retain a fail-closed receipt for the canonical file committed. */
+int write_locked_index_with_receipt(
+	struct index_state *, struct lock_file *, unsigned flags,
+	struct clean_status_index_write_receipt *);
 
 /* Commit's close-only main-index write and optional historical-only repair. */
 int write_locked_index_for_commit(
