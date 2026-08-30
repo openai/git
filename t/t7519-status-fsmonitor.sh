@@ -1646,8 +1646,8 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 				test_must_be_empty "$gitdir/$mode.checkpoint" &&
 				test_trace2_data fsmonitor history/external-stored 1 \
 					<"$gitdir/$mode.checkpoint.trace" &&
-				test_path_is_file "$gitdir/index.csts" &&
-				rm "$gitdir/index.csts" &&
+				test_remove_clean_status_sidecar \
+					"$gitdir/index.csts" &&
 				find "$gitdir" -maxdepth 1 -type f \
 					-name "index.csh1.*" >"$gitdir/$mode.csh" &&
 				test_line_count = 1 "$gitdir/$mode.csh" &&

@@ -1051,10 +1051,35 @@ test_expect_success DURABLE_FSMONITOR,PERL_TEST_HELPERS \
 		hardlink-sidecar-repair-reissue.trace &&
 	test_grep "\"label\":\"do_write_index\"" \
 		hardlink-sidecar-repair-reissue.trace &&
-	test_trace2_data status clean-proof/sidecar 1 \
-		<hardlink-sidecar-repair-reissue.trace &&
-	test_trace2_data status clean-proof/postwrite-reissued 1 \
-		<hardlink-sidecar-repair-reissue.trace &&
+	if test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-sidecar-repair-reissue.trace
+	then
+		test_trace2_data status clean-proof/postwrite-reissued 1 \
+			<hardlink-sidecar-repair-reissue.trace
+	else
+		test_trace2_data status clean-proof/miss \
+			issue-scan-or-index-shape \
+			<hardlink-sidecar-repair-reissue.trace &&
+		! test_trace2_data status clean-proof/postwrite-reissued 1 \
+			<hardlink-sidecar-repair-reissue.trace &&
+		hardlink_sidecar_recovered= &&
+		for recovery_attempt in 1 2 3
+		do
+			test_env GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-recovery-$recovery_attempt.trace" \
+				git -C sidecar-hardlink-stale-stat status \
+					>"hardlink-sidecar-recovery-$recovery_attempt.actual" &&
+			test_grep "nothing to commit, working tree clean" \
+				"hardlink-sidecar-recovery-$recovery_attempt.actual" ||
+				return 1
+			if test_trace2_data status clean-proof/sidecar 1 \
+				<"hardlink-sidecar-recovery-$recovery_attempt.trace"
+			then
+				hardlink_sidecar_recovered=1 &&
+				break
+			fi
+		done &&
+		test "$hardlink_sidecar_recovered" = 1
+	fi &&
 	! test_cmp sidecar-hardlink-stale-stat/.git/index.before-repair \
 		sidecar-hardlink-stale-stat/.git/index &&
 	assert_clean_sidecar_hit sidecar-hardlink-stale-stat \

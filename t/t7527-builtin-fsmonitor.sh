@@ -5542,8 +5542,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_must_be_empty .git/baseline &&
 		test_trace2_data fsmonitor history/external-stored 1 \
 			<"$TRASH_DIRECTORY/restored-racy-baseline.trace" &&
-		test_path_is_file .git/index.csts &&
-		rm .git/index.csts &&
+		test_remove_clean_status_sidecar .git/index.csts &&
 		cp .git/index .git/owned.before &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$TRASH_DIRECTORY/restored-racy-checkpoint.trace" \
@@ -5551,8 +5550,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_must_be_empty .git/checkpoint &&
 		test_trace2_data fsmonitor history/external-stored 1 \
 			<"$TRASH_DIRECTORY/restored-racy-checkpoint.trace" &&
-		test_path_is_file .git/index.csts &&
-		rm .git/index.csts &&
+		test_remove_clean_status_sidecar .git/index.csts &&
 		cp .git/owned.before .git/index &&
 		git -c core.fsmonitor=false update-index \
 			--no-fsmonitor --force-write-index &&
