@@ -11,6 +11,7 @@
 #include "gettext.h"
 #include "hash.h"
 #include "hex.h"
+#include "hook.h"
 #include "object-name.h"
 #include "parse-options.h"
 #include "refs.h"
@@ -400,7 +401,8 @@ static int reset_tree(struct object_id *i_tree, int update, int reset,
 }
 
 static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
-						      int worktree_updated)
+						      int worktree_updated,
+						      int reissue_sidecar)
 {
 	struct lock_file lock = LOCK_INIT;
 	int repaired;
@@ -421,7 +423,10 @@ static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
 		the_repository->index->fsmonitor_has_run_once = 0;
 		refresh_fsmonitor(the_repository->index);
 	}
-	repaired = worktree_updated ?
+	repaired = worktree_updated && reissue_sidecar ?
+		wt_status_repair_fsmonitor_proof_after_worktree_update_with_sidecar(
+			the_repository, &lock, had_full_proof,
+			&stash_clean_digest) : worktree_updated ?
 		wt_status_repair_fsmonitor_proof_after_worktree_update(
 			the_repository, &lock, had_full_proof) :
 		wt_status_repair_fsmonitor_proof_after_index_update(
@@ -430,11 +435,24 @@ static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
 		rollback_lock_file(&lock);
 		return error(_("could not repair index"));
 	}
+	if (reissue_sidecar && worktree_updated && repaired > 0)
+		return 0;
 	if (write_locked_index(the_repository->index, &lock,
 			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
 		return error(_("could not write index"));
 
 	return 0;
+}
+
+static int stash_clean_sidecar_present(void)
+{
+	struct stat st;
+	char *path = xstrfmt("%s.csts", repo_get_index_file(the_repository));
+	int present = !lstat(path, &st) && S_ISREG(st.st_mode) &&
+		st.st_nlink == 1;
+
+	free(path);
+	return present;
 }
 
 static int create_index_from_tree(const struct object_id *tree_id,
@@ -838,7 +856,7 @@ restore_untracked:
 	if (info->has_u && restore_untracked(&info->u_tree))
 		ret = error(_("could not restore untracked files from stash"));
 	if (!ret && repair_stash_fsmonitor_proof_after_update(
-			    had_full_proof, 1))
+			    had_full_proof, 1, 0))
 		ret = -1;
 
 	if (!quiet) {
@@ -1772,7 +1790,7 @@ static int create_stash(int argc, const char **argv, const char *prefix UNUSED,
 	ret = do_create_stash(&ps, &stash_msg_buf, 0, 0, NULL, 0, &info,
 			      NULL, 0);
 	if (!ret && repair_stash_fsmonitor_proof_after_update(
-			    had_full_proof, 0))
+			    had_full_proof, 0, 0))
 		ret = -1;
 	if (!ret)
 		printf_ln("%s", oid_to_hex(&info.w_commit));
@@ -1789,6 +1807,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 {
 	int ret = 0;
 	int preserve_clean_history = !ps->nr && !include_untracked;
+	int had_clean_sidecar;
 	int had_full_proof;
 	struct lock_file index_lock = LOCK_INIT;
 	struct stash_info info = STASH_INFO_INIT;
@@ -1828,6 +1847,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	repo_read_index_preload(the_repository, NULL, 0);
 	had_full_proof = clean_status_has_persistent_fsmonitor_semantic_history(
 		the_repository->index);
+	had_clean_sidecar = stash_clean_sidecar_present();
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
 
@@ -2025,6 +2045,13 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 				goto done;
 			}
 		}
+		if (had_clean_sidecar && use_optional_locks() &&
+		    !hook_exists(the_repository, "post-index-change") &&
+		    repair_stash_fsmonitor_proof_after_update(
+			    had_full_proof, 1, 1)) {
+			ret = -1;
+			goto done;
+		}
 		goto done;
 	} else {
 		struct child_process cp = CHILD_PROCESS_INIT;
@@ -2054,7 +2081,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 		}
 		if (preserve_clean_history &&
 		    repair_stash_fsmonitor_proof_after_update(
-			    had_full_proof, 1)) {
+			    had_full_proof, 1, 0)) {
 			ret = -1;
 			goto done;
 		}

@@ -3562,4 +3562,20 @@ test_expect_success PERL_TEST_HELPERS \
 	)
 '
 
+test_expect_success DURABLE_FSMONITOR \
+	'scoped stash publishes a sidecar for its final clean index' '
+	test_when_finished "stop_daemon sidecar-scoped-stash" &&
+	setup_repo sidecar-scoped-stash &&
+	git -C sidecar-scoped-stash config core.autocrlf false &&
+	issue_sidecar sidecar-scoped-stash &&
+	assert_clean_sidecar_hit sidecar-scoped-stash \
+		sidecar-scoped-stash scoped-stash-before &&
+	test_write_lines changed >sidecar-scoped-stash/tracked &&
+	GIT_TRACE2_EVENT="$PWD/scoped-stash.trace" \
+		git -C sidecar-scoped-stash stash push -q -- tracked &&
+	test_path_is_file sidecar-scoped-stash/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-scoped-stash \
+		sidecar-scoped-stash scoped-stash-after
+'
+
 test_done

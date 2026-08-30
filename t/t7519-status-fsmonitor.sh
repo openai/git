@@ -4045,8 +4045,8 @@ test_expect_success FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OP
 				test_must_be_empty "$gitdir/$label-$pass" &&
 				test_cmp_bin "$gitdir/$label-$pass.index" \
 					"$gitdir/index" &&
-				test_trace2_data fsmonitor config/coherent 1 \
-					<"$gitdir/$label-$pass.trace" &&
+				assert_clean_status_fast \
+					"$gitdir/$label-$pass.trace" &&
 				! test_trace2_data fsmonitor untracked/proof-missing 1 \
 					<"$gitdir/$label-$pass.trace" &&
 				assert_no_full_worktree_scan \

@@ -2466,7 +2466,8 @@ int wt_status_refresh_index(struct wt_status *s,
 	return ret;
 }
 
-static int fsmonitor_proof_repair_is_eligible(struct repository *repo)
+static int fsmonitor_proof_repair_is_eligible(
+	struct repository *repo, int allow_untracked_bootstrap)
 {
 	struct index_state *istate = repo->index;
 	const char *test_sequence =
@@ -2481,7 +2482,8 @@ static int fsmonitor_proof_repair_is_eligible(struct repository *repo)
 	    getenv(ALTERNATE_DB_ENVIRONMENT) || istate->split_index ||
 	    istate->sparse_index != INDEX_EXPANDED ||
 	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
-	    !istate->untracked || !istate->untracked->root ||
+	    (!allow_untracked_bootstrap &&
+	     (!istate->untracked || !istate->untracked->root)) ||
 	    (!istate->fsmonitor_token_valid &&
 	     !fsmonitor_pending_token_from_provider(istate)))
 		return 0;
@@ -2583,47 +2585,60 @@ int wt_status_fsmonitor_proof_needs_repair(struct repository *repo)
 {
 	struct index_state *istate = repo->index;
 
-	if (!fsmonitor_proof_repair_is_eligible(repo))
+	if (!fsmonitor_proof_repair_is_eligible(repo, 0))
 		return 0;
 	return fsmonitor_pending_token_from_provider(istate) ||
 		!istate->fsmonitor_untracked_valid ||
 		!istate->untracked->root->valid_recursive;
 }
 
+static void release_repair_status(struct wt_status *status)
+{
+	wt_status_collect_free_buffers(status);
+	string_list_clear(&status->change, 1);
+	string_list_clear(&status->untracked, 0);
+	string_list_clear(&status->ignored, 0);
+	free(status->branch);
+}
+
 static int repair_fsmonitor_proof(
-	struct repository *repo, const char *index_path, int force_refresh)
+	struct repository *repo, const char *index_path, int force_refresh,
+	struct wt_status *repaired_status)
 {
 	struct index_state *istate = repo->index;
-	struct wt_status status;
+	struct wt_status local_status;
+	struct wt_status *status = repaired_status ?
+		repaired_status : &local_status;
 	int no_pending, paired_untracked, valid_root, certifiable_index;
 	int full_proof, repaired = 0;
 
-	if (!fsmonitor_proof_repair_is_eligible(repo))
+	if (!fsmonitor_proof_repair_is_eligible(
+		    repo, !!repaired_status))
 		return 0;
 	if (!force_refresh && !wt_status_fsmonitor_proof_needs_repair(repo))
 		return 1;
 
-	wt_status_prepare(repo, &status);
-	status.proof_index_path = index_path;
-	status.allow_clean_status_shortcuts = 1;
-	status.certify_clean_status = 1;
-	wt_status_start_untracked_cache_preload(&status);
+	wt_status_prepare(repo, status);
+	status->proof_index_path = index_path;
+	status->allow_clean_status_shortcuts = 1;
+	status->certify_clean_status = 1;
+	wt_status_start_untracked_cache_preload(status);
 	/* There is no subsequent diff to consume deferred bulk results. */
 	wt_status_refresh_index(
-		&status,
+		status,
 		REFRESH_QUIET | REFRESH_UNMERGED,
 		1);
-	if (status.certify_active_filter_found)
+	if (status->certify_active_filter_found)
 		goto done;
 	/* A policy-file update can invalidate the cache during token closure. */
-	wt_status_collect_untracked(&status);
+	wt_status_collect_untracked(status);
 	/* Bind the rebuilt cache and refreshed entries to a fresh token. */
 	if (fsmonitor_reopen_token(istate))
 		wt_status_refresh_index(
-			&status,
+			status,
 			REFRESH_QUIET | REFRESH_UNMERGED,
 			1);
-	if (status.certify_active_filter_found)
+	if (status->certify_active_filter_found)
 		goto done;
 	untracked_cache_recompute_fsmonitor_valid_recursive(istate->untracked);
 	no_pending = !fsmonitor_has_pending_token(istate);
@@ -2636,15 +2651,27 @@ static int repair_fsmonitor_proof(
 	certifiable_index = clean_status_index_entries_are_certifiable(istate) ||
 		(index_path && locked_index_entries_are_certifiable(istate));
 	full_proof = clean_status_has_current_full_fsmonitor_proof(istate);
-	repaired = !status.certify_untracked_scan_failed && no_pending &&
+	repaired = !status->certify_untracked_scan_failed && no_pending &&
 		paired_untracked && valid_root && certifiable_index && full_proof;
+	if (repaired_status && repaired) {
+		struct object_id oid;
+
+		status->status_format = STATUS_FORMAT_PORCELAIN_V2;
+		status->show_branch = 0;
+		status->is_initial =
+			repo_get_oid(repo, status->reference, &oid) ? 1 : 0;
+		if (!status->is_initial)
+			oidcpy(&status->oid_commit, &oid);
+		wt_status_collect_changes_worktree(status);
+		if (status->is_initial)
+			wt_status_collect_changes_initial(status);
+		else
+			wt_status_collect_changes_index(status);
+	}
 
 done:
-	wt_status_collect_free_buffers(&status);
-	string_list_clear(&status.change, 1);
-	string_list_clear(&status.untracked, 0);
-	string_list_clear(&status.ignored, 0);
-	free(status.branch);
+	if (!repaired_status || !repaired)
+		release_repair_status(status);
 	trace2_data_intmax("fsmonitor", repo,
 			   "history/writer-proof-repaired", repaired);
 	return repaired;
@@ -2652,7 +2679,7 @@ done:
 
 int wt_status_repair_fsmonitor_proof(struct repository *repo)
 {
-	return repair_fsmonitor_proof(repo, NULL, 0);
+	return repair_fsmonitor_proof(repo, NULL, 0, NULL);
 }
 
 int wt_status_prepare_fsmonitor_proof_for_worktree_update(
@@ -2673,21 +2700,37 @@ int wt_status_repair_fsmonitor_proof_at_path(
 {
 	if (!index_path || !*index_path)
 		return 0;
-	return repair_fsmonitor_proof(repo, index_path, 0);
+	return repair_fsmonitor_proof(repo, index_path, 0, NULL);
 }
 
 static int repair_fsmonitor_proof_after_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof,
-	int allow_manifest_refresh)
+	int allow_manifest_refresh, struct wt_status *repaired_status)
 {
 	const char *proof_index_path;
 	int repaired;
 
-	if (!had_full_proof || !fsmonitor_proof_repair_is_eligible(repo) ||
-	    (!allow_manifest_refresh &&
-	     clean_status_worktree_manifest_needs_refresh(repo->index)))
+	if (!had_full_proof) {
+		trace2_data_string("fsmonitor", repo,
+				   "history/writer-repair-skip", "no-history");
 		return 0;
-	if (!wt_status_fsmonitor_proof_needs_repair(repo) &&
+	}
+	if (repaired_status && !repo->index->untracked)
+		add_untracked_cache(repo->index);
+	if (!fsmonitor_proof_repair_is_eligible(
+		    repo, !!repaired_status)) {
+		trace2_data_string("fsmonitor", repo,
+				   "history/writer-repair-skip", "ineligible");
+		return 0;
+	}
+	if (!allow_manifest_refresh &&
+	    clean_status_worktree_manifest_needs_refresh(repo->index)) {
+		trace2_data_string("fsmonitor", repo,
+				   "history/writer-repair-skip", "manifest");
+		return 0;
+	}
+	if (!repaired_status &&
+	    !wt_status_fsmonitor_proof_needs_repair(repo) &&
 	    clean_status_has_current_full_fsmonitor_proof(repo->index) &&
 	    locked_index_entries_have_stat_data(repo->index))
 		return 1;
@@ -2698,7 +2741,8 @@ static int repair_fsmonitor_proof_after_update(
 	if (write_locked_index(repo->index, lock, PROVISIONAL_LOCK))
 		return -1;
 	proof_index_path = get_lock_file_path(lock);
-	repaired = repair_fsmonitor_proof(repo, proof_index_path, 1);
+	repaired = repair_fsmonitor_proof(
+		repo, proof_index_path, 1, repaired_status);
 	if (reopen_lock_file(lock) < 0)
 		return -1;
 	return repaired;
@@ -2708,14 +2752,48 @@ int wt_status_repair_fsmonitor_proof_after_worktree_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof)
 {
 	return repair_fsmonitor_proof_after_update(
-		repo, lock, had_full_proof, 0);
+		repo, lock, had_full_proof, 0, NULL);
+}
+
+int wt_status_repair_fsmonitor_proof_after_worktree_update_with_sidecar(
+	struct repository *repo, struct lock_file *lock, int had_full_proof,
+	const struct clean_status_config_digest *config)
+{
+	struct wt_status status = { 0 };
+	int installed = 0;
+	int repaired = repair_fsmonitor_proof_after_update(
+		repo, lock, had_full_proof, 1, &status);
+
+	if (repaired <= 0)
+		return repaired;
+	if (write_locked_index(
+		    repo->index, lock, COMMIT_LOCK | SKIP_IF_UNCHANGED)) {
+		release_repair_status(&status);
+		return -1;
+	}
+	/* Rebind the repaired proof to the index inode just committed. */
+	discard_index(repo->index);
+	if (repo_read_index(repo) < 0)
+		goto done;
+	if (repo_hold_locked_index(repo, lock, 0) < 0)
+		goto done;
+	if (clean_status_issue_sidecar(&status, config, lock, 1))
+		installed = 1;
+	else
+		rollback_lock_file(lock);
+
+done:
+	release_repair_status(&status);
+	trace2_data_intmax("status", repo,
+			   "clean-proof/writer-sidecar", installed);
+	return repaired;
 }
 
 int wt_status_repair_fsmonitor_proof_after_index_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof)
 {
 	return repair_fsmonitor_proof_after_update(
-		repo, lock, had_full_proof, 1);
+		repo, lock, had_full_proof, 1, NULL);
 }
 
 static void wt_status_release_attr_snapshot(struct wt_status *s)
