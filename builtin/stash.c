@@ -424,7 +424,7 @@ static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
 		refresh_fsmonitor(the_repository->index);
 	}
 	repaired = worktree_updated && reissue_sidecar ?
-		wt_status_repair_fsmonitor_proof_after_worktree_update_with_sidecar(
+		wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 			the_repository, &lock, had_full_proof,
 			&stash_clean_digest) : worktree_updated ?
 		wt_status_repair_fsmonitor_proof_after_worktree_update(
@@ -442,17 +442,6 @@ static int repair_stash_fsmonitor_proof_after_update(int had_full_proof,
 		return error(_("could not write index"));
 
 	return 0;
-}
-
-static int stash_clean_sidecar_present(void)
-{
-	struct stat st;
-	char *path = xstrfmt("%s.csts", repo_get_index_file(the_repository));
-	int present = !lstat(path, &st) && S_ISREG(st.st_mode) &&
-		st.st_nlink == 1;
-
-	free(path);
-	return present;
 }
 
 static int create_index_from_tree(const struct object_id *tree_id,
@@ -1847,7 +1836,7 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	repo_read_index_preload(the_repository, NULL, 0);
 	had_full_proof = clean_status_has_persistent_fsmonitor_semantic_history(
 		the_repository->index);
-	had_clean_sidecar = stash_clean_sidecar_present();
+	had_clean_sidecar = wt_status_clean_sidecar_present(the_repository);
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
 

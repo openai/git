@@ -3578,4 +3578,33 @@ test_expect_success DURABLE_FSMONITOR \
 		sidecar-scoped-stash scoped-stash-after
 '
 
+test_expect_success DURABLE_FSMONITOR \
+	'rebase --continue publishes a sidecar for its final clean index' '
+	test_when_finished "stop_daemon sidecar-rebase-continue" &&
+	setup_repo sidecar-rebase-continue &&
+	git -C sidecar-rebase-continue config core.autocrlf false &&
+	issue_sidecar sidecar-rebase-continue &&
+	git -C sidecar-rebase-continue branch topic &&
+	git -C sidecar-rebase-continue checkout -q -b upstream &&
+	test_write_lines upstream >sidecar-rebase-continue/tracked &&
+	git -C sidecar-rebase-continue add tracked &&
+	git -C sidecar-rebase-continue commit -m upstream &&
+	git -C sidecar-rebase-continue checkout -q topic &&
+	test_write_lines topic >sidecar-rebase-continue/tracked &&
+	git -C sidecar-rebase-continue add tracked &&
+	git -C sidecar-rebase-continue commit -m topic &&
+	test_must_fail git -C sidecar-rebase-continue rebase upstream &&
+	test_path_is_file sidecar-rebase-continue/.git/index.csts &&
+	test_write_lines resolved >sidecar-rebase-continue/tracked &&
+	git -C sidecar-rebase-continue add tracked &&
+	GIT_EDITOR=true \
+	GIT_TRACE2_EVENT="$PWD/rebase-continue.trace" \
+		git -C sidecar-rebase-continue rebase --continue &&
+	test_trace2_data status clean-proof/writer-sidecar 1 \
+		<rebase-continue.trace &&
+	test_path_is_file sidecar-rebase-continue/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-rebase-continue \
+		sidecar-rebase-continue rebase-continue-after
+'
+
 test_done

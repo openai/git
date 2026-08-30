@@ -2755,7 +2755,7 @@ int wt_status_repair_fsmonitor_proof_after_worktree_update(
 		repo, lock, had_full_proof, 0, NULL);
 }
 
-int wt_status_repair_fsmonitor_proof_after_worktree_update_with_sidecar(
+int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 	struct repository *repo, struct lock_file *lock, int had_full_proof,
 	const struct clean_status_config_digest *config)
 {
@@ -2787,6 +2787,17 @@ done:
 	trace2_data_intmax("status", repo,
 			   "clean-proof/writer-sidecar", installed);
 	return repaired;
+}
+
+int wt_status_clean_sidecar_present(struct repository *repo)
+{
+	struct stat st;
+	char *path = xstrfmt("%s.csts", repo_get_index_file(repo));
+	int present = !lstat(path, &st) && S_ISREG(st.st_mode) &&
+		st.st_nlink == 1;
+
+	free(path);
+	return present;
 }
 
 int wt_status_repair_fsmonitor_proof_after_index_update(

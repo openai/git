@@ -5615,16 +5615,54 @@ out:
 	return ret;
 }
 
+static int reissue_clean_sidecar_after_rebase(
+	struct repository *r, int had_full_proof,
+	const struct clean_status_config_digest *config)
+{
+	struct lock_file lock = LOCK_INIT;
+	int repaired;
+
+	if (repo_hold_locked_index(r, &lock, LOCK_REPORT_ON_ERROR) < 0)
+		return error(_("could not write index"));
+	/* A replayed commit may have replaced the index in a child process. */
+	discard_index(r->index);
+	if (repo_read_index(r) < 0) {
+		rollback_lock_file(&lock);
+		return error(_("could not read index"));
+	}
+	if (!r->index->fsmonitor_token_valid) {
+		r->index->fsmonitor_has_run_once = 0;
+		refresh_fsmonitor(r->index);
+	}
+	repaired = wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
+		r, &lock, had_full_proof, config);
+	if (repaired < 0) {
+		rollback_lock_file(&lock);
+		return error(_("could not repair index"));
+	}
+	if (!repaired)
+		rollback_lock_file(&lock);
+	return 0;
+}
+
 int sequencer_continue(struct repository *r, struct replay_opts *opts)
 {
 	struct todo_list todo_list = TODO_LIST_INIT;
-	int res;
+	int res, reissue_sidecar;
+	int had_clean_sidecar = wt_status_clean_sidecar_present(r);
+	int had_full_proof = 0;
 
 	if (read_and_refresh_cache(r, opts))
 		return -1;
 
 	if (read_populate_opts(opts))
 		return -1;
+	reissue_sidecar = is_rebase_i(opts) && had_clean_sidecar;
+	if (reissue_sidecar)
+		had_full_proof =
+			clean_status_has_persistent_fsmonitor_semantic_history(
+				r->index) ||
+			clean_status_has_worktree_manifest_history(r->index);
 	if (is_rebase_i(opts)) {
 		if ((res = read_populate_todo(r, &todo_list, opts)))
 			goto release_todo_list;
@@ -5672,6 +5710,16 @@ int sequencer_continue(struct repository *r, struct replay_opts *opts)
 	}
 
 	res = pick_commits(r, &todo_list, opts);
+	if (!res && reissue_sidecar && had_full_proof &&
+	    use_optional_locks() &&
+	    !hook_exists(r, "post-index-change")) {
+		struct clean_status_config_digest digest;
+
+		if (!clean_status_config_read_repository(r, &digest) &&
+		    reissue_clean_sidecar_after_rebase(
+			    r, had_full_proof, &digest))
+			res = -1;
+	}
 release_todo_list:
 	todo_list_release(&todo_list);
 	return res;

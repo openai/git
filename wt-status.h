@@ -198,11 +198,12 @@ int wt_status_prepare_fsmonitor_proof_for_worktree_update(
 int wt_status_fsmonitor_proof_needs_repair(struct repository *repo);
 int wt_status_repair_fsmonitor_proof_after_worktree_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof);
-int wt_status_repair_fsmonitor_proof_after_worktree_update_with_sidecar(
+int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 	struct repository *repo, struct lock_file *lock, int had_full_proof,
 	const struct clean_status_config_digest *config);
 int wt_status_repair_fsmonitor_proof_after_index_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof);
+int wt_status_clean_sidecar_present(struct repository *repo);
 void wt_status_invalidate_refresh(struct wt_status *s);
 int wt_status_certified_excludes_digest(
 	struct wt_status *s, struct object_id *digest,
