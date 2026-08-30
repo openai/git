@@ -5,6 +5,7 @@
 #include "hash.h"
 
 struct index_state;
+struct lock_file;
 struct repository;
 
 /*
@@ -50,6 +51,11 @@ int clean_status_index_adopt_write_receipt(
 	struct index_state *istate,
 	struct clean_status_index_write_receipt *receipt);
 void clean_status_index_write_receipt_release(
+	struct clean_status_index_write_receipt *receipt);
+
+/* Finish a provisional write without widening the ordinary status hot path. */
+int clean_status_write_index_after_provisional(
+	struct index_state *istate, struct lock_file *lock, unsigned flags,
 	struct clean_status_index_write_receipt *receipt);
 
 int clean_status_index_snapshot_open(

@@ -3632,16 +3632,23 @@ test_expect_success PERL_TEST_HELPERS \
 '
 
 test_expect_success DURABLE_FSMONITOR \
-	'scoped stash publishes a sidecar for its final clean index' '
+	'scoped stash authenticates its final skipHash index' '
 	test_when_finished "stop_daemon sidecar-scoped-stash" &&
 	setup_repo sidecar-scoped-stash &&
 	git -C sidecar-scoped-stash config core.autocrlf false &&
+	git -C sidecar-scoped-stash config feature.manyFiles true &&
 	issue_sidecar sidecar-scoped-stash &&
 	assert_clean_sidecar_hit sidecar-scoped-stash \
 		sidecar-scoped-stash scoped-stash-before &&
 	test_write_lines changed >sidecar-scoped-stash/tracked &&
 	GIT_TRACE2_EVENT="$PWD/scoped-stash.trace" \
 		git -C sidecar-scoped-stash stash push -q -- tracked &&
+	test_trace2_data fsmonitor history/own-write-source-recorded 1 \
+		<scoped-stash.trace &&
+	test_trace2_data fsmonitor history/own-write-source-adopted 1 \
+		<scoped-stash.trace &&
+	test_trace2_data status clean-proof/writer-sidecar 1 \
+		<scoped-stash.trace &&
 	test_path_is_file sidecar-scoped-stash/.git/index.csts &&
 	assert_clean_sidecar_hit sidecar-scoped-stash \
 		sidecar-scoped-stash scoped-stash-after
@@ -3674,6 +3681,28 @@ test_expect_success DURABLE_FSMONITOR \
 	test_path_is_file sidecar-rebase-continue/.git/index.csts &&
 	assert_clean_sidecar_hit sidecar-rebase-continue \
 		sidecar-rebase-continue rebase-continue-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'non-fast-forward merge publishes a sidecar for its final clean index' '
+	test_when_finished "stop_daemon sidecar-no-ff-merge" &&
+	setup_repo sidecar-no-ff-merge &&
+	primary=$(git -C sidecar-no-ff-merge symbolic-ref --short HEAD) &&
+	git -C sidecar-no-ff-merge switch -c side &&
+	test_commit -C sidecar-no-ff-merge topic topic-file &&
+	git -C sidecar-no-ff-merge switch "$primary" &&
+	test_commit -C sidecar-no-ff-merge primary primary-file &&
+	test-tool chmtime -120 sidecar-no-ff-merge/primary-file &&
+	git -C sidecar-no-ff-merge update-index --refresh &&
+	issue_sidecar sidecar-no-ff-merge &&
+	assert_clean_sidecar_hit sidecar-no-ff-merge \
+		sidecar-no-ff-merge no-ff-merge-before &&
+	GIT_TRACE2_EVENT="$PWD/no-ff-merge.trace" \
+		git -C sidecar-no-ff-merge merge --no-ff --no-edit side &&
+	test_trace2_data status clean-proof/writer-sidecar 1 \
+		<no-ff-merge.trace &&
+	assert_clean_sidecar_hit sidecar-no-ff-merge \
+		sidecar-no-ff-merge no-ff-merge-after
 '
 
 test_expect_success DURABLE_FSMONITOR \

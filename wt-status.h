@@ -201,6 +201,9 @@ int wt_status_repair_fsmonitor_proof_after_worktree_update(
 int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 	struct repository *repo, struct lock_file *lock, int had_full_proof,
 	const struct clean_status_config_digest *config);
+void wt_status_reissue_clean_sidecar_after_worktree_update(
+	struct repository *repo, int had_full_proof,
+	const struct clean_status_config_digest *config);
 int wt_status_repair_fsmonitor_proof_after_index_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof);
 int wt_status_clean_sidecar_present(struct repository *repo);

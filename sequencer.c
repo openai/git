@@ -5616,46 +5616,6 @@ out:
 	return ret;
 }
 
-static void reissue_clean_sidecar_after_rebase(
-	struct repository *r, int had_full_proof,
-	const struct clean_status_config_digest *config)
-{
-	struct lock_file lock = LOCK_INIT;
-	int repaired;
-
-	/* The rebase has completed; a missing sidecar safely falls back. */
-	if (repo_hold_locked_index(r, &lock, 0) < 0) {
-		trace2_data_string("status", r,
-				   "clean-proof/writer-sidecar-skip",
-				   "index-lock");
-		return;
-	}
-	/* A replayed commit may have replaced the index in a child process. */
-	discard_index(r->index);
-	if (repo_read_index(r) < 0) {
-		rollback_lock_file(&lock);
-		trace2_data_string("status", r,
-				   "clean-proof/writer-sidecar-skip",
-				   "index-read");
-		return;
-	}
-	if (!r->index->fsmonitor_token_valid) {
-		r->index->fsmonitor_has_run_once = 0;
-		refresh_fsmonitor(r->index);
-	}
-	repaired = wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
-		r, &lock, had_full_proof, config);
-	if (repaired < 0) {
-		rollback_lock_file(&lock);
-		trace2_data_string("status", r,
-				   "clean-proof/writer-sidecar-skip",
-				   "proof-repair");
-		return;
-	}
-	if (!repaired)
-		rollback_lock_file(&lock);
-}
-
 int sequencer_continue(struct repository *r, struct replay_opts *opts)
 {
 	struct todo_list todo_list = TODO_LIST_INIT;
@@ -5727,7 +5687,7 @@ int sequencer_continue(struct repository *r, struct replay_opts *opts)
 		struct clean_status_config_digest digest;
 
 		if (!clean_status_config_read_repository(r, &digest))
-			reissue_clean_sidecar_after_rebase(
+			wt_status_reissue_clean_sidecar_after_worktree_update(
 				r, had_full_proof, &digest);
 	}
 release_todo_list:

@@ -1431,6 +1431,7 @@ int cmd_merge(int argc,
 	struct strbuf buf = STRBUF_INIT;
 	int i, ret = 0, head_subsumed;
 	int best_cnt = -1, merge_was_ok = 0, automerge_was_ok = 0;
+	int merge_committed = 0, reissue_sidecar = 0;
 	int repair_after_merge = 0;
 	struct commit_list *common = NULL;
 	const char *best_strategy = NULL, *wt_strategy = NULL;
@@ -1536,6 +1537,8 @@ int cmd_merge(int argc,
 	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
 		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository, &clean_digest);
+		reissue_sidecar =
+			wt_status_clean_sidecar_present(the_repository);
 	}
 
 	if (repo_read_index_unmerged(the_repository))
@@ -1800,6 +1803,8 @@ int cmd_merge(int argc,
 					       &remoteheads->item->object.oid)) {
 				ret = merge_trivial(head_commit, remoteheads,
 						    repair_after_merge);
+				if (!ret)
+					merge_committed = 1;
 				goto done;
 			}
 			printf(_("Nope.\n"));
@@ -1909,6 +1914,8 @@ int cmd_merge(int argc,
 		ret = finish_automerge(head_commit, head_subsumed,
 				       common, remoteheads,
 				       &result_tree, wt_strategy);
+		if (!ret)
+			merge_committed = 1;
 		goto done;
 	}
 
@@ -1957,6 +1964,11 @@ int cmd_merge(int argc,
 		printf(_("When finished, apply stashed changes with `git stash pop`\n"));
 
 done:
+	if (!ret && merge_committed && reissue_sidecar &&
+	    repair_after_merge && use_optional_locks() &&
+	    !hook_exists(the_repository, "post-index-change"))
+		wt_status_reissue_clean_sidecar_after_worktree_update(
+			the_repository, repair_after_merge, &clean_digest);
 	if (!automerge_was_ok) {
 		commit_list_free(common);
 		commit_list_free(remoteheads);

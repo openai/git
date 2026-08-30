@@ -344,6 +344,11 @@ static inline int reopen_lock_file(struct lock_file *lk)
 	return reopen_tempfile(lk->tempfile);
 }
 
+static inline int reopen_lock_file_for_readwrite(struct lock_file *lk)
+{
+	return reopen_tempfile_for_readwrite(lk->tempfile);
+}
+
 /*
  * Commit the change represented by `lk`: close the file descriptor
  * and/or file pointer if they are still open and rename the lockfile

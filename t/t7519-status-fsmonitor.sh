@@ -8164,6 +8164,142 @@ test_expect_success LINUX_SCOPED_HISTORY,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORE
 	)
 '
 
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'worktree add primes a read-only clean status proof' '
+	test_when_finished "rm -rf worktree-add-proof worktree-add-proof-linked" &&
+	test_when_finished \
+		"git -C worktree-add-proof-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo worktree-add-proof &&
+	(
+		cd worktree-add-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines tracked >tracked &&
+		git add tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		GIT_TRACE2_EVENT="$PWD/.git/worktree-add.trace" \
+			git worktree add --detach \
+				../worktree-add-proof-linked HEAD &&
+		worktree="$PWD/../worktree-add-proof-linked" &&
+		gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+		test_trace2_data worktree add/clean-status-primed 1 \
+			<.git/worktree-add.trace &&
+		test_fsmonitor_full_proof "$gitdir/index" paired &&
+		cp "$gitdir/index" "$gitdir/before.index" &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$gitdir/status.trace" \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/status.actual" &&
+		test_must_be_empty "$gitdir/status.actual" &&
+		test_cmp_bin "$gitdir/before.index" "$gitdir/index" &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<"$gitdir/status.trace" &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<"$gitdir/status.trace"
+	)
+'
+
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'worktree add primes after a post-checkout index write' '
+	test_when_finished "rm -rf worktree-add-hook-proof worktree-add-hook-proof-linked" &&
+	test_when_finished \
+		"git -C worktree-add-hook-proof-linked fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo worktree-add-hook-proof &&
+	(
+		cd worktree-add-hook-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines tracked >tracked &&
+		git add tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		write_script .git/hooks/post-checkout <<-\EOF &&
+		git update-index --no-fsmonitor
+		EOF
+		GIT_TRACE2_EVENT="$PWD/.git/worktree-add.trace" \
+			git worktree add --detach \
+				../worktree-add-hook-proof-linked HEAD &&
+		worktree="$PWD/../worktree-add-hook-proof-linked" &&
+		gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+		test_trace2_data worktree add/clean-status-primed 1 \
+			<.git/worktree-add.trace &&
+		cp "$gitdir/index" "$gitdir/before.index" &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$gitdir/status.trace" \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/status.actual" &&
+		test_must_be_empty "$gitdir/status.actual" &&
+		test_cmp_bin "$gitdir/before.index" "$gitdir/index" &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<"$gitdir/status.trace" &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<"$gitdir/status.trace"
+	)
+'
+
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'worktree add primes from linked worktree config after post-checkout' '
+	test_when_finished "rm -rf worktree-add-config-proof worktree-add-config-proof-linked" &&
+	test_create_repo worktree-add-config-proof &&
+	(
+		cd worktree-add-config-proof &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines tracked >tracked &&
+		git add tracked &&
+		git commit -qm base &&
+		git config extensions.worktreeConfig true &&
+		git config --worktree core.fsmonitor false &&
+		git config --worktree core.untrackedCache false &&
+		write_script .git/hooks/post-checkout <<-\EOF &&
+		git update-index --no-fsmonitor &&
+		git config --worktree core.fsmonitor true &&
+		git config --worktree core.untrackedCache true
+		EOF
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$PWD/.git/worktree-add.trace" \
+			git worktree add --detach \
+				../worktree-add-config-proof-linked HEAD &&
+		worktree="$PWD/../worktree-add-config-proof-linked" &&
+		gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir) &&
+		test_trace2_data worktree add/clean-status-primed 1 \
+			<.git/worktree-add.trace &&
+		test_fsmonitor_full_proof "$gitdir/index" paired &&
+		cp "$gitdir/index" "$gitdir/before.index" &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+		GIT_TRACE2_EVENT="$gitdir/status.trace" \
+			git -C "$worktree" status --porcelain=v2 \
+				>"$gitdir/status.actual" &&
+		test_must_be_empty "$gitdir/status.actual" &&
+		test_cmp_bin "$gitdir/before.index" "$gitdir/index" &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<"$gitdir/status.trace" &&
+		! test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<"$gitdir/status.trace"
+	)
+'
+
+test_expect_success MACOS,FSMONITOR_DAEMON,UNTRACKED_CACHE \
+	'worktree add honors disabled optional locks' '
+	test_when_finished "rm -rf worktree-add-no-locks worktree-add-no-locks-linked" &&
+	test_create_repo worktree-add-no-locks &&
+	(
+		cd worktree-add-no-locks &&
+		test_write_lines tracked >tracked &&
+		git add tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/worktree-add.trace" \
+			git worktree add --detach \
+				../worktree-add-no-locks-linked HEAD &&
+		! test_trace2_data worktree add/clean-status-primed 1 \
+			<.git/worktree-add.trace
+	)
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'repeated provider resets fall back before an unclosable rescan' '
 	test_when_finished "rm -rf builtin-closure-terminal-reset" &&

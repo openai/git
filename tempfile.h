@@ -268,6 +268,13 @@ int close_tempfile_gently(struct tempfile *tempfile);
 int reopen_tempfile(struct tempfile *tempfile);
 
 /*
+ * Like `reopen_tempfile()`, but open the temporary file for both reading and
+ * writing. This requires read permission in addition to the write permission
+ * required by the ordinary reopen operation.
+ */
+int reopen_tempfile_for_readwrite(struct tempfile *tempfile);
+
+/*
  * Close the file descriptor and/or file pointer and remove the
  * temporary file associated with `tempfile`. It is a NOOP to call
  * `delete_tempfile()` for a `tempfile` object that has already been

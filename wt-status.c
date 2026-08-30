@@ -2743,8 +2743,16 @@ static int repair_fsmonitor_proof_after_update(
 	proof_index_path = get_lock_file_path(lock);
 	repaired = repair_fsmonitor_proof(
 		repo, proof_index_path, 1, repaired_status);
+	/* Receipt preparation needs read access, but the write must not. */
+#ifdef __APPLE__
+	/* Preserve the read-write reopen historically used on Apple platforms. */
+	if (reopen_lock_file_for_readwrite(lock) < 0 &&
+	    reopen_lock_file(lock) < 0)
+		return -1;
+#else
 	if (reopen_lock_file(lock) < 0)
 		return -1;
+#endif
 	return repaired;
 }
 
@@ -2769,7 +2777,7 @@ int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 
 	if (repaired <= 0)
 		return repaired;
-	if (write_locked_index_with_receipt(
+	if (clean_status_write_index_after_provisional(
 		    repo->index, lock, COMMIT_LOCK | SKIP_IF_UNCHANGED,
 		    &written_index)) {
 		clean_status_index_write_receipt_release(&written_index);
@@ -2811,6 +2819,46 @@ int wt_status_clean_sidecar_present(struct repository *repo)
 
 	free(path);
 	return present;
+}
+
+void wt_status_reissue_clean_sidecar_after_worktree_update(
+	struct repository *repo, int had_full_proof,
+	const struct clean_status_config_digest *config)
+{
+	struct lock_file lock = LOCK_INIT;
+	int repaired;
+
+	/* A missing replacement sidecar safely falls back to normal status. */
+	if (repo_hold_locked_index(repo, &lock, 0) < 0) {
+		trace2_data_string("status", repo,
+				   "clean-proof/writer-sidecar-skip",
+				   "index-lock");
+		return;
+	}
+	/* A child command may have replaced the canonical index inode. */
+	discard_index(repo->index);
+	if (repo_read_index(repo) < 0) {
+		rollback_lock_file(&lock);
+		trace2_data_string("status", repo,
+				   "clean-proof/writer-sidecar-skip",
+				   "index-read");
+		return;
+	}
+	if (!repo->index->fsmonitor_token_valid) {
+		repo->index->fsmonitor_has_run_once = 0;
+		refresh_fsmonitor(repo->index);
+	}
+	repaired = wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
+		repo, &lock, had_full_proof, config);
+	if (repaired < 0) {
+		rollback_lock_file(&lock);
+		trace2_data_string("status", repo,
+				   "clean-proof/writer-sidecar-skip",
+				   "proof-repair");
+		return;
+	}
+	if (!repaired)
+		rollback_lock_file(&lock);
 }
 
 int wt_status_repair_fsmonitor_proof_after_index_update(
