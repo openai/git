@@ -8388,6 +8388,24 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! test_trace2_data fsmonitor semantic/manifest-scan-count \
 			"[1-9][0-9]*" <.git/disabled-filter.trace &&
 
+		GIT_CONFIG_COUNT=3 \
+		GIT_CONFIG_KEY_0=filter.demo.clean GIT_CONFIG_VALUE_0= \
+		GIT_CONFIG_KEY_1=filter.demo.process GIT_CONFIG_VALUE_1= \
+		GIT_CONFIG_KEY_2=filter.demo.required GIT_CONFIG_VALUE_2=false \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/disabled-clean-filter.trace" \
+			git -c core.fsmonitor=true -c core.hooksPath=/dev/null \
+				diff --no-textconv --no-ext-diff --submodule=short \
+				--ignore-submodules=dirty --color \
+			>.git/disabled-clean-filter.out &&
+		test_must_be_empty .git/disabled-clean-filter.out &&
+		test_cmp_bin .git/disabled-filter.index .git/index &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/disabled-clean-filter.trace &&
+		! test_trace2_data index preload/sum_lstat \
+			"[1-9][0-9]*" <.git/disabled-clean-filter.trace &&
+
 		test_write_lines "tracked filter=demo" >.git/info/attributes &&
 		GIT_TEST_PRELOAD_INDEX=1 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
@@ -8406,8 +8424,10 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+for disable_smudge in true false
+do
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'disabled filters cannot publish a proof for active filtered paths' '
+	"disabled filters cannot publish a proof for active filtered paths (smudge: $disable_smudge)" '
 	test_when_finished "rm -rf disabled-filter-active-path" &&
 	test_create_repo disabled-filter-active-path &&
 	(
@@ -8431,14 +8451,16 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_trace2_data fsmonitor filter-scope/valid 1 \
 			<.git/prime.trace &&
 
+		set -- -c filter.demo.clean= -c filter.demo.process= \
+			-c filter.demo.required=false &&
+		if test "$disable_smudge" = true
+		then
+			set -- "$@" -c filter.demo.smudge=
+		fi &&
 		test_write_lines raw >active.filtered &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
 		GIT_TEST_FSMONITOR_QUERY_PATH=active.filtered \
-			git -c filter.demo.clean= \
-			    -c filter.demo.smudge= \
-			    -c filter.demo.process= \
-			    -c filter.demo.required=false \
-			    add active.filtered &&
+			git "$@" add active.filtered &&
 		GIT_OPTIONAL_LOCKS=0 \
 			git -c core.fsmonitor=false -c core.untrackedCache=false \
 			    status --porcelain=v2 --untracked-files=no \
@@ -8452,6 +8474,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_cmp .git/expected .git/actual
 	)
 '
+done
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'partial required-filter overrides cannot hide a missing clean helper' '
@@ -8489,8 +8512,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+for disable_smudge in true false
+do
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'disabled filters cannot prime a reusable proof for active clean filters' '
+	"disabled filters cannot prime a reusable proof for active clean filters (smudge: $disable_smudge)" '
 	test_when_finished "rm -rf disabled-filter-prime" &&
 	test_create_repo disabled-filter-prime &&
 	(
@@ -8508,14 +8533,16 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		git config core.fsmonitor true &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
 			git update-index --fsmonitor &&
+		set -- -c filter.demo.clean= -c filter.demo.process= \
+			-c filter.demo.required=false &&
+		if test "$disable_smudge" = true
+		then
+			set -- "$@" -c filter.demo.smudge=
+		fi &&
 		GIT_INDEX_FILE="$PWD/.git/index" \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/disabled-prime.trace" \
-			git -c filter.demo.clean= \
-			    -c filter.demo.smudge= \
-			    -c filter.demo.process= \
-			    -c filter.demo.required=false \
-			    status --porcelain=v2 --untracked-files=no \
+			git "$@" status --porcelain=v2 --untracked-files=no \
 			>.git/disabled &&
 		test_must_be_empty .git/disabled &&
 		GIT_OPTIONAL_LOCKS=0 \
@@ -8531,6 +8558,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_cmp .git/expected .git/actual
 	)
 '
+done
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'unused configured filters preserve staged and dry-run history' '
