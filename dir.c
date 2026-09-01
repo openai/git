@@ -2857,6 +2857,56 @@ static struct path_pattern *last_matching_pattern_from_lists(
 }
 
 /*
+ * A valid cache directory may not have needed its per-directory excludes yet,
+ * leaving exclude_oid null.  When a provider later reports its first child,
+ * use an exact stage-zero index entry as the comparison point before loading
+ * the worktree source.  A regular stage-zero case-folded alias is also a safe
+ * comparison point: add_patterns() still opens and hashes the actual worktree
+ * source because its exact-case index lookup misses the alias.  For staged,
+ * non-regular, removed, or intent-to-add matches, use the empty-blob ID to
+ * force the same source read and conservative invalidation.  If the source is
+ * actually empty, retaining the cache is semantically safe.
+ */
+static int prime_cached_exclude_from_index(struct index_state *istate,
+					   const struct strbuf *base,
+					   const char *exclude_per_dir,
+					   struct object_id *oid)
+{
+	struct cache_entry *ce;
+	struct strbuf path = STRBUF_INIT;
+	int pos;
+
+	strbuf_addbuf(&path, base);
+	strbuf_addstr(&path, exclude_per_dir);
+	pos = index_name_pos(istate, path.buf, path.len);
+	if (pos >= 0) {
+		ce = istate->cache[pos];
+	} else {
+		pos = -1 - pos;
+		if (pos < istate->cache_nr &&
+		    ce_namelen(istate->cache[pos]) == path.len &&
+		    !memcmp(istate->cache[pos]->name, path.buf, path.len)) {
+			ce = istate->cache[pos];
+		} else if (repo_ignore_case(istate->repo)) {
+			ce = index_file_exists(istate, path.buf, path.len, 1);
+		} else {
+			ce = NULL;
+		}
+	}
+	if (!ce) {
+		strbuf_release(&path);
+		return 0;
+	}
+	if (!ce_stage(ce) && S_ISREG(ce->ce_mode) &&
+	    !(ce->ce_flags & CE_REMOVE) && !ce_intent_to_add(ce))
+		oidcpy(oid, &ce->oid);
+	else
+		oidcpy(oid, the_hash_algo->empty_blob);
+	strbuf_release(&path);
+	return 1;
+}
+
+/*
  * Loads the per-directory exclude list for the substring of base
  * which has a char length of baselen.
  */
@@ -2958,6 +3008,15 @@ static void prep_exclude(struct dir_struct *dir,
 		/* Try to read per-directory file */
 		oidclr(&oid_stat.oid, the_repository->hash_algo);
 		oid_stat.valid = 0;
+		if (dir->exclude_per_dir && untracked &&
+		    untracked->valid && untracked->fsmonitor_dirty &&
+		    is_null_oid(&untracked->exclude_oid) &&
+		    prime_cached_exclude_from_index(
+			    istate, &dir->internal.basebuf,
+			    dir->exclude_per_dir, &untracked->exclude_oid)) {
+			istate->cache_changed |= UNTRACKED_CHANGED;
+			istate->fsmonitor_untracked_must_persist = 1;
+		}
 		if (dir->exclude_per_dir &&
 		    /*
 		     * If we know that no files have been added in

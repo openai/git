@@ -2580,6 +2580,8 @@ LIBS = $(filter-out %.o, $(GITLIBS)) $(EXTLIBS)
 
 BASIC_CFLAGS += $(COMPAT_CFLAGS)
 LIB_OBJS += $(COMPAT_OBJS)
+# Keep provisional-index glue after every existing library object.
+LIB_OBJS += clean-status-index-provisional.o
 
 # Quote for C
 

@@ -46,6 +46,10 @@ struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
 	struct index_state *istate,
 	const struct attr_source_snapshot *attrs,
 	int validate_filter_scope);
+struct clean_status_proof_epoch *clean_status_capture_proof_epoch_at_path(
+	struct index_state *istate,
+	const struct attr_source_snapshot *attrs,
+	int validate_filter_scope, const char *index_path);
 int clean_status_proof_epoch_start_token_matches(
 	struct index_state *istate,
 	const struct clean_status_proof_epoch *epoch);
@@ -112,7 +116,9 @@ int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
 	struct lock_file *index_lock,
-	int normal_clean_query);
+	const struct clean_status_index_snapshot *scanned_index,
+	int certifying_clean_query);
+int clean_status_sidecar_postwrite_test_barrier(void);
 int clean_status_try_sidecar(
 	struct repository *repo,
 	const struct clean_status_config_digest *config,
@@ -124,6 +130,10 @@ void clean_status_prepare_fsmonitor_config(struct index_state *istate);
 int clean_status_probe_fsmonitor_config(struct index_state *istate);
 void clean_status_invalidate_current_proof(struct index_state *istate);
 int clean_status_index_entry_is_semantically_safe(
+	const struct index_state *istate,
+	const struct cache_entry *old,
+	const struct cache_entry *new_entry);
+int clean_status_intent_to_add_change_is_semantically_safe(
 	const struct index_state *istate,
 	const struct cache_entry *old,
 	const struct cache_entry *new_entry);
@@ -162,6 +172,9 @@ int clean_status_transfer_current_proof_if_same_index(
 	struct index_state *dst, const struct index_state *src);
 int clean_status_transfer_current_proof_if_semantically_same_index(
 	struct index_state *dst, const struct index_state *src);
+int clean_status_transfer_current_proof_after_checkout(
+	struct index_state *dst, const struct index_state *src,
+	int *manifest_refresh_required);
 
 /*
  * A canonical main-index source may lend suspended historical state to an

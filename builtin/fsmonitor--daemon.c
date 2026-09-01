@@ -8,12 +8,14 @@
 #include "environment.h"
 #include "gettext.h"
 #include "parse-options.h"
+
 #include "fsmonitor-ll.h"
 #include "fsmonitor-ipc.h"
 #include "fsmonitor-settings.h"
 #include "compat/fsmonitor/fsm-health.h"
 #include "compat/fsmonitor/fsm-listen.h"
 #include "fsmonitor--daemon.h"
+#include "khash.h"
 
 #include "simple-ipc.h"
 #include "strmap.h"
@@ -30,6 +32,19 @@ static const char * const builtin_fsmonitor__daemon_usage[] = {
 };
 
 #ifdef HAVE_FSMONITOR_DAEMON_BACKEND
+static khint_t fsmonitor_path_hash(const char *path)
+{
+	return memhash(&path, sizeof(path));
+}
+
+static int fsmonitor_path_equal(const char *a, const char *b)
+{
+	return a == b;
+}
+
+KHASH_INIT(fsmonitor_path_sequence, const char *, uint64_t, 1,
+	   fsmonitor_path_hash, fsmonitor_path_equal)
+
 /*
  * Global state loaded from config.
  */
@@ -142,6 +157,7 @@ static int do_as_client__status(void)
 }
 
 enum fsmonitor_cookie_item_result {
+	FCIR_TIMEOUT = -2,
 	FCIR_ERROR = -1, /* could not create cookie file ? */
 	FCIR_INIT,
 	FCIR_SEEN,
@@ -151,6 +167,7 @@ enum fsmonitor_cookie_item_result {
 struct fsmonitor_cookie_item {
 	struct hashmap_entry entry;
 	char *name;
+	uint64_t token_generation;
 	enum fsmonitor_cookie_item_result result;
 };
 
@@ -177,6 +194,10 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	struct strbuf cookie_filename = STRBUF_INIT;
 	enum fsmonitor_cookie_item_result result;
 	int my_cookie_seq;
+#ifdef __APPLE__
+	uint64_t cookie_token_generation;
+	enum fsm_listen_flush_result flush_result;
+#endif
 
 	CALLOC_ARRAY(cookie, 1);
 
@@ -188,6 +209,7 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	strbuf_addbuf(&cookie_pathname, &cookie_filename);
 
 	cookie->name = strbuf_detach(&cookie_filename, NULL);
+	cookie->token_generation = state->token_generation;
 	cookie->result = FCIR_INIT;
 	hashmap_entry_init(&cookie->entry, strhash(cookie->name));
 
@@ -218,11 +240,10 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 	unlink(cookie_pathname.buf);
 
 	/*
-	 * Wait for the listener thread to observe the cookie file.
-	 * Time out after a short interval so that the client
-	 * does not hang forever if the filesystem does not deliver
-	 * events (e.g., on certain container/overlay filesystems
-	 * where inotify watches succeed but events never arrive).
+	 * Wait for the provider to observe the cookie.  On Darwin this is the
+	 * first half of the boundary: a later synchronous provider fence is
+	 * still required because FSEvents may report the cookie before a later
+	 * callback containing logically older worktree events.
 	 */
 	{
 		struct timeval now;
@@ -240,9 +261,46 @@ static enum fsmonitor_cookie_item_result with_lock__wait_for_cookie(
 		if (err == ETIMEDOUT && cookie->result == FCIR_INIT) {
 			trace_printf_key(&trace_fsmonitor,
 					 "cookie_wait timed out");
+#ifndef __APPLE__
+			cookie->result = FCIR_ERROR;
+#endif
+		}
+	}
+
+#ifdef __APPLE__
+	/*
+	 * A delivered Darwin cookie is not a completeness boundary.  Once the
+	 * cookie is visible (or its ordinary wait expires), request the stronger
+	 * provider fence without holding main_lock so callbacks can publish every
+	 * event that preceded the fence.  A successful fence may also rescue a
+	 * late cookie, but is accepted only if that cookie is then SEEN.
+	 */
+	if (cookie->result == FCIR_INIT || cookie->result == FCIR_SEEN) {
+		cookie_token_generation = cookie->token_generation;
+		trace_printf_key(&trace_fsmonitor,
+				 "cookie_wait: requesting Darwin provider fence after cookie wait");
+		pthread_mutex_unlock(&state->main_lock);
+		flush_result = fsm_listen__flush_sync(state);
+		pthread_mutex_lock(&state->main_lock);
+
+		if (flush_result == FSM_LISTEN_FLUSH_TIMEOUT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: synchronous flush timed out");
+			cookie->result = FCIR_TIMEOUT;
+		} else if (flush_result != FSM_LISTEN_FLUSH_OK) {
+			cookie->result = FCIR_ABORT;
+		} else if (state->token_generation !=
+			   cookie_token_generation) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: provider fence crossed token generation");
+			cookie->result = FCIR_ABORT;
+		} else if (cookie->result == FCIR_INIT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie_wait: synchronous flush missed cookie");
 			cookie->result = FCIR_ERROR;
 		}
 	}
+#endif
 
 done:
 	hashmap_remove(&state->cookies, &cookie->entry, NULL);
@@ -275,10 +333,17 @@ static void with_lock__mark_cookies_seen(struct fsmonitor_daemon_state *state,
 		hashmap_entry_init(&key.entry, strhash(key.name));
 
 		cookie = hashmap_get_entry(&state->cookies, &key, entry, NULL);
-		if (cookie) {
+		if (cookie && cookie->result == FCIR_INIT &&
+		    cookie->token_generation == state->token_generation) {
 			trace_printf_key(&trace_fsmonitor, "cookie-seen: '%s'",
 					 cookie->name);
 			cookie->result = FCIR_SEEN;
+			nr_seen++;
+		} else if (cookie && cookie->result == FCIR_INIT) {
+			trace_printf_key(&trace_fsmonitor,
+					 "cookie-abort-generation: '%s'",
+					 cookie->name);
+			cookie->result = FCIR_ABORT;
 			nr_seen++;
 		}
 	}
@@ -390,6 +455,7 @@ struct fsmonitor_batch {
 	const char **interned_paths;
 	size_t nr, alloc;
 	time_t pinned_time;
+	kh_fsmonitor_path_sequence_t *overflow_path_seqs;
 };
 
 static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
@@ -410,12 +476,8 @@ static struct fsmonitor_token_data *fsmonitor_new_token_data(void)
 	if (test_env_value < 0)
 		test_env_value = git_env_bool("GIT_TEST_FSMONITOR_TOKEN", 0);
 
-#ifdef __APPLE__
 	strbuf_addstr(&token->token_id,
-		      FSMONITOR_IPC_HARDLINK_INODE_TOKEN_PREFIX);
-#endif
-	strbuf_addstr(&token->token_id,
-		      FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_PREFIX);
+		      FSMONITOR_IPC_COOKIE_TOKEN_PREFIX);
 
 	if (!test_env_value) {
 		struct timeval tv;
@@ -489,6 +551,7 @@ void fsmonitor_batch__free_list(struct fsmonitor_batch *batch)
 		 * are interned, so we don't own them.  We only own
 		 * the array.
 		 */
+		kh_destroy_fsmonitor_path_sequence(batch->overflow_path_seqs);
 		free(batch->interned_paths);
 		free(batch);
 
@@ -521,16 +584,102 @@ static void fsmonitor_batch__combine(struct fsmonitor_batch *batch_dest,
 			batch_src->interned_paths[k];
 }
 
+static void fsmonitor_batch__add_overflow_path(struct fsmonitor_batch *batch,
+					       const char *path,
+					       uint64_t batch_seq_nr)
+{
+	khint_t pos;
+	int added;
+
+	pos = kh_put_fsmonitor_path_sequence(
+		batch->overflow_path_seqs, path, &added);
+	if (!added) {
+		if (kh_value(batch->overflow_path_seqs, pos) < batch_seq_nr)
+			kh_value(batch->overflow_path_seqs, pos) = batch_seq_nr;
+		return;
+	}
+	kh_value(batch->overflow_path_seqs, pos) = batch_seq_nr;
+
+	ALLOC_GROW(batch->interned_paths, batch->nr + 1, batch->alloc);
+	batch->interned_paths[batch->nr++] = path;
+}
+
+/*
+ * Collapse this batch and everything older than it into one deduplicated
+ * overflow batch.  Every path is interned, so pointer identity is sufficient.
+ *
+ * Keep the set with the overflow batch.  Future compactions then hash only
+ * newly retired paths instead of repeatedly rebuilding the complete set.
+ */
+static size_t fsmonitor_batch__compact_tail(struct fsmonitor_batch *batch,
+					    size_t *input_nr)
+{
+	struct fsmonitor_batch compacted = { 0 };
+	struct fsmonitor_batch *item, *overflow = NULL;
+
+	*input_nr = 0;
+	for (item = batch; item; item = item->next) {
+		*input_nr = st_add(*input_nr, item->nr);
+		if (item->overflow_path_seqs) {
+			overflow = item;
+			break;
+		}
+	}
+
+	if (overflow) {
+		/*
+		 * Reuse the persistent set and array from the prior overflow
+		 * batch.  Only the newly retired paths need a lookup.
+		 */
+		if (overflow->next)
+			BUG("overflow batch is not the batch tail");
+		for (item = batch; item != overflow; item = item->next) {
+			size_t k;
+
+			for (k = 0; k < item->nr; k++)
+				fsmonitor_batch__add_overflow_path(
+					overflow, item->interned_paths[k],
+					item->batch_seq_nr);
+		}
+		compacted.interned_paths = overflow->interned_paths;
+		compacted.nr = overflow->nr;
+		compacted.alloc = overflow->alloc;
+		compacted.overflow_path_seqs = overflow->overflow_path_seqs;
+		overflow->interned_paths = NULL;
+		overflow->nr = overflow->alloc = 0;
+		overflow->overflow_path_seqs = NULL;
+	} else {
+		compacted.overflow_path_seqs =
+			kh_init_fsmonitor_path_sequence();
+		for (item = batch; item; item = item->next) {
+			size_t k;
+
+			for (k = 0; k < item->nr; k++)
+				fsmonitor_batch__add_overflow_path(
+					&compacted, item->interned_paths[k],
+					item->batch_seq_nr);
+		}
+	}
+
+	free(batch->interned_paths);
+	batch->interned_paths = compacted.interned_paths;
+	batch->nr = compacted.nr;
+	batch->alloc = compacted.alloc;
+	batch->overflow_path_seqs = compacted.overflow_path_seqs;
+
+	return batch->nr;
+}
+
 /*
  * To keep the batch list from growing unbounded in response to filesystem
- * activity, we try to truncate old batches from the end of the list as
- * they become irrelevant.
+ * activity, collapse old batches from the end of the list after a delay.
  *
- * We assume that the .git/index will be updated with the most recent token
- * any time the index is updated.  And future commands will only ask for
- * recent changes *since* that new token.  So as tokens advance into the
- * future, older batch items will never be requested/needed.  So we can
- * truncate them without loss of functionality.
+ * A repository may have multiple durable indexes with different tokens.  In
+ * particular, advancing a private GIT_INDEX_FILE does not advance .git/index.
+ * We therefore cannot discard old paths just because one client asked for a
+ * newer token.  Instead, keep their deduplicated union in an overflow batch.
+ * Keep the newest original sequence number for each path so that clients do
+ * not receive events that they consumed before their requested checkpoint.
  *
  * However, multiple commands may be talking to the daemon concurrently
  * or perform a slow command, so a little "token skew" is possible.
@@ -549,6 +698,7 @@ static void fsmonitor_batch__combine(struct fsmonitor_batch *batch_dest,
  * the official list so that the caller can free it after leaving the lock.
  */
 #define MY_TIME_DELAY_SECONDS (5 * 60) /* seconds */
+static unsigned long truncate_delay_seconds = MY_TIME_DELAY_SECONDS;
 
 static struct fsmonitor_batch *with_lock__truncate_old_batches(
 	struct fsmonitor_daemon_state *state,
@@ -558,6 +708,7 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 
 	const struct fsmonitor_batch *batch;
 	struct fsmonitor_batch *remainder;
+	size_t input_nr, unique_nr;
 
 	if (!batch_marker)
 		return NULL;
@@ -566,13 +717,13 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 			 batch_marker->batch_seq_nr,
 			 (uint64_t)batch_marker->pinned_time);
 
-	for (batch = batch_marker; batch; batch = batch->next) {
+	for (batch = batch_marker->next; batch; batch = batch->next) {
 		time_t t;
 
-		if (!batch->pinned_time) /* an overflow batch */
+		if (!batch->pinned_time || batch->overflow_path_seqs)
 			continue;
 
-		t = batch->pinned_time + MY_TIME_DELAY_SECONDS;
+		t = batch->pinned_time + truncate_delay_seconds;
 		if (t > batch_marker->pinned_time) /* too close to marker */
 			continue;
 
@@ -582,9 +733,20 @@ static struct fsmonitor_batch *with_lock__truncate_old_batches(
 	return NULL;
 
 truncate_past_here:
+	remainder = ((struct fsmonitor_batch *)batch)->next;
+	if (!remainder)
+		return NULL;
+
+	unique_nr = fsmonitor_batch__compact_tail(
+		(struct fsmonitor_batch *)batch, &input_nr);
+	trace_printf_key(&trace_fsmonitor,
+			 "Compact: batch %"PRIu64" covers %"PRIuMAX
+			 " of %"PRIuMAX" paths",
+			 batch->batch_seq_nr,
+			 (uintmax_t)unique_nr, (uintmax_t)input_nr);
+
 	state->current_token_data->batch_tail = (struct fsmonitor_batch *)batch;
 
-	remainder = ((struct fsmonitor_batch *)batch)->next;
 	((struct fsmonitor_batch *)batch)->next = NULL;
 
 	return remainder;
@@ -635,6 +797,9 @@ static void with_lock__do_force_resync(struct fsmonitor_daemon_state *state)
 	if (state->current_token_data->client_ref_count == 0)
 		free_me = state->current_token_data;
 	state->current_token_data = new_one;
+	state->token_generation++;
+	if (!state->token_generation)
+		state->token_generation++;
 
 	fsmonitor_free_token_data(free_me);
 
@@ -692,6 +857,18 @@ static int fsmonitor_parse_client_token(const char *buf_token,
 	return 0;
 }
 
+static void fsmonitor_reply_overflow_paths(
+	const struct fsmonitor_batch *batch,
+	uint64_t requested_oldest_seq_nr,
+	int hardlink_aware_query,
+	ipc_server_reply_cb *reply,
+	struct ipc_server_reply_data *reply_data,
+	struct strset *shown,
+	struct strbuf *payload,
+	uint64_t *total_response_len,
+	intmax_t *count,
+	intmax_t *duplicates);
+
 static int do_handle_client(struct fsmonitor_daemon_state *state,
 			    const char *command,
 			    ipc_server_reply_cb *reply,
@@ -712,6 +889,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	int do_trivial = 0;
 	int do_flush = 0;
 	int do_cookie = 0;
+	int stop_after_response = 0;
 	int invalid_binding = 0;
 	int hardlink_aware_query = 0;
 	enum fsmonitor_cookie_item_result cookie_result;
@@ -760,7 +938,12 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			FSMONITOR_IPC_COOKIE_TOKEN_RETIREMENT_CAPABILITY "\n"
 #ifdef __APPLE__
 			FSMONITOR_IPC_HARDLINK_QUERY_VERSION "\n"
+			FSMONITOR_IPC_DARWIN_PROVIDER_FENCE_CAPABILITY "\n"
+#endif
+#if FSMONITOR_IPC_HAS_DIR_METADATA
 			FSMONITOR_IPC_DIR_METADATA_CAPABILITY "\n"
+#endif
+#ifdef __APPLE__
 			FSMONITOR_IPC_HARDLINK_INODE_CAPABILITY "\n"
 #endif
 			;
@@ -863,6 +1046,10 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			 */
 			if (cookie_result == FCIR_ERROR)
 				do_flush = 1;
+			else if (cookie_result == FCIR_TIMEOUT) {
+				do_flush = 1;
+				stop_after_response = 1;
+			}
 		}
 	}
 
@@ -909,13 +1096,15 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			do_trivial = 1;
 
 		} else if (requested_oldest_seq_nr <
-			   token_data->batch_tail->batch_seq_nr) {
+			   token_data->batch_tail->batch_seq_nr &&
+			   !token_data->batch_tail->overflow_path_seqs) {
 			/*
 			 * The client wants older events than we have for
-			 * this token_id.  This means that the end of our
-			 * batch list was truncated and we cannot give the
-			 * client a complete snapshot relative to their
-			 * request.
+			 * this token_id.  A normal tail means that the end
+			 * of our batch list was truncated and we cannot
+			 * give the client a complete snapshot.  An overflow
+			 * tail retains the latest original sequence for each
+			 * older path.
 			 */
 			trace_printf_key(&trace_fsmonitor,
 					 "client requested truncated data");
@@ -964,7 +1153,8 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	 */
 	strset_init_with_options(&shown, NULL, 0);
 	for (batch = batch_head;
-	     batch && batch->batch_seq_nr > requested_oldest_seq_nr;
+	     batch && batch->batch_seq_nr > requested_oldest_seq_nr &&
+	     !batch->overflow_path_seqs;
 	     batch = batch->next) {
 		size_t k;
 
@@ -998,6 +1188,13 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 				count++;
 			}
 		}
+	}
+	if (batch && batch->batch_seq_nr > requested_oldest_seq_nr) {
+		fsmonitor_reply_overflow_paths(
+			batch, requested_oldest_seq_nr, hardlink_aware_query,
+			reply, reply_data, &shown, &payload,
+			&total_response_len, &count, &duplicates);
+		batch = batch->next;
 	}
 
 	if (payload.len) {
@@ -1052,8 +1249,61 @@ cleanup:
 	strbuf_release(&response_token);
 	strbuf_release(&requested_token_id);
 	strbuf_release(&payload);
+	return stop_after_response ? SIMPLE_IPC_QUIT : 0;
+}
 
-	return 0;
+static void fsmonitor_reply_overflow_paths(
+	const struct fsmonitor_batch *batch,
+	uint64_t requested_oldest_seq_nr,
+	int hardlink_aware_query,
+	ipc_server_reply_cb *reply,
+	struct ipc_server_reply_data *reply_data,
+	struct strset *shown,
+	struct strbuf *payload,
+	uint64_t *total_response_len,
+	intmax_t *count,
+	intmax_t *duplicates)
+{
+	size_t k;
+
+	if (!batch->overflow_path_seqs)
+		BUG("expected an overflow batch");
+
+	for (k = 0; k < batch->nr; k++) {
+		const char *s = batch->interned_paths[k];
+		khint_t pos = kh_get_fsmonitor_path_sequence(
+			batch->overflow_path_seqs, s);
+		size_t s_len;
+
+		if (pos == kh_end(batch->overflow_path_seqs))
+			BUG("overflow path is missing its sequence");
+		if (kh_value(batch->overflow_path_seqs, pos) <=
+		    requested_oldest_seq_nr)
+			continue;
+
+		if (!hardlink_aware_query &&
+		    starts_with(s, FSMONITOR_PATH_HARDLINK_INODE_PREFIX))
+			s = FSMONITOR_PATH_GLOBAL_INVALIDATE;
+
+		if (!strset_add(shown, s))
+			(*duplicates)++;
+		else {
+			trace_printf_key(&trace_fsmonitor,
+					 "send[%"PRIuMAX"]: %s", *count, s);
+
+			/* Each path gets written with a trailing NUL */
+			s_len = strlen(s) + 1;
+
+			if (payload->len + s_len >= LARGE_PACKET_DATA_MAX) {
+				reply(reply_data, payload->buf, payload->len);
+				*total_response_len += payload->len;
+				strbuf_reset(payload);
+			}
+
+			strbuf_add(payload, s, s_len);
+			(*count)++;
+		}
+	}
 }
 
 static ipc_server_application_cb handle_client;
@@ -1178,14 +1428,11 @@ enum fsmonitor_path_type fsmonitor_classify_path_absolute(
  */
 #define MY_COMBINE_LIMIT (1024)
 
-void fsmonitor_publish(struct fsmonitor_daemon_state *state,
-		       struct fsmonitor_batch *batch,
-		       const struct string_list *cookie_names)
+static void with_lock__publish(struct fsmonitor_daemon_state *state,
+			       struct fsmonitor_batch *batch,
+			       const struct string_list *cookie_names)
 {
-	if (!batch && !cookie_names->nr)
-		return;
-
-	pthread_mutex_lock(&state->main_lock);
+	/* assert current thread holding state->main_lock */
 
 	if (batch) {
 		struct fsmonitor_batch *head;
@@ -1243,8 +1490,40 @@ void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 
 	if (cookie_names->nr)
 		with_lock__mark_cookies_seen(state, cookie_names);
+}
 
+void fsmonitor_publish(struct fsmonitor_daemon_state *state,
+		       struct fsmonitor_batch *batch,
+		       const struct string_list *cookie_names)
+{
+	if (!batch && !cookie_names->nr)
+		return;
+
+	pthread_mutex_lock(&state->main_lock);
+	with_lock__publish(state, batch, cookie_names);
 	pthread_mutex_unlock(&state->main_lock);
+}
+
+int fsmonitor_publish_if_current_generation(
+	struct fsmonitor_daemon_state *state,
+	struct fsmonitor_batch *batch,
+	uint64_t token_generation)
+{
+	struct string_list no_cookies = STRING_LIST_INIT_NODUP;
+	int current;
+
+	if (!batch)
+		return 1;
+
+	pthread_mutex_lock(&state->main_lock);
+	current = state->token_generation == token_generation;
+	if (current)
+		with_lock__publish(state, batch, &no_cookies);
+	pthread_mutex_unlock(&state->main_lock);
+
+	if (!current)
+		fsmonitor_batch__free_list(batch);
+	return current;
 }
 
 static void *fsm_health__thread_proc(void *_state)
@@ -1273,12 +1552,14 @@ static void *fsm_listen__thread_proc(void *_state)
 
 	fsm_listen__loop(state);
 
-	pthread_mutex_lock(&state->main_lock);
-	if (state->current_token_data &&
-	    state->current_token_data->client_ref_count == 0)
-		fsmonitor_free_token_data(state->current_token_data);
-	state->current_token_data = NULL;
-	pthread_mutex_unlock(&state->main_lock);
+	/*
+	 * Leave token-data teardown to the main thread.  The listener can
+	 * initiate IPC shutdown while an existing client is still waiting for
+	 * a filesystem boundary and has not taken a token-data reference yet.
+	 * ipc_server_await() joins every IPC worker before the main thread
+	 * reaches final state cleanup, so that is the first point where it is
+	 * safe to release the current token unconditionally.
+	 */
 
 	trace2_thread_exit();
 	return NULL;
@@ -1330,6 +1611,12 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 */
 	if (pthread_create(&state->health_thread, NULL,
 			   fsm_health__thread_proc, state)) {
+		/*
+		 * The listener may still be starting the provider and IPC pool.
+		 * Publish its stop request before stopping IPC so that it cannot
+		 * subsequently start an already-stopped server.
+		 */
+		fsm_listen__stop_async(state);
 		ipc_server_stop_async(state->ipc_server_data);
 		err = error(_("could not start fsmonitor health thread"));
 		goto cleanup;
@@ -1348,6 +1635,19 @@ cleanup:
 	 */
 	ipc_server_await(state->ipc_server_data);
 
+#ifdef __APPLE__
+	/*
+	 * If the bounded provider-fence wait expired, the client received a
+	 * conservative response and stopped the IPC pool.  Fail-stop rather
+	 * than running normal IPC cleanup: a replacement daemon may already
+	 * own the socket pathname.  Normal startup can steal a stale,
+	 * non-listening pathname after this process exits.
+	 */
+	if (fsm_listen__flush_failed(state)) {
+		_exit(1);
+	}
+#endif
+
 	/*
 	 * The fsmonitor listener thread may have received a shutdown
 	 * event from the IPC thread pool, but it doesn't hurt to tell
@@ -1355,6 +1655,16 @@ cleanup:
 	 */
 	if (listener_started) {
 		fsm_listen__stop_async(state);
+#ifdef __APPLE__
+		/*
+		 * Normal shutdown can cancel a provider fence which started after
+		 * the first check above.  Preserve the same fail-stop IPC teardown
+		 * so a replacement daemon cannot lose its socket pathname.
+		 */
+		if (fsm_listen__flush_failed(state)) {
+			_exit(1);
+		}
+#endif
 		pthread_join(state->listener_thread, NULL);
 	}
 
@@ -1379,6 +1689,9 @@ static int fsmonitor_run_daemon(void)
 	int err;
 
 	memset(&state, 0, sizeof(state));
+	truncate_delay_seconds = git_env_ulong(
+		"GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS",
+		MY_TIME_DELAY_SECONDS);
 
 	hashmap_init(&state.cookies, cookies_cmp, NULL, 0);
 	pthread_mutex_init(&state.main_lock, NULL);
@@ -1386,6 +1699,7 @@ static int fsmonitor_run_daemon(void)
 	state.listen_error_code = 0;
 	state.health_error_code = 0;
 	state.current_token_data = fsmonitor_new_token_data();
+	state.token_generation = 1;
 
 	/* Prepare to (recursively) watch the <worktree-root> directory. */
 	strbuf_init(&state.path_worktree_watch, 0);
@@ -1504,6 +1818,9 @@ static int fsmonitor_run_daemon(void)
 	err = fsmonitor_run_daemon_1(&state);
 
 done:
+	/* Stop provider callbacks before releasing the state they publish to. */
+	fsm_listen__dtor(&state);
+
 	fsmonitor_free_token_data(state.current_token_data);
 	state.current_token_data = NULL;
 	pthread_cond_destroy(&state.cookies_cond);
@@ -1517,7 +1834,6 @@ done:
 		hashmap_clear_and_free(&state.cookies,
 				       struct fsmonitor_cookie_item, entry);
 	}
-	fsm_listen__dtor(&state);
 	fsm_health__dtor(&state);
 
 	ipc_server_free(state.ipc_server_data);

@@ -38,6 +38,24 @@ void fsm_listen__dtor(struct fsmonitor_daemon_state *state);
  */
 void fsm_listen__loop(struct fsmonitor_daemon_state *state);
 
+#ifdef __APPLE__
+enum fsm_listen_flush_result {
+	FSM_LISTEN_FLUSH_OK = 0,
+	FSM_LISTEN_FLUSH_SHUTDOWN,
+	FSM_LISTEN_FLUSH_TIMEOUT,
+};
+
+/*
+ * Request and wait for delivery of all FSEvents that occurred before
+ * this call.  The caller must not hold fsmonitor_daemon_state::main_lock.
+ */
+enum fsm_listen_flush_result fsm_listen__flush_sync(
+	struct fsmonitor_daemon_state *state);
+
+/* True when provider-fence failure requires fail-stop IPC teardown. */
+int fsm_listen__flush_failed(struct fsmonitor_daemon_state *state);
+#endif
+
 /*
  * Gently request that the fsmonitor listener thread shutdown.
  * It does not wait for it to stop.  The caller should do a JOIN

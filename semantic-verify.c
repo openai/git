@@ -134,9 +134,14 @@ int semantic_verify_prepare(struct index_state *istate,
 		return -1;
 	}
 	if (proof->epoch_required) {
-		proof->epoch = clean_status_capture_proof_epoch(
-			istate, options->attr_snapshot,
-			proof->filter_scope_checked);
+		proof->epoch = options->index_path ?
+			clean_status_capture_proof_epoch_at_path(
+				istate, options->attr_snapshot,
+				proof->filter_scope_checked,
+				options->index_path) :
+			clean_status_capture_proof_epoch(
+				istate, options->attr_snapshot,
+				proof->filter_scope_checked);
 		if (!proof->epoch) {
 			for (size_t i = 0; i < proof->cache_nr; i++) {
 				proof->results[i].kind = SEMANTIC_VERIFY_ERROR;

@@ -5,6 +5,7 @@
 #include "clean-status.h"
 #include "hash.h"
 #include "hex.h"
+#include "fsmonitor.h"
 #include "lockfile.h"
 #include "merge.h"
 #include "commit.h"
@@ -14,6 +15,7 @@
 #include "tree.h"
 #include "tree-walk.h"
 #include "unpack-trees.h"
+#include "wt-status.h"
 
 static const char *merge_argument(struct commit *commit)
 {
@@ -58,10 +60,17 @@ int checkout_fast_forward(struct repository *r,
 	struct tree *trees[MAX_UNPACK_TREES];
 	struct unpack_trees_options opts;
 	struct tree_desc t[MAX_UNPACK_TREES];
-	int i, nr_trees = 0;
+	int i, nr_trees = 0, repair_after_checkout;
 	struct lock_file lock_file = LOCK_INIT;
 
 	refresh_index(r->index, REFRESH_QUIET, NULL, NULL, NULL);
+	repair_after_checkout =
+		clean_status_has_current_full_fsmonitor_proof(r->index);
+	if (!repair_after_checkout &&
+	    wt_status_fsmonitor_proof_needs_repair(r) &&
+	    wt_status_repair_fsmonitor_proof(r))
+		repair_after_checkout =
+			clean_status_has_current_full_fsmonitor_proof(r->index);
 
 	if (repo_hold_locked_index(r, &lock_file, LOCK_REPORT_ON_ERROR) < 0)
 		return -1;
@@ -99,6 +108,7 @@ int checkout_fast_forward(struct repository *r,
 	opts.merge = 1;
 	opts.preserve_semantic_history =
 		clean_status_revalidated_token_matches(r->index);
+	opts.preserve_untracked_history = opts.preserve_semantic_history;
 	opts.fn = twoway_merge;
 	init_checkout_metadata(&opts.meta, NULL, remote, NULL);
 	setup_unpack_trees_porcelain(&opts, "merge");
@@ -109,6 +119,11 @@ int checkout_fast_forward(struct repository *r,
 		return -1;
 	}
 	clear_unpack_trees_porcelain(&opts);
+	if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    r, &lock_file, repair_after_checkout) < 0) {
+		rollback_lock_file(&lock_file);
+		return error(_("unable to repair new index file"));
+	}
 
 	if (write_locked_index(r->index, &lock_file, COMMIT_LOCK))
 		return error(_("unable to write new index file"));

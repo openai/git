@@ -233,6 +233,93 @@ static int directory_attribute_source_matches(
 	return entry && entry->source == ATTR_MANIFEST_INDEX &&
 		!memcmp(entry->hash, indexed->oid.hash, algo->rawsz);
 }
+
+static int directory_attribute_sources_match_manifest(
+	struct index_state *istate, const char *directory, unsigned int first)
+{
+	struct clean_status_state *state = istate->clean_status;
+	struct semantic_verify_root *root = NULL;
+	struct semantic_verify_path *path = NULL;
+	struct attr_manifest_cursor manifest_cursor;
+	struct attr_manifest_entry manifest_entry;
+	struct string_list candidates = STRING_LIST_INIT_DUP;
+	struct strbuf candidate = STRBUF_INIT;
+	const struct git_hash_algo *algo = istate->repo->hash_algo;
+	const char *previous = NULL;
+	unsigned int namespace_unstable = 0;
+	size_t len = strlen(directory), previous_len = 0;
+	int manifest_ret, safe = 0;
+
+	if (semantic_verify_root_init(istate->repo, &root))
+		goto done;
+	path = semantic_verify_path_new(root);
+	if (!path)
+		goto done;
+
+	strbuf_addstr(&candidate, directory);
+	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+	string_list_append(&candidates, candidate.buf);
+	for (unsigned int i = first; i < istate->cache_nr &&
+	     starts_with(istate->cache[i]->name, directory); i++) {
+		const struct cache_entry *ce = istate->cache[i];
+		const char *slash = ce->name + len;
+
+		while ((slash = strchr(slash, '/')) != NULL) {
+			size_t parent_len = slash - ce->name;
+
+			if (!previous || previous_len <= parent_len ||
+			    previous[parent_len] != '/' ||
+			    memcmp(previous, ce->name, parent_len)) {
+				strbuf_reset(&candidate);
+				strbuf_add(&candidate, ce->name, parent_len + 1);
+				strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
+				string_list_append(&candidates, candidate.buf);
+			}
+			slash++;
+		}
+		previous = ce->name;
+		previous_len = ce_namelen(ce);
+	}
+	string_list_sort(&candidates);
+	string_list_remove_duplicates(&candidates, 0);
+	if (attr_manifest_cursor_init(&manifest_cursor,
+				      state->manifest.current.buf,
+				      state->manifest.current.len, algo))
+		goto done;
+	manifest_ret = attr_manifest_cursor_next(&manifest_cursor,
+						 &manifest_entry);
+	for (size_t i = 0; i < candidates.nr; i++) {
+		const char *name = candidates.items[i].string;
+		const struct attr_manifest_entry *entry = NULL;
+
+		while (manifest_ret > 0 &&
+		       directory_manifest_entry_path_compare(
+			       &manifest_entry, name) < 0)
+			manifest_ret = attr_manifest_cursor_next(
+				&manifest_cursor, &manifest_entry);
+		if (manifest_ret < 0)
+			goto done;
+		if (manifest_ret > 0 &&
+		    !directory_manifest_entry_path_compare(
+			    &manifest_entry, name))
+			entry = &manifest_entry;
+		if (!directory_attribute_source_matches(
+				istate, path, name, entry, first + i))
+			goto done;
+	}
+
+	semantic_verify_path_free(path, &namespace_unstable, NULL);
+	path = NULL;
+	safe = !namespace_unstable && semantic_verify_root_stable(root);
+
+done:
+	if (path)
+		semantic_verify_path_free(path, NULL, NULL);
+	semantic_verify_root_clear(root);
+	string_list_clear(&candidates, 0);
+	strbuf_release(&candidate);
+	return safe;
+}
 #endif
 
 int clean_status_manifest_path_attributes_unchanged(
@@ -328,25 +415,56 @@ done:
 #endif
 }
 
+int clean_status_manifest_directory_sources_unchanged(
+	const struct index_state *istate, const char *directory)
+{
+#if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
+	struct clean_status_state *state = istate->clean_status;
+	const struct git_hash_algo *algo = istate->repo->hash_algo;
+	unsigned int first;
+	size_t len;
+	int pos;
+	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
+		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
+
+	if (!state || !state->manifest.current_valid ||
+	    !state->manifest.checked || state->manifest.current_invalidated ||
+	    state->manifest.global_fallback ||
+	    (state->manifest.current_flags & required) != required ||
+	    !attr_manifest_valid(state->manifest.current.buf,
+				 state->manifest.current.len, algo))
+		return 0;
+	len = strlen(directory);
+	if (!len || directory[len - 1] != '/')
+		return 0;
+	pos = index_name_pos((struct index_state *)istate, directory, len);
+	if (pos >= 0)
+		return 0;
+	first = -pos - 1;
+	if (first >= istate->cache_nr ||
+	    !starts_with(istate->cache[first]->name, directory))
+		return 0;
+	return directory_attribute_sources_match_manifest(
+		(struct index_state *)istate, directory, first);
+#else
+	(void)istate;
+	(void)directory;
+	return 0;
+#endif
+}
+
 int clean_status_manifest_directory_unchanged(
 	struct index_state *istate, const char *directory)
 {
 #if SEMANTIC_VERIFY_HAS_ANCHORED_OPEN
 	struct clean_status_state *state = istate->clean_status;
-	struct semantic_verify_root *root = NULL;
-	struct semantic_verify_path *path = NULL;
 	struct clean_status_index_snapshot snapshot;
 	struct clean_status_config_digest config;
 	struct attr_fingerprint attrs;
-	struct attr_manifest_cursor manifest_cursor;
-	struct attr_manifest_entry manifest_entry;
-	struct string_list candidates = STRING_LIST_INIT_DUP;
-	struct strbuf candidate = STRBUF_INIT;
 	const struct git_hash_algo *algo = istate->repo->hash_algo;
-	const char *previous = NULL;
-	unsigned int first, namespace_unstable = 0;
-	size_t len, previous_len = 0;
-	int pos, manifest_ret, pinned = 0, safe = 0;
+	unsigned int first;
+	size_t len;
+	int pos, pinned = 0, safe = 0;
 	uint32_t required = FSMONITOR_CLEAN_PROOF_MANIFEST_COMPLETE |
 		FSMONITOR_CLEAN_PROOF_FULL_INDEX;
 
@@ -399,72 +517,17 @@ int clean_status_manifest_directory_unchanged(
 	if (clean_status_index_snapshot_pin_proof_epoch(&snapshot, istate))
 		goto done;
 	pinned = 1;
-	if (semantic_verify_root_init(istate->repo, &root))
-		goto done;
-	path = semantic_verify_path_new(root);
-	if (!path)
-		goto done;
-
-	strbuf_addstr(&candidate, directory);
-	strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
-	string_list_append(&candidates, candidate.buf);
 	for (unsigned int i = first; i < istate->cache_nr &&
 	     starts_with(istate->cache[i]->name, directory); i++) {
 		const struct cache_entry *ce = istate->cache[i];
-		const char *slash = ce->name + len;
 
 		if (ce_stage(ce) || ce_skip_worktree(ce) ||
 		    ce_intent_to_add(ce) || (ce->ce_flags & CE_VALID) ||
 		    S_ISSPARSEDIR(ce->ce_mode))
 			goto done;
-		while ((slash = strchr(slash, '/')) != NULL) {
-			size_t parent_len = slash - ce->name;
-
-			if (!previous || previous_len <= parent_len ||
-			    previous[parent_len] != '/' ||
-			    memcmp(previous, ce->name, parent_len)) {
-				strbuf_reset(&candidate);
-				strbuf_add(&candidate, ce->name, parent_len + 1);
-				strbuf_addstr(&candidate, GITATTRIBUTES_FILE);
-				string_list_append(&candidates, candidate.buf);
-			}
-			slash++;
-		}
-		previous = ce->name;
-		previous_len = ce_namelen(ce);
 	}
-	string_list_sort(&candidates);
-	string_list_remove_duplicates(&candidates, 0);
-	if (attr_manifest_cursor_init(&manifest_cursor,
-				      state->manifest.current.buf,
-				      state->manifest.current.len, algo))
-		goto done;
-	manifest_ret = attr_manifest_cursor_next(&manifest_cursor,
-						 &manifest_entry);
-	for (size_t i = 0; i < candidates.nr; i++) {
-		const char *name = candidates.items[i].string;
-		const struct attr_manifest_entry *entry = NULL;
-
-		while (manifest_ret > 0 &&
-		       directory_manifest_entry_path_compare(
-			       &manifest_entry, name) < 0)
-			manifest_ret = attr_manifest_cursor_next(
-				&manifest_cursor, &manifest_entry);
-		if (manifest_ret < 0)
-			goto done;
-		if (manifest_ret > 0 &&
-		    !directory_manifest_entry_path_compare(
-			    &manifest_entry, name))
-			entry = &manifest_entry;
-		if (!directory_attribute_source_matches(
-				istate, path, name, entry,
-				first + i))
-			goto done;
-	}
-
-	semantic_verify_path_free(path, &namespace_unstable, NULL);
-	path = NULL;
-	if (namespace_unstable || !semantic_verify_root_stable(root) ||
+	if (!directory_attribute_sources_match_manifest(
+			istate, directory, first) ||
 	    !clean_status_index_snapshot_still_matches_proof_epoch(
 		&snapshot, istate) ||
 	    !semantic_verify_proof_is_current(
@@ -481,13 +544,8 @@ int clean_status_manifest_directory_unchanged(
 	safe = 1;
 
 done:
-	if (path)
-		semantic_verify_path_free(path, NULL, NULL);
-	semantic_verify_root_clear(root);
 	if (pinned)
 		clean_status_index_snapshot_release(&snapshot);
-	string_list_clear(&candidates, 0);
-	strbuf_release(&candidate);
 	return safe;
 #else
 	(void)istate;

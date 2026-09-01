@@ -1914,6 +1914,50 @@ static int checkout_introduces_new_indexed_directory(
 	return 0;
 }
 
+static unsigned int checkout_invalidate_new_index_entries(
+	struct index_state *source, struct index_state *result, int safe_path)
+{
+	unsigned int invalidated = 0, source_pos = 0;
+
+	for (unsigned int result_pos = 0;
+	     result_pos < result->cache_nr; result_pos++) {
+		const struct cache_entry *entry = result->cache[result_pos];
+		int cmp;
+
+		while (source_pos < source->cache_nr) {
+			const struct cache_entry *source_entry =
+				source->cache[source_pos];
+
+			cmp = strcmp(source_entry->name, entry->name);
+			if (!cmp)
+				cmp = ce_stage(source_entry) - ce_stage(entry);
+			if (cmp >= 0)
+				break;
+			source_pos++;
+		}
+		if (source_pos < source->cache_nr) {
+			const struct cache_entry *source_entry =
+				source->cache[source_pos];
+
+			cmp = strcmp(source_entry->name, entry->name);
+			if (!cmp)
+				cmp = ce_stage(source_entry) - ce_stage(entry);
+		} else {
+			cmp = 1;
+		}
+		if (!cmp)
+			continue;
+		/*
+		 * The result receives the source untracked cache after its entries
+		 * are built. Replay additions now so a newly tracked directory is
+		 * represented by invalid cache nodes rather than dropping FSUC.
+		 */
+		untracked_cache_invalidate_path(result, entry->name, safe_path);
+		invalidated++;
+	}
+	return invalidated;
+}
+
 /*
  * N-way merge "len" trees.  Returns 0 on success, -1 on failure to manipulate the
  * resulting index, -2 on failure to reflect the changes to the work tree.
@@ -2121,7 +2165,11 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 	ret = check_updates(o, &o->internal.result) ? (-2) : 0;
 	if (o->dst_index) {
 		int history_transferred = 0;
+		int manifest_refresh_required = 0;
 		int new_indexed_directory = 0;
+		int source_untracked_fully_valid = o->src_index->untracked &&
+			o->src_index->untracked->root &&
+			o->src_index->untracked->root->valid_recursive;
 
 		if (!ret) {
 			history_transferred =
@@ -2129,20 +2177,49 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 					&o->internal.result, o->src_index);
 			if (!history_transferred && o->preserve_semantic_history)
 				history_transferred =
-					clean_status_transfer_current_proof_if_semantically_same_index(
-						&o->internal.result, o->src_index);
+					clean_status_transfer_current_proof_after_checkout(
+						&o->internal.result, o->src_index,
+						&manifest_refresh_required);
 			if (history_transferred && o->preserve_semantic_history)
 				new_indexed_directory =
 					checkout_introduces_new_indexed_directory(
 						o->src_index, &o->internal.result);
 		}
 		move_index_extensions(&o->internal.result, o->src_index);
+		if (!ret && history_transferred && manifest_refresh_required) {
+			int manifest_refreshed = 0;
+
+			/*
+			 * The checkout has installed the new attribute sources.  Refresh
+			 * them before allowing the old provider boundary to authenticate
+			 * the resulting index and paired untracked cache.
+			 */
+			if (clean_status_refresh_worktree_manifest(
+				    &o->internal.result) < 0 ||
+			    clean_status_manifest_global_fallback(
+				    &o->internal.result)) {
+				clean_status_invalidate_current_proof(
+					&o->internal.result);
+				history_transferred = 0;
+			} else {
+				manifest_refreshed = 1;
+				clean_status_mark_fsmonitor_config_valid(
+					&o->internal.result,
+					o->internal.result.fsmonitor_last_update);
+				history_transferred =
+					clean_status_has_current_full_fsmonitor_proof(
+						&o->internal.result);
+			}
+			trace2_data_intmax(
+				"fsmonitor", repo,
+				"history/checkout-manifest-refreshed",
+				manifest_refreshed);
+		}
 		if (!ret && o->internal.backoff_transfer)
 			clean_status_transfer_backoff_history(
 				o->internal.backoff_transfer,
 				&o->internal.result, o->src_index);
 		if (!ret && o->preserve_semantic_history && history_transferred &&
-		    !new_indexed_directory &&
 		    !o->src_index->sparse_index &&
 		    !o->internal.result.sparse_index &&
 		    !o->src_index->split_index &&
@@ -2169,10 +2246,19 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 			o->internal.result.untracked->use_fsmonitor = 1;
 			trace2_data_intmax("fsmonitor", repo,
 					   "history/untracked-paired-transfer", 1);
+			if (new_indexed_directory)
+				trace2_data_intmax(
+					"fsmonitor", repo,
+					"history/untracked-paired-new-directory-invalidated",
+					checkout_invalidate_new_index_entries(
+						o->src_index,
+						&o->internal.result,
+						!source_untracked_fully_valid));
 		} else if (new_indexed_directory) {
 			trace2_data_intmax(
 				"fsmonitor", repo,
-				"history/untracked-paired-new-directory-deferred", 1);
+				"history/untracked-paired-new-directory-deferred",
+				1);
 		}
 		if (!ret) {
 			if (git_env_bool("GIT_TEST_CHECK_CACHE_TREE", 0) &&
@@ -2407,6 +2493,30 @@ static void invalidate_ce_path(const struct cache_entry *ce,
 	untracked_cache_invalidate_path(o->src_index, ce->name, 1);
 }
 
+static void invalidate_added_ce_path(const struct cache_entry *ce,
+				     struct unpack_trees_options *o)
+{
+	const char *basename;
+	int policy_file;
+
+	if (!ce)
+		return;
+	cache_tree_invalidate_path(o->src_index, ce->name);
+	basename = find_last_dir_sep(ce->name);
+	basename = basename ? basename + 1 : ce->name;
+	policy_file = !fspathcmp(basename, ".gitattributes") ||
+		!fspathcmp(basename, ".gitignore");
+	if (o->preserve_untracked_history && policy_file) {
+		untracked_cache_invalidate_path(o->src_index, ce->name, 0);
+		trace2_data_intmax("fsmonitor", o->src_index->repo,
+				   "checkout/untracked-policy-targeted", 1);
+		return;
+	}
+	clean_status_release_backoff_transfer(o->internal.backoff_transfer);
+	o->internal.backoff_transfer = NULL;
+	untracked_cache_invalidate_path(o->src_index, ce->name, 1);
+}
+
 static void invalidate_replaced_ce_path(const struct cache_entry *old,
 					const struct cache_entry *new,
 					struct unpack_trees_options *o)
@@ -2414,6 +2524,19 @@ static void invalidate_replaced_ce_path(const struct cache_entry *old,
 	const unsigned int unsafe_flags = CE_SKIP_WORKTREE |
 		CE_NEW_SKIP_WORKTREE | CE_INTENT_TO_ADD | CE_CONFLICTED;
 	const char *basename;
+	int policy_file;
+
+	basename = find_last_dir_sep(old->name);
+	basename = basename ? basename + 1 : old->name;
+	policy_file = !fspathcmp(basename, ".gitattributes") ||
+		!fspathcmp(basename, ".gitignore");
+	if (o->preserve_untracked_history && policy_file) {
+		cache_tree_invalidate_path(o->src_index, old->name);
+		untracked_cache_invalidate_path(o->src_index, old->name, 0);
+		trace2_data_intmax("fsmonitor", o->src_index->repo,
+				   "checkout/untracked-policy-targeted", 1);
+		return;
+	}
 
 	if (o->internal.backoff_transfer &&
 	    clean_status_backoff_transfer_entry_is_safe(
@@ -2437,10 +2560,7 @@ static void invalidate_replaced_ce_path(const struct cache_entry *old,
 	    ((old->ce_mode & S_IFMT) != (new->ce_mode & S_IFMT)))
 		goto rooted;
 
-	basename = find_last_dir_sep(old->name);
-	basename = basename ? basename + 1 : old->name;
-	if (!fspathcmp(basename, ".gitattributes") ||
-	    !fspathcmp(basename, ".gitignore"))
+	if (policy_file)
 		goto rooted;
 
 	cache_tree_invalidate_path(o->src_index, old->name);
@@ -2740,7 +2860,7 @@ static int merged_entry(const struct cache_entry *ce,
 			discard_cache_entry(merge);
 			return -1;
 		}
-		invalidate_ce_path(merge, o);
+		invalidate_added_ce_path(merge, o);
 
 		if (submodule_from_ce(ce) && file_exists(ce->name)) {
 			int ret = check_submodule_move_head(ce, NULL,

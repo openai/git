@@ -7,6 +7,7 @@ struct semantic_verify_proof;
 
 struct semantic_verify_options {
 	unsigned int nr_threads;
+	const char *index_path;
 	const struct attr_source_snapshot *attr_snapshot;
 	unsigned int require_proof_epoch : 1;
 	unsigned int validate_filter_scope : 1;

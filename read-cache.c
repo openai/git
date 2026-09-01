@@ -945,7 +945,10 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 		    ce->ce_mode == alias->ce_mode);
 	logical_same = same_persistent_add_entry(alias, ce);
 	semantic_same = clean_status_index_entry_is_semantically_safe(
-		istate, alias, ce);
+		istate, alias, ce) ||
+		(intent_only &&
+		 clean_status_intent_to_add_change_is_semantically_safe(
+			 istate, alias, ce));
 
 	if (!pretend && (flags & ADD_CACHE_TRACK_CLEAN_HISTORY) &&
 	    !logical_same && !semantic_same)
@@ -3381,7 +3384,7 @@ int has_racy_timestamp(struct index_state *istate)
 	return 0;
 }
 
-static int write_locked_index_with_receipt(
+static int write_locked_index_with_receipt_and_checkpoint(
 	struct index_state *istate, struct lock_file *lock,
 	unsigned flags, struct clean_status_index_write_receipt *receipt,
 	struct clean_status_commit_checkpoint *checkpoint);
@@ -3395,8 +3398,8 @@ void repo_update_index_if_able_with_receipt(
 	if ((repo->index->cache_changed ||
 	     has_racy_timestamp(repo->index)) &&
 	    repo_verify_index(repo))
-		write_locked_index_with_receipt(repo->index, lockfile,
-					COMMIT_LOCK, receipt, NULL);
+		write_locked_index_with_receipt_and_checkpoint(
+			repo->index, lockfile, COMMIT_LOCK, receipt, NULL);
 	else
 		rollback_lock_file(lockfile);
 }
@@ -3532,7 +3535,14 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	f = hashfd(the_repository->hash_algo, tempfile->fd, tempfile->filename.buf);
 
 	prepare_repo_settings(r);
-	f->skip_hash = r->settings.index_skip_hash;
+	/*
+	 * A provisional lock is a proof witness for the current in-memory
+	 * index.  Its fresh file identity cannot authenticate a null trailer,
+	 * so give only that witness a checksum.  The final index write still
+	 * honors index.skipHash.
+	 */
+	f->skip_hash = r->settings.index_skip_hash &&
+		!(flags & PROVISIONAL_LOCK);
 
 	for (i = removed = extended = 0; i < entries; i++) {
 		if (cache[i]->ce_flags & CE_REMOVE)
@@ -3931,11 +3941,13 @@ static int do_write_locked_index(
 	if (!ret && checkpoint && !(flags & COMMIT_LOCK))
 		clean_status_record_commit_checkpoint(checkpoint, istate, lock);
 
-	run_hooks_l(the_repository, "post-index-change",
-		    istate->updated_workdir ? "1" : "0",
-		    istate->updated_skipworktree ? "1" : "0", NULL);
-	istate->updated_workdir = 0;
-	istate->updated_skipworktree = 0;
+	if (!(flags & PROVISIONAL_LOCK)) {
+		run_hooks_l(the_repository, "post-index-change",
+			    istate->updated_workdir ? "1" : "0",
+			    istate->updated_skipworktree ? "1" : "0", NULL);
+		istate->updated_workdir = 0;
+		istate->updated_skipworktree = 0;
+	}
 
 	return ret;
 }
@@ -4089,7 +4101,7 @@ static int too_many_not_shared_entries(struct index_state *istate)
 	return (int64_t)istate->cache_nr * max_split < (int64_t)not_shared * 100;
 }
 
-static int write_locked_index_with_receipt(
+static int write_locked_index_with_receipt_and_checkpoint(
 	struct index_state *istate, struct lock_file *lock,
 	unsigned flags, struct clean_status_index_write_receipt *receipt,
 	struct clean_status_commit_checkpoint *checkpoint)
@@ -4189,7 +4201,16 @@ out:
 int write_locked_index(struct index_state *istate, struct lock_file *lock,
 		       unsigned flags)
 {
-	return write_locked_index_with_receipt(istate, lock, flags, NULL, NULL);
+	return write_locked_index_with_receipt_and_checkpoint(
+		istate, lock, flags, NULL, NULL);
+}
+
+int write_locked_index_with_receipt(
+	struct index_state *istate, struct lock_file *lock, unsigned flags,
+	struct clean_status_index_write_receipt *receipt)
+{
+	return write_locked_index_with_receipt_and_checkpoint(
+		istate, lock, flags, receipt, NULL);
 }
 
 int write_locked_index_for_commit(
@@ -4202,7 +4223,8 @@ int write_locked_index_for_commit(
 	clean_status_release_commit_checkpoint(*checkpoint);
 	*checkpoint = NULL;
 	candidate = clean_status_capture_commit_checkpoint(istate, lock);
-	ret = write_locked_index_with_receipt(istate, lock, 0, NULL, candidate);
+	ret = write_locked_index_with_receipt_and_checkpoint(
+		istate, lock, 0, NULL, candidate);
 	if (ret)
 		clean_status_release_commit_checkpoint(candidate);
 	else

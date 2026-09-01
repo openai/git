@@ -7,6 +7,7 @@
 #include "config.h"
 #include "copy.h"
 #include "environment.h"
+#include "fsmonitor-ll.h"
 #include "gettext.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -22,6 +23,7 @@
 #include "hook.h"
 #include "utf8.h"
 #include "cache-tree.h"
+#include "clean-status.h"
 #include "diff.h"
 #include "path.h"
 #include "revision.h"
@@ -34,6 +36,7 @@
 #include "strvec.h"
 #include "quote.h"
 #include "trailer.h"
+#include "trace2.h"
 #include "log-tree.h"
 #include "wt-status.h"
 #include "hashmap.h"
@@ -432,6 +435,11 @@ int sequencer_remove_state(struct replay_opts *opts)
 	int ret = 0;
 
 	if (is_rebase_i(opts) &&
+	    refs_delete_ref(get_main_ref_store(the_repository), NULL,
+			    "REBASE_HEAD", NULL, REF_NO_DEREF))
+		ret = -1;
+
+	if (is_rebase_i(opts) &&
 	    strbuf_read_file(&buf, rebase_path_refs_to_delete(), 0) > 0) {
 		char *p = buf.buf;
 		while (*p) {
@@ -752,7 +760,7 @@ static int do_recursive_merge(struct repository *r,
 	struct merge_options o;
 	struct merge_result result;
 	struct tree *next_tree, *base_tree, *head_tree;
-	int clean, show_output;
+	int clean, show_output, repair_after_merge;
 	int i;
 	struct lock_file index_lock = LOCK_INIT;
 
@@ -760,6 +768,8 @@ static int do_recursive_merge(struct repository *r,
 		return -1;
 
 	repo_read_index(r);
+	repair_after_merge =
+		clean_status_has_current_full_fsmonitor_proof(r->index);
 
 	init_ui_merge_options(&o, r);
 	o.ancestor = base ? base_label : "(empty tree)";
@@ -794,6 +804,12 @@ static int do_recursive_merge(struct repository *r,
 	if (clean < 0) {
 		rollback_lock_file(&index_lock);
 		return clean;
+	}
+	if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    r, &index_lock, repair_after_merge) < 0) {
+		rollback_lock_file(&index_lock);
+		return error(_("%s: Unable to repair new index file"),
+			     _(action_name(opts)));
 	}
 
 	if (write_locked_index(r->index, &index_lock,
@@ -5348,6 +5364,47 @@ static int continue_single_pick(struct repository *r, struct replay_opts *opts)
 	return run_command(&cmd);
 }
 
+static int reload_index_after_commit(struct repository *r,
+				     int repair_fsmonitor_proof)
+{
+	struct lock_file lock = LOCK_INIT;
+	int repaired;
+
+	/* git commit may have rewritten the index in the child process. */
+	discard_index(r->index);
+	if (repo_read_index(r) < 0)
+		return error(_("could not read index"));
+	if (!repair_fsmonitor_proof ||
+	    (clean_status_has_current_full_fsmonitor_proof(r->index) &&
+	     !wt_status_fsmonitor_proof_needs_repair(r)))
+		return 0;
+
+	if (repo_hold_locked_index(r, &lock, LOCK_REPORT_ON_ERROR) < 0)
+		return error(_("could not write index"));
+
+	/* Recheck the child result while holding the canonical index lock. */
+	discard_index(r->index);
+	if (repo_read_index(r) < 0) {
+		rollback_lock_file(&lock);
+		return error(_("could not read index"));
+	}
+	if (!r->index->fsmonitor_token_valid) {
+		r->index->fsmonitor_has_run_once = 0;
+		refresh_fsmonitor(r->index);
+	}
+	repaired = wt_status_repair_fsmonitor_proof_after_index_update(
+		r, &lock, repair_fsmonitor_proof);
+	if (repaired < 0) {
+		rollback_lock_file(&lock);
+		return error(_("could not repair index"));
+	}
+	if (write_locked_index(r->index, &lock,
+			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+		return error(_("could not write index"));
+
+	return 0;
+}
+
 static int commit_staged_changes(struct repository *r,
 				 struct replay_opts *opts,
 				 struct todo_list *todo_list)
@@ -5357,6 +5414,9 @@ static int commit_staged_changes(struct repository *r,
 	unsigned int final_fixup = 0, is_clean;
 	struct strbuf rev = STRBUF_INIT;
 	const char *reflog_action = reflog_message(opts, "continue", NULL);
+	int repair_fsmonitor_proof =
+		clean_status_has_persistent_fsmonitor_semantic_history(r->index) ||
+		clean_status_has_worktree_manifest_history(r->index);
 	int ret;
 
 	if (has_unstaged_changes(r, 1)) {
@@ -5526,6 +5586,10 @@ static int commit_staged_changes(struct repository *r,
 		ret = error(_("could not commit staged changes."));
 		goto out;
 	}
+	if (reload_index_after_commit(r, repair_fsmonitor_proof)) {
+		ret = -1;
+		goto out;
+	}
 
 	unlink(rebase_path_amend());
 	unlink(git_path_merge_head(r));
@@ -5555,13 +5619,21 @@ out:
 int sequencer_continue(struct repository *r, struct replay_opts *opts)
 {
 	struct todo_list todo_list = TODO_LIST_INIT;
-	int res;
+	int res, reissue_sidecar;
+	int had_clean_sidecar = wt_status_clean_sidecar_present(r);
+	int had_full_proof = 0;
 
 	if (read_and_refresh_cache(r, opts))
 		return -1;
 
 	if (read_populate_opts(opts))
 		return -1;
+	reissue_sidecar = is_rebase_i(opts) && had_clean_sidecar;
+	if (reissue_sidecar)
+		had_full_proof =
+			clean_status_has_persistent_fsmonitor_semantic_history(
+				r->index) ||
+			clean_status_has_worktree_manifest_history(r->index);
 	if (is_rebase_i(opts)) {
 		if ((res = read_populate_todo(r, &todo_list, opts)))
 			goto release_todo_list;
@@ -5609,6 +5681,15 @@ int sequencer_continue(struct repository *r, struct replay_opts *opts)
 	}
 
 	res = pick_commits(r, &todo_list, opts);
+	if (!res && reissue_sidecar && had_full_proof &&
+	    use_optional_locks() &&
+	    !hook_exists(r, "post-index-change")) {
+		struct clean_status_config_digest digest;
+
+		if (!clean_status_config_read_repository(r, &digest))
+			wt_status_reissue_clean_sidecar_after_worktree_update(
+				r, had_full_proof, &digest);
+	}
 release_todo_list:
 	todo_list_release(&todo_list);
 	return res;

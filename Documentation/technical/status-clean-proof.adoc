@@ -83,9 +83,12 @@ checksum is accepted only when the pinned index is bound by the durable
 local-APFS identity used for raced-input checks.
 
 The sidecar is installed while the index lock remains held and after
-the pinned index is rechecked. Status then rolls back the index lock, so
-issuing a sidecar does not itself rewrite the index. With optional locks
-disabled, status does not issue a sidecar.
+the pinned index is rechecked. If the exact query first has to repair
+the index's file system monitor checkpoint, status writes that repair,
+refreshes the resumable history checkpoint, and then installs a proof
+bound to the rewritten index. Status rolls back the lock used for the
+sidecar itself, so issuing a sidecar does not itself rewrite the index.
+With optional locks disabled, status does not issue a sidecar.
 
 Validation and races
 --------------------

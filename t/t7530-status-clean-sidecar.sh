@@ -233,6 +233,50 @@ start_issue_raced_status () {
 	wait_for_fast_ready
 }
 
+start_postwrite_raced_stash () {
+	repo=$1 &&
+	ready=$TRASH_DIRECTORY/$repo.postwrite-ready &&
+	resume=$TRASH_DIRECTORY/$repo.postwrite-resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.postwrite-trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	: >"$ready" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		test_env \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_READY="$ready" \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			git -C "$repo" stash push -q --keep-index -- tracked \
+			>raced.actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_fast_ready
+}
+
+start_postwrite_raced_status () {
+	repo=$1 &&
+	ready=$TRASH_DIRECTORY/$repo.postwrite-ready &&
+	resume=$TRASH_DIRECTORY/$repo.postwrite-resume &&
+	race_trace=$TRASH_DIRECTORY/$repo.postwrite-trace &&
+	status_pid= &&
+	rm -f "$ready" "$resume" "$race_trace" &&
+	: >"$ready" &&
+	mkfifo "$resume" &&
+	exec 9<>"$resume" &&
+	{
+		test_env \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_READY="$ready" \
+		GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_RESUME="$resume" \
+		GIT_TRACE2_EVENT="$race_trace" \
+			bulk_status -C "$repo" status --porcelain=v2 \
+			>raced.actual 9>&- &
+		status_pid=$!
+	} &&
+	wait_for_fast_ready
+}
+
 stop_after_fast_fallback () {
 	for i in $(test_seq 1 1000)
 	do
@@ -1007,10 +1051,35 @@ test_expect_success DURABLE_FSMONITOR,PERL_TEST_HELPERS \
 		hardlink-sidecar-repair-reissue.trace &&
 	test_grep "\"label\":\"do_write_index\"" \
 		hardlink-sidecar-repair-reissue.trace &&
-	test_trace2_data status clean-proof/sidecar 1 \
-		<hardlink-sidecar-repair-reissue.trace &&
-	test_trace2_data status clean-proof/postwrite-reissued 1 \
-		<hardlink-sidecar-repair-reissue.trace &&
+	if test_trace2_data status clean-proof/sidecar 1 \
+		<hardlink-sidecar-repair-reissue.trace
+	then
+		test_trace2_data status clean-proof/postwrite-reissued 1 \
+			<hardlink-sidecar-repair-reissue.trace
+	else
+		test_trace2_data status clean-proof/miss \
+			issue-scan-or-index-shape \
+			<hardlink-sidecar-repair-reissue.trace &&
+		! test_trace2_data status clean-proof/postwrite-reissued 1 \
+			<hardlink-sidecar-repair-reissue.trace &&
+		hardlink_sidecar_recovered= &&
+		for recovery_attempt in 1 2 3
+		do
+			test_env GIT_TRACE2_EVENT="$PWD/hardlink-sidecar-recovery-$recovery_attempt.trace" \
+				git -C sidecar-hardlink-stale-stat status \
+					>"hardlink-sidecar-recovery-$recovery_attempt.actual" &&
+			test_grep "nothing to commit, working tree clean" \
+				"hardlink-sidecar-recovery-$recovery_attempt.actual" ||
+				return 1
+			if test_trace2_data status clean-proof/sidecar 1 \
+				<"hardlink-sidecar-recovery-$recovery_attempt.trace"
+			then
+				hardlink_sidecar_recovered=1 &&
+				break
+			fi
+		done &&
+		test "$hardlink_sidecar_recovered" = 1
+	fi &&
 	! test_cmp sidecar-hardlink-stale-stat/.git/index.before-repair \
 		sidecar-hardlink-stale-stat/.git/index &&
 	assert_clean_sidecar_hit sidecar-hardlink-stale-stat \
@@ -1727,7 +1796,7 @@ test_expect_success DURABLE_FSMONITOR \
 '
 
 test_expect_success DURABLE_FSMONITOR \
-	'exact status persists stat repairs before a sidecar' '
+	'exact status installs a sidecar after stat repairs' '
 	test_when_finished "stop_daemon external-stat-exact" &&
 	setup_repo external-stat-exact &&
 	git -C external-stat-exact config core.autocrlf false &&
@@ -1740,21 +1809,32 @@ test_expect_success DURABLE_FSMONITOR \
 	test_must_be_empty actual &&
 	test_trace2_data fsmonitor history/external-stored 1 \
 		<external-stat-exact.trace &&
-	test_path_is_missing external-stat-exact/.git/index.csts &&
+	test_path_is_file external-stat-exact/.git/index.csts &&
 	test_grep "\"label\":\"do_write_index\"" \
 		external-stat-exact.trace &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<external-stat-exact.trace &&
+	test_trace2_data status clean-proof/postwrite-issued 1 \
+		<external-stat-exact.trace &&
 	git -C external-stat-exact -c core.fsmonitor=false \
 		diff-index --quiet HEAD &&
+	cp external-stat-exact/.git/index external-stat-exact.index &&
+	cp external-stat-exact/.git/index.csts external-stat-exact.sidecar &&
 
-	test_env GIT_TRACE2_EVENT="$PWD/external-stat-exact-issue.trace" \
+	test_env GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/external-stat-exact-issue.trace" \
 		bulk_status -C external-stat-exact status --porcelain=v2 \
 		>actual &&
 	test_must_be_empty actual &&
-	test_trace2_data fsmonitor history/external-stored 1 \
+	test_trace2_data status clean-proof/hit 1 \
 		<external-stat-exact-issue.trace &&
-	test_path_is_file external-stat-exact/.git/index.csts &&
+	test_grep ! "\"label\":\"do_read_index\"" \
+		external-stat-exact-issue.trace &&
 	test_grep ! "\"label\":\"do_write_index\"" \
-		external-stat-exact-issue.trace
+		external-stat-exact-issue.trace &&
+	test_cmp_bin external-stat-exact.index external-stat-exact/.git/index &&
+	test_cmp_bin external-stat-exact.sidecar \
+		external-stat-exact/.git/index.csts
 '
 
 test_expect_success DURABLE_FSMONITOR \
@@ -2005,6 +2085,10 @@ test_expect_success DURABLE_FSMONITOR \
 	prime_semantic_history sidecar-shape &&
 
 	bulk_status -C sidecar-shape status --porcelain=2 >actual &&
+	test_must_be_empty actual &&
+	test_path_is_missing sidecar-shape/.git/index.csts &&
+	bulk_status -C sidecar-shape status --porcelain=v2 \
+		--untracked-files=normal --no-ahead-behind >actual &&
 	test_must_be_empty actual &&
 	test_path_is_missing sidecar-shape/.git/index.csts &&
 
@@ -3545,6 +3629,248 @@ test_expect_success PERL_TEST_HELPERS \
 		done &&
 		test_cmp_bin .git/config.before .git/config
 	)
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'scoped stash authenticates its final skipHash index' '
+	test_when_finished "stop_daemon sidecar-scoped-stash" &&
+	setup_repo sidecar-scoped-stash &&
+	git -C sidecar-scoped-stash config core.autocrlf false &&
+	git -C sidecar-scoped-stash config feature.manyFiles true &&
+	issue_sidecar sidecar-scoped-stash &&
+	assert_clean_sidecar_hit sidecar-scoped-stash \
+		sidecar-scoped-stash scoped-stash-before &&
+	test_write_lines changed >sidecar-scoped-stash/tracked &&
+	GIT_TRACE2_EVENT="$PWD/scoped-stash.trace" \
+		git -C sidecar-scoped-stash stash push -q -- tracked &&
+	test_trace2_data fsmonitor history/own-write-source-recorded 1 \
+		<scoped-stash.trace &&
+	test_trace2_data fsmonitor history/own-write-source-adopted 1 \
+		<scoped-stash.trace &&
+	test_trace2_data status clean-proof/writer-sidecar 1 \
+		<scoped-stash.trace &&
+	test_path_is_file sidecar-scoped-stash/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-scoped-stash \
+		sidecar-scoped-stash scoped-stash-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'rebase --continue publishes a sidecar for its final clean index' '
+	test_when_finished "stop_daemon sidecar-rebase-continue" &&
+	setup_repo sidecar-rebase-continue &&
+	git -C sidecar-rebase-continue config core.autocrlf false &&
+	issue_sidecar sidecar-rebase-continue &&
+	git -C sidecar-rebase-continue branch topic &&
+	git -C sidecar-rebase-continue checkout -q -b upstream &&
+	test_write_lines upstream >sidecar-rebase-continue/tracked &&
+	git -C sidecar-rebase-continue add tracked &&
+	git -C sidecar-rebase-continue commit -m upstream &&
+	git -C sidecar-rebase-continue checkout -q topic &&
+	test_write_lines topic >sidecar-rebase-continue/tracked &&
+	git -C sidecar-rebase-continue add tracked &&
+	git -C sidecar-rebase-continue commit -m topic &&
+	test_must_fail git -C sidecar-rebase-continue rebase upstream &&
+	test_path_is_file sidecar-rebase-continue/.git/index.csts &&
+	test_write_lines resolved >sidecar-rebase-continue/tracked &&
+	git -C sidecar-rebase-continue add tracked &&
+	GIT_EDITOR=true \
+	GIT_TRACE2_EVENT="$PWD/rebase-continue.trace" \
+		git -C sidecar-rebase-continue rebase --continue &&
+	test_trace2_data status clean-proof/writer-sidecar 1 \
+		<rebase-continue.trace &&
+	test_path_is_file sidecar-rebase-continue/.git/index.csts &&
+	assert_clean_sidecar_hit sidecar-rebase-continue \
+		sidecar-rebase-continue rebase-continue-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'non-fast-forward merge publishes a sidecar for its final clean index' '
+	test_when_finished "stop_daemon sidecar-no-ff-merge" &&
+	setup_repo sidecar-no-ff-merge &&
+	primary=$(git -C sidecar-no-ff-merge symbolic-ref --short HEAD) &&
+	git -C sidecar-no-ff-merge switch -c side &&
+	test_commit -C sidecar-no-ff-merge topic topic-file &&
+	git -C sidecar-no-ff-merge switch "$primary" &&
+	test_commit -C sidecar-no-ff-merge primary primary-file &&
+	test-tool chmtime -120 sidecar-no-ff-merge/primary-file &&
+	git -C sidecar-no-ff-merge update-index --refresh &&
+	issue_sidecar sidecar-no-ff-merge &&
+	assert_clean_sidecar_hit sidecar-no-ff-merge \
+		sidecar-no-ff-merge no-ff-merge-before &&
+	GIT_TRACE2_EVENT="$PWD/no-ff-merge.trace" \
+		git -C sidecar-no-ff-merge merge --no-ff --no-edit side &&
+	test_trace2_data status clean-proof/writer-sidecar 1 \
+		<no-ff-merge.trace &&
+	assert_clean_sidecar_hit sidecar-no-ff-merge \
+		sidecar-no-ff-merge no-ff-merge-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'scoped stash ignores optional sidecar lock contention' '
+	test_when_finished "stop_daemon sidecar-scoped-stash-lock" &&
+	test_when_finished "rm -f sidecar-scoped-stash-lock/.git/index.lock" &&
+	setup_repo sidecar-scoped-stash-lock &&
+	git -C sidecar-scoped-stash-lock config core.autocrlf false &&
+	issue_sidecar sidecar-scoped-stash-lock &&
+	assert_clean_sidecar_hit sidecar-scoped-stash-lock \
+		sidecar-scoped-stash-lock scoped-stash-lock-before &&
+	cp sidecar-scoped-stash-lock/tracked scoped-stash-lock.expect &&
+	write_script sidecar-scoped-stash-lock/.git/hooks/post-checkout <<-\EOF &&
+	: >.git/index.lock
+	EOF
+	test_write_lines changed >sidecar-scoped-stash-lock/tracked &&
+	GIT_TRACE2_EVENT="$PWD/scoped-stash-lock.trace" \
+		git -C sidecar-scoped-stash-lock stash push -q \
+			--keep-index -- tracked 2>scoped-stash-lock.err &&
+	test_trace2_data status clean-proof/writer-sidecar-skip index-lock \
+		<scoped-stash-lock.trace &&
+	test_grep ! "Unable to create .*index.lock" \
+		scoped-stash-lock.err &&
+	test_grep ! "could not write index" scoped-stash-lock.err &&
+	test_path_is_missing sidecar-scoped-stash-lock/.git/refs/stash.lock &&
+	git -C sidecar-scoped-stash-lock rev-parse --verify refs/stash &&
+	test_cmp scoped-stash-lock.expect sidecar-scoped-stash-lock/tracked &&
+	rm -f sidecar-scoped-stash-lock/.git/index.lock &&
+	assert_clean_sidecar_fallback sidecar-scoped-stash-lock \
+		sidecar-scoped-stash-lock scoped-stash-lock-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'rebase --continue ignores optional sidecar lock contention' '
+	test_when_finished "stop_daemon sidecar-rebase-lock" &&
+	test_when_finished "rm -f sidecar-rebase-lock/.git/index.lock" &&
+	setup_repo sidecar-rebase-lock &&
+	git -C sidecar-rebase-lock config core.autocrlf false &&
+	issue_sidecar sidecar-rebase-lock &&
+	git -C sidecar-rebase-lock branch topic &&
+	git -C sidecar-rebase-lock checkout -q -b upstream &&
+	test_write_lines upstream >sidecar-rebase-lock/tracked &&
+	git -C sidecar-rebase-lock add tracked &&
+	git -C sidecar-rebase-lock commit -m upstream &&
+	git -C sidecar-rebase-lock checkout -q topic &&
+	test_write_lines topic >sidecar-rebase-lock/tracked &&
+	git -C sidecar-rebase-lock add tracked &&
+	git -C sidecar-rebase-lock commit -m topic &&
+	test_must_fail git -C sidecar-rebase-lock rebase upstream &&
+	test_write_lines resolved >rebase-lock.expect &&
+	cp rebase-lock.expect sidecar-rebase-lock/tracked &&
+	git -C sidecar-rebase-lock add tracked &&
+	write_script sidecar-rebase-lock/.git/hooks/post-rewrite <<-\EOF &&
+	: >.git/index.lock
+	EOF
+	GIT_EDITOR=true \
+	GIT_TRACE2_EVENT="$PWD/rebase-lock.trace" \
+		git -C sidecar-rebase-lock rebase --continue \
+			2>rebase-lock.err &&
+	test_trace2_data status clean-proof/writer-sidecar-skip index-lock \
+		<rebase-lock.trace &&
+	test_grep ! "Unable to create .*index.lock" rebase-lock.err &&
+	test_grep ! "could not write index" rebase-lock.err &&
+	test_path_is_missing sidecar-rebase-lock/.git/rebase-merge &&
+	test_cmp rebase-lock.expect sidecar-rebase-lock/tracked &&
+	rm -f sidecar-rebase-lock/.git/index.lock &&
+	assert_clean_sidecar_fallback sidecar-rebase-lock \
+		sidecar-rebase-lock rebase-lock-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a postwrite index replacement cannot inherit an earlier clean scan' '
+	test_when_finished "stop_daemon sidecar-postwrite-race" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-postwrite-race &&
+	git -C sidecar-postwrite-race config core.autocrlf false &&
+	issue_sidecar sidecar-postwrite-race &&
+	test_write_lines stashed >sidecar-postwrite-race/tracked &&
+	start_postwrite_raced_stash sidecar-postwrite-race &&
+	test_write_lines concurrent >sidecar-postwrite-race/tracked &&
+	git -C sidecar-postwrite-race add tracked &&
+	GIT_OPTIONAL_LOCKS=1 git -C sidecar-postwrite-race \
+		status --porcelain=v2 >postwrite-race.expect &&
+	test_file_not_empty postwrite-race.expect &&
+	finish_fast_raced_status &&
+	test_must_be_empty raced.actual &&
+	test_trace2_data status clean-proof/writer-sidecar 0 \
+		<"$race_trace" &&
+	assert_clean_sidecar_fallback sidecar-postwrite-race \
+		sidecar-postwrite-race postwrite-race-after
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'status cannot bind a clean scan to a replaced postwrite index' '
+	test_when_finished "stop_daemon sidecar-status-postwrite-race" &&
+	test_when_finished "cleanup_fast_race" &&
+	setup_repo sidecar-status-postwrite-race &&
+	git -C sidecar-status-postwrite-race config core.autocrlf false &&
+	prime_semantic_history sidecar-status-postwrite-race &&
+	test-tool chmtime -60 sidecar-status-postwrite-race/tracked &&
+	test-tool -C sidecar-status-postwrite-race \
+		fsmonitor-client flush >status-postwrite-race.flush &&
+	start_postwrite_raced_status sidecar-status-postwrite-race &&
+	test_write_lines concurrent >sidecar-status-postwrite-race/tracked &&
+	git -C sidecar-status-postwrite-race add tracked &&
+	GIT_OPTIONAL_LOCKS=1 git -C sidecar-status-postwrite-race \
+		status --porcelain=v2 >status-postwrite-race.expect &&
+	test_file_not_empty status-postwrite-race.expect &&
+	finish_fast_raced_status &&
+	test_must_be_empty raced.actual &&
+	test_trace2_data status clean-proof/miss postwrite-index-raced \
+		<"$race_trace" &&
+	assert_clean_sidecar_fallback sidecar-status-postwrite-race \
+		sidecar-status-postwrite-race status-postwrite-race-after \
+		--porcelain=v2 &&
+	test_cmp status-postwrite-race.expect \
+		status-postwrite-race-after.actual
+'
+
+test_expect_success DURABLE_FSMONITOR \
+	'a registered linked worktree can issue and consume a clean sidecar' '
+	test_when_finished "stop_daemon sidecar-linked-review" &&
+	test_when_finished "stop_daemon sidecar-linked-main" &&
+	setup_repo sidecar-linked-main &&
+	git -C sidecar-linked-main config core.autocrlf false &&
+	git -C sidecar-linked-main config core.untrackedCache true &&
+	git -C sidecar-linked-main worktree add -q \
+		-b sidecar-linked-topic ../sidecar-linked-review &&
+	linked_gitdir=$(git -C sidecar-linked-review \
+		rev-parse --absolute-git-dir) &&
+	linked_index=$linked_gitdir/index &&
+	test_path_is_missing "$linked_index.csts" &&
+	test_env GIT_TRACE2_EVENT="$PWD/linked-short.trace" \
+		bulk_status -C sidecar-linked-review status --short \
+		>linked-short.actual &&
+	test_must_be_empty linked-short.actual &&
+	test_trace2_data status clean-proof/sidecar 1 \
+		<linked-short.trace &&
+	test_path_is_file "$linked_index.csts" &&
+	cp "$linked_index" linked.index &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false -C sidecar-linked-review \
+		status --porcelain=v2 >linked.expect &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/linked-hit.trace" \
+		git -C sidecar-linked-review status --porcelain=v2 \
+		>linked.actual &&
+	test_cmp linked.expect linked.actual &&
+	test_cmp_bin linked.index "$linked_index" &&
+	test_trace2_data status clean-proof/hit 1 <linked-hit.trace &&
+	test_region ! index do_read_index linked-hit.trace &&
+	mkdir sidecar-linked-impostor &&
+	cp sidecar-linked-review/tracked sidecar-linked-impostor/tracked &&
+	GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+		-c core.untrackedCache=false --git-dir="$linked_gitdir" \
+		--work-tree="$PWD/sidecar-linked-impostor" \
+		status --porcelain=v2 >linked-impostor.expect &&
+	GIT_OPTIONAL_LOCKS=0 \
+	GIT_TRACE2_EVENT="$PWD/linked-impostor.trace" \
+		git --git-dir="$linked_gitdir" \
+		--work-tree="$PWD/sidecar-linked-impostor" \
+		status --porcelain=v2 >linked-impostor.actual &&
+	test_cmp linked-impostor.expect linked-impostor.actual &&
+	test_cmp_bin linked.index "$linked_index" &&
+	test_trace2_data status clean-proof/miss fast-repository-shape \
+		<linked-impostor.trace &&
+	test_grep ! "\"key\":\"clean-proof/hit\"" \
+		linked-impostor.trace
 '
 
 test_done

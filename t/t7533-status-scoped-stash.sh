@@ -472,11 +472,12 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
-	'whole-worktree stash retains its deliberate proof invalidation' '
+	'whole-worktree stash preserves its authenticated proof' '
 	test_when_finished "rm -rf scoped-stash-whole" &&
 	scoped_stash_setup scoped-stash-whole &&
 	(
 		cd scoped-stash-whole &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
 		test_write_lines dirty >tracked &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCCCCCCCCCCCCCC \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
@@ -485,7 +486,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELP
 		! test_trace2_data fsmonitor \
 			apply/untracked-replacement-preserved 1 \
 			<.git/whole.trace &&
-		! scoped_stash_full_proof .git/index &&
+		scoped_stash_full_proof .git/index &&
 		GIT_OPTIONAL_LOCKS=0 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCCCCCCCC \
 			git status --porcelain=v2 >.git/actual &&

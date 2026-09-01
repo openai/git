@@ -19,9 +19,11 @@
 #define CLEAN_STATUS_FILTER_SMUDGE (1U << 1)
 #define CLEAN_STATUS_FILTER_PROCESS (1U << 2)
 #define CLEAN_STATUS_FILTER_REQUIRED (1U << 3)
+#define CLEAN_STATUS_FILTER_READ_DISABLED \
+	(CLEAN_STATUS_FILTER_CLEAN | CLEAN_STATUS_FILTER_PROCESS | \
+	 CLEAN_STATUS_FILTER_REQUIRED)
 #define CLEAN_STATUS_FILTER_COMPLETE \
-	(CLEAN_STATUS_FILTER_CLEAN | CLEAN_STATUS_FILTER_SMUDGE | \
-	 CLEAN_STATUS_FILTER_PROCESS | CLEAN_STATUS_FILTER_REQUIRED)
+	(CLEAN_STATUS_FILTER_READ_DISABLED | CLEAN_STATUS_FILTER_SMUDGE)
 
 struct clean_status_pending_filter_entry {
 	char *key;
@@ -90,7 +92,16 @@ static int config_is_command_transport(const char *key,
 
 	if (!ctx || !ctx->kvi || ctx->kvi->scope != CONFIG_SCOPE_COMMAND)
 		return 0;
+	if (!strcmp(key, "protocol.version") ||
+	    !strcmp(key, "fetch.uriprotocols") ||
+	    !strcmp(key, "push.negotiate") ||
+	    starts_with(key, "http."))
+		return 1;
 	if (starts_with(key, "credential."))
+		return 1;
+	if (!parse_config_key(key, "remote", &subsection, &subsection_len,
+			      &subkey) && subsection && subsection_len &&
+	    !strcmp(subkey, "pushurl"))
 		return 1;
 	if (parse_config_key(key, "url", &subsection, &subsection_len,
 			     &subkey) || !subsection || !subsection_len)
@@ -246,17 +257,25 @@ static void hash_retained_config_entry(
 static void flush_pending_filter(struct clean_status_config_digest *digest)
 {
 	struct clean_status_pending_filter *pending = digest->pending_filter;
+	int read_disabled;
 
 	if (!pending)
 		return;
-	/* Remember command overrides omitted from the authenticated digest. */
-	if (pending->mask == CLEAN_STATUS_FILTER_COMPLETE)
+	/*
+	 * Read-side conversion does not use the smudge command. Disabling clean
+	 * and process, with required=false, is sufficient for an authenticated
+	 * filter-free scope. Keep recording the override so that it cannot
+	 * publish a sidecar without rechecking that scope.
+	 */
+	read_disabled = (pending->mask & CLEAN_STATUS_FILTER_READ_DISABLED) ==
+		CLEAN_STATUS_FILTER_READ_DISABLED;
+	if (read_disabled)
 		digest->normalized_filter_disable = 1;
 	for (unsigned i = 0; i < pending->nr; i++) {
 		struct clean_status_pending_filter_entry *entry =
 			&pending->entries[i];
 
-		if (pending->mask != CLEAN_STATUS_FILTER_COMPLETE) {
+		if (!read_disabled) {
 			struct key_value_info kvi = KVI_INIT;
 			struct config_context ctx = { .kvi = &kvi };
 

@@ -19,6 +19,7 @@
 #include "repository.h"
 #include "semantic-verify-internal.h"
 #include "strbuf.h"
+#include "strmap.h"
 #include "trace2.h"
 #include "ewah/ewok.h"
 
@@ -2018,22 +2019,187 @@ int clean_status_transfer_current_proof_if_same_index(
 	return replace_current_fsmonitor_proof(dst, src);
 }
 
-int clean_status_transfer_current_proof_if_semantically_same_index(
-	struct index_state *dst, const struct index_state *src)
+enum checkout_policy_change {
+	CHECKOUT_POLICY_NONE = 0,
+	CHECKOUT_POLICY_IGNORE = 1 << 0,
+	CHECKOUT_POLICY_ATTRIBUTES = 1 << 1,
+};
+
+struct checkout_policy_change_context {
+	enum checkout_policy_change kinds;
+	struct strset attribute_directories;
+};
+
+static enum checkout_policy_change checkout_policy_change_kind(
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	const struct cache_entry *entry = old ? old : new_entry;
+	const char *base;
+
+	if (!entry ||
+	    (old && (!S_ISREG(old->ce_mode) || ce_stage(old) ||
+		     ce_skip_worktree(old) || ce_intent_to_add(old) ||
+		     (old->ce_flags & CE_VALID))) ||
+	    (new_entry && (!S_ISREG(new_entry->ce_mode) || ce_stage(new_entry) ||
+			    ce_skip_worktree(new_entry) ||
+			    ce_intent_to_add(new_entry) ||
+			    (new_entry->ce_flags & CE_VALID))) ||
+	    (old && new_entry &&
+	     (strcmp(old->name, new_entry->name) || old->ce_mode != new_entry->ce_mode)))
+		return CHECKOUT_POLICY_NONE;
+	base = strrchr(entry->name, '/');
+	base = base ? base + 1 : entry->name;
+	if (!fspathcmp(base, GITATTRIBUTES_FILE))
+		return CHECKOUT_POLICY_ATTRIBUTES;
+	if (!fspathcmp(base, ".gitignore"))
+		return CHECKOUT_POLICY_IGNORE;
+	return CHECKOUT_POLICY_NONE;
+}
+
+static int record_checkout_policy_change(
+	struct checkout_policy_change_context *context,
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	enum checkout_policy_change change =
+		checkout_policy_change_kind(old, new_entry);
+	const struct cache_entry *entry = old ? old : new_entry;
+
+	if (!change)
+		return 0;
+	context->kinds |= change;
+	if (change == CHECKOUT_POLICY_ATTRIBUTES) {
+		const char *slash = strrchr(entry->name, '/');
+		char *directory = slash ?
+			xmemdupz(entry->name, slash - entry->name + 1) :
+			xstrdup("");
+
+		strset_add(&context->attribute_directories, directory);
+		free(directory);
+	}
+	return 1;
+}
+
+static void collect_checkout_policy_changes(
+	struct checkout_policy_change_context *context,
+	const struct index_state *dst, const struct index_state *src)
 {
 	const unsigned int semantic_flags =
 		CE_STAGEMASK | CE_VALID | CE_EXTENDED_FLAGS;
 	unsigned int src_pos = 0, dst_pos = 0;
-	int transferred;
 
+	while (src_pos < src->cache_nr || dst_pos < dst->cache_nr) {
+		const struct cache_entry *old = src_pos < src->cache_nr ?
+			src->cache[src_pos] : NULL;
+		const struct cache_entry *new_entry = dst_pos < dst->cache_nr ?
+			dst->cache[dst_pos] : NULL;
+		int cmp;
+
+		if (!old)
+			cmp = 1;
+		else if (!new_entry)
+			cmp = -1;
+		else
+			cmp = strcmp(old->name, new_entry->name);
+		if (cmp < 0) {
+			record_checkout_policy_change(context, old, NULL);
+			src_pos++;
+		} else if (cmp > 0) {
+			record_checkout_policy_change(context, NULL, new_entry);
+			dst_pos++;
+		} else {
+			if (old->ce_mode != new_entry->ce_mode ||
+			    !oideq(&old->oid, &new_entry->oid) ||
+			    ((old->ce_flags ^ new_entry->ce_flags) & semantic_flags))
+				record_checkout_policy_change(context, old,
+							      new_entry);
+			src_pos++;
+			dst_pos++;
+		}
+	}
+}
+
+static int checkout_policy_scope_entry_has_safe_shape(
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	const struct cache_entry *entry = old ? old : new_entry;
+
+	if (!entry ||
+	    (old && (!S_ISREG(old->ce_mode) && !S_ISLNK(old->ce_mode))) ||
+	    (new_entry && (!S_ISREG(new_entry->ce_mode) &&
+			   !S_ISLNK(new_entry->ce_mode))) ||
+	    (old && (ce_stage(old) || ce_skip_worktree(old) ||
+		     ce_intent_to_add(old) || (old->ce_flags & CE_VALID))) ||
+	    (new_entry && (ce_stage(new_entry) || ce_skip_worktree(new_entry) ||
+			   ce_intent_to_add(new_entry) ||
+			   (new_entry->ce_flags & CE_VALID))) ||
+	    (old && new_entry &&
+	     (strcmp(old->name, new_entry->name) || old->ce_mode != new_entry->ce_mode)))
+		return 0;
+	return 1;
+}
+
+static int checkout_entry_is_in_changed_attribute_scope(
+	struct checkout_policy_change_context *context,
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	const struct cache_entry *entry = old ? old : new_entry;
+	struct strbuf directory = STRBUF_INIT;
+	const char *slash = entry->name;
+	int found = strset_contains(&context->attribute_directories, "");
+
+	while (!found && (slash = strchr(slash, '/')) != NULL) {
+		strbuf_reset(&directory);
+		strbuf_add(&directory, entry->name, slash - entry->name + 1);
+		found = strset_contains(&context->attribute_directories,
+					 directory.buf);
+		slash++;
+	}
+	strbuf_release(&directory);
+	return found;
+}
+
+static int checkout_policy_change_allows_entry(
+	struct checkout_policy_change_context *context,
+	const struct cache_entry *old, const struct cache_entry *new_entry)
+{
+	if (record_checkout_policy_change(context, old, new_entry))
+		return 1;
+	return (context->kinds & CHECKOUT_POLICY_ATTRIBUTES) &&
+		checkout_policy_scope_entry_has_safe_shape(old, new_entry) &&
+		checkout_entry_is_in_changed_attribute_scope(context, old,
+							     new_entry);
+}
+
+static int transfer_current_proof_if_semantically_same_index(
+	struct index_state *dst, const struct index_state *src,
+	int allow_checkout_policy_changes,
+	int *manifest_refresh_required)
+{
+	const unsigned int semantic_flags =
+		CE_STAGEMASK | CE_VALID | CE_EXTENDED_FLAGS;
+	unsigned int src_pos = 0, dst_pos = 0;
+	struct checkout_policy_change_context policy_changes = {
+		.attribute_directories = STRSET_INIT,
+	};
+	int transferred = 0;
+
+	if (manifest_refresh_required)
+		*manifest_refresh_required = 0;
+
+	/*
+	 * Clearing resolve-undo changes only its optional index extension.
+	 * A live resolve-undo map is still rejected below, but its removal does
+	 * not change tracked entries or the worktree state certified here.
+	 */
 	if (!current_proof_is_writable(src) ||
 	    src->repo != dst->repo || src->split_index || dst->split_index ||
 	    src->sparse_index || dst->sparse_index ||
-	    (src->cache_changed & RESOLVE_UNDO_CHANGED) ||
 	    src->resolve_undo ||
 	    !src->fsmonitor_last_update || !dst->fsmonitor_last_update ||
 	    strcmp(src->fsmonitor_last_update, dst->fsmonitor_last_update))
 		return 0;
+	if (allow_checkout_policy_changes)
+		collect_checkout_policy_changes(&policy_changes, dst, src);
 
 	while (src_pos < src->cache_nr || dst_pos < dst->cache_nr) {
 		const struct cache_entry *old = src_pos < src->cache_nr ?
@@ -2050,25 +2216,37 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 			cmp = strcmp(old->name, new_entry->name);
 		if (cmp < 0) {
 			if (!clean_status_index_entry_is_semantically_safe(
-				    src, old, NULL))
-				return 0;
+				    src, old, NULL) &&
+			    (!allow_checkout_policy_changes ||
+			     !checkout_policy_change_allows_entry(&policy_changes,
+							     old, NULL)))
+					goto done;
 			src_pos++;
 		} else if (cmp > 0) {
 			if (!clean_status_index_entry_is_semantically_safe(
-				    src, NULL, new_entry))
-				return 0;
+				    src, NULL, new_entry) &&
+			    (!allow_checkout_policy_changes ||
+			     !checkout_policy_change_allows_entry(&policy_changes,
+							     NULL, new_entry)))
+					goto done;
 			dst_pos++;
 		} else {
 			if ((old->ce_mode != new_entry->ce_mode ||
 			     !oideq(&old->oid, &new_entry->oid) ||
 			     ((old->ce_flags ^ new_entry->ce_flags) & semantic_flags)) &&
 			    !clean_status_index_entry_is_semantically_safe(
-				    src, old, new_entry))
-				return 0;
+				    src, old, new_entry) &&
+			    (!allow_checkout_policy_changes ||
+			     !checkout_policy_change_allows_entry(&policy_changes,
+							     old, new_entry)))
+					goto done;
 			src_pos++;
 			dst_pos++;
 		}
 	}
+	if (manifest_refresh_required &&
+	    (policy_changes.kinds & CHECKOUT_POLICY_ATTRIBUTES))
+		*manifest_refresh_required = 1;
 
 	if (current_proof_is_writable(dst)) {
 		const struct clean_status_state *src_state = src->clean_status;
@@ -2088,10 +2266,11 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 		    memcmp(src_state->manifest.current.buf,
 			   dst_state->manifest.current.buf,
 			   src_state->manifest.current.len))
-			return 0;
+				goto done;
 		trace2_data_intmax("fsmonitor", dst->repo,
 				   "history/semantic-transferred", 1);
-		return 1;
+		transferred = 1;
+		goto done;
 	}
 
 	transferred = replace_current_fsmonitor_proof(dst, src);
@@ -2099,7 +2278,29 @@ int clean_status_transfer_current_proof_if_semantically_same_index(
 		trace2_data_intmax("fsmonitor", dst->repo,
 				   "history/semantic-transferred", 1);
 
+done:
+	strset_clear(&policy_changes.attribute_directories);
 	return transferred;
+}
+
+int clean_status_transfer_current_proof_if_semantically_same_index(
+	struct index_state *dst, const struct index_state *src)
+{
+	return transfer_current_proof_if_semantically_same_index(
+		dst, src, 0, NULL);
+}
+
+int clean_status_transfer_current_proof_after_checkout(
+	struct index_state *dst, const struct index_state *src,
+	int *manifest_refresh_required)
+{
+	/*
+	 * A successful checkout owns these worktree writes.  It may therefore
+	 * retain history across policy-file changes, but the caller must refresh
+	 * changed attribute sources before pairing the transferred proof.
+	 */
+	return transfer_current_proof_if_semantically_same_index(
+		dst, src, 1, manifest_refresh_required);
 }
 
 struct clean_status_commit_checkpoint {

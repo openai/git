@@ -322,14 +322,24 @@ int close_tempfile_gently(struct tempfile *tempfile)
 	return err ? -1 : 0;
 }
 
-int reopen_tempfile(struct tempfile *tempfile)
+static int reopen_tempfile_with_flags(struct tempfile *tempfile, int flags)
 {
 	if (!is_tempfile_active(tempfile))
 		BUG("reopen_tempfile called for an inactive object");
 	if (0 <= tempfile->fd)
 		BUG("reopen_tempfile called for an open object");
-	tempfile->fd = open(tempfile->filename.buf, O_WRONLY|O_TRUNC);
+	tempfile->fd = open(tempfile->filename.buf, flags | O_TRUNC);
 	return tempfile->fd;
+}
+
+int reopen_tempfile(struct tempfile *tempfile)
+{
+	return reopen_tempfile_with_flags(tempfile, O_WRONLY);
+}
+
+int reopen_tempfile_for_readwrite(struct tempfile *tempfile)
+{
+	return reopen_tempfile_with_flags(tempfile, O_RDWR);
 }
 
 int rename_tempfile(struct tempfile **tempfile_p, const char *path)

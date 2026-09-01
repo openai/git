@@ -8,6 +8,8 @@
 
 struct repository;
 struct stat;
+struct lock_file;
+struct clean_status_config_digest;
 struct attr_source_snapshot;
 struct exclude_source_proof;
 struct wt_status_exclude_context;
@@ -151,6 +153,7 @@ struct wt_status {
 	unsigned untracked_from_preload : 1;
 	unsigned bulk_update_index_stat : 1;
 	const char *index_file;
+	const char *proof_index_path;
 	FILE *fp;
 	const char *prefix;
 	struct string_list change;
@@ -166,6 +169,7 @@ struct wt_status {
 	unsigned attr_snapshot_failed : 1;
 	unsigned certify_exclude_digest_valid : 1;
 	unsigned certify_untracked_scan_failed : 1;
+	unsigned certify_active_filter_found : 1;
 };
 
 size_t wt_status_locate_end(const char *s, size_t len);
@@ -182,6 +186,30 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s);
 int wt_status_refresh_index(struct wt_status *s,
 			    unsigned int refresh_flags,
 			    int require_untracked);
+/*
+ * Re-establish a complete, writable fsmonitor proof after a provider reset or
+ * an owned worktree update invalidates part of an authenticated proof.
+ */
+int wt_status_repair_fsmonitor_proof(struct repository *repo);
+int wt_status_repair_fsmonitor_proof_at_path(
+	struct repository *repo, const char *index_path);
+int wt_status_prepare_fsmonitor_proof_for_worktree_update(
+	struct repository *repo);
+int wt_status_fsmonitor_proof_needs_repair(struct repository *repo);
+int wt_status_repair_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof);
+/* The caller owns the mandatory index lock for the initial checkout. */
+int wt_status_prime_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock);
+int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
+	struct repository *repo, struct lock_file *lock, int had_full_proof,
+	const struct clean_status_config_digest *config);
+void wt_status_reissue_clean_sidecar_after_worktree_update(
+	struct repository *repo, int had_full_proof,
+	const struct clean_status_config_digest *config);
+int wt_status_repair_fsmonitor_proof_after_index_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof);
+int wt_status_clean_sidecar_present(struct repository *repo);
 void wt_status_invalidate_refresh(struct wt_status *s);
 int wt_status_certified_excludes_digest(
 	struct wt_status *s, struct object_id *digest,

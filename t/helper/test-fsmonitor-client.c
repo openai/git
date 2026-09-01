@@ -65,6 +65,29 @@ static int do_send_query(const char *token)
 }
 
 /*
+ * Send a protocol-v2 token without the capability and worktree-binding
+ * prefix used by current clients.  This models an older client that does
+ * not understand hard-link inode events.
+ */
+static int do_send_legacy_query(const char *token)
+{
+	struct strbuf answer = STRBUF_INIT;
+	int ret;
+
+	if (!token || !*token)
+		token = get_token_from_index();
+
+	ret = fsmonitor_ipc__send_command(token, &answer);
+	if (ret < 0)
+		die("could not query fsmonitor--daemon");
+
+	write_in_full(1, answer.buf, answer.len);
+	strbuf_release(&answer);
+
+	return 0;
+}
+
+/*
  * Send a "flush" command to the `git-fsmonitor--daemon` (if running)
  * and tell it to flush its cache.
  *
@@ -221,6 +244,7 @@ int cmd__fsmonitor_client(int argc, const char **argv)
 
 	const char * const fsmonitor_client_usage[] = {
 		"test-tool fsmonitor-client query [<token>]",
+		"test-tool fsmonitor-client query-legacy [<token>]",
 		"test-tool fsmonitor-client flush",
 		"test-tool fsmonitor-client record-watch-limit",
 		"test-tool fsmonitor-client hammer [<token>] [<threads>] [<requests>]",
@@ -248,6 +272,9 @@ int cmd__fsmonitor_client(int argc, const char **argv)
 
 	if (!strcmp(subcmd, "query"))
 		return !!do_send_query(token);
+
+	if (!strcmp(subcmd, "query-legacy"))
+		return !!do_send_legacy_query(token);
 
 	if (!strcmp(subcmd, "flush"))
 		return !!do_send_flush();

@@ -70,10 +70,24 @@ void test_clean_status_config__origin_only_affects_full_hash(void)
 void test_clean_status_config__command_transport_config_does_not_change_proof(void)
 {
 	static const char *const ignored_keys[] = {
+		"protocol.version",
+		"fetch.uriprotocols",
+		"push.negotiate",
+		"http.https://Example.Invalid.extraheader",
+		"http.https://Example.Invalid.proactiveauth",
+		"http.https://Example.Invalid.sslverify",
 		"credential.helper",
 		"credential.https://Example/Team.helper",
+		"remote.origin.pushurl",
+		"remote.MixedCase.pushurl",
 		"url.https://Proxy.Example/Team/.insteadof",
 		"url.https://Proxy.Example/Team/.pushinsteadof",
+	};
+	static const char *const retained_command_keys[] = {
+		"push.default",
+		"remote.origin.url",
+		"remote.pushurl",
+		"remote.origin.fetch",
 	};
 	static const enum config_scope persistent_scopes[] = {
 		CONFIG_SCOPE_GLOBAL,
@@ -105,6 +119,11 @@ void test_clean_status_config__command_transport_config_does_not_change_proof(vo
 		}
 		kvi.scope = CONFIG_SCOPE_COMMAND;
 		digest_one(&digest, ignored_keys[i], "transport", NULL);
+		cl_assert(!hashes_equal(digest.hash, baseline.hash));
+	}
+
+	for (size_t i = 0; i < ARRAY_SIZE(retained_command_keys); i++) {
+		digest_one(&digest, retained_command_keys[i], "transport", &ctx);
 		cl_assert(!hashes_equal(digest.hash, baseline.hash));
 	}
 }
@@ -376,7 +395,7 @@ void test_clean_status_config__presentation_does_not_join_filter_parts(void)
 	}
 }
 
-void test_clean_status_config__only_complete_disabled_filters_are_normalized(void)
+void test_clean_status_config__only_complete_disabled_clean_filters_are_normalized(void)
 {
 	static const char *const keys[] = {
 		"filter.demo.clean", "filter.demo.smudge",
@@ -384,6 +403,7 @@ void test_clean_status_config__only_complete_disabled_filters_are_normalized(voi
 	};
 	static const char *const values[] = { "", "", "", "false" };
 	static const int algorithms[] = { GIT_HASH_SHA1, GIT_HASH_SHA256 };
+	const unsigned clean_parts = (1U << 0) | (1U << 2) | (1U << 3);
 	struct key_value_info kvi = KVI_INIT;
 	struct config_context ctx = { .kvi = &kvi };
 
@@ -399,6 +419,8 @@ void test_clean_status_config__only_complete_disabled_filters_are_normalized(voi
 		cl_assert(!baseline.normalized_filter_disable);
 
 		for (unsigned mask = 0; mask < (1U << ARRAY_SIZE(keys)); mask++) {
+			int disabled_clean = (mask & clean_parts) == clean_parts;
+
 			clean_status_config_init(&digest, algo);
 			kvi.scope = CONFIG_SCOPE_LOCAL;
 			clean_status_config_add(&digest, keys[0], "configured", &ctx);
@@ -410,10 +432,10 @@ void test_clean_status_config__only_complete_disabled_filters_are_normalized(voi
 			}
 			clean_status_config_final(&digest);
 			cl_assert_equal_i(hasheq(digest.hash, baseline.hash, algo),
-					  !mask || mask == 15);
+					  !mask || disabled_clean);
 			cl_assert_equal_i(digest.normalized_filter_disable,
-					  mask == 15);
-			if (mask == 15) {
+					  disabled_clean);
+			if (disabled_clean) {
 				cl_assert(hasheq(digest.semantic_hash,
 						 baseline.semantic_hash, algo));
 				cl_assert(hasheq(digest.tracked_policy_hash,

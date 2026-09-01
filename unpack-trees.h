@@ -73,6 +73,7 @@ struct unpack_trees_options {
 		     dry_run,
 		     skip_cache_tree_update,
 		     preserve_semantic_history,
+		     preserve_untracked_history,
 		     preserve_backoff_history;
 	enum unpack_trees_reset_type reset;
 	const char *prefix;

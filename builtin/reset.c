@@ -41,6 +41,7 @@
 #include "trace2.h"
 #include "dir.h"
 #include "add-interactive.h"
+#include "wt-status.h"
 
 #define REFRESH_INDEX_DELAY_WARNING_IN_MS (2 * 1000)
 
@@ -100,6 +101,11 @@ static int reset_index(const char *ref, const struct object_id *oid, int reset_t
 	}
 
 	repo_read_index_unmerged(the_repository);
+	if (reset_type == HARD &&
+	    clean_status_revalidated_token_matches(the_repository->index)) {
+		opts.preserve_semantic_history = 1;
+		opts.preserve_untracked_history = 1;
+	}
 
 	if (reset_type == KEEP) {
 		struct object_id head_oid;
@@ -529,6 +535,12 @@ int cmd_reset(int argc,
 	if (reset_type != SOFT) {
 		struct lock_file lock = LOCK_INIT;
 		unsigned int write_flags = COMMIT_LOCK;
+		int repair_after_reset = reset_type == HARD &&
+			clean_status_has_current_full_fsmonitor_proof(
+				the_repository->index);
+		/* A missing index has not acquired an on-disk version yet. */
+		int prime_after_reset = reset_type == HARD &&
+			!the_repository->index->version;
 
 		repo_hold_locked_index(the_repository, &lock,
 				       LOCK_DIE_ON_ERROR);
@@ -580,6 +592,14 @@ int cmd_reset(int argc,
 		    !the_repository->index->cache_changed &&
 		    !hook_exists(the_repository, "post-index-change"))
 			write_flags |= SKIP_IF_UNCHANGED;
+		if (prime_after_reset) {
+			if (wt_status_prime_fsmonitor_proof_after_worktree_update(
+				    the_repository, &lock) < 0)
+				die(_("Could not prepare new index file."));
+		} else if (reset_type == HARD &&
+		    wt_status_repair_fsmonitor_proof_after_worktree_update(
+			    the_repository, &lock, repair_after_reset) < 0)
+			die(_("Could not repair new index file."));
 		if (write_locked_index(the_repository->index, &lock, write_flags))
 			die(_("Could not write new index file."));
 	}

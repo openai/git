@@ -24,12 +24,11 @@ static void trace_miss(struct repository *repo, const char *reason)
 	trace2_data_string("status", repo, "clean-proof/miss", reason);
 }
 
-static int issue_test_barrier(void)
+static int sidecar_test_barrier(const char *ready_name,
+				const char *resume_name)
 {
-	const char *ready =
-		getenv("GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_READY");
-	const char *resume =
-		getenv("GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_RESUME");
+	const char *ready = getenv(ready_name);
+	const char *resume = getenv(resume_name);
 	struct strbuf buf = STRBUF_INIT;
 	int ret;
 
@@ -43,14 +42,30 @@ static int issue_test_barrier(void)
 	return ret;
 }
 
+static int issue_test_barrier(void)
+{
+	return sidecar_test_barrier(
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_READY",
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_ISSUE_BARRIER_RESUME");
+}
+
+int clean_status_sidecar_postwrite_test_barrier(void)
+{
+	return sidecar_test_barrier(
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_READY",
+		"GIT_TEST_STATUS_CLEAN_SIDECAR_POSTWRITE_BARRIER_RESUME");
+}
+
 static int output_is_certifiable(const struct wt_status *status,
-				 int normal_clean_query)
+				 int certifying_clean_query)
 {
 	return (status->status_format == STATUS_FORMAT_PORCELAIN_V2 ||
-		(normal_clean_query &&
-		 status->status_format == STATUS_FORMAT_NONE)) &&
+		(certifying_clean_query &&
+		 (status->status_format == STATUS_FORMAT_NONE ||
+		  status->status_format == STATUS_FORMAT_SHORT))) &&
 		!status->pathspec.nr && !status->show_branch &&
-		(!status->show_stash || normal_clean_query) &&
+		(!status->show_stash ||
+		 status->status_format == STATUS_FORMAT_NONE) &&
 		!status->show_ignored_mode &&
 		!status->null_termination && !status->verbose &&
 		status->show_untracked_files == SHOW_NORMAL_UNTRACKED_FILES &&
@@ -215,7 +230,8 @@ int clean_status_issue_sidecar(
 	struct wt_status *status,
 	const struct clean_status_config_digest *config,
 	struct lock_file *index_lock,
-	int normal_clean_query)
+	const struct clean_status_index_snapshot *scanned_index,
+	int certifying_clean_query)
 {
 	struct repository *repo = status->repo;
 	struct index_state *istate = repo->index;
@@ -230,7 +246,7 @@ int clean_status_issue_sidecar(
 
 	if (!is_lock_file_locked(index_lock) ||
 	    !config->finalized ||
-	    !output_is_certifiable(status, normal_clean_query)) {
+	    !output_is_certifiable(status, certifying_clean_query)) {
 		trace_miss(repo, "issue-command-or-output");
 		goto done;
 	}
@@ -247,6 +263,12 @@ int clean_status_issue_sidecar(
 	}
 	if (issue_test_barrier()) {
 		trace_miss(repo, "issue-test-barrier");
+		goto done;
+	}
+	if (scanned_index &&
+	    !clean_status_index_snapshot_still_matches(
+		    scanned_index, istate)) {
+		trace_miss(repo, "issue-index-raced");
 		goto done;
 	}
 	if (!status->attr_source_snapshot ||

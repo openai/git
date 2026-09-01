@@ -70,6 +70,7 @@ int clean_status_sidecar_install(
 	const char *index_path, const struct clean_status_sidecar *sidecar,
 	const struct clean_status_index_snapshot *snapshot,
 	const struct git_hash_algo *algo);
+int clean_status_worktree_shape_supported(struct repository *repo);
 int clean_status_repository_fingerprint(
 	struct repository *repo,
 	const struct attr_source_snapshot *attrs,

@@ -35,10 +35,25 @@ test_expect_success 'merge based rebase --continue removes .git/MERGE_MSG' '
 	git checkout -f --detach topic &&
 
 	test_must_fail git rebase --onto main HEAD^ &&
+	test_cmp_rev REBASE_HEAD topic &&
 	git read-tree --reset -u HEAD &&
 	test_path_is_file .git/MERGE_MSG &&
 	git rebase --continue &&
-	test_path_is_missing .git/MERGE_MSG
+	test_path_is_missing .git/MERGE_MSG &&
+	test_must_fail git rev-parse --verify REBASE_HEAD
+'
+
+test_expect_success REFFILES 'merge based rebase --continue reports REBASE_HEAD cleanup failure' '
+	git checkout -f --detach topic &&
+
+	test_must_fail git rebase --onto main HEAD^ &&
+	git read-tree --reset -u HEAD &&
+	test_when_finished "rm -f .git/REBASE_HEAD .git/REBASE_HEAD.lock" &&
+	>.git/REBASE_HEAD.lock &&
+	test_must_fail git rebase --continue 2>err &&
+	test_grep "cannot lock ref.*REBASE_HEAD" err &&
+	test_path_is_missing .git/rebase-merge &&
+	test_path_is_file .git/REBASE_HEAD
 '
 
 test_expect_success 'apply based rebase --continue works with touched file' '

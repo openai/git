@@ -44,6 +44,7 @@
 #include "merge-ort-wrappers.h"
 #include "resolve-undo.h"
 #include "remote.h"
+#include "reset.h"
 #include "fmt-merge-msg.h"
 #include "sequencer.h"
 #include "string-list.h"
@@ -392,13 +393,13 @@ static void read_empty(const struct object_id *oid)
 
 static void reset_hard(const struct object_id *oid)
 {
-	struct child_process cmd = CHILD_PROCESS_INIT;
+	struct reset_working_tree_options opts = {
+		.oid = oid,
+		.flags = RESET_WORKING_TREE_HARD |
+			 RESET_WORKING_TREE_PRESERVE_SEMANTIC_HISTORY,
+	};
 
-	strvec_pushl(&cmd.args, "read-tree", "-v", "--reset", "-u",
-		     oid_to_hex(oid), NULL);
-	cmd.git_cmd = 1;
-
-	if (run_command(&cmd))
+	if (reset_working_tree(the_repository, &opts) < 0)
 		die(_("read-tree failed"));
 }
 
@@ -759,6 +760,9 @@ static int read_tree_trivial(struct object_id *common, struct object_id *head,
 	opts.trivial_merges_only = 1;
 	opts.merge = 1;
 	opts.preserve_ignored = 0; /* FIXME: !overwrite_ignore */
+	opts.preserve_semantic_history =
+		clean_status_revalidated_token_matches(the_repository->index);
+	opts.preserve_untracked_history = opts.preserve_semantic_history;
 	trees[nr_trees] = repo_parse_tree_indirect(the_repository, common);
 	if (!trees[nr_trees++])
 		return -1;
@@ -788,19 +792,50 @@ static void write_tree_trivial(struct object_id *oid)
 		die(_("git write-tree failed to write a tree"));
 }
 
+/*
+ * An external strategy may replace the index before it succeeds or fails.
+ * After a clean result, or after restore_state() has put the index and
+ * worktree back into a known state, certify that state instead of trusting
+ * history left by the child process.
+ */
+static void repair_merge_fsmonitor_proof(int had_full_proof)
+{
+	struct lock_file lock = LOCK_INIT;
+
+	if (!had_full_proof)
+		return;
+	if (repo_hold_locked_index(the_repository, &lock,
+				   LOCK_REPORT_ON_ERROR) < 0)
+		die(_("unable to write new index file"));
+	if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    the_repository, &lock, had_full_proof) < 0) {
+		rollback_lock_file(&lock);
+		die(_("unable to repair new index file"));
+	}
+	if (write_locked_index(the_repository->index, &lock,
+			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+		die(_("unable to write new index file"));
+}
+
 static int try_merge_strategy(const char *strategy, struct commit_list *common,
 			      struct commit_list *remoteheads,
-			      struct commit *head)
+			      struct commit *head, int repair_after_merge)
 {
 	const char *head_arg = "HEAD";
+	int use_builtin_strategy = !strcmp(strategy, "recursive") ||
+		!strcmp(strategy, "subtree") || !strcmp(strategy, "ort");
+
+	if (use_builtin_strategy && !repair_after_merge)
+		repair_after_merge =
+			wt_status_prepare_fsmonitor_proof_for_worktree_update(
+				the_repository);
 
 	if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET,
 					 SKIP_IF_UNCHANGED, 0, NULL, NULL,
 					 NULL) < 0)
 		die(_("Unable to write index."));
 
-	if (!strcmp(strategy, "recursive") || !strcmp(strategy, "subtree") ||
-	    !strcmp(strategy, "ort")) {
+	if (use_builtin_strategy) {
 		struct lock_file lock = LOCK_INIT;
 		int clean, x;
 		struct commit *result;
@@ -841,14 +876,24 @@ static int try_merge_strategy(const char *strategy, struct commit_list *common,
 			rollback_lock_file(&lock);
 			return 2;
 		}
+		if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+			    the_repository, &lock, repair_after_merge) < 0) {
+			rollback_lock_file(&lock);
+			die(_("unable to repair new index file"));
+		}
 		if (write_locked_index(the_repository->index, &lock,
 				       COMMIT_LOCK | SKIP_IF_UNCHANGED))
 			die(_("unable to write %s"), repo_get_index_file(the_repository));
 		return clean ? 0 : 1;
 	} else {
-		return try_merge_command(the_repository,
-					 strategy, xopts.nr, xopts.v,
-					 common, head_arg, remoteheads);
+		int ret = try_merge_command(the_repository,
+					    strategy, xopts.nr, xopts.v,
+					    common, head_arg, remoteheads);
+
+		if (!ret)
+			repair_merge_fsmonitor_proof(
+				repair_after_merge);
+		return ret;
 	}
 }
 
@@ -988,14 +1033,28 @@ static void prepare_to_commit(struct commit_list *remoteheads)
 	strbuf_release(&msg);
 }
 
-static int merge_trivial(struct commit *head, struct commit_list *remoteheads)
+static int merge_trivial(struct commit *head, struct commit_list *remoteheads,
+			 int repair_after_merge)
 {
+	struct lock_file lock = LOCK_INIT;
 	struct object_id result_tree, result_commit;
 	struct commit_list *parents = NULL, **pptr = &parents;
+	int refresh_error;
 
-	if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET,
-					 SKIP_IF_UNCHANGED, 0, NULL, NULL,
-					 NULL) < 0)
+	if (repo_hold_locked_index(the_repository, &lock,
+				   LOCK_REPORT_ON_ERROR) < 0)
+		return error(_("Unable to write index."));
+	refresh_error = refresh_index(the_repository->index, REFRESH_QUIET,
+				      NULL, NULL, NULL);
+	if (wt_status_repair_fsmonitor_proof_after_worktree_update(
+		    the_repository, &lock, repair_after_merge) < 0) {
+		rollback_lock_file(&lock);
+		return error(_("unable to repair new index file"));
+	}
+	if (write_locked_index(the_repository->index, &lock,
+			       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+		return error(_("Unable to write index."));
+	if (refresh_error)
 		return error(_("Unable to write index."));
 
 	write_tree_trivial(&result_tree);
@@ -1372,6 +1431,8 @@ int cmd_merge(int argc,
 	struct strbuf buf = STRBUF_INIT;
 	int i, ret = 0, head_subsumed;
 	int best_cnt = -1, merge_was_ok = 0, automerge_was_ok = 0;
+	int merge_committed = 0, reissue_sidecar = 0;
+	int repair_after_merge = 0;
 	struct commit_list *common = NULL;
 	const char *best_strategy = NULL, *wt_strategy = NULL;
 	struct commit_list *remoteheads = NULL, *p;
@@ -1472,10 +1533,12 @@ int cmd_merge(int argc,
 		goto done;
 	}
 
-	if (fast_forward != FF_NO && !getenv(INDEX_ENVIRONMENT) &&
+	if (!getenv(INDEX_ENVIRONMENT) &&
 	    !clean_status_config_read_repository(the_repository, &clean_digest)) {
 		clean_status_enable_external_history(the_repository);
 		clean_status_set_config_digest(the_repository, &clean_digest);
+		reissue_sidecar =
+			wt_status_clean_sidecar_present(the_repository);
 	}
 
 	if (repo_read_index_unmerged(the_repository))
@@ -1732,10 +1795,16 @@ int cmd_merge(int argc,
 			/* See if it is really trivial. */
 			git_committer_info(IDENT_STRICT);
 			printf(_("Trying really trivial in-index merge...\n"));
+			repair_after_merge =
+				wt_status_prepare_fsmonitor_proof_for_worktree_update(
+					the_repository);
 			if (!read_tree_trivial(&common->item->object.oid,
 					       &head_commit->object.oid,
 					       &remoteheads->item->object.oid)) {
-				ret = merge_trivial(head_commit, remoteheads);
+				ret = merge_trivial(head_commit, remoteheads,
+						    repair_after_merge);
+				if (!ret)
+					merge_committed = 1;
 				goto done;
 			}
 			printf(_("Nope.\n"));
@@ -1767,6 +1836,10 @@ int cmd_merge(int argc,
 	if (fast_forward == FF_ONLY)
 		die_ff_impossible();
 
+	repair_after_merge =
+		wt_status_prepare_fsmonitor_proof_for_worktree_update(
+			the_repository);
+
 	if (autostash)
 		create_autostash_ref(the_repository, "MERGE_AUTOSTASH",
 				     NULL, false);
@@ -1794,6 +1867,7 @@ int cmd_merge(int argc,
 		if (i) {
 			printf(_("Rewinding the tree to pristine...\n"));
 			restore_state(&head_commit->object.oid, &stash);
+			repair_merge_fsmonitor_proof(repair_after_merge);
 		}
 		if (use_strategies_nr != 1)
 			printf(_("Trying merge strategy %s...\n"),
@@ -1806,7 +1880,8 @@ int cmd_merge(int argc,
 
 		ret = try_merge_strategy(wt_strategy,
 					 common, remoteheads,
-					 head_commit);
+					 head_commit,
+					 repair_after_merge);
 		/*
 		 * The backend exits with 1 when conflicts are
 		 * left to be resolved, with 2 when it does not
@@ -1839,6 +1914,8 @@ int cmd_merge(int argc,
 		ret = finish_automerge(head_commit, head_subsumed,
 				       common, remoteheads,
 				       &result_tree, wt_strategy);
+		if (!ret)
+			merge_committed = 1;
 		goto done;
 	}
 
@@ -1848,6 +1925,7 @@ int cmd_merge(int argc,
 	 */
 	if (!best_strategy) {
 		restore_state(&head_commit->object.oid, &stash);
+		repair_merge_fsmonitor_proof(repair_after_merge);
 		if (use_strategies_nr > 1)
 			fprintf(stderr,
 				_("No merge strategy handled the merge.\n"));
@@ -1863,10 +1941,11 @@ int cmd_merge(int argc,
 	else {
 		printf(_("Rewinding the tree to pristine...\n"));
 		restore_state(&head_commit->object.oid, &stash);
+		repair_merge_fsmonitor_proof(repair_after_merge);
 		printf(_("Using the %s strategy to prepare resolving by hand.\n"),
 			best_strategy);
 		try_merge_strategy(best_strategy, common, remoteheads,
-				   head_commit);
+				   head_commit, repair_after_merge);
 	}
 
 	if (squash) {
@@ -1885,6 +1964,11 @@ int cmd_merge(int argc,
 		printf(_("When finished, apply stashed changes with `git stash pop`\n"));
 
 done:
+	if (!ret && merge_committed && reissue_sidecar &&
+	    repair_after_merge && use_optional_locks() &&
+	    !hook_exists(the_repository, "post-index-change"))
+		wt_status_reissue_clean_sidecar_after_worktree_update(
+			the_repository, repair_after_merge, &clean_digest);
 	if (!automerge_was_ok) {
 		commit_list_free(common);
 		commit_list_free(remoteheads);

@@ -199,11 +199,13 @@ void test_clean_status_manifest__invalidates_only_changed_scopes(void)
 	clean_status_manifest_invalidate(&state);
 	cl_assert(state.current_invalidated);
 	istate.cache[0]->ce_flags = create_ce_flags(1);
+	istate.sparse_index = INDEX_COLLAPSED;
 	cl_assert_equal_i(clean_status_manifest_refresh(&istate, &state), -1);
 	cl_assert(!state.current_valid);
 	cl_assert(state.global_fallback);
 	cl_assert_equal_i(strbuf_cmp(&state.current, &old), 0);
 
+	istate.sparse_index = INDEX_EXPANDED;
 	write_file(path.buf, "*.txt text\n");
 	for (size_t i = 0; i < istate.cache_nr; i++) {
 		istate.cache[i]->ce_flags = CE_FSMONITOR_VALID | CE_UPTODATE;

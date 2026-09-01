@@ -59,6 +59,54 @@ test_lazy_prereq HARDLINKS '
 	ln hardlink-a hardlink-b
 '
 
+test_lazy_prereq UNTRACKED_CACHE '
+	git update-index --test-untracked-cache
+'
+
+test_lazy_prereq FSMONITOR_DIR_METADATA '
+	test "$uname_s" = Darwin || test "$uname_s" = Linux
+'
+
+test_lazy_prereq FSMONITOR_LINUX '
+	test "$uname_s" = Linux
+'
+
+test_lazy_prereq DARWIN_ASYNC_FENCE '
+	test "$uname_s" = Darwin || return 1
+	git init test_darwin_async_fence || return 1
+
+	GIT_TRACE2_EVENT="$PWD/darwin-async-fence.trace2" &&
+	export GIT_TRACE2_EVENT &&
+	maybe_timeout 30 \
+		git -C test_darwin_async_fence fsmonitor--daemon start \
+			--start-timeout=10
+	start_ret=$?
+	if test $start_ret -eq 0
+	then
+		maybe_timeout 10 \
+			test-tool -C test_darwin_async_fence \
+				fsmonitor-client query --token 0 \
+				>/dev/null 2>&1
+		query_ret=$?
+		maybe_timeout 5 \
+			git -C test_darwin_async_fence \
+				fsmonitor--daemon stop 2>/dev/null || :
+	else
+		query_ret=1
+	fi
+	unset GIT_TRACE2_EVENT
+
+	test $start_ret -eq 0 &&
+	test $query_ret -eq 0 &&
+	test_grep "region_enter.*darwin-flush-async" \
+		darwin-async-fence.trace2 &&
+	test_grep ! "region_enter.*darwin-flush-sync" \
+		darwin-async-fence.trace2
+	ret=$?
+	rm -rf test_darwin_async_fence darwin-async-fence.trace2
+	return $ret
+'
+
 test_lazy_prereq FOREIGN_FSMONITOR_GIT '
 	test -x /opt/homebrew/bin/git &&
 	/opt/homebrew/bin/git version
@@ -74,18 +122,33 @@ then
 	test_done
 fi
 
-if test_have_prereq MACOS
-then
+case "$uname_s" in
+Darwin)
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.inode-v1.
-else
+	fsmonitor_pre_fence_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
+	fsmonitor_cookie_token_prefix=${fsmonitor_pre_fence_token_prefix}fence-v1.
+	;;
+Linux)
+	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.
+	fsmonitor_cookie_token_prefix=cookie-v1.dirmeta-v1.
+	;;
+*)
 	fsmonitor_pre_cookie_token_prefix=
-fi
-fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
+	fsmonitor_cookie_token_prefix=cookie-v1.
+	;;
+esac
 
 stop_daemon_delete_repo () {
 	r=$1 &&
 	{ maybe_timeout 30 git -C $r fsmonitor--daemon stop 2>/dev/null || :; } &&
 	rm -rf $1
+}
+
+stop_daemon_delete_linked_repo () {
+	r=$1 &&
+	wt=$2 &&
+	{ maybe_timeout 30 git -C "$wt" fsmonitor--daemon stop 2>/dev/null || :; } &&
+	rm -rf "$r" "$wt"
 }
 
 start_daemon () {
@@ -144,6 +207,112 @@ start_daemon () {
 	)
 }
 
+provider_rename_scope_run () {
+	repo=$1
+	scope=$2
+	fsm=$3
+	uc=$4
+	defer_path=$5
+
+	git init "$repo" || return 1
+	(
+		cd "$repo" &&
+		mkdir dir1 dir2 &&
+		printf "root\\n" >rename &&
+		printf "one\\n" >dir1/rename &&
+		printf "two\\n" >dir2/rename &&
+		git add rename dir1/rename dir2/rename &&
+		git commit -m base &&
+
+		if test "$uc" = true
+		then
+			git config core.untrackedCache true &&
+			git update-index --untracked-cache
+		else
+			git config core.untrackedCache false &&
+			git update-index --no-untracked-cache
+		fi &&
+		if test "$fsm" = true
+		then
+			git config core.fsmonitor true &&
+			GIT_TEST_FSMONITOR_DEFER_PATH=$defer_path &&
+			export GIT_TEST_FSMONITOR_DEFER_PATH &&
+			start_daemon --tf "$PWD/../$repo.trace"
+		else
+			git config core.fsmonitor false
+		fi &&
+
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+		printf "stale-root\\n" >new &&
+		printf "stale-one\\n" >dir1/new &&
+		printf "stale-two\\n" >dir2/new &&
+		git status --porcelain=v2 >.git/stale-prime-1 &&
+		git status --porcelain=v2 >.git/stale-prime-2 &&
+		rm new dir1/new dir2/new &&
+
+		case "$scope" in
+		all)
+			mv rename renamed &&
+			mv dir1/rename dir1/renamed &&
+			mv dir2/rename dir2/renamed
+			;;
+		root)
+			mv rename renamed
+			;;
+		nested)
+			mv dir1/rename dir1/renamed &&
+			mv dir2/rename dir2/renamed
+			;;
+		*)
+			BUG "unknown provider rename scope: $scope"
+			;;
+		esac &&
+
+		GIT_INDEX_FILE="$PWD/.git/cold.index" git read-tree HEAD &&
+		GIT_INDEX_FILE="$PWD/.git/cold.index" \
+		GIT_OPTIONAL_LOCKS=0 \
+			git -c core.fsmonitor=false -c core.untrackedCache=false \
+			status --porcelain=v2 >.git/expect &&
+		cp .git/index .git/index-before &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_cmp .git/index-before .git/index &&
+
+		if test "$fsm" = true
+		then
+			test_grep "test-defer-path: '$defer_path'" \
+				"../$repo.trace" &&
+			test_grep \
+				"test-publish-deferred-path-at-provider-fence" \
+				"../$repo.trace" &&
+			test_grep "Darwin provider fence complete" \
+				"../$repo.trace"
+		fi
+	)
+	result=$?
+	maybe_timeout 30 git -C "$repo" fsmonitor--daemon stop \
+		>/dev/null 2>&1 || :
+	rm -rf "$repo"
+	return $result
+}
+
+cleanup_provider_rename_matrix () {
+	for scope in all root nested
+	do
+		for fsm in false true
+		do
+			for uc in false true
+			do
+				stop_daemon_delete_repo \
+					"provider-rename-$scope-$fsm-$uc"
+			done
+		done
+	done
+}
+
 # Is a Trace2 data event present with the given catetory and key?
 # We do not care what the value is.
 #
@@ -152,6 +321,63 @@ have_t2_data_event () {
 	k=$2 &&
 
 	grep -e '"event":"data".*"category":"'"$c"'".*"key":"'"$k"'"'
+}
+
+native_stash_full_proof () {
+	perl - "$1" <<-\EOF
+	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
+	binmode $input;
+	local $/;
+	my $index = <$input>;
+	my %tokens;
+	for my $name ("FSMN", "FSUC", "FSCF") {
+		my $offset = index($index, $name);
+		die "missing $name extension\n" if $offset < 0;
+		my $size = unpack("N", substr($index, $offset + 4, 4));
+		my $payload = substr($index, $offset + 8, $size);
+		if ($name eq "FSCF") {
+			my $flags = unpack("N", substr($payload, 8, 4));
+			die "unbound FSCF flags $flags\n" if $flags != 15;
+			my $length = unpack("N", substr($payload, 12, 4));
+			$tokens{$name} = substr($payload, 20, $length);
+		} else {
+			my $end = index($payload, "\0", 4);
+			die "invalid $name token\n" if $end < 0;
+			$tokens{$name} = substr($payload, 4, $end - 4);
+		}
+	}
+	die "mismatched provider tokens\n" unless
+		$tokens{"FSMN"} eq $tokens{"FSUC"} &&
+		$tokens{"FSMN"} eq $tokens{"FSCF"};
+	EOF
+}
+
+native_tracked_full_proof () {
+	perl - "$1" <<-\EOF
+	open my $input, "<", $ARGV[0] or die "cannot read index: $!\n";
+	binmode $input;
+	local $/;
+	my $index = <$input>;
+	my %tokens;
+	for my $name ("FSMN", "FSCF") {
+		my $offset = index($index, $name);
+		die "missing $name extension\n" if $offset < 0;
+		my $size = unpack("N", substr($index, $offset + 4, 4));
+		my $payload = substr($index, $offset + 8, $size);
+		if ($name eq "FSCF") {
+			my $flags = unpack("N", substr($payload, 8, 4));
+			die "unbound FSCF flags $flags\n" if $flags != 15;
+			my $length = unpack("N", substr($payload, 12, 4));
+			$tokens{$name} = substr($payload, 20, $length);
+		} else {
+			my $end = index($payload, "\0", 4);
+			die "invalid $name token\n" if $end < 0;
+			$tokens{$name} = substr($payload, 4, $end - 4);
+		}
+	}
+	die "mismatched provider tokens\n" unless
+		$tokens{"FSMN"} eq $tokens{"FSCF"};
+	EOF
 }
 
 test_expect_success 'explicit daemon start and stop' '
@@ -194,6 +420,1013 @@ test_expect_success 'implicit daemon start' '
 	git -C test_implicit fsmonitor--daemon status &&
 	git -C test_implicit fsmonitor--daemon stop &&
 	test_must_fail git -C test_implicit fsmonitor--daemon status
+'
+
+test_expect_success MACOS \
+	'provider-fence client replaces an unfenced Darwin daemon' '
+	test_when_finished "stop_daemon_delete_repo test_pre_fence" &&
+
+	git init test_pre_fence &&
+	(
+		cd test_pre_fence &&
+		test_commit base tracked &&
+		git config core.fsmonitor true &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 --max-wait=10 \
+			--fsmonitor-pre-provider-fence &&
+		test-tool simple-ipc send --name="$ipc_path" \
+			--token=get-capabilities >.git/old-capabilities &&
+		test_grep "^cookie-token-retirement-v1$" \
+			.git/old-capabilities &&
+		test_grep ! "^darwin-provider-fence-v1$" \
+			.git/old-capabilities &&
+		old_token="builtin:${fsmonitor_pre_fence_token_prefix}test-pre-fence:0" &&
+		GIT_TRACE2_EVENT="$PWD/.git/upgrade.trace" \
+			test-tool fsmonitor-client query --token "$old_token" \
+				>.git/upgrade.raw &&
+		nul_to_q <.git/upgrade.raw >.git/upgrade.response &&
+		test_grep "^builtin:${fsmonitor_cookie_token_prefix}" \
+			.git/upgrade.response &&
+		test_trace2_data fsm_client query/incompatible-daemon 1 \
+			<.git/upgrade.trace &&
+		test_grep \
+			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
+			.git/upgrade.trace &&
+		git fsmonitor--daemon status
+	)
+'
+
+test_expect_success MACOS \
+	'provider-fence daemon retains the token marker for older clients' '
+	test_when_finished "stop_daemon_delete_repo test_new_fence" &&
+
+	git init test_new_fence &&
+	(
+		cd test_new_fence &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 --max-wait=10 \
+			--fsmonitor-capability-superset &&
+		test-tool simple-ipc send --name="$ipc_path" \
+			--token=get-capabilities >.git/new-capabilities &&
+		test_grep "^query-v1$" .git/new-capabilities &&
+		test_grep "^query-v2$" .git/new-capabilities &&
+		test_grep "^cookie-token-retirement-v1$" \
+			.git/new-capabilities &&
+		test_grep "^dir-metadata-filter-v1$" \
+			.git/new-capabilities &&
+		test_grep "^hardlink-inode-v1$" .git/new-capabilities &&
+		test_grep "^darwin-provider-fence-v1$" \
+			.git/new-capabilities &&
+		test-tool simple-ipc send --name="$ipc_path" \
+			--token="query-v2 pre-fence-client" \
+			>.git/new-response &&
+		test_grep "^builtin:${fsmonitor_pre_fence_token_prefix}" \
+			.git/new-response &&
+		test_grep "^builtin:${fsmonitor_cookie_token_prefix}" \
+			.git/new-response
+	)
+'
+
+test_expect_success MACOS 'complete a delayed Darwin provider fence within budget' '
+	test_when_finished "stop_daemon_delete_repo test_delayed_cookie" &&
+
+	git init test_delayed_cookie &&
+	(
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=1200 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=3000 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon -C test_delayed_cookie \
+			--tf "$PWD/delayed-cookie.trace" --tk true
+	) &&
+
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	test-tool -C test_delayed_cookie fsmonitor-client query \
+		--token "$token" >actual 2>error &&
+	nul_to_q <actual >actual-q &&
+	response=$(sed -n "s/Q.*//p" actual-q) &&
+	test "${response%:*}" = "${token%:*}" &&
+	test_grep "^builtin:.*Q$" actual-q &&
+	test_grep ! "Q/Q" actual-q &&
+	test_grep ! "Q//Q" actual-q &&
+	test_grep "Darwin provider fence requested" delayed-cookie.trace &&
+	test_grep "Darwin provider fence begin" delayed-cookie.trace &&
+	test_grep "Darwin provider fence complete" delayed-cookie.trace &&
+	test_grep "cookie-seen:" delayed-cookie.trace &&
+	test_grep ! "synchronous flush timed out" delayed-cookie.trace &&
+	test_must_be_empty error
+'
+
+test_expect_success MACOS,DARWIN_ASYNC_FENCE \
+	'real Darwin provider fence rescues a delayed cookie callback' '
+	test_when_finished "
+		stop_daemon_delete_repo test_delayed_callback;
+		rm -f delayed-callback.trace
+	" &&
+
+	git init test_delayed_callback &&
+	(
+		GIT_TEST_FSMONITOR_COOKIE_DELAY_MS=1500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=3000 &&
+		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon -C test_delayed_callback \
+			--tf "$PWD/delayed-callback.trace" --tk true
+	) &&
+
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	test-tool -C test_delayed_callback fsmonitor-client query \
+		--token "$token" >actual 2>error &&
+	nul_to_q <actual >actual-q &&
+	response=$(sed -n "s/Q.*//p" actual-q) &&
+	test "${response%:*}" = "${token%:*}" &&
+	test_grep "^builtin:.*Q$" actual-q &&
+	test_grep ! "Q/Q" actual-q &&
+	test_grep "cookie_wait timed out" delayed-callback.trace &&
+	test_grep "Darwin provider fence begin" delayed-callback.trace &&
+	# FlushAsync may return zero after dequeuing the callback; the
+	# serial queue barrier must still wait for its publication.
+	test_grep "Darwin provider fence target=.* event-pending=[01]" \
+		delayed-callback.trace &&
+	test_grep "cookie-seen:" delayed-callback.trace &&
+	test_grep "Darwin provider fence complete" \
+		delayed-callback.trace &&
+	test_grep ! "synchronous flush timed out" delayed-callback.trace &&
+	perl -ne '\''
+		$t ||= $. if /cookie_wait timed out/;
+		$b ||= $. if $t && /Darwin provider fence begin/;
+		$s ||= $. if $b && /cookie-seen:/;
+		$c ||= $. if $s && /Darwin provider fence complete/;
+		END { exit !($t && $b && $s && $c &&
+			$t < $b && $b < $s && $s < $c) }
+	'\'' delayed-callback.trace &&
+	test_must_be_empty error
+'
+
+test_expect_success MACOS 'retire a daemon when its provider fence times out' '
+	test_when_finished "stop_daemon_delete_repo test_lost_cookie" &&
+
+	git init test_lost_cookie &&
+	(
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=2500 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		start_daemon -C test_lost_cookie \
+			--tf "$PWD/lost-cookie.trace" --tk true
+	) &&
+
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	test-tool -C test_lost_cookie fsmonitor-client query \
+		--token "$token" >actual 2>error &&
+	nul_to_q <actual >actual-q &&
+	response=$(sed -n "s/Q.*//p" actual-q) &&
+	test "${response%:*}" != "${token%:*}" &&
+	test_grep "Q/Q$" actual-q &&
+	test_grep "Darwin provider fence requested" lost-cookie.trace &&
+	test_grep "cookie_wait: synchronous flush timed out" \
+		lost-cookie.trace &&
+	test_must_be_empty error &&
+	test_must_fail git -C test_lost_cookie fsmonitor--daemon status &&
+	test-tool -C test_lost_cookie fsmonitor-client query --token 0 \
+		>restarted &&
+	git -C test_lost_cookie fsmonitor--daemon status
+'
+
+test_expect_success MACOS \
+	'retire a daemon when a callback blocks the real provider fence' '
+	test_when_finished "
+		stop_daemon_delete_repo test_blocked_callback;
+		rm -f blocked-callback.trace
+	" &&
+
+	git init test_blocked_callback &&
+	(
+		GIT_TEST_FSMONITOR_COOKIE_DELAY_MS=2500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=500 &&
+		export GIT_TEST_FSMONITOR_COOKIE_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon -C test_blocked_callback \
+			--tf "$PWD/blocked-callback.trace" --tk true
+	) &&
+
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	test-tool -C test_blocked_callback fsmonitor-client query \
+		--token "$token" >actual 2>error &&
+	nul_to_q <actual >actual-q &&
+	test_grep "Q/Q$" actual-q &&
+	test_grep "cookie_wait timed out" blocked-callback.trace &&
+	test_grep "Darwin provider fence begin" blocked-callback.trace &&
+	test_grep "cookie_wait: synchronous flush timed out" \
+		blocked-callback.trace &&
+	test_grep ! "Darwin provider fence complete" \
+		blocked-callback.trace &&
+	test_must_be_empty error &&
+
+	# Start the replacement immediately.  The timed-out daemon must not
+	# unlink a socket which the replacement has already claimed.
+	test-tool -C test_blocked_callback fsmonitor-client query --token 0 \
+		>restarted &&
+	git -C test_blocked_callback fsmonitor--daemon status
+'
+
+test_expect_success MACOS \
+	'bypassing the Darwin provider fence reproduces stale status' '
+	test_when_finished "stop_daemon_delete_repo test_provider_bypass" &&
+
+	git init test_provider_bypass &&
+	(
+		cd test_provider_bypass &&
+		printf "base\\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		GIT_TEST_FSMONITOR_DEFER_PATH=tracked &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_BYPASS=1 &&
+		export GIT_TEST_FSMONITOR_DEFER_PATH &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_BYPASS &&
+		start_daemon --tf "$PWD/../provider-bypass.trace" &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+
+		printf "changed\\n" >>tracked &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		cp .git/index .git/index-before &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 \
+			>.git/actual &&
+		test_grep "^1 \\.M .* tracked$" .git/expect &&
+		test_must_be_empty .git/actual &&
+		test_cmp .git/index-before .git/index &&
+		test_grep "test-defer-path: .*tracked" \
+			../provider-bypass.trace &&
+		test_grep "test-bypass-darwin-flush-sync" \
+			../provider-bypass.trace &&
+		test_grep ! "test-publish-deferred-path-at-provider-fence" \
+			../provider-bypass.trace
+	)
+'
+
+test_expect_success MACOS \
+	'Darwin provider fence publishes older paths before returning' '
+	test_when_finished "stop_daemon_delete_repo test_provider_fence" &&
+
+	git init test_provider_fence &&
+	(
+		cd test_provider_fence &&
+		printf "base\\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		GIT_TEST_FSMONITOR_DEFER_PATH=tracked &&
+		export GIT_TEST_FSMONITOR_DEFER_PATH &&
+		start_daemon --tf "$PWD/../provider-fence.trace" &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+
+		printf "changed\\n" >>tracked &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 \
+			>.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		test_grep "^1 \\.M .* tracked$" .git/actual &&
+		test_grep "test-defer-path: '\''tracked'\''" \
+			../provider-fence.trace &&
+		test_grep "test-publish-deferred-path-at-provider-fence" \
+			../provider-fence.trace &&
+		perl -ne '\''
+			$d ||= $. if /test-defer-path: .tracked./;
+			$s ||= $. if $d && /cookie-seen:/;
+			$p ||= $. if $s &&
+				/test-publish-deferred-path-at-provider-fence/;
+			$c ||= $. if $p && /Darwin provider fence complete/;
+			END { exit !($d && $s && $p && $c &&
+				$d < $s && $s < $p && $p < $c) }
+		'\'' ../provider-fence.trace
+	)
+'
+
+test_expect_success MACOS \
+	'Darwin provider fence rejects a token reset while in flight' '
+	test_when_finished "stop_daemon_delete_repo test_provider_reset" &&
+
+	git init test_provider_reset &&
+	(
+		cd test_provider_reset &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=1500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=5000 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon --tf "$PWD/../provider-reset.trace" --tk true &&
+		test-tool fsmonitor-client query --token 0 >.git/initial &&
+		nul_to_q <.git/initial >.git/initial-q &&
+		token=$(sed -n "s/Q.*//p" .git/initial-q) &&
+		test -n "$token" &&
+		: >../provider-reset.trace &&
+
+		{
+			test-tool fsmonitor-client query --token "$token" \
+				>.git/in-flight 2>.git/in-flight.err &
+			query_pid=$!
+		} &&
+		seen= &&
+		for i in $(test_seq 1 100)
+		do
+			if grep "Darwin provider fence begin" \
+				../provider-reset.trace >/dev/null 2>&1
+			then
+				seen=1 &&
+				break
+			fi &&
+			sleep 0.05 || return 1
+		done &&
+		test "$seen" = 1 &&
+		test-tool fsmonitor-client flush >.git/reset &&
+		wait "$query_pid" &&
+		test_must_be_empty .git/in-flight.err &&
+		nul_to_q <.git/in-flight >.git/in-flight-q &&
+		test_grep "Q/Q$" .git/in-flight-q &&
+		test_grep "provider fence crossed token generation" \
+			../provider-reset.trace &&
+		test_grep ! "synchronous flush timed out" \
+			../provider-reset.trace &&
+		git fsmonitor--daemon status
+	)
+'
+
+test_expect_success MACOS \
+	'Darwin provider fence discards a deferred path across token reset' '
+	test_when_finished "
+		stop_daemon_delete_repo test_provider_deferred_reset;
+		rm -f provider-deferred-reset.trace
+	" &&
+
+	git init test_provider_deferred_reset &&
+	(
+		cd test_provider_deferred_reset &&
+		printf "base\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		GIT_TEST_FSMONITOR_DEFER_PATH=tracked &&
+		GIT_TEST_FSMONITOR_DEFER_PATH_DELAY_MS=1500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=5000 &&
+		export GIT_TEST_FSMONITOR_DEFER_PATH &&
+		export GIT_TEST_FSMONITOR_DEFER_PATH_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon \
+			--tf "$PWD/../provider-deferred-reset.trace" \
+			--tk true &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+		test-tool fsmonitor-client query --token 0 >.git/initial &&
+		nul_to_q <.git/initial >.git/initial-q &&
+		token=$(sed -n "s/Q.*//p" .git/initial-q) &&
+		test -n "$token" &&
+
+		: >../provider-deferred-reset.trace &&
+		printf "changed\n" >>tracked &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+
+		{
+			test-tool fsmonitor-client query --token "$token" \
+				>.git/in-flight 2>.git/in-flight.err &
+			query_pid=$!
+		} &&
+		seen= &&
+		for i in $(test_seq 1 100)
+		do
+			if grep "Darwin provider fence begin" \
+				../provider-deferred-reset.trace >/dev/null 2>&1 &&
+			   grep "test-defer-path: '\''tracked'\''" \
+				../provider-deferred-reset.trace >/dev/null 2>&1
+			then
+				seen=1 &&
+				break
+			fi &&
+			sleep 0.05 || return 1
+		done &&
+		test "$seen" = 1 &&
+		test-tool fsmonitor-client flush >.git/reset &&
+		wait "$query_pid" &&
+		test_must_be_empty .git/in-flight.err &&
+		nul_to_q <.git/in-flight >.git/in-flight-q &&
+		test_grep "Q/Q$" .git/in-flight-q &&
+		test_grep "test-publish-deferred-path-at-provider-fence" \
+			../provider-deferred-reset.trace &&
+		test_grep "test-discard-deferred-path-after-token-reset" \
+			../provider-deferred-reset.trace &&
+		test_grep "provider fence crossed token generation" \
+			../provider-deferred-reset.trace &&
+		GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 \
+			>.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		git fsmonitor--daemon status
+	)
+'
+
+test_expect_success MACOS \
+	'watched-root shutdown retires an in-flight Darwin fence' '
+	test_when_finished "
+		stop_daemon_delete_repo test_provider_root;
+		stop_daemon_delete_repo test_provider_root-away;
+		rm -f provider-root.trace
+	" &&
+
+	git init test_provider_root &&
+	(
+		cd test_provider_root &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=1500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=5000 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon --tf "$PWD/../provider-root.trace" --tk true
+	) &&
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	: >provider-root.trace &&
+	{
+		test-tool -C test_provider_root fsmonitor-client query \
+			--token "$token" >test_provider_root/.git/in-flight \
+			2>test_provider_root/.git/in-flight.err &
+		query_pid=$!
+	} &&
+	seen= &&
+	for i in $(test_seq 1 100)
+	do
+		if grep "Darwin provider fence begin" provider-root.trace \
+			>/dev/null 2>&1
+		then
+			seen=1 &&
+			break
+		fi &&
+		sleep 0.05 || return 1
+	done &&
+	test "$seen" = 1 &&
+	mv test_provider_root test_provider_root-away &&
+	wait "$query_pid" &&
+	test_must_be_empty test_provider_root-away/.git/in-flight.err &&
+	nul_to_q <test_provider_root-away/.git/in-flight \
+		>test_provider_root-away/.git/in-flight-q &&
+	test_grep "Q/Q$" test_provider_root-away/.git/in-flight-q &&
+	test_grep "event: root changed" provider-root.trace &&
+	test_must_fail git -C test_provider_root-away \
+		fsmonitor--daemon status &&
+	test-tool -C test_provider_root-away fsmonitor-client query \
+		--token 0 >test_provider_root-away/.git/restarted &&
+	git -C test_provider_root-away fsmonitor--daemon status
+'
+
+test_expect_success MACOS,DARWIN_ASYNC_FENCE \
+	'Darwin provider fence detects a zero-ID watched-root ancestor ABA' '
+	test_when_finished "
+		stop_daemon_delete_repo test_provider_root_identity/repo;
+		stop_daemon_delete_repo test_provider_root_identity-away/repo;
+		rm -rf test_provider_root_identity \
+			test_provider_root_identity-away;
+		rm -f provider-root-identity.trace
+	" &&
+
+	mkdir test_provider_root_identity &&
+	git init test_provider_root_identity/repo &&
+	(
+		cd test_provider_root_identity/repo &&
+		printf "base\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=1500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=5000 &&
+		GIT_TEST_FSMONITOR_IGNORE_ROOT_CHANGED=1 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		export GIT_TEST_FSMONITOR_IGNORE_ROOT_CHANGED &&
+		start_daemon --tf "$PWD/../../provider-root-identity.trace" \
+			--tk true
+	) &&
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	: >provider-root-identity.trace &&
+	{
+		test-tool -C test_provider_root_identity/repo \
+			fsmonitor-client query \
+			--token "$token" \
+			>test_provider_root_identity/repo/.git/in-flight \
+			2>test_provider_root_identity/repo/.git/in-flight.err &
+		query_pid=$!
+	} &&
+	seen= &&
+	for i in $(test_seq 1 100)
+	do
+		if grep "Darwin provider fence begin" \
+			provider-root-identity.trace >/dev/null 2>&1
+		then
+			seen=1 &&
+			break
+		fi &&
+		sleep 0.05 || return 1
+	done &&
+	test "$seen" = 1 &&
+	mv test_provider_root_identity test_provider_root_identity-away &&
+	printf "changed\n" \
+		>>test_provider_root_identity-away/repo/tracked &&
+	mv test_provider_root_identity-away test_provider_root_identity &&
+	wait "$query_pid" &&
+	test_must_be_empty \
+		test_provider_root_identity/repo/.git/in-flight.err &&
+	nul_to_q <test_provider_root_identity/repo/.git/in-flight \
+		>test_provider_root_identity/repo/.git/in-flight-q &&
+	test_grep "Q/Q$" \
+		test_provider_root_identity/repo/.git/in-flight-q &&
+	test_grep "provider fence observed watch-root edge" \
+		provider-root-identity.trace &&
+	test_grep "provider fence rejected changed watch root" \
+		provider-root-identity.trace &&
+	test_must_fail git -C test_provider_root_identity/repo \
+		fsmonitor--daemon status
+'
+
+test_expect_success MACOS \
+	'Darwin provider fence retains the synchronous fallback' '
+	test_when_finished "
+		stop_daemon_delete_repo test_provider_sync_fallback;
+		rm -f provider-sync-fallback.trace \
+			provider-sync-fallback.trace2
+	" &&
+
+	git init test_provider_sync_fallback &&
+	(
+		cd test_provider_sync_fallback &&
+		printf "base\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_FORCE_SYNC_FLUSH=1 &&
+		export GIT_TEST_FSMONITOR_FORCE_SYNC_FLUSH &&
+		start_daemon --tf "$PWD/../provider-sync-fallback.trace" \
+			--t2 "$PWD/../provider-sync-fallback.trace2" &&
+		git status --porcelain=v2 >.git/actual &&
+		test_must_be_empty .git/actual &&
+		test_grep "region_enter.*darwin-flush-sync" \
+			../provider-sync-fallback.trace2 &&
+		test_grep ! "region_enter.*darwin-flush-async" \
+			../provider-sync-fallback.trace2
+	)
+'
+
+test_expect_success MACOS \
+	'explicit shutdown drains an in-flight Darwin fence' '
+	test_when_finished "stop_daemon_delete_repo test_provider_stop" &&
+
+	git init test_provider_stop &&
+	(
+		cd test_provider_stop &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=1200 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=3000 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon --tf "$PWD/../provider-stop.trace" --tk true
+	) &&
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	: >provider-stop.trace &&
+	{
+		test-tool -C test_provider_stop fsmonitor-client query \
+			--token "$token" >test_provider_stop/.git/in-flight \
+			2>test_provider_stop/.git/in-flight.err &
+		query_pid=$!
+	} &&
+	seen= &&
+	for i in $(test_seq 1 100)
+	do
+		if grep "Darwin provider fence begin" provider-stop.trace \
+			>/dev/null 2>&1
+		then
+			seen=1 &&
+			break
+		fi &&
+		sleep 0.05 || return 1
+	done &&
+	test "$seen" = 1 &&
+	{
+		git -C test_provider_stop fsmonitor--daemon stop \
+			>test_provider_stop/.git/stop.out \
+			2>test_provider_stop/.git/stop.err &
+		stop_pid=$!
+	} &&
+	wait "$query_pid" &&
+	wait "$stop_pid" &&
+	test_must_be_empty test_provider_stop/.git/in-flight.err &&
+	test_must_be_empty test_provider_stop/.git/stop.err &&
+	nul_to_q <test_provider_stop/.git/in-flight \
+		>test_provider_stop/.git/in-flight-q &&
+	response=$(sed -n "s/Q.*//p" \
+		test_provider_stop/.git/in-flight-q) &&
+	test "${response%:*}" = "${token%:*}" &&
+	test_grep ! "Q/Q$" test_provider_stop/.git/in-flight-q &&
+	test_grep "Darwin provider fence complete" provider-stop.trace &&
+	test_grep ! "abandoned during shutdown" provider-stop.trace &&
+	test_must_fail git -C test_provider_stop fsmonitor--daemon status
+'
+
+test_expect_success MACOS \
+	'concurrent Darwin queries coalesce without hiding dirt' '
+	test_when_finished "stop_daemon_delete_repo test_provider_coalesce" &&
+
+	git init test_provider_coalesce &&
+	(
+		cd test_provider_coalesce &&
+		mkdir tracked-dir &&
+		printf "base-a\\n" >tracked-a &&
+		printf "base-b\\n" >tracked-dir/tracked-b &&
+		git add tracked-a tracked-dir/tracked-b &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		GIT_TEST_FSMONITOR_FLUSH_COALESCE_DELAY_MS=500 &&
+		export GIT_TEST_FSMONITOR_FLUSH_COALESCE_DELAY_MS &&
+		start_daemon --tf "$PWD/../provider-coalesce.trace" &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+
+		printf "dirty\\n" >>tracked-a &&
+		printf "untracked\\n" >tracked-dir/untracked &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/expect &&
+		: >../provider-coalesce.trace &&
+
+		pids= &&
+		{
+			for i in $(test_seq 1 8)
+			do
+				GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 \
+					>.git/actual-$i 2>.git/error-$i &
+				pids="$pids $!" || return 1
+			done &&
+			for pid in $pids
+			do
+				wait "$pid" || return 1
+			done
+		} &&
+		for i in $(test_seq 1 8)
+		do
+			test_cmp .git/expect .git/actual-$i || return 1
+			test_must_be_empty .git/error-$i || return 1
+		done &&
+		requests=$(grep -c "Darwin provider fence requested" \
+			../provider-coalesce.trace) &&
+		fences=$(grep -c "Darwin provider fence begin" \
+			../provider-coalesce.trace) &&
+		test "$requests" -ge 8 &&
+		test "$fences" -lt "$requests" &&
+		test_grep "coalesced=[2-9]" ../provider-coalesce.trace &&
+		test_grep ! "synchronous flush timed out" \
+			../provider-coalesce.trace &&
+		git fsmonitor--daemon status
+	)
+'
+
+test_expect_success MACOS \
+	'queries arriving during a Darwin fence require a second fence' '
+	test_when_finished "
+		stop_daemon_delete_repo test_provider_two_wave;
+		rm -f provider-two-wave.trace
+	" &&
+
+	git init test_provider_two_wave &&
+	(
+		cd test_provider_two_wave &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS=2500 &&
+		GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS=7000 &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_DELAY_MS &&
+		export GIT_TEST_FSMONITOR_FLUSH_SYNC_TIMEOUT_MS &&
+		start_daemon --tf "$PWD/../provider-two-wave.trace" \
+			--tk true
+	) &&
+	token="builtin:${fsmonitor_cookie_token_prefix}test_00000001:0" &&
+	: >provider-two-wave.trace &&
+	{
+		test-tool -C test_provider_two_wave fsmonitor-client query \
+			--token "$token" >test_provider_two_wave/.git/q1 \
+			2>test_provider_two_wave/.git/q1.err &
+		q1_pid=$!
+	} &&
+	seen= &&
+	for i in $(test_seq 1 100)
+	do
+		if grep "Darwin provider fence begin request=1" \
+			provider-two-wave.trace >/dev/null 2>&1
+		then
+			seen=1 &&
+			break
+		fi &&
+		sleep 0.05 || return 1
+	done &&
+	test "$seen" = 1 &&
+	{
+		test-tool -C test_provider_two_wave fsmonitor-client query \
+			--token "$token" >test_provider_two_wave/.git/q2 \
+			2>test_provider_two_wave/.git/q2.err &
+		q2_pid=$!
+	} &&
+	seen= &&
+	for i in $(test_seq 1 100)
+	do
+		if grep "Darwin provider fence requested request=2" \
+			provider-two-wave.trace >/dev/null 2>&1
+		then
+			seen=1 &&
+			break
+		fi &&
+		sleep 0.05 || return 1
+	done &&
+	test "$seen" = 1 &&
+	wait "$q1_pid" &&
+	wait "$q2_pid" &&
+	test_must_be_empty test_provider_two_wave/.git/q1.err &&
+	test_must_be_empty test_provider_two_wave/.git/q2.err &&
+	nul_to_q <test_provider_two_wave/.git/q1 \
+		>test_provider_two_wave/.git/q1-q &&
+	nul_to_q <test_provider_two_wave/.git/q2 \
+		>test_provider_two_wave/.git/q2-q &&
+	test_grep ! "Q/Q$" test_provider_two_wave/.git/q1-q &&
+	test_grep ! "Q/Q$" test_provider_two_wave/.git/q2-q &&
+	test "$(grep -c "Darwin provider fence begin" \
+		provider-two-wave.trace)" = 2 &&
+	test "$(grep -c "Darwin provider fence complete" \
+		provider-two-wave.trace)" = 2 &&
+	perl -ne '\''
+		$b1 ||= $. if /fence begin request=1/;
+		$c1 ||= $. if $b1 && /fence complete request=1/;
+		$b2 ||= $. if $c1 && /fence begin request=2/;
+		$c2 ||= $. if $b2 && /fence complete request=2/;
+		END { exit !($b1 && $c1 && $b2 && $c2 &&
+			$b1 < $c1 && $c1 < $b2 && $b2 < $c2) }
+	'\'' provider-two-wave.trace &&
+	git -C test_provider_two_wave fsmonitor--daemon status
+'
+
+test_expect_success MACOS,UNTRACKED_CACHE \
+	'Darwin provider fence covers rename scopes and cache controls' '
+	test_when_finished cleanup_provider_rename_matrix &&
+
+	for scope in all root nested
+	do
+		case "$scope" in
+		all|root)
+			defer_path=rename
+			;;
+		nested)
+			defer_path=dir1/rename
+			;;
+		esac &&
+		for fsm in false true
+		do
+			for uc in false true
+			do
+				# The UC-only control is covered by the main matrix
+				# and is known to be timing-sensitive on macOS.
+				if test "$fsm" = false && test "$uc" = true
+				then
+					continue
+				fi &&
+				provider_rename_scope_run \
+					"provider-rename-$scope-$fsm-$uc" \
+					"$scope" "$fsm" "$uc" "$defer_path" ||
+					return 1
+			done
+		done
+	done
+'
+
+test_expect_success MACOS,UNTRACKED_CACHE,DARWIN_ASYNC_FENCE \
+	'repeated Darwin provider fences remain live' '
+	test_when_finished "
+		stop_daemon_delete_repo test_provider_stress;
+		rm -f provider-stress.trace provider-stress.trace2
+	" &&
+
+	git init test_provider_stress &&
+	(
+		cd test_provider_stress &&
+		printf "base\\n" >tracked &&
+		git add tracked &&
+		git commit -m base &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		start_daemon --tf "$PWD/../provider-stress.trace" \
+			--t2 "$PWD/../provider-stress.trace2" &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+
+		for i in $(test_seq 1 512)
+		do
+			GIT_OPTIONAL_LOCKS=0 git status --porcelain=v2 \
+				>.git/actual || return 1
+			test_must_be_empty .git/actual || return 1
+		done &&
+		requests=$(grep -c "Darwin provider fence requested" \
+			../provider-stress.trace) &&
+		completed=$(grep -c "Darwin provider fence complete" \
+			../provider-stress.trace) &&
+		test "$requests" -ge 512 &&
+		test "$requests" = "$completed" &&
+		test_grep ! "synchronous flush timed out" \
+			../provider-stress.trace &&
+		test_grep "region_enter.*darwin-flush-async" \
+			../provider-stress.trace2 &&
+		test_grep ! "region_enter.*darwin-flush-sync" \
+			../provider-stress.trace2 &&
+		git fsmonitor--daemon status
+	)
+'
+
+test_expect_success MACOS 'fresh unpinned batches honor the retention grace' '
+	test_when_finished "stop_daemon_delete_repo test_fresh_history" &&
+
+	git init test_fresh_history &&
+	(
+		cd test_fresh_history &&
+		printf "target/\\n" >.gitignore &&
+		printf "a\\n" >tracked-a &&
+		printf "b\\n" >tracked-b &&
+		git add .gitignore tracked-a tracked-b &&
+		git commit -m base &&
+		sane_unset GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS &&
+		start_daemon --tf "$PWD/../fresh-history.trace" &&
+		git config core.fsmonitor true &&
+		git config core.untrackedCache true &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+		mkdir target &&
+		for i in $(test_seq 1 5250)
+		do
+			printf "x\\n" >"target/ignored-$i" || return 1
+		done &&
+		test-tool fsmonitor-client query >../fresh-history.response &&
+		perl -0ne '\''$nr++; END { print "$nr\n" }'\'' \
+			<../fresh-history.response >../fresh-history.count &&
+		test "$(cat ../fresh-history.count)" -gt 1025 &&
+		git status --porcelain=v2 >.git/after-burst &&
+		printf "new\\n" >>tracked-a &&
+		git status --porcelain=v2 >.git/after-event &&
+		test_grep ! "Compact: batch" ../fresh-history.trace
+	)
+'
+
+test_expect_success MACOS 'private index cannot prune canonical index history' '
+	test_when_finished "stop_daemon_delete_repo test_index_history" &&
+	test_when_finished "rm -f private-index" &&
+
+	git init test_index_history &&
+	(
+		cd test_index_history &&
+		test_commit base tracked &&
+		test_commit other other &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		(
+			GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS=0 &&
+			export GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS &&
+			start_daemon --tf "$PWD/../index-history.trace"
+		) &&
+
+		GIT_INDEX_FILE="$PWD/.git/index" \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		cp .git/index ../private-index &&
+		cp .git/index .git/index.before &&
+
+		echo first >>tracked &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo second >>other &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo third >>tracked &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo fourth >>other &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		echo fifth >>tracked &&
+		GIT_INDEX_FILE="$PWD/../private-index" git add -u &&
+		test_cmp .git/index.before .git/index &&
+		test_grep "Compact: batch" ../index-history.trace \
+			>../index-history.compactions &&
+		test_line_count = 3 ../index-history.compactions &&
+		test_grep "covers 2 of 3 paths" ../index-history.compactions &&
+
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/canonical.trace" \
+			git status --porcelain=v2 >.git/canonical &&
+		test_line_count = 2 .git/canonical &&
+		test_grep "^1 \.M .* tracked$" .git/canonical &&
+		test_grep "^1 \.M .* other$" .git/canonical &&
+		test_cmp .git/index.before .git/index &&
+		! test_trace2_data fsm_client query/trivial-response 1 \
+			<.git/canonical.trace
+	)
+'
+
+test_expect_success MACOS,HARDLINKS \
+	'compaction does not replay consumed hardlink events' '
+	test_when_finished "stop_daemon_delete_repo test_hardlink_history" &&
+	test_when_finished "rm -f hardlink-private-index" &&
+
+	git init test_hardlink_history &&
+	(
+		cd test_hardlink_history &&
+		printf "target/\\n" >.gitignore &&
+		printf "a\\n" >tracked-a &&
+		printf "b\\n" >tracked-b &&
+		git add .gitignore tracked-a tracked-b &&
+		git commit -m base &&
+		git config core.untrackedCache true &&
+		git config core.trustctime false &&
+		git config core.checkStat minimal &&
+		(
+			GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS=0 &&
+			export GIT_TEST_FSMONITOR_TRUNCATE_DELAY_SECONDS &&
+			start_daemon --tf "$PWD/../hardlink-history.trace"
+		) &&
+		git config core.fsmonitor true &&
+		git status --porcelain=v2 >.git/prime-1 &&
+		git status --porcelain=v2 >.git/prime-2 &&
+		test_must_be_empty .git/prime-1 &&
+		test_must_be_empty .git/prime-2 &&
+		mkdir target &&
+		printf "AAAA\\n" >target/object &&
+		ln target/object target/object-link &&
+		printf "BBBB\\n" >target/object-link &&
+		GIT_TRACE2_EVENT="$PWD/.git/consume.trace" \
+			git status --porcelain=v2 >.git/consume &&
+		test_must_be_empty .git/consume &&
+		test_trace2_data fsmonitor apply/hardlink-index-scan 1 \
+			<.git/consume.trace &&
+		git update-index --refresh --force-write-index &&
+		test-tool dump-fsmonitor >.git/checkpoint &&
+		checkpoint=$(sed -n "s/^fsmonitor last update //p" \
+			.git/checkpoint) &&
+		test -n "$checkpoint" &&
+		test "${checkpoint##*:}" -gt 0 &&
+		cp .git/index .git/index.before &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/control.trace" \
+			git status --porcelain=v2 >.git/control &&
+		test_must_be_empty .git/control &&
+		! test_trace2_data fsmonitor apply/hardlink-index-scan 1 \
+			<.git/control.trace &&
+		cp .git/index ../hardlink-private-index &&
+		grep -c "event: //inode:" ../hardlink-history.trace \
+			>.git/inodes.before &&
+		for i in $(test_seq 1 8)
+		do
+			if test $((i % 2)) -eq 0
+			then
+				printf "private-%s\\n" "$i" >>tracked-a
+			else
+				printf "private-%s\\n" "$i" >>tracked-b
+			fi &&
+			GIT_INDEX_FILE="$PWD/../hardlink-private-index" \
+				git add -u || return 1
+		done &&
+		test_cmp .git/index.before .git/index &&
+		grep -c "event: //inode:" ../hardlink-history.trace \
+			>.git/inodes.after &&
+		test_cmp .git/inodes.before .git/inodes.after &&
+		test_grep "Compact: batch" ../hardlink-history.trace &&
+		for i in $(test_seq 1 5)
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$PWD/.git/repeat-$i.trace" \
+				git status --porcelain=v2 \
+				>.git/repeat-$i || return 1
+			! test_trace2_data fsmonitor apply/hardlink-index-scan 1 \
+				<.git/repeat-$i.trace || return 1
+		done &&
+		test_cmp .git/index.before .git/index &&
+		test-tool fsmonitor-client query-legacy \
+			--token "$checkpoint" >.git/legacy &&
+		nul_to_q <.git/legacy >.git/legacy-q &&
+		test_grep ! "Q/Q" .git/legacy-q &&
+		test_grep ! "Q//Q" .git/legacy-q
+	)
 '
 
 # Verify that the daemon has shutdown.  Spin a few seconds to
@@ -720,10 +1953,6 @@ test_expect_success 'cleanup worktrees' '
 # confirm that status is correct.  That is, that the data (or lack of
 # data) from fsmonitor doesn't cause incorrect results.  And doesn't
 # cause incorrect results when the untracked-cache is enabled.
-
-test_lazy_prereq UNTRACKED_CACHE '
-	git update-index --test-untracked-cache
-'
 
 test_expect_success 'Matrix: setup for untracked-cache,fsmonitor matrix' '
 	test_unconfig core.fsmonitor &&
@@ -1374,14 +2603,15 @@ test_expect_success CASE_INSENSITIVE_FS 'fsmonitor file case wrong on disk' '
 	test_grep -q "fsmonitor_refresh_callback.*FILE-4-A.*pos 6"  "$PWD/file_case_wrong-try1.log" &&
 	test_grep -q "fsmonitor_refresh_callback.*file-4-a.*pos -9" "$PWD/file_case_wrong-try1.log" &&
 
-	# FSM refresh will have invalidated the FSM bit and cause a regular
-	# (real) scan of these tracked files, so they should have "H" status.
-	# (We will not see a "h" status until the next refresh (on the next
-	# command).)
+	# FSM refresh invalidates the FSM bit and causes a regular (real) scan
+	# of these tracked files. Authenticated external history may retain the
+	# refreshed bit for the following reader, so either marker is valid.
 
 	git -C file_case_wrong ls-files -f >"$PWD/file_case_wrong-lsf1.out" &&
-	test_grep -q "H dir1/dir2/dir3/file-3-a" "$PWD/file_case_wrong-lsf1.out" &&
-	test_grep -q "H dir1/dir2/dir4/FILE-4-A" "$PWD/file_case_wrong-lsf1.out" &&
+	test_grep -E -q "^[Hh] dir1/dir2/dir3/file-3-a$" \
+		"$PWD/file_case_wrong-lsf1.out" &&
+	test_grep -E -q "^[Hh] dir1/dir2/dir4/FILE-4-A$" \
+		"$PWD/file_case_wrong-lsf1.out" &&
 
 
 	# Try the status again. We assume that the above status command
@@ -1719,6 +2949,62 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 	)
 '
 
+test_expect_success FSMONITOR_LINUX \
+	'nameless inotify events use the watched directory' '
+	test_when_finished \
+		"git -C inotify-nameless fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo inotify-nameless &&
+	(
+		cd inotify-nameless &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p existing/inner &&
+		test_write_lines tracked >existing/inner/tracked &&
+		git add existing/inner/tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		start_daemon --tf "$PWD/.git/daemon.trace" &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		git update-index --force-write-index &&
+
+		chmod 750 existing/inner &&
+		test-tool fsmonitor-client query >.git/chmod.raw &&
+		nul_to_q <.git/chmod.raw >.git/chmod.response &&
+		test_grep "Qexisting/inner/Q" .git/chmod.response &&
+		test_grep ! "Qexisting/inner/[^Q][^Q]*Q" \
+			.git/chmod.response &&
+		chmod 755 existing/inner
+	)
+'
+
+test_expect_success FSMONITOR_LINUX \
+	'nested Git directory events remain valid' '
+	test_when_finished \
+		"git -C nested-dotgit fsmonitor--daemon stop 2>/dev/null || :" &&
+	test_create_repo nested-dotgit &&
+	(
+		cd nested-dotgit &&
+		test_write_lines tracked >tracked &&
+		git add tracked &&
+		git commit -qm base &&
+		git config core.fsmonitor true &&
+		start_daemon &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		mkdir -p scratch/.git &&
+		test_write_lines nested >scratch/.git/file &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			status --porcelain=v2 >.git/expect &&
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
+			git status --porcelain=v2 >.git/actual &&
+		test_cmp .git/expect .git/actual &&
+		! test_trace2_data fsm_client query/invalid-response 1 \
+			<.git/status.trace
+	)
+'
+
 test_expect_success MACOS 'implicit daemon reuses the invoking Git executable' '
 	test_create_repo same-executable-spawn &&
 	mkdir fake-exec-path &&
@@ -1829,7 +3115,121 @@ test_expect_success 'bound query replaces a legacy daemon' '
 	)
 '
 
-test_expect_success MACOS 'bound query upgrades stale directory event daemon' '
+test_expect_success MACOS \
+	'read-only legacy upgrade waits for one writable exact repair' '
+	test_when_finished \
+		"stop_daemon_delete_repo legacy-read-only-upgrade" &&
+	test_create_repo legacy-read-only-upgrade &&
+	(
+		cd legacy-read-only-upgrade &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		git config core.fsmonitor false &&
+		for i in $(test_seq 1 64)
+		do
+			test_write_lines "$i" >"tracked-$i" || return 1
+		done &&
+		git add . &&
+		git commit -qm base &&
+		git config core.preloadIndex false &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		ipc_path=$(git rev-parse --path-format=absolute \
+			--git-path fsmonitor--daemon.ipc) &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 \
+			--fsmonitor-capability-superset &&
+		git status --porcelain=v2 --untracked-files=normal \
+			--no-ahead-behind >.git/prime &&
+		test_must_be_empty .git/prime &&
+		test_path_is_missing .git/index.csts &&
+		test-tool simple-ipc stop-daemon --name="$ipc_path" &&
+		test-tool simple-ipc start-daemon \
+			--name="$ipc_path" --threads=1 --fsmonitor-legacy &&
+		cp .git/index .git/index.before &&
+
+		for label in first repeat
+		do
+			GIT_OPTIONAL_LOCKS=0 \
+			GIT_TRACE2_EVENT="$PWD/.git/$label.trace" \
+				git status --porcelain=v2 >.git/$label &&
+			test_must_be_empty .git/$label &&
+			test_cmp_bin .git/index.before .git/index &&
+			test_trace2_data index refresh/sum_lstat 64 \
+				<.git/$label.trace || return 1
+		done &&
+		test_trace2_data fsm_client query/incompatible-daemon 1 \
+			<.git/first.trace &&
+		test_path_is_missing .git/index.csts &&
+		{ git fsmonitor--daemon stop 2>/dev/null || :; } &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/repair.trace" \
+			git status --porcelain=v2 >.git/repair &&
+		test_must_be_empty .git/repair &&
+		! test_cmp_bin .git/index.before .git/index &&
+		test-tool dump-fsmonitor >.git/fsmonitor &&
+		test_grep "fsmonitor last update builtin:test:1" \
+			.git/fsmonitor
+	)
+'
+
+test_expect_success MACOS \
+	'linked worktree legacy upgrade uses its writable index repair' '
+	test_when_finished \
+		"stop_daemon_delete_linked_repo legacy-linked legacy-linked-wt" &&
+	test_create_repo legacy-linked &&
+	(
+		cd legacy-linked &&
+		git config core.fsmonitor false &&
+		for i in $(test_seq 1 32)
+		do
+			test_write_lines "$i" >"tracked-$i" || return 1
+		done &&
+		git add . &&
+		git commit -qm base &&
+		git worktree add -q -b linked ../legacy-linked-wt
+	) &&
+	git -C legacy-linked config core.preloadIndex false &&
+	git -C legacy-linked config core.untrackedCache true &&
+	git -C legacy-linked config core.fsmonitor true &&
+	gitdir=$(git -C legacy-linked-wt rev-parse --absolute-git-dir) &&
+	ipc_path=$(git -C legacy-linked-wt rev-parse --path-format=absolute \
+		--git-path fsmonitor--daemon.ipc) &&
+	test-tool simple-ipc start-daemon \
+		--name="$ipc_path" --threads=1 \
+		--fsmonitor-capability-superset &&
+	git -C legacy-linked-wt status --porcelain=v2 \
+		--untracked-files=normal --no-ahead-behind >linked.prime &&
+	test_must_be_empty linked.prime &&
+	test-tool simple-ipc stop-daemon --name="$ipc_path" &&
+	test-tool simple-ipc start-daemon \
+		--name="$ipc_path" --threads=1 --fsmonitor-legacy &&
+	cp "$gitdir/index" linked.index.before &&
+	for label in first repeat
+	do
+		GIT_OPTIONAL_LOCKS=0 \
+		GIT_TRACE2_EVENT="$PWD/linked-$label.trace" \
+			git -C legacy-linked-wt status --porcelain=v2 \
+				>linked-$label &&
+		test_must_be_empty linked-$label &&
+		test_cmp_bin linked.index.before "$gitdir/index" &&
+		test_trace2_data index refresh/sum_lstat 32 \
+			<linked-$label.trace || return 1
+	done &&
+	{ git -C legacy-linked-wt fsmonitor--daemon stop 2>/dev/null || :; } &&
+	GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+	GIT_TRACE2_EVENT="$PWD/linked-repair.trace" \
+		git -C legacy-linked-wt status --porcelain=v2 >linked-repair &&
+	test_must_be_empty linked-repair &&
+	! test_cmp_bin linked.index.before "$gitdir/index" &&
+	test_path_is_missing "$gitdir/index.csts" &&
+	test-tool -C legacy-linked-wt dump-fsmonitor >linked.fsmonitor &&
+	test_grep "fsmonitor last update builtin:test:1" \
+		linked.fsmonitor
+'
+
+test_expect_success FSMONITOR_DIR_METADATA \
+	'bound query upgrades stale directory event daemon' '
 	test_when_finished \
 		"stop_daemon_delete_repo directory-daemon-upgrade" &&
 	test_create_repo directory-daemon-upgrade &&
@@ -1858,7 +3258,7 @@ test_expect_success MACOS 'bound query upgrades stale directory event daemon' '
 			"\"argv\":.*\"fsmonitor--daemon\",\"run\",\"--detach\"" \
 			.git/upgrade.trace &&
 		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep "fsmonitor last update builtin:dirmeta-v1\\." \
+		test_grep "fsmonitor last update builtin:${fsmonitor_cookie_token_prefix}" \
 			.git/fsmonitor &&
 
 		GIT_TRACE2_EVENT="$PWD/.git/repeat.trace" \
@@ -2091,7 +3491,7 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 		! test_trace2_data fsm_client query/worktree-mismatch 1 \
 			<.git/reconnect.trace &&
 		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep "fsmonitor last update builtin:dirmeta-v1\\." \
+		test_grep "fsmonitor last update builtin:${fsmonitor_cookie_token_prefix}" \
 			.git/fsmonitor &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index &&
@@ -2109,7 +3509,7 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 	)
 '
 
-test_expect_success MACOS,UNTRACKED_CACHE \
+test_expect_success FSMONITOR_DIR_METADATA,UNTRACKED_CACHE \
 	'concurrent clients share one stale directory daemon upgrade' '
 	test_when_finished \
 		"stop_daemon_delete_repo concurrent-directory-daemon-upgrade" &&
@@ -2165,7 +3565,7 @@ test_expect_success MACOS,UNTRACKED_CACHE \
 			.git/client-*.trace >.git/daemon-spawns &&
 		test_line_count = 1 .git/daemon-spawns &&
 		test-tool dump-fsmonitor >.git/fsmonitor &&
-		test_grep "fsmonitor last update builtin:dirmeta-v1\\." \
+		test_grep "fsmonitor last update builtin:${fsmonitor_cookie_token_prefix}" \
 			.git/fsmonitor &&
 		test_grep FSCF .git/index &&
 		test_grep FSUC .git/index &&
@@ -2201,6 +3601,12 @@ test_expect_success 'bound daemon also serves legacy token queries' '
 		token=$(sed -n "s/^fsmonitor last update //p" \
 			.git/fsmonitor) &&
 		test -n "$token" &&
+		if test_have_prereq FSMONITOR_LINUX
+		then
+			test_grep \
+				"^fsmonitor last update builtin:cookie-v1\\.dirmeta-v1\\." \
+				.git/fsmonitor || return 1
+		fi &&
 		ipc_path=$(git rev-parse --path-format=absolute \
 			--git-path fsmonitor--daemon.ipc) &&
 		test-tool simple-ipc send --name="$ipc_path" \
@@ -2897,6 +4303,68 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! have_t2_data_event fsmonitor \
 			semantic/authenticated-restored-directory \
 			<.git/new-attributes.trace
+	)
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
+	'large directory events authenticate distinct attribute sources once' '
+	test_when_finished "rm -rf large-directory-event" &&
+	test_create_repo large-directory-event &&
+	(
+		cd large-directory-event &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		mkdir -p bulk/nested siblings &&
+		for file in $(test_seq 1 96)
+		do
+			test_write_lines "bulk-$file" >"bulk/nested/$file" ||
+				return 1
+		done &&
+		for file in $(test_seq 1 128)
+		do
+			test_write_lines "sibling-$file" >"siblings/$file" ||
+				return 1
+		done &&
+		git add bulk siblings &&
+		git commit -qm base &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+			git update-index --fsmonitor &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
+			git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=bulk/ \
+		GIT_TRACE2_EVENT="$PWD/.git/bulk.trace" \
+			git status --porcelain=v2 >.git/bulk.actual &&
+		test_must_be_empty .git/bulk.actual &&
+		test_trace2_data fsmonitor \
+			semantic/authenticated-restored-directory 1 \
+			<.git/bulk.trace &&
+		test_trace2_data index refresh/sum_lstat 96 \
+			<.git/bulk.trace &&
+		! have_t2_data_event fsmonitor semantic/attributes-cone \
+			<.git/bulk.trace &&
+		! have_t2_data_event fsmonitor semantic/manifest-scan-count \
+			<.git/bulk.trace &&
+
+		test_write_lines "*.txt text" >bulk/nested/.gitattributes &&
+		GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false \
+			-c core.untrackedCache=false status --porcelain=v2 \
+			>.git/attributes.expect &&
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=DCCCC \
+		GIT_TEST_FSMONITOR_QUERY_PATH=bulk/ \
+		GIT_TRACE2_EVENT="$PWD/.git/attributes.trace" \
+			git status --porcelain=v2 >.git/attributes.actual &&
+		test_cmp .git/attributes.expect .git/attributes.actual &&
+		test_trace2_data fsmonitor semantic/attributes-cone 96 \
+			<.git/attributes.trace &&
+		test_trace2_data fsmonitor semantic/manifest-scan-count 1 \
+			<.git/attributes.trace &&
+		! have_t2_data_event fsmonitor \
+			semantic/authenticated-restored-directory \
+			<.git/attributes.trace
 	)
 '
 
@@ -4074,6 +5542,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_must_be_empty .git/baseline &&
 		test_trace2_data fsmonitor history/external-stored 1 \
 			<"$TRASH_DIRECTORY/restored-racy-baseline.trace" &&
+		test_remove_clean_status_sidecar .git/index.csts &&
 		cp .git/index .git/owned.before &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$TRASH_DIRECTORY/restored-racy-checkpoint.trace" \
@@ -4081,6 +5550,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_must_be_empty .git/checkpoint &&
 		test_trace2_data fsmonitor history/external-stored 1 \
 			<"$TRASH_DIRECTORY/restored-racy-checkpoint.trace" &&
+		test_remove_clean_status_sidecar .git/index.csts &&
 		cp .git/owned.before .git/index &&
 		git -c core.fsmonitor=false update-index \
 			--no-fsmonitor --force-write-index &&
@@ -4507,6 +5977,336 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+native_stash_setup () {
+	repo=$1 &&
+	mode=$2 &&
+	test_create_repo "$repo" &&
+	(
+		cd "$repo" &&
+		sane_unset GIT_TEST_SPLIT_INDEX &&
+		test_write_lines base >tracked &&
+		test_write_lines sibling >sibling &&
+		test_write_lines "# baseline" >.gitattributes &&
+		test_write_lines "# baseline" >.gitignore &&
+		git add tracked sibling .gitattributes .gitignore &&
+		git commit -qm base &&
+		test-tool chmtime -120 tracked sibling \
+			.gitattributes .gitignore &&
+		git update-index --refresh &&
+		git config core.autocrlf false &&
+		git config core.trustctime true &&
+		git config core.checkStat default &&
+		git config core.untrackedCache true &&
+		git config core.fsmonitor true &&
+		if test "$mode" = lfs
+		then
+			git config filter.lfs.clean "git-lfs clean -- %f" &&
+			git config filter.lfs.smudge "git-lfs smudge -- %f" &&
+			git config filter.lfs.process "git-lfs filter-process" &&
+			git config filter.lfs.required true
+		fi &&
+		start_daemon &&
+		git update-index --fsmonitor &&
+		git status --porcelain=v2 >.git/prime &&
+		test_must_be_empty .git/prime &&
+		native_stash_full_proof .git/index
+	)
+}
+
+native_stash_reset () {
+	git reset --hard -q HEAD &&
+	git clean -fdq &&
+	git stash clear &&
+	git status --porcelain=v2 >.git/stash.reset &&
+	test_must_be_empty .git/stash.reset &&
+	native_stash_full_proof .git/index
+}
+
+native_stash_create_policy_file () {
+	source=$1 &&
+	test_write_lines staged >tracked &&
+	git add -- tracked &&
+	native_stash_full_proof .git/index &&
+	test_write_lines "# baseline" "# harmless" >"$source" &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/create.before &&
+	git stash create >.git/create.oid &&
+	test_file_not_empty .git/create.oid &&
+	git cat-file -e "$(cat .git/create.oid)^{commit}" &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/create.after &&
+	test_cmp .git/create.before .git/create.after &&
+	test_grep "^1 M\\. .* tracked$" .git/create.after &&
+	test_grep "^1 \\.M .* $source$" .git/create.after &&
+	test_must_fail git rev-parse --verify refs/stash
+}
+
+native_stash_staged_existing () {
+	test_write_lines staged >tracked &&
+	git add -- tracked &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/staged.before &&
+	git stash push --staged -q -m staged &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/staged.pushed &&
+	test_must_be_empty .git/staged.pushed &&
+	git stash apply --index -q stash@{0} &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/staged.after &&
+	test_cmp .git/staged.before .git/staged.after
+}
+
+native_stash_staged_new () {
+	test_write_lines staged >new-file &&
+	git add -- new-file &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/indexed.expect &&
+	git stash push --staged -q -m indexed &&
+	native_stash_full_proof .git/index &&
+	git status --porcelain=v2 >.git/indexed.clean &&
+	test_must_be_empty .git/indexed.clean &&
+	git stash apply --index -q stash@{0} &&
+	native_stash_full_proof .git/index &&
+	GIT_OPTIONAL_LOCKS=0 \
+		git -c core.fsmonitor=false \
+			-c core.untrackedCache=false \
+			status --porcelain=v2 >.git/indexed.actual &&
+	test_cmp .git/indexed.expect .git/indexed.actual &&
+	test_write_lines new-file >.git/indexed.expect-paths &&
+	git diff --cached --name-only >.git/indexed.actual-paths &&
+	test_cmp .git/indexed.expect-paths .git/indexed.actual-paths
+}
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS \
+	'native stash updates retain a full proof' '
+	for mode in plain lfs
+	do
+		repo="native-stash-$mode" &&
+		test_when_finished "stop_daemon_delete_repo $repo" &&
+		native_stash_setup "$repo" "$mode" &&
+		(
+			cd "$repo" &&
+			sane_unset GIT_TEST_SPLIT_INDEX &&
+			native_stash_create_policy_file .gitattributes &&
+			native_stash_reset &&
+			native_stash_create_policy_file .gitignore &&
+			native_stash_reset &&
+			native_stash_staged_existing &&
+			native_stash_reset &&
+			native_stash_staged_new
+		) || return 1
+	done
+'
+
+test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,PERL_TEST_HELPERS,!MINGW \
+	'completed native replay retains a full proof with skip-hash index' '
+	for mode in plain lfs
+	do
+		for location in primary linked
+		do
+			repo="native-replay-$mode-$location" &&
+			linked="$repo-linked" &&
+			if test "$location" = linked
+			then
+				test_when_finished \
+					"stop_daemon_delete_linked_repo $repo $linked"
+			else
+				test_when_finished "stop_daemon_delete_repo $repo"
+			fi &&
+			test_create_repo "$repo" &&
+			(
+				cd "$repo" &&
+				sane_unset GIT_TEST_SPLIT_INDEX &&
+				mkdir unrelated &&
+				for i in $(test_seq 1 96)
+				do
+					d=$(( (i - 1) % 32 + 1 )) &&
+					mkdir -p "unrelated/d$d" &&
+					test_write_lines "stable-$i" \
+						>"unrelated/d$d/file-$i" || return 1
+				done &&
+				test_write_lines base >conflict &&
+				test_write_lines "# baseline" >.gitattributes &&
+				test_write_lines "# baseline" >.gitignore &&
+				git add unrelated conflict .gitattributes .gitignore &&
+				git commit -qm base &&
+				base=$(git rev-parse HEAD) &&
+				git switch -qc upstream &&
+				test_write_lines upstream >conflict &&
+				git add conflict &&
+				git commit -qm upstream &&
+				git switch -qc topic "$base" &&
+				test_write_lines prefix >prefix &&
+				git add prefix &&
+				git commit -qm prefix &&
+				test_write_lines topic >conflict &&
+				git add conflict &&
+				git commit -qm topic &&
+				git config core.autocrlf false &&
+				git config core.trustctime true &&
+				git config core.checkStat default &&
+				git config core.untrackedCache true &&
+				git config core.fsmonitor true &&
+				git config index.skipHash true &&
+				git config core.preloadIndex true &&
+				git config core.preloadIndexBulk true &&
+				if test "$mode" = lfs
+				then
+					git config filter.lfs.clean \
+						"git-lfs clean -- %f" &&
+					git config filter.lfs.smudge \
+						"git-lfs smudge -- %f" &&
+					git config filter.lfs.process \
+						"git-lfs filter-process" &&
+					git config filter.lfs.required true
+				fi &&
+				if test "$location" = linked
+				then
+					git switch -q upstream &&
+					git worktree add -q "../$linked" topic
+				fi
+			) &&
+			if test "$location" = linked
+			then
+				worktree="$linked"
+			else
+				worktree="$repo"
+			fi &&
+			(
+				cd "$worktree" &&
+				sane_unset GIT_TEST_SPLIT_INDEX &&
+				git fsmonitor--daemon status >/dev/null 2>&1 ||
+				start_daemon &&
+				index=$(git rev-parse --git-path index) &&
+				scratch=$(git rev-parse --path-format=absolute \
+					--git-path replay-test) &&
+				mkdir -p "$scratch" &&
+				topic=$(git rev-parse topic) &&
+				upstream=$(git rev-parse upstream) &&
+				test-tool chmtime -120 $(git ls-files) &&
+				git -c core.fsmonitor=false update-index --refresh &&
+				git update-index --fsmonitor &&
+				git status --porcelain=v2 >"$scratch/prime.actual" &&
+				test_must_be_empty "$scratch/prime.actual" &&
+				native_stash_full_proof "$index" &&
+				for replay in rebase rebase-merges cherry-pick
+				do
+					artifact="$scratch/$replay" &&
+					if test "$replay" = cherry-pick
+					then
+						git reset --hard -q "$upstream"
+					else
+						git reset --hard -q "$topic"
+					fi &&
+					git status --porcelain=v2 \
+						>"$artifact.prime" &&
+					test_must_be_empty "$artifact.prime" &&
+					native_stash_full_proof "$index" &&
+					case "$replay" in
+					rebase)
+						test_must_fail git rebase upstream
+						;;
+					rebase-merges)
+						test_must_fail git rebase \
+							--rebase-merges upstream
+						;;
+					cherry-pick)
+						test_must_fail git cherry-pick "$topic"
+						;;
+					esac &&
+					if test "$replay" != cherry-pick
+					then
+						test_path_is_file prefix &&
+						test "$(git log -1 --format=%s)" = prefix
+					fi &&
+					test -n "$(git ls-files -u)" &&
+					test_grep ! FSUC "$index" &&
+					test_write_lines resolved >conflict &&
+					GIT_TRACE2_EVENT="$artifact.add.trace" \
+						git add conflict &&
+					! have_t2_data_event fsmonitor \
+						semantic/manifest-scan-failed \
+						<"$artifact.add.trace" &&
+					! test_trace2_data index refresh/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.add.trace" &&
+					! test_trace2_data index preload/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.add.trace" &&
+					if test "$replay" = cherry-pick
+					then
+						GIT_TRACE2_EVENT="$artifact.continue.trace" \
+							GIT_EDITOR=true git cherry-pick --continue
+					else
+						GIT_TRACE2_EVENT="$artifact.continue.trace" \
+							GIT_EDITOR=true git rebase --continue
+					fi &&
+					if test "$replay" = cherry-pick
+					then
+						native_tracked_full_proof "$index" &&
+						test_grep ! FSUC "$index"
+					else
+						native_stash_full_proof "$index" &&
+						test_trace2_data fsmonitor \
+							history/writer-proof-repaired 1 \
+							<"$artifact.continue.trace" &&
+						! test_trace2_data fsmonitor \
+							history/writer-proof-repaired 0 \
+							<"$artifact.continue.trace"
+					fi &&
+					cp "$index" "$artifact.index.before" &&
+					GIT_OPTIONAL_LOCKS=0 \
+					GIT_TRACE2_EVENT="$artifact.status.trace" \
+						git status --porcelain=v2 \
+						>"$artifact.status" &&
+					test_must_be_empty "$artifact.status" &&
+					test_cmp "$artifact.index.before" "$index" &&
+					test-tool dump-fsmonitor | tail -n 1 \
+						>"$artifact.bitmap" &&
+					test_grep ! + "$artifact.bitmap" &&
+					! test_trace2_data index refresh/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.status.trace" &&
+					! test_trace2_data index preload/sum_lstat \
+						"[1-9][0-9]*" \
+						<"$artifact.status.trace" &&
+					if test "$replay" = cherry-pick
+					then
+						test_trace2_data read_directory \
+							directories-visited \
+							"[1-9][0-9]*" \
+							<"$artifact.status.trace"
+					else
+						! test_trace2_data read_directory \
+							directories-visited "[2-9]" \
+							<"$artifact.status.trace" &&
+						! test_trace2_data read_directory \
+							directories-visited \
+							"[1-9][0-9][0-9]*" \
+							<"$artifact.status.trace"
+					fi || return 1
+				done
+			) || return 1
+		done
+	done
+'
+
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'clean stash push preserves closed semantic history' '
 	test_when_finished "rm -rf stash-clean-history" &&
@@ -4544,7 +6344,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'dirty stash push drops closed semantic history' '
+	'dirty stash push preserves closed semantic history' '
 	test_when_finished "rm -rf stash-dirty-history" &&
 	test_create_repo stash-dirty-history &&
 	(
@@ -4566,17 +6366,19 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 			git stash push >.git/stash &&
 		test_grep "Saved working directory" .git/stash &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "nothing to commit, working tree clean" .git/actual &&
-		test_trace2_data fsmonitor config/coherent 0 \
+		test_trace2_data fsmonitor config/coherent 1 \
 			<.git/status.trace
 	)
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
-	'dirty stash cannot resurrect an invalidated external checkpoint' '
+	'dirty stash preserves current proof without restoring a checkpoint' '
 	test_when_finished "rm -rf stash-checkpoint-history" &&
 	test_create_repo stash-checkpoint-history &&
 	(
@@ -4604,13 +6406,13 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN,!MINGW \
 		GIT_TEST_FSMONITOR_QUERY_PATH=tracked \
 			git stash push >.git/stash &&
 		test_grep "Saved working directory" .git/stash &&
+		test_grep FSUC .git/index &&
+		test_grep FSCF .git/index &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "nothing to commit, working tree clean" .git/actual &&
-		test_trace2_data fsmonitor history/external-proof-invalidated 1 \
-			<.git/status.trace &&
-		test_trace2_data fsmonitor config/coherent 0 \
+		test_trace2_data fsmonitor config/coherent 1 \
 			<.git/status.trace &&
 		! test_trace2_data fsmonitor history/external-restored 1 \
 			<.git/status.trace
@@ -6001,7 +7803,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 '
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'hard reset to a different tree drops closed semantic history' '
+	'hard reset to a different tree preserves closed semantic history' '
 	test_when_finished "rm -rf reset-hard-changed" &&
 	test_create_repo reset-hard-changed &&
 	(
@@ -6027,8 +7829,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		GIT_TRACE2_EVENT="$PWD/.git/status.trace" \
 			git status >.git/actual &&
 		test_grep "nothing to commit, working tree clean" .git/actual &&
-		test_trace2_data fsmonitor config/coherent 0 \
-			<.git/status.trace
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/status.trace &&
+		test_grep FSCF .git/index &&
+		test_grep FSUC .git/index
 	)
 '
 
@@ -6584,6 +8388,24 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 		! test_trace2_data fsmonitor semantic/manifest-scan-count \
 			"[1-9][0-9]*" <.git/disabled-filter.trace &&
 
+		GIT_CONFIG_COUNT=3 \
+		GIT_CONFIG_KEY_0=filter.demo.clean GIT_CONFIG_VALUE_0= \
+		GIT_CONFIG_KEY_1=filter.demo.process GIT_CONFIG_VALUE_1= \
+		GIT_CONFIG_KEY_2=filter.demo.required GIT_CONFIG_VALUE_2=false \
+		GIT_TEST_PRELOAD_INDEX=1 \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
+		GIT_TRACE2_EVENT="$PWD/.git/disabled-clean-filter.trace" \
+			git -c core.fsmonitor=true -c core.hooksPath=/dev/null \
+				diff --no-textconv --no-ext-diff --submodule=short \
+				--ignore-submodules=dirty --color \
+			>.git/disabled-clean-filter.out &&
+		test_must_be_empty .git/disabled-clean-filter.out &&
+		test_cmp_bin .git/disabled-filter.index .git/index &&
+		test_trace2_data fsmonitor config/coherent 1 \
+			<.git/disabled-clean-filter.trace &&
+		! test_trace2_data index preload/sum_lstat \
+			"[1-9][0-9]*" <.git/disabled-clean-filter.trace &&
+
 		test_write_lines "tracked filter=demo" >.git/info/attributes &&
 		GIT_TEST_PRELOAD_INDEX=1 \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCC \
@@ -6602,8 +8424,10 @@ test_expect_success SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+for disable_smudge in true false
+do
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'disabled filters cannot publish a proof for active filtered paths' '
+	"disabled filters cannot publish a proof for active filtered paths (smudge: $disable_smudge)" '
 	test_when_finished "rm -rf disabled-filter-active-path" &&
 	test_create_repo disabled-filter-active-path &&
 	(
@@ -6627,14 +8451,16 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_trace2_data fsmonitor filter-scope/valid 1 \
 			<.git/prime.trace &&
 
+		set -- -c filter.demo.clean= -c filter.demo.process= \
+			-c filter.demo.required=false &&
+		if test "$disable_smudge" = true
+		then
+			set -- "$@" -c filter.demo.smudge=
+		fi &&
 		test_write_lines raw >active.filtered &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=D \
 		GIT_TEST_FSMONITOR_QUERY_PATH=active.filtered \
-			git -c filter.demo.clean= \
-			    -c filter.demo.smudge= \
-			    -c filter.demo.process= \
-			    -c filter.demo.required=false \
-			    add active.filtered &&
+			git "$@" add active.filtered &&
 		GIT_OPTIONAL_LOCKS=0 \
 			git -c core.fsmonitor=false -c core.untrackedCache=false \
 			    status --porcelain=v2 --untracked-files=no \
@@ -6648,6 +8474,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_cmp .git/expected .git/actual
 	)
 '
+done
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'partial required-filter overrides cannot hide a missing clean helper' '
@@ -6685,8 +8512,10 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	)
 '
 
+for disable_smudge in true false
+do
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
-	'disabled filters cannot prime a reusable proof for active clean filters' '
+	"disabled filters cannot prime a reusable proof for active clean filters (smudge: $disable_smudge)" '
 	test_when_finished "rm -rf disabled-filter-prime" &&
 	test_create_repo disabled-filter-prime &&
 	(
@@ -6704,14 +8533,16 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		git config core.fsmonitor true &&
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=C \
 			git update-index --fsmonitor &&
+		set -- -c filter.demo.clean= -c filter.demo.process= \
+			-c filter.demo.required=false &&
+		if test "$disable_smudge" = true
+		then
+			set -- "$@" -c filter.demo.smudge=
+		fi &&
 		GIT_INDEX_FILE="$PWD/.git/index" \
 		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCCCC \
 		GIT_TRACE2_EVENT="$PWD/.git/disabled-prime.trace" \
-			git -c filter.demo.clean= \
-			    -c filter.demo.smudge= \
-			    -c filter.demo.process= \
-			    -c filter.demo.required=false \
-			    status --porcelain=v2 --untracked-files=no \
+			git "$@" status --porcelain=v2 --untracked-files=no \
 			>.git/disabled &&
 		test_must_be_empty .git/disabled &&
 		GIT_OPTIONAL_LOCKS=0 \
@@ -6727,6 +8558,7 @@ test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 		test_cmp .git/expected .git/actual
 	)
 '
+done
 
 test_expect_success UNTRACKED_CACHE,SEMANTIC_VERIFY_ANCHORED_OPEN \
 	'unused configured filters preserve staged and dry-run history' '
@@ -7217,7 +9049,7 @@ test_expect_success UNTRACKED_CACHE,!MINGW,!CYGWIN \
 		test-tool chmtime =$mtime cached/hook-tracked
 		EOF
 		GIT_EDITOR=: \
-		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCDC \
+		GIT_TEST_FSMONITOR_QUERY_SEQUENCE=CCCDC \
 		GIT_TEST_FSMONITOR_QUERY_PATH=cached/hook-tracked \
 		GIT_TRACE2_EVENT="$PWD/.git/commit.trace" \
 			git commit --allow-empty --edit -m adoption &&

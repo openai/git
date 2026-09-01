@@ -456,23 +456,16 @@ done:
 	return safe;
 }
 
-int clean_status_index_entry_is_semantically_safe(
-	const struct index_state *istate,
-	const struct cache_entry *old,
+static int clean_status_index_entries_have_safe_shape(
+	const struct index_state *istate, const struct cache_entry *old,
 	const struct cache_entry *new_entry)
 {
 	const struct clean_status_state *state = istate->clean_status;
 	const struct cache_entry *entry = old ? old : new_entry;
 	struct conv_attrs attrs;
 	const char *base;
-	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
 
-	if (!state ||
-	    (!suspended && !clean_status_revalidated_token_matches(istate)) ||
-	    (!suspended && state->filter_configured &&
-	     !state->filter_scope_valid) ||
-	    istate->split_index ||
-	    istate->sparse_index || !entry)
+	if (!state || !entry)
 		return 0;
 	if ((old && (!S_ISREG(old->ce_mode) && !S_ISLNK(old->ce_mode))) ||
 	    (new_entry && (!S_ISREG(new_entry->ce_mode) &&
@@ -490,22 +483,85 @@ int clean_status_index_entry_is_semantically_safe(
 	if (!fspathcmp(base, ".gitattributes") ||
 	    !fspathcmp(base, ".gitignore"))
 		return 0;
-	if (suspended &&
-	    (!old || !new_entry || !S_ISREG(old->ce_mode) ||
-	     !S_ISREG(new_entry->ce_mode) ||
-	     !clean_status_manifest_path_attributes_unchanged(istate, entry->name)))
-		return 0;
 	if (state->filter_configured) {
 		convert_attrs((struct index_state *)istate, &attrs, entry->name);
 		if (convert_attrs_has_clean_filter(&attrs))
 			return 0;
 	}
+	return 1;
+}
+
+int clean_status_index_entry_is_semantically_safe(
+	const struct index_state *istate,
+	const struct cache_entry *old,
+	const struct cache_entry *new_entry)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	const struct cache_entry *entry = old ? old : new_entry;
+	int suspended = clean_status_fsmonitor_backoff_suspended(istate);
+
+	if (!state ||
+	    (!suspended && !clean_status_revalidated_token_matches(istate)) ||
+	    (!suspended && state->filter_configured &&
+	     !state->filter_scope_valid) ||
+	    istate->split_index || istate->sparse_index || !entry ||
+	    !clean_status_index_entries_have_safe_shape(istate, old, new_entry))
+		return 0;
+	if (suspended &&
+	    (!old || !new_entry || !S_ISREG(old->ce_mode) ||
+	     !S_ISREG(new_entry->ce_mode) ||
+	     !clean_status_manifest_path_attributes_unchanged(istate, entry->name)))
+		return 0;
 	if (!old || !new_entry)
 		return path_has_no_new_attribute_sources(istate, entry->name,
 							 old && !new_entry);
 	return ce_namelen(old) == ce_namelen(new_entry) &&
 		!memcmp(old->name, new_entry->name, ce_namelen(old)) &&
 		old->ce_mode == new_entry->ce_mode;
+}
+
+int clean_status_intent_to_add_change_is_semantically_safe(
+	const struct index_state *istate,
+	const struct cache_entry *old,
+	const struct cache_entry *new_entry)
+{
+	const struct clean_status_state *state = istate->clean_status;
+	const struct cache_entry *entry = old ? old : new_entry;
+	struct conv_attrs attrs;
+	const char *base;
+
+	/*
+	 * An intent-to-add entry is deliberately dirty, so adding or removing
+	 * one does not invalidate the clean bits of unrelated tracked entries.
+	 * Keep the paired untracked cache after invalidating this path, but do
+	 * not retain a proof when the placeholder can affect policy semantics.
+	 */
+	if (!state || !!old == !!new_entry || !entry ||
+	    (old && !ce_intent_to_add(old)) ||
+	    (new_entry && !ce_intent_to_add(new_entry)) ||
+	    !S_ISREG(entry->ce_mode) || ce_stage(entry) ||
+	    ce_skip_worktree(entry) || (entry->ce_flags & CE_VALID) ||
+	    !clean_status_has_current_full_fsmonitor_proof(istate) ||
+	    !istate->fsmonitor_untracked_valid ||
+	    !istate->fsmonitor_untracked_extension_seen ||
+	    istate->fsmonitor_untracked_extension_invalid ||
+	    !istate->fsmonitor_last_update ||
+	    !istate->fsmonitor_untracked_token ||
+	    strcmp(istate->fsmonitor_last_update,
+		   istate->fsmonitor_untracked_token))
+		return 0;
+	base = strrchr(entry->name, '/');
+	base = base ? base + 1 : entry->name;
+	if (!fspathcmp(base, ".gitattributes") ||
+	    !fspathcmp(base, ".gitignore"))
+		return 0;
+	if (state->filter_configured) {
+		convert_attrs((struct index_state *)istate, &attrs, entry->name);
+		if (convert_attrs_has_clean_filter(&attrs))
+			return 0;
+	}
+	return path_has_no_new_attribute_sources(
+		istate, entry->name, old && !new_entry);
 }
 
 void clean_status_clear_authenticated_new_directories(
@@ -547,7 +603,7 @@ static int clean_status_changed_directory_is_semantically_safe(
 	const char *basename;
 	unsigned int first, i, namespace_unstable = 0;
 	size_t len;
-	int parent_fd, next, removed, safe = 0;
+	int bulk, parent_fd, next, removed, safe = 0;
 
 	if (!state || !fstat_is_reliable() ||
 	    !state->current_config_valid || !state->current_attr_valid ||
@@ -570,10 +626,8 @@ static int clean_status_changed_directory_is_semantically_safe(
 	if (first >= istate->cache_nr ||
 	    !starts_with(istate->cache[first]->name, name))
 		return 0;
-	/* Each descendant independently authenticates its attribute ancestry. */
-	if (istate->cache_nr - first > 64 &&
-	    starts_with(istate->cache[first + 64]->name, name))
-		return 0;
+	bulk = istate->cache_nr - first > 64 &&
+		starts_with(istate->cache[first + 64]->name, name);
 
 	if (attr_manifest_cursor_init(&cursor,
 				      state->manifest.current.buf,
@@ -599,12 +653,30 @@ static int clean_status_changed_directory_is_semantically_safe(
 		removed = 0;
 	}
 
-	for (i = first; i < istate->cache_nr &&
-	     starts_with(istate->cache[i]->name, name); i++)
-		if (!clean_status_index_entry_is_semantically_safe(
-				istate, removed ? istate->cache[i] : NULL,
-				removed ? NULL : istate->cache[i]))
+	if (bulk) {
+		/*
+		 * Avoid repeating anchored ancestry checks for every entry in a
+		 * large cone. The manifest helper verifies each distinct attribute
+		 * candidate once. Removed cones retain the conservative fallback.
+		 */
+		if (removed ||
+		    !clean_status_manifest_directory_sources_unchanged(
+			    istate, name))
 			goto done;
+		for (i = first; i < istate->cache_nr &&
+		     starts_with(istate->cache[i]->name, name); i++)
+			if (!clean_status_index_entries_have_safe_shape(
+					istate, NULL, istate->cache[i]))
+				goto done;
+	} else {
+		for (i = first; i < istate->cache_nr &&
+		     starts_with(istate->cache[i]->name, name); i++)
+			if (!clean_status_index_entry_is_semantically_safe(
+					istate,
+					removed ? istate->cache[i] : NULL,
+					removed ? NULL : istate->cache[i]))
+				goto done;
+	}
 
 	semantic_verify_path_free(path, &namespace_unstable, NULL);
 	path = NULL;

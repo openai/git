@@ -13,10 +13,15 @@ fi
 if test_have_prereq MACOS
 then
 	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.inode-v1.
+	fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.fence-v1.
+elif test "$uname_s" = Linux
+then
+	fsmonitor_pre_cookie_token_prefix=dirmeta-v1.
+	fsmonitor_cookie_token_prefix=cookie-v1.dirmeta-v1.
 else
 	fsmonitor_pre_cookie_token_prefix=
+	fsmonitor_cookie_token_prefix=cookie-v1.
 fi
-fsmonitor_cookie_token_prefix=${fsmonitor_pre_cookie_token_prefix}cookie-v1.
 
 stop_cookie_compat_daemon () {
 	cookie_compat_repo=$1 &&

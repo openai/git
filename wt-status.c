@@ -1157,7 +1157,8 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 
 	if (s->untracked_cache_preload)
 		BUG("untracked-cache preload already started");
-	if (!use_optional_locks())
+	/* An index writer can certify under the lock it already owns. */
+	if (!use_optional_locks() && !s->proof_index_path)
 		s->certify_clean_status = 0;
 	wt_status_begin_attr_snapshot(s);
 	/* Record the provider token before either filesystem traversal. */
@@ -1707,6 +1708,7 @@ static struct semantic_verify_proof *wt_status_prepare_semantic_verify(
 	options.require_proof_epoch = 1;
 	options.validate_filter_scope =
 		clean_status_filter_scope_needs_validation(istate);
+	options.index_path = s->proof_index_path;
 	options.attr_snapshot = s->attr_source_snapshot;
 	trace2_region_enter("status", "semantic_verify", s->repo);
 	ret = semantic_verify_prepare(istate, &options, &proof);
@@ -1728,6 +1730,18 @@ static int wt_status_collect_untracked(struct wt_status *s)
 		return 0;
 	return wt_status_collect_untracked_1(
 		s, &s->untracked, &s->ignored);
+}
+
+static int wt_status_clear_authenticated_untracked(struct wt_status *s)
+{
+	if (!s->untracked_from_token_closure && !s->untracked_from_preload)
+		return 0;
+
+	string_list_clear(&s->untracked, 0);
+	string_list_clear(&s->ignored, 0);
+	s->untracked_from_token_closure = 0;
+	s->untracked_from_preload = 0;
+	return 1;
 }
 
 #define FSMONITOR_TOKEN_MAX_QUERIES 3
@@ -1910,8 +1924,12 @@ static void wt_status_refresh_for_token(
 	struct index_state *istate = s->repo->index;
 
 	if (!*epoch)
-		*epoch = clean_status_capture_proof_epoch(
-			istate, s->attr_source_snapshot, 0);
+		*epoch = s->proof_index_path ?
+			clean_status_capture_proof_epoch_at_path(
+				istate, s->attr_source_snapshot, 0,
+				s->proof_index_path) :
+			clean_status_capture_proof_epoch(
+				istate, s->attr_source_snapshot, 0);
 	if (*epoch && use_bulk_provider)
 		istate->preload_bulk_proof_epoch = *epoch;
 	if (*epoch) {
@@ -1951,8 +1969,12 @@ static int wt_status_close_ordinary_fsmonitor_token(
 		    !clean_status_manifest_global_fallback(istate) &&
 		    !clean_status_worktree_manifest_needs_refresh(istate) &&
 		    clean_status_index_entries_are_certifiable(istate) &&
-		    (scan_epoch = clean_status_capture_proof_epoch(
-			istate, s->attr_source_snapshot, 0)) &&
+		    (scan_epoch = s->proof_index_path ?
+			clean_status_capture_proof_epoch_at_path(
+				istate, s->attr_source_snapshot, 0,
+				s->proof_index_path) :
+			clean_status_capture_proof_epoch(
+				istate, s->attr_source_snapshot, 0)) &&
 		    wt_status_stage_untracked(closure) &&
 		    closure->staged_untracked.nr &&
 		    !clean_status_worktree_manifest_needs_refresh(istate)) {
@@ -2127,7 +2149,8 @@ wt_status_close_semantic_fsmonitor_token(
 		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 	}
 	closure->refresh_result |= refresh_index(
-		istate, closure->refresh_flags, &s->pathspec, NULL, NULL);
+		istate, closure->refresh_flags | REFRESH_IN_PROOF_EPOCH,
+		&s->pathspec, NULL, NULL);
 	trace2_data_intmax("status", s->repo,
 			   "fsmonitor_token/semantic-closed", 1);
 	if (!semantic_verify_proof_is_current(istate, *proof)) {
@@ -2138,8 +2161,6 @@ wt_status_close_semantic_fsmonitor_token(
 	}
 
 	if (defer_untracked) {
-		int directory_delta_reused;
-
 		closure->untracked_ready =
 			wt_status_stage_untracked(closure);
 		closure->untracked_proof_complete =
@@ -2152,13 +2173,19 @@ wt_status_close_semantic_fsmonitor_token(
 		    closure->queries >= FSMONITOR_TOKEN_MAX_QUERIES)
 			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 
-		/* A second query closes the subsequent untracked scan. */
-		closure->queries++;
+	}
+
+	/* A second query closes the ordinary refresh tail and untracked scan. */
+	closure->queries++;
+	if (defer_untracked)
 		clean_status_manifest_begin_directory_delta(istate, *proof);
-		result = wt_status_query_pending_token(
-			closure, wt_status_untracked_cache_valid(closure));
-		directory_delta_reused =
+	result = wt_status_query_pending_token(
+		closure, defer_untracked ?
+		wt_status_untracked_cache_valid(closure) : 0);
+	if (defer_untracked) {
+		int directory_delta_reused =
 			clean_status_manifest_end_directory_delta(istate);
+
 		if (result != FSMONITOR_TOKEN_CLEAN) {
 			/* Only directory reuse adds an unobserved exclude risk. */
 			int reuse_semantic_subtrees =
@@ -2191,12 +2218,20 @@ wt_status_close_semantic_fsmonitor_token(
 				return WT_STATUS_TOKEN_CLOSURE_RETRY;
 			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 		}
-		if (!semantic_verify_proof_is_current(istate, *proof)) {
-			wt_status_reset_attr_snapshot_if_changed(s);
-			wt_status_discard_semantic_verify(
-				s, proof, "closure-drift");
-			return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
-		}
+	} else if (result != FSMONITOR_TOKEN_CLEAN) {
+		closure->untracked_ready = 0;
+		closure->untracked_proof_complete = !closure->require_untracked;
+		wt_status_discard_semantic_verify(
+			s, proof, "token-reset");
+		if (fsmonitor_token_requires_rescan(result))
+			return WT_STATUS_TOKEN_CLOSURE_RETRY;
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
+	}
+	if (!semantic_verify_proof_is_current(istate, *proof)) {
+		wt_status_reset_attr_snapshot_if_changed(s);
+		wt_status_discard_semantic_verify(
+			s, proof, "closure-drift");
+		return WT_STATUS_TOKEN_CLOSURE_FALLBACK;
 	}
 	if (semantic_verify_accept_filter_scope(istate, *proof) < 0) {
 		wt_status_discard_semantic_verify(
@@ -2251,6 +2286,11 @@ static int wt_status_close_fsmonitor_token(
 	int preserve_untracked, token_accepted = 0;
 
 	refresh_fsmonitor(istate);
+	if (require_untracked && fsmonitor_has_pending_token(istate) &&
+	    wt_status_clear_authenticated_untracked(s))
+		trace2_data_intmax(
+			"status", s->repo,
+			"untracked/replaced-authenticated-snapshot", 1);
 	preserve_untracked = !require_untracked &&
 		s->show_untracked_files == SHOW_NO_UNTRACKED_FILES &&
 		!s->show_ignored_mode && !s->pathspec.nr &&
@@ -2399,6 +2439,22 @@ int wt_status_refresh_index(struct wt_status *s,
 	wt_status_begin_attr_snapshot(s);
 	refresh_fsmonitor(istate);
 	proof = wt_status_prepare_semantic_verify(s, refresh_flags);
+	if (proof && s->proof_index_path) {
+		struct semantic_verify_stats stats;
+
+		semantic_verify_get_stats(proof, &stats);
+		if (stats.active_filters) {
+			s->certify_active_filter_found = 1;
+			trace2_data_intmax(
+				"status", s->repo,
+				"semantic_verify/writer-repair-filtered", 1);
+			semantic_verify_proof_clear(proof);
+			git_attr_invalidate_all();
+			if (fsmonitor_has_pending_token(istate))
+				fsmonitor_reject_pending_token(istate);
+			return 0;
+		}
+	}
 	ret = wt_status_close_fsmonitor_token(
 		s, proof, refresh_flags, require_untracked, 0);
 	istate->preload_bulk_recovery_requested = 0;
@@ -2409,6 +2465,435 @@ int wt_status_refresh_index(struct wt_status *s,
 		istate->preload_untracked_complete = 0;
 	}
 	return ret;
+}
+
+static int fsmonitor_proof_repair_is_eligible(
+	struct repository *repo, int allow_untracked_bootstrap)
+{
+	struct index_state *istate = repo->index;
+	const char *test_sequence =
+		getenv("GIT_TEST_FSMONITOR_QUERY_SEQUENCE");
+
+	if ((test_sequence && *test_sequence &&
+	     !getenv("GIT_TEST_FSMONITOR_ALLOW_PROOF_REPAIR_SEQUENCE")) ||
+	    !fstat_is_reliable() ||
+	    getenv(INDEX_ENVIRONMENT) ||
+	    getenv(GIT_WORK_TREE_ENVIRONMENT) ||
+	    getenv(GIT_COMMON_DIR_ENVIRONMENT) || getenv(DB_ENVIRONMENT) ||
+	    getenv(ALTERNATE_DB_ENVIRONMENT) || istate->split_index ||
+	    istate->sparse_index != INDEX_EXPANDED ||
+	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC ||
+	    (!allow_untracked_bootstrap &&
+	     (!istate->untracked || !istate->untracked->root)) ||
+	    (!istate->fsmonitor_token_valid &&
+	     !fsmonitor_pending_token_from_provider(istate)))
+		return 0;
+	return 1;
+}
+
+static int locked_index_entries_are_certifiable(
+	const struct index_state *istate)
+{
+	const unsigned int allowed = CE_UPTODATE | CE_ADDED | CE_HASHED |
+		CE_FSMONITOR_VALID | CE_NEW_SKIP_WORKTREE | CE_UPDATE_IN_BASE;
+	const struct stat_data empty = { 0 };
+
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		const struct cache_entry *ce = istate->cache[i];
+
+		if (S_ISGITLINK(ce->ce_mode) || ce_stage(ce) ||
+		    ce_intent_to_add(ce) || ce_skip_worktree(ce) ||
+		    (ce->ce_flags & CE_VALID) ||
+		    !(ce->ce_flags & CE_FSMONITOR_VALID) ||
+		    (ce->ce_flags & ~allowed) ||
+		    !memcmp(&ce->ce_stat_data, &empty, sizeof(empty)))
+			return 0;
+	}
+	return 1;
+}
+
+static int locked_index_entries_have_stat_data(
+	const struct index_state *istate)
+{
+	const struct stat_data empty = { 0 };
+
+	for (size_t i = 0; i < istate->cache_nr; i++)
+		if (!memcmp(&istate->cache[i]->ce_stat_data,
+			    &empty, sizeof(empty)))
+			return 0;
+	return 1;
+}
+
+static void prepare_uncertified_index_entries_for_refresh(
+	struct index_state *istate)
+{
+	const struct stat_data empty = { 0 };
+	int changed = 0;
+	size_t refreshes = 0;
+
+	/*
+	 * An owned worktree update can leave new entries process-locally
+	 * up-to-date without a provider-valid bit, or transfer provider-valid
+	 * bits to entries without stat data. A provider reset has no prior event
+	 * interval from which to report those writes. Force the repair refresh
+	 * to stat only those entries before certifying them.
+	 */
+	for (size_t i = 0; i < istate->cache_nr; i++) {
+		struct cache_entry *ce = istate->cache[i];
+		int zero_stat =
+			!memcmp(&ce->ce_stat_data, &empty, sizeof(empty));
+
+		if (!zero_stat && (ce->ce_flags & CE_FSMONITOR_VALID))
+			continue;
+		refreshes++;
+		if (zero_stat && (ce->ce_flags & CE_FSMONITOR_VALID)) {
+			changed = 1;
+			ce->ce_flags &= ~CE_FSMONITOR_VALID;
+		}
+		ce->ce_flags &= ~CE_UPTODATE;
+	}
+	if (changed)
+		istate->cache_changed |= FSMONITOR_CHANGED;
+	trace2_data_intmax("fsmonitor", istate->repo,
+			   "history/writer-entry-refreshes", refreshes);
+}
+
+static int has_repairable_fsmonitor_proof_candidate(
+	struct repository *repo)
+{
+	struct index_state *istate = repo->index;
+
+	if (clean_status_has_current_full_fsmonitor_proof(istate))
+		return 1;
+	/*
+	 * A provider reset can arrive while the index is being read. The live
+	 * proof is then deliberately invalid, but a complete persistent proof
+	 * and its paired untracked cache remain authenticated candidates for a
+	 * full refresh. Preserve that pre-reset authority across an owned
+	 * worktree update; the repair path still revalidates every component
+	 * before publishing a new proof.
+	 */
+	return clean_status_has_persistent_fsmonitor_semantic_history(istate) &&
+		clean_status_fsmonitor_semantic_baseline_pending(istate) &&
+		!clean_status_fsmonitor_strong_mismatch(istate) &&
+		!clean_status_filter_scope_needs_validation(istate) &&
+		!clean_status_manifest_global_fallback(istate) &&
+		istate->untracked && istate->untracked->root &&
+		istate->untracked->fsmonitor_revalidation;
+}
+
+int wt_status_fsmonitor_proof_needs_repair(struct repository *repo)
+{
+	struct index_state *istate = repo->index;
+
+	if (!fsmonitor_proof_repair_is_eligible(repo, 0))
+		return 0;
+	return fsmonitor_pending_token_from_provider(istate) ||
+		!istate->fsmonitor_untracked_valid ||
+		!istate->untracked->root->valid_recursive;
+}
+
+static void release_repair_status(struct wt_status *status)
+{
+	wt_status_collect_free_buffers(status);
+	string_list_clear(&status->change, 1);
+	string_list_clear(&status->untracked, 0);
+	string_list_clear(&status->ignored, 0);
+	free(status->branch);
+}
+
+static int repair_fsmonitor_proof(
+	struct repository *repo, const char *index_path, int force_refresh,
+	struct wt_status *repaired_status)
+{
+	struct index_state *istate = repo->index;
+	struct wt_status local_status;
+	struct wt_status *status = repaired_status ?
+		repaired_status : &local_status;
+	int no_pending, paired_untracked, valid_root, certifiable_index;
+	int full_proof, repaired = 0;
+
+	if (!fsmonitor_proof_repair_is_eligible(
+		    repo, !!repaired_status))
+		return 0;
+	if (!force_refresh && !wt_status_fsmonitor_proof_needs_repair(repo))
+		return 1;
+
+	wt_status_prepare(repo, status);
+	status->proof_index_path = index_path;
+	status->allow_clean_status_shortcuts = 1;
+	status->certify_clean_status = 1;
+	wt_status_start_untracked_cache_preload(status);
+	/* There is no subsequent diff to consume deferred bulk results. */
+	wt_status_refresh_index(
+		status,
+		REFRESH_QUIET | REFRESH_UNMERGED,
+		1);
+	if (status->certify_active_filter_found)
+		goto done;
+	/* A policy-file update can invalidate the cache during token closure. */
+	wt_status_collect_untracked(status);
+	/* Bind the rebuilt cache and refreshed entries to a fresh token. */
+	if (fsmonitor_reopen_token(istate))
+		wt_status_refresh_index(
+			status,
+			REFRESH_QUIET | REFRESH_UNMERGED,
+			1);
+	if (status->certify_active_filter_found)
+		goto done;
+	untracked_cache_recompute_fsmonitor_valid_recursive(istate->untracked);
+	no_pending = !fsmonitor_has_pending_token(istate);
+	paired_untracked = istate->fsmonitor_untracked_valid &&
+		istate->fsmonitor_last_update &&
+		istate->fsmonitor_untracked_token &&
+		!strcmp(istate->fsmonitor_last_update,
+			istate->fsmonitor_untracked_token);
+	valid_root = istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid_recursive;
+	certifiable_index = clean_status_index_entries_are_certifiable(istate) ||
+		(index_path && locked_index_entries_are_certifiable(istate));
+	full_proof = clean_status_has_current_full_fsmonitor_proof(istate);
+	repaired = !status->certify_untracked_scan_failed && no_pending &&
+		paired_untracked && valid_root && certifiable_index && full_proof;
+	if (repaired_status && repaired) {
+		struct object_id oid;
+
+		status->status_format = STATUS_FORMAT_PORCELAIN_V2;
+		status->show_branch = 0;
+		status->is_initial =
+			repo_get_oid(repo, status->reference, &oid) ? 1 : 0;
+		if (!status->is_initial)
+			oidcpy(&status->oid_commit, &oid);
+		wt_status_collect_changes_worktree(status);
+		if (status->is_initial)
+			wt_status_collect_changes_initial(status);
+		else
+			wt_status_collect_changes_index(status);
+	}
+
+done:
+	if (!repaired_status || !repaired)
+		release_repair_status(status);
+	trace2_data_intmax("fsmonitor", repo,
+			   "history/writer-proof-repaired", repaired);
+	return repaired;
+}
+
+int wt_status_repair_fsmonitor_proof(struct repository *repo)
+{
+	return repair_fsmonitor_proof(repo, NULL, 0, NULL);
+}
+
+int wt_status_prepare_fsmonitor_proof_for_worktree_update(
+	struct repository *repo)
+{
+	if (!has_repairable_fsmonitor_proof_candidate(repo))
+		return 0;
+	if (clean_status_has_current_full_fsmonitor_proof(repo->index))
+		return 1;
+	if (!wt_status_fsmonitor_proof_needs_repair(repo) ||
+	    !wt_status_repair_fsmonitor_proof(repo))
+		return 0;
+	return clean_status_has_current_full_fsmonitor_proof(repo->index);
+}
+
+int wt_status_repair_fsmonitor_proof_at_path(
+	struct repository *repo, const char *index_path)
+{
+	if (!index_path || !*index_path)
+		return 0;
+	return repair_fsmonitor_proof(repo, index_path, 0, NULL);
+}
+
+static int repair_fsmonitor_proof_after_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof,
+	int allow_manifest_refresh, struct wt_status *repaired_status)
+{
+	const char *proof_index_path;
+	int repaired;
+
+	if (!had_full_proof) {
+		trace2_data_string("fsmonitor", repo,
+				   "history/writer-repair-skip", "no-history");
+		return 0;
+	}
+	if (repaired_status && !repo->index->untracked)
+		add_untracked_cache(repo->index);
+	if (!fsmonitor_proof_repair_is_eligible(
+		    repo, !!repaired_status)) {
+		trace2_data_string("fsmonitor", repo,
+				   "history/writer-repair-skip", "ineligible");
+		return 0;
+	}
+	if (!allow_manifest_refresh &&
+	    clean_status_worktree_manifest_needs_refresh(repo->index)) {
+		trace2_data_string("fsmonitor", repo,
+				   "history/writer-repair-skip", "manifest");
+		return 0;
+	}
+	if (!repaired_status &&
+	    !wt_status_fsmonitor_proof_needs_repair(repo) &&
+	    clean_status_has_current_full_fsmonitor_proof(repo->index) &&
+	    locked_index_entries_have_stat_data(repo->index))
+		return 1;
+
+	/* Consume paths written by this process before publishing its index. */
+	fsmonitor_refresh_after_worktree_update(repo->index);
+	prepare_uncertified_index_entries_for_refresh(repo->index);
+	if (write_locked_index(repo->index, lock, PROVISIONAL_LOCK))
+		return -1;
+	proof_index_path = get_lock_file_path(lock);
+	repaired = repair_fsmonitor_proof(
+		repo, proof_index_path, 1, repaired_status);
+	/* Receipt preparation needs read access, but the write must not. */
+#ifdef __APPLE__
+	/* Preserve the read-write reopen historically used on Apple platforms. */
+	if (reopen_lock_file_for_readwrite(lock) < 0 &&
+	    reopen_lock_file(lock) < 0)
+		return -1;
+#else
+	if (reopen_lock_file(lock) < 0)
+		return -1;
+#endif
+	return repaired;
+}
+
+int wt_status_repair_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof)
+{
+	return repair_fsmonitor_proof_after_update(
+		repo, lock, had_full_proof, 0, NULL);
+}
+
+int wt_status_prime_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock)
+{
+	struct wt_status status = { 0 };
+	int repaired;
+
+	prepare_repo_settings(repo);
+	if (repo->settings.core_untracked_cache != UNTRACKED_CACHE_WRITE ||
+	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC)
+		return 0;
+	/*
+	 * A newly created index has no history to repair. Certify its checkout
+	 * under the writer's existing lock, including a complete untracked scan
+	 * and a closing provider query, before the first index is committed.
+	 */
+	clean_status_attach_config(repo->index);
+	if (!repo->index->fsmonitor_token_valid)
+		repo->index->fsmonitor_has_run_once = 0;
+	refresh_fsmonitor(repo->index);
+	repaired = repair_fsmonitor_proof_after_update(
+		repo, lock, 1, 1, &status);
+	if (repaired > 0)
+		release_repair_status(&status);
+	return repaired;
+}
+
+int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
+	struct repository *repo, struct lock_file *lock, int had_full_proof,
+	const struct clean_status_config_digest *config)
+{
+	struct wt_status status = { 0 };
+	struct clean_status_index_snapshot scanned_index = { .fd = -1 };
+	struct clean_status_index_write_receipt written_index =
+		CLEAN_STATUS_INDEX_WRITE_RECEIPT_INIT;
+	int installed = 0;
+	int repaired = repair_fsmonitor_proof_after_update(
+		repo, lock, had_full_proof, 1, &status);
+
+	if (repaired <= 0)
+		return repaired;
+	if (clean_status_write_index_after_provisional(
+		    repo->index, lock, COMMIT_LOCK | SKIP_IF_UNCHANGED,
+		    &written_index)) {
+		clean_status_index_write_receipt_release(&written_index);
+		release_repair_status(&status);
+		return -1;
+	}
+	if (clean_status_sidecar_postwrite_test_barrier())
+		goto done;
+	clean_status_index_adopt_write_receipt(repo->index, &written_index);
+	if (clean_status_index_snapshot_pin(&scanned_index, repo->index))
+		goto done;
+	/* Rebind the repaired proof to the index inode just committed. */
+	discard_index(repo->index);
+	if (repo_read_index(repo) < 0)
+		goto done;
+	if (repo_hold_locked_index(repo, lock, 0) < 0)
+		goto done;
+	if (clean_status_issue_sidecar(
+		    &status, config, lock, &scanned_index, 1))
+		installed = 1;
+	else
+		rollback_lock_file(lock);
+
+done:
+	clean_status_index_write_receipt_release(&written_index);
+	clean_status_index_snapshot_release(&scanned_index);
+	release_repair_status(&status);
+	trace2_data_intmax("status", repo,
+			   "clean-proof/writer-sidecar", installed);
+	return repaired;
+}
+
+int wt_status_clean_sidecar_present(struct repository *repo)
+{
+	struct stat st;
+	char *path = xstrfmt("%s.csts", repo_get_index_file(repo));
+	int present = !lstat(path, &st) && S_ISREG(st.st_mode) &&
+		st.st_nlink == 1;
+
+	free(path);
+	return present;
+}
+
+void wt_status_reissue_clean_sidecar_after_worktree_update(
+	struct repository *repo, int had_full_proof,
+	const struct clean_status_config_digest *config)
+{
+	struct lock_file lock = LOCK_INIT;
+	int repaired;
+
+	/* A missing replacement sidecar safely falls back to normal status. */
+	if (repo_hold_locked_index(repo, &lock, 0) < 0) {
+		trace2_data_string("status", repo,
+				   "clean-proof/writer-sidecar-skip",
+				   "index-lock");
+		return;
+	}
+	/* A child command may have replaced the canonical index inode. */
+	discard_index(repo->index);
+	if (repo_read_index(repo) < 0) {
+		rollback_lock_file(&lock);
+		trace2_data_string("status", repo,
+				   "clean-proof/writer-sidecar-skip",
+				   "index-read");
+		return;
+	}
+	if (!repo->index->fsmonitor_token_valid) {
+		repo->index->fsmonitor_has_run_once = 0;
+		refresh_fsmonitor(repo->index);
+	}
+	repaired = wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
+		repo, &lock, had_full_proof, config);
+	if (repaired < 0) {
+		rollback_lock_file(&lock);
+		trace2_data_string("status", repo,
+				   "clean-proof/writer-sidecar-skip",
+				   "proof-repair");
+		return;
+	}
+	if (!repaired)
+		rollback_lock_file(&lock);
+}
+
+int wt_status_repair_fsmonitor_proof_after_index_update(
+	struct repository *repo, struct lock_file *lock, int had_full_proof)
+{
+	return repair_fsmonitor_proof_after_update(
+		repo, lock, had_full_proof, 1, NULL);
 }
 
 static void wt_status_release_attr_snapshot(struct wt_status *s)
@@ -2425,11 +2910,7 @@ void wt_status_invalidate_refresh(struct wt_status *s)
 	struct index_state *istate = s->repo->index;
 
 	s->tracked_from_fsmonitor = 0;
-	if (s->untracked_from_token_closure) {
-		string_list_clear(&s->untracked, 0);
-		string_list_clear(&s->ignored, 0);
-		s->untracked_from_token_closure = 0;
-	}
+	wt_status_clear_authenticated_untracked(s);
 	wt_status_release_exclude_proof(s);
 	wt_status_release_attr_snapshot(s);
 	if (!s->pathspec.nr && !istate->split_index &&

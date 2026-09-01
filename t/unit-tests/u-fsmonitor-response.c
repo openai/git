@@ -103,6 +103,8 @@ void test_fsmonitor_response__accepts_valid_builtin_responses(void)
 	static const char directory_path[] = "nested/\0";
 	static const char both_paths[] = "merged\0merged/\0";
 	static const char case_path[] = "Tracked\0";
+	static const char nested_git[] =
+		"builtin:12\0scratch/.git/file\0scratch/.git/\0";
 
 	check_response(delta, sizeof(delta) - 1, FSMONITOR_QUERY_DELTA,
 		       "builtin:2", delta + sizeof("builtin:2"),
@@ -112,6 +114,10 @@ void test_fsmonitor_response__accepts_valid_builtin_responses(void)
 		       sizeof(global) - 1 - sizeof("builtin:3"));
 	check_response(trivial, sizeof(trivial) - 1, FSMONITOR_QUERY_TRIVIAL,
 		       "builtin:4", NULL, 0);
+	check_response(nested_git, sizeof(nested_git) - 1,
+		       FSMONITOR_QUERY_DELTA, "builtin:12",
+		       nested_git + sizeof("builtin:12"),
+		       sizeof(nested_git) - 1 - sizeof("builtin:12"));
 
 	check_worktree_event(stale_root, strlen("/repo"), 0, 1,
 			     global_path, sizeof(global_path) - 1);

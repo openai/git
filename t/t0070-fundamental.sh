@@ -21,6 +21,11 @@ test_expect_success POSIXPERM,SANITY 'mktemp to unwritable directory prints file
 	test_grep "cannotwrite/test" err
 '
 
+test_expect_success POSIXPERM,SANITY \
+	'reopen tempfile retains its write-only contract' '
+	test-tool mktemp --reopen-write-only write-only-XXXXXX
+'
+
 test_expect_success 'git_mkstemps_mode does not fail if fd 0 is not open' '
 	git commit --allow-empty -m message <&-
 '

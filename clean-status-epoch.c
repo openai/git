@@ -22,6 +22,7 @@ struct clean_status_proof_epoch {
 	unsigned char attr_hash[GIT_MAX_RAWSZ];
 	unsigned char attr_namespace_hash[GIT_MAX_RAWSZ];
 	unsigned char manifest_hash[GIT_MAX_RAWSZ];
+	char *index_path;
 	uint32_t manifest_flags;
 	unsigned semantic_explicit : 1;
 	unsigned attr_sources_present : 1;
@@ -54,10 +55,10 @@ static int config_matches_epoch(
 			algo->rawsz);
 }
 
-struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
+static struct clean_status_proof_epoch *capture_proof_epoch(
 	struct index_state *istate,
 	const struct attr_source_snapshot *attrs,
-	int validate_filter_scope)
+	int validate_filter_scope, const char *index_path)
 {
 	struct clean_status_state *state = istate->clean_status;
 	struct clean_status_proof_epoch *epoch;
@@ -97,12 +98,17 @@ struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
 		   istate->repo->hash_algo->rawsz) ||
 	    memcmp(digest.semantic_hash, state->current_semantic_hash,
 		   istate->repo->hash_algo->rawsz) ||
-	    clean_status_index_snapshot_pin_proof_epoch(&index, istate))
+	    (index_path ?
+	     clean_status_index_snapshot_pin_path_proof_epoch(
+		     &index, istate, index_path) :
+	     clean_status_index_snapshot_pin_proof_epoch(&index, istate)))
 		return NULL;
 
 	CALLOC_ARRAY(epoch, 1);
 	epoch->istate = istate;
 	epoch->index = index;
+	epoch->index_path = xstrdup(index_path ? index_path :
+				     istate->repo->index_file);
 	epoch->scan_start_token = xstrdup(istate->fsmonitor_last_update_pending);
 	memcpy(epoch->config_hash, state->current_config_hash,
 	       istate->repo->hash_algo->rawsz);
@@ -125,6 +131,26 @@ struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
 	trace2_data_intmax("fsmonitor", istate->repo,
 			   "semantic/proof-epoch-captured", 1);
 	return epoch;
+}
+
+struct clean_status_proof_epoch *clean_status_capture_proof_epoch(
+	struct index_state *istate,
+	const struct attr_source_snapshot *attrs,
+	int validate_filter_scope)
+{
+	return capture_proof_epoch(
+		istate, attrs, validate_filter_scope, NULL);
+}
+
+struct clean_status_proof_epoch *clean_status_capture_proof_epoch_at_path(
+	struct index_state *istate,
+	const struct attr_source_snapshot *attrs,
+	int validate_filter_scope, const char *index_path)
+{
+	if (!index_path || !*index_path)
+		return NULL;
+	return capture_proof_epoch(
+		istate, attrs, validate_filter_scope, index_path);
 }
 
 int clean_status_proof_epoch_start_token_matches(
@@ -174,8 +200,8 @@ static int proof_epoch_matches(
 	    memcmp(state->manifest.current_hash, epoch->manifest_hash,
 		   algo->rawsz) ||
 	    !config_matches_epoch(istate, epoch) ||
-	    !clean_status_index_snapshot_still_matches_proof_epoch(
-		    &epoch->index, istate))
+	    !clean_status_index_snapshot_still_matches_path_proof_epoch(
+		    &epoch->index, istate, epoch->index_path))
 		goto done;
 	matched = 1;
 done:
@@ -217,6 +243,7 @@ void clean_status_release_proof_epoch(
 	if (!epoch)
 		return;
 	clean_status_index_snapshot_release(&epoch->index);
+	free(epoch->index_path);
 	free(epoch->scan_start_token);
 	free(epoch);
 }
