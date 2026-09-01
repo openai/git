@@ -198,6 +198,9 @@ int wt_status_prepare_fsmonitor_proof_for_worktree_update(
 int wt_status_fsmonitor_proof_needs_repair(struct repository *repo);
 int wt_status_repair_fsmonitor_proof_after_worktree_update(
 	struct repository *repo, struct lock_file *lock, int had_full_proof);
+/* The caller owns the mandatory index lock for the initial checkout. */
+int wt_status_prime_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock);
 int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
 	struct repository *repo, struct lock_file *lock, int had_full_proof,
 	const struct clean_status_config_digest *config);

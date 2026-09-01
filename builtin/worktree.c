@@ -401,14 +401,21 @@ worktree_copy_cleanup:
 }
 
 static int checkout_worktree(const struct add_opts *opts,
-			     struct strvec *child_env)
+			     struct strvec *child_env, const char *path)
 {
 	struct child_process cp = CHILD_PROCESS_INIT;
 	cp.git_cmd = 1;
 	strvec_pushl(&cp.args, "reset", "--hard", "--no-recurse-submodules", NULL);
 	if (opts->quiet)
 		strvec_push(&cp.args, "--quiet");
-	strvec_pushv(&cp.env, child_env->v);
+	if (path) {
+		/* Let the checkout authenticate the registered worktree's index. */
+		cp.dir = path;
+		strvec_pushl(&cp.env, GIT_DIR_ENVIRONMENT,
+			      GIT_WORK_TREE_ENVIRONMENT, NULL);
+	} else {
+		strvec_pushv(&cp.env, child_env->v);
+	}
 	return run_command(&cp);
 }
 
@@ -418,10 +425,9 @@ static void prime_worktree_clean_status_proof(const char *path)
 	int ret;
 
 	/*
-	 * The checkout creates the linked index before it has a provider epoch
-	 * from which to certify the worktree.  Establish that epoch while this
-	 * writer can still update the index; a later read-only status cannot
-	 * persist the missing proof.
+	 * The checkout may have certified its new index, but post-checkout can
+	 * change files or replace the index. Recheck while optional writes are
+	 * allowed so that later read-only status can reuse a durable proof.
 	 */
 	cp.git_cmd = 1;
 	cp.dir = path;
@@ -450,6 +456,19 @@ static int worktree_clean_status_proof_is_enabled(const char *git_dir,
 		repo.settings.core_untracked_cache == UNTRACKED_CACHE_WRITE;
 	repo_clear(&repo);
 	return enabled;
+}
+
+static int worktree_clean_status_context_is_supported(void)
+{
+	const char *global = getenv("GIT_CONFIG_GLOBAL");
+	const char *system = getenv("GIT_CONFIG_SYSTEM");
+
+	return !getenv(INDEX_ENVIRONMENT) &&
+		!getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
+		!getenv(DB_ENVIRONMENT) &&
+		!getenv(ALTERNATE_DB_ENVIRONMENT) &&
+		(!global || !*global || is_absolute_path(global)) &&
+		(!system || !*system || is_absolute_path(system));
 }
 
 static int make_worktree_orphan(const char * ref, const struct add_opts *opts,
@@ -634,7 +653,10 @@ static int add_worktree(const char *path, const char *refname,
 		goto done;
 
 	if (opts->checkout &&
-	    (ret = checkout_worktree(opts, &child_env)))
+	    (ret = checkout_worktree(opts, &child_env,
+		worktree_clean_status_context_is_supported() &&
+		worktree_clean_status_proof_is_enabled(sb_repo.buf, path) ?
+		path : NULL)))
 		goto done;
 	is_junk = 0;
 	FREE_AND_NULL(junk_work_tree);
@@ -665,10 +687,7 @@ done:
 		ret = run_hooks_opt(the_repository, "post-checkout", &opt);
 	}
 	if (!ret && opts->checkout && use_optional_locks() &&
-	    !getenv(INDEX_ENVIRONMENT) &&
-	    !getenv(GIT_COMMON_DIR_ENVIRONMENT) &&
-	    !getenv(DB_ENVIRONMENT) &&
-	    !getenv(ALTERNATE_DB_ENVIRONMENT) &&
+	    worktree_clean_status_context_is_supported() &&
 	    worktree_clean_status_proof_is_enabled(sb_repo.buf, path))
 		prime_worktree_clean_status_proof(path);
 

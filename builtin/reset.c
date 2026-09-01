@@ -538,6 +538,9 @@ int cmd_reset(int argc,
 		int repair_after_reset = reset_type == HARD &&
 			clean_status_has_current_full_fsmonitor_proof(
 				the_repository->index);
+		/* A missing index has not acquired an on-disk version yet. */
+		int prime_after_reset = reset_type == HARD &&
+			!the_repository->index->version;
 
 		repo_hold_locked_index(the_repository, &lock,
 				       LOCK_DIE_ON_ERROR);
@@ -589,7 +592,11 @@ int cmd_reset(int argc,
 		    !the_repository->index->cache_changed &&
 		    !hook_exists(the_repository, "post-index-change"))
 			write_flags |= SKIP_IF_UNCHANGED;
-		if (reset_type == HARD &&
+		if (prime_after_reset) {
+			if (wt_status_prime_fsmonitor_proof_after_worktree_update(
+				    the_repository, &lock) < 0)
+				die(_("Could not prepare new index file."));
+		} else if (reset_type == HARD &&
 		    wt_status_repair_fsmonitor_proof_after_worktree_update(
 			    the_repository, &lock, repair_after_reset) < 0)
 			die(_("Could not repair new index file."));

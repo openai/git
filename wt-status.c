@@ -1157,7 +1157,8 @@ void wt_status_start_untracked_cache_preload(struct wt_status *s)
 
 	if (s->untracked_cache_preload)
 		BUG("untracked-cache preload already started");
-	if (!use_optional_locks())
+	/* An index writer can certify under the lock it already owns. */
+	if (!use_optional_locks() && !s->proof_index_path)
 		s->certify_clean_status = 0;
 	wt_status_begin_attr_snapshot(s);
 	/* Record the provider token before either filesystem traversal. */
@@ -2647,7 +2648,8 @@ static int repair_fsmonitor_proof(
 		istate->fsmonitor_untracked_token &&
 		!strcmp(istate->fsmonitor_last_update,
 			istate->fsmonitor_untracked_token);
-	valid_root = istate->untracked->root->valid_recursive;
+	valid_root = istate->untracked && istate->untracked->root &&
+		istate->untracked->root->valid_recursive;
 	certifiable_index = clean_status_index_entries_are_certifiable(istate) ||
 		(index_path && locked_index_entries_are_certifiable(istate));
 	full_proof = clean_status_has_current_full_fsmonitor_proof(istate);
@@ -2761,6 +2763,32 @@ int wt_status_repair_fsmonitor_proof_after_worktree_update(
 {
 	return repair_fsmonitor_proof_after_update(
 		repo, lock, had_full_proof, 0, NULL);
+}
+
+int wt_status_prime_fsmonitor_proof_after_worktree_update(
+	struct repository *repo, struct lock_file *lock)
+{
+	struct wt_status status = { 0 };
+	int repaired;
+
+	prepare_repo_settings(repo);
+	if (repo->settings.core_untracked_cache != UNTRACKED_CACHE_WRITE ||
+	    fsm_settings__get_mode(repo) != FSMONITOR_MODE_IPC)
+		return 0;
+	/*
+	 * A newly created index has no history to repair. Certify its checkout
+	 * under the writer's existing lock, including a complete untracked scan
+	 * and a closing provider query, before the first index is committed.
+	 */
+	clean_status_attach_config(repo->index);
+	if (!repo->index->fsmonitor_token_valid)
+		repo->index->fsmonitor_has_run_once = 0;
+	refresh_fsmonitor(repo->index);
+	repaired = repair_fsmonitor_proof_after_update(
+		repo, lock, 1, 1, &status);
+	if (repaired > 0)
+		release_repair_status(&status);
+	return repaired;
 }
 
 int wt_status_repair_fsmonitor_proof_after_update_with_sidecar(
