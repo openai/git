@@ -543,6 +543,15 @@ static void batch_object_write(const char *obj_name,
 		if (opt->objects_filter.choice == LOFC_BLOB_LIMIT)
 			data->info.sizep = &data->size;
 
+		/*
+		 * With "--batch-all-objects --unordered" we read straight
+		 * from the pack the walk handed us.  If a concurrent repack
+		 * removed it, fall back to a normal lookup; is_pack_valid()
+		 * pins the pack's fd, so a passing check stays valid even if
+		 * the pack is unlinked right after.
+		 */
+		if (pack && !is_pack_valid(pack))
+			pack = NULL;
 		if (pack)
 			ret = packed_object_info(NULL, pack, offset, &data->info);
 		else
