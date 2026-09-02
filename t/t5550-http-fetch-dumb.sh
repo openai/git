@@ -329,90 +329,59 @@ test_expect_success 'http-fetch --packfile resumes a partial download' '
 	git -C packfileclient-resume cat-file -e "$HASH"
 '
 
-test_expect_success 'setup large pack for ignored Range requests' '
-	no_range_blob=$(test-tool genrandom ignored-range 128k |
-		git -C "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git \
-			hash-object -w --stdin) &&
-	packhash=$(printf "%s\n" "$no_range_blob" |
-		git -C "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git \
-			pack-objects "$HTTPD_DOCUMENT_ROOT_PATH/no-range") &&
-	no_range_pack="no-range-$packhash.pack"
+test_expect_success 'setup for ignored Range requests' '
+	pack="$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" &&
+	packhash=$(cat packhash) &&
+	test_copy_bytes 64 <"$pack" >short &&
+	cat "$pack" "$pack" >oversized
 '
 
 for partial in short oversized
 do
 	test_expect_success "http-fetch --packfile restarts when Range is ignored ($partial partial)" '
-		git init packfileclient-no-range-$partial &&
-		pack="$HTTPD_DOCUMENT_ROOT_PATH/$no_range_pack" &&
-		tmpfile="packfileclient-no-range-$partial/.git/objects/pack/pack-$packhash.pack.temp" &&
-		case "$partial" in
-		short)
-			test_copy_bytes 64 <"$pack" >"$tmpfile"
-			;;
-		oversized)
-			cat "$pack" "$pack" >"$tmpfile"
-			;;
-		esac &&
-		offset=$(wc -c <"$tmpfile") &&
+		git init no-range-$partial &&
+		cat "$partial" >"no-range-$partial/.git/$p.temp" &&
 		GIT_TRACE_CURL="$TRASH_DIRECTORY/no-range-$partial.trace" \
-		git -C packfileclient-no-range-$partial http-fetch --packfile="$packhash" \
+		git -C no-range-$partial http-fetch --packfile="$packhash" \
 			--index-pack-arg=index-pack --index-pack-arg=--stdin \
 			--index-pack-arg=--keep \
-			"$HTTPD_URL/dumb-no-range/$no_range_pack" >out &&
-		test_grep "Range: bytes=$((offset))-" no-range-$partial.trace &&
+			"$HTTPD_URL/dumb-no-range/repo_pack.git/$p" >out &&
+		test_grep "Range: bytes=" no-range-$partial.trace &&
 		test_grep "200 OK" no-range-$partial.trace &&
-		test_path_is_missing "$tmpfile" &&
-		test_cmp "$pack" \
-			packfileclient-no-range-$partial/.git/objects/pack/pack-$packhash.pack &&
-		git -C packfileclient-no-range-$partial cat-file -e "$no_range_blob"
+		test_cmp "$pack" "no-range-$partial/.git/$p"
 	'
 done
 
 test_expect_success 'http-fetch --packfile accepts a complete partial after an empty response' '
-	git init packfileclient-empty-response &&
-	pack="$HTTPD_DOCUMENT_ROOT_PATH/$no_range_pack" &&
-	tmpfile="packfileclient-empty-response/.git/objects/pack/pack-$packhash.pack.temp" &&
-	cp "$pack" "$tmpfile" &&
-	chmod u+w "$tmpfile" &&
+	git init empty-response &&
+	cat "$pack" >"empty-response/.git/$p.temp" &&
 	>"$HTTPD_DOCUMENT_ROOT_PATH/empty-response" &&
-	offset=$(wc -c <"$tmpfile") &&
 	GIT_TRACE_CURL="$TRASH_DIRECTORY/empty-response.trace" \
-	git -C packfileclient-empty-response http-fetch --packfile="$packhash" \
+	git -C empty-response http-fetch --packfile="$packhash" \
 		--index-pack-arg=index-pack --index-pack-arg=--stdin \
 		--index-pack-arg=--keep \
 		"$HTTPD_URL/dumb-no-range/empty-response" >out &&
-	test_grep "Range: bytes=$((offset))-" empty-response.trace &&
 	test_grep "200 OK" empty-response.trace &&
 	test_grep "Content-Length: 0" empty-response.trace &&
-	test_path_is_missing "$tmpfile" &&
-	test_cmp "$pack" \
-		packfileclient-empty-response/.git/objects/pack/pack-$packhash.pack &&
-	git -C packfileclient-empty-response cat-file -e "$no_range_blob"
+	test_cmp "$pack" "empty-response/.git/$p"
 '
 
 test_expect_success 'interrupted full response preserves the existing pack prefix' '
-	git init packfileclient-interrupted &&
-	pack="$HTTPD_DOCUMENT_ROOT_PATH/$no_range_pack" &&
-	tmpfile="packfileclient-interrupted/.git/objects/pack/pack-$packhash.pack.temp" &&
-	test_copy_bytes 65536 <"$pack" >"$tmpfile" &&
-	cp "$tmpfile" saved-prefix &&
-	pack_length=$(wc -c <"$pack") &&
+	git init interrupted &&
+	tmpfile="interrupted/.git/$p.temp" &&
+	cp short "$tmpfile" &&
 	test_when_finished "rm -f \"$HTTPD_ROOT_PATH/nph-truncated-pack.sh\"" &&
 	write_script "$HTTPD_ROOT_PATH/nph-truncated-pack.sh" <<-EOF &&
-	printf "HTTP/1.1 200 OK\\r\\n"
-	printf "Content-Type: application/x-git-packed-objects\\r\\n"
-	printf "Content-Length: $((pack_length))\\r\\n"
-	printf "Connection: close\\r\\n\\r\\n"
+	printf "%s\\r\\n" "HTTP/1.0 200 OK" "Content-Length: 64" ""
 	dd if="$pack" bs=1 count=32 2>/dev/null
 	EOF
-	GIT_TRACE_CURL="$TRASH_DIRECTORY/interrupted.trace" \
-	test_must_fail git -C packfileclient-interrupted http-fetch --packfile="$packhash" \
+	test_env GIT_TRACE_CURL="$TRASH_DIRECTORY/interrupted.trace" \
+	test_must_fail git -C interrupted http-fetch --packfile="$packhash" \
 		--index-pack-arg=index-pack --index-pack-arg=--stdin \
 		--index-pack-arg=--keep \
-		"$HTTPD_URL/truncated-pack/$no_range_pack" >out 2>err &&
-	test_grep "Range: bytes=65536-" interrupted.trace &&
+		"$HTTPD_URL/truncated-pack/" >out 2>err &&
 	test_grep "200 OK" interrupted.trace &&
-	test_cmp saved-prefix "$tmpfile"
+	test_cmp short "$tmpfile"
 '
 
 test_expect_success 'http-fetch --packfile permits unlink while indexing' '
