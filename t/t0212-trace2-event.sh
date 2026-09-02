@@ -407,4 +407,11 @@ test_expect_success 'URL signature redaction can be disabled' '
 	test_grep "\"event\":\"error\".*sig=secret" trace.event
 '
 
+test_expect_success 'alias events redact URL signatures' '
+	test_when_finished "rm trace.event" &&
+	test_config alias.redact "rev-parse --sq-quote https://example.com/?sig=secret" &&
+	GIT_TRACE2_EVENT="$(pwd)/trace.event" git redact >/dev/null &&
+	test_grep "\"event\":\"alias\".*sig=<REDACTED>" trace.event
+'
+
 test_done
