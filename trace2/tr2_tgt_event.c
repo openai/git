@@ -238,15 +238,31 @@ static void fn_error_va_fl(const char *file, int line, const char *fmt,
 
 	jw_object_begin(&jw, 0);
 	event_fmt_prepare(event_name, file, line, NULL, &jw);
-	maybe_add_string_va(&jw, "msg", fmt, ap);
+	if (fmt && *fmt) {
+		struct strbuf message = STRBUF_INIT;
+		va_list copy_ap;
+
+		va_copy(copy_ap, ap);
+		strbuf_vaddf(&message, fmt, copy_ap);
+		va_end(copy_ap);
+		tr2_redact_error(&message, 0);
+		jw_object_string(&jw, "msg", message.buf);
+		strbuf_release(&message);
+	}
 	/*
 	 * Also emit the format string as a field in case
 	 * post-processors want to aggregate common error
 	 * messages by type without argument fields (such
 	 * as pathnames or branch names) cluttering it up.
 	 */
-	if (fmt && *fmt)
-		jw_object_string(&jw, "fmt", fmt);
+	if (fmt && *fmt) {
+		struct strbuf format = STRBUF_INIT;
+
+		strbuf_addstr(&format, fmt);
+		tr2_redact_error(&format, 1);
+		jw_object_string(&jw, "fmt", format.buf);
+		strbuf_release(&format);
+	}
 	jw_end(&jw);
 
 	tr2_dst_write_line(&tr2dst_event, &jw.json);
