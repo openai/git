@@ -2736,7 +2736,7 @@ void http_install_packfile(struct packed_git *p,
 }
 
 static size_t fwrite_pack_file(char *ptr, size_t eltsize, size_t nmemb,
-			      void *data)
+			       void *data)
 {
 	struct http_pack_request *preq = data;
 
@@ -2747,7 +2747,7 @@ static size_t fwrite_pack_file(char *ptr, size_t eltsize, size_t nmemb,
 	if (preq->check_resume) {
 		long http_code;
 		CURLcode c = curl_easy_getinfo(preq->slot->curl,
-					      CURLINFO_HTTP_CODE, &http_code);
+					       CURLINFO_HTTP_CODE, &http_code);
 
 		if (c != CURLE_OK)
 			BUG("curl_easy_getinfo for HTTP code failed: %s",
