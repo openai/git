@@ -221,6 +221,9 @@ struct http_pack_request {
 	 */
 	const char **index_pack_args;
 	unsigned preserve_index_pack_stdout : 1;
+	/* Check the first response bytes before appending to a saved pack. */
+	unsigned check_resume : 1;
+	unsigned truncate_on_finish : 1;
 
 	FILE *packfile;
 	struct strbuf tmpfile;

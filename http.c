@@ -2687,13 +2687,24 @@ static const char *default_index_pack_args[] =
 int finish_http_pack_request(struct http_pack_request *preq)
 {
 	struct child_process ip = CHILD_PROCESS_INIT;
+	off_t truncate_to = -1;
 	int tmpfile_fd;
 	int ret = 0;
+
+	if (preq->truncate_on_finish) {
+		truncate_to = ftello(preq->packfile);
+		if (truncate_to < 0)
+			die_errno("unable to determine local file position %s for pack",
+				  preq->tmpfile.buf);
+	}
 
 	/* Another downloader may unlink the staging path while we index it. */
 	tmpfile_fd = xdup(fileno(preq->packfile));
 	fclose(preq->packfile);
 	preq->packfile = NULL;
+	if (truncate_to >= 0 && ftruncate(tmpfile_fd, truncate_to) < 0)
+		die_errno("unable to truncate local file %s for pack",
+			  preq->tmpfile.buf);
 	if (lseek(tmpfile_fd, 0, SEEK_SET) < 0)
 		die_errno("unable to seek local file %s for pack",
 			  preq->tmpfile.buf);
@@ -2722,6 +2733,46 @@ void http_install_packfile(struct packed_git *p,
 	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
 	packfile_list_remove(list_to_remove_from, p);
 	packfile_store_add_pack(files->packed, p);
+}
+
+static size_t fwrite_pack_file(char *ptr, size_t eltsize, size_t nmemb,
+			      void *data)
+{
+	struct http_pack_request *preq = data;
+
+	/* An empty response must leave any saved pack for index-pack to check. */
+	if (!nmemb)
+		return 0;
+
+	if (preq->check_resume) {
+		long http_code;
+		CURLcode c = curl_easy_getinfo(preq->slot->curl,
+					      CURLINFO_HTTP_CODE, &http_code);
+
+		if (c != CURLE_OK)
+			BUG("curl_easy_getinfo for HTTP code failed: %s",
+			    curl_easy_strerror(c));
+		if (http_code >= 300)
+			return nmemb;
+
+		/*
+		 * A server may ignore our Range header and send the entire
+		 * pack. Rewind before writing, but leave the old tail until
+		 * the replacement is complete: another downloader may still
+		 * be reading or writing the same temporary file.
+		 */
+		if (http_code == 200) {
+			if (fseek(preq->packfile, 0, SEEK_SET)) {
+				error_errno("unable to restart local file %s for pack",
+					    preq->tmpfile.buf);
+				return 0;
+			}
+			preq->truncate_on_finish = 1;
+		}
+		preq->check_resume = 0;
+	}
+
+	return fwrite(ptr, eltsize, nmemb, preq->packfile);
 }
 
 struct http_pack_request *new_http_pack_request(
@@ -2781,12 +2832,13 @@ struct http_pack_request *new_direct_http_pack_request(
 
 	preq->slot = get_active_slot();
 	preq->headers = object_request_headers();
-	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq->packfile);
-	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_pack_file);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
 
 	if (prev_posn > 0) {
+		preq->check_resume = 1;
 		if (http_is_verbose)
 			fprintf(stderr,
 				"Resuming fetch of pack %s at byte %"PRIuMAX"\n",
