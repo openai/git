@@ -1008,10 +1008,10 @@ static int batch_one_object_oi(const struct object_id *oid,
 	return payload->callback(oid, NULL, 0, payload->payload);
 }
 
-static void batch_each_object(struct batch_options *opt,
-			      for_each_object_fn callback,
-			      unsigned flags,
-			      void *_payload)
+static int batch_each_object(struct batch_options *opt,
+			     for_each_object_fn callback,
+			     unsigned flags,
+			     void *_payload)
 {
 	struct for_each_object_payload payload = {
 		.callback = callback,
@@ -1026,8 +1026,8 @@ static void batch_each_object(struct batch_options *opt,
 		.filter = &opt->objects_filter,
 	};
 
-	odb_for_each_object_ext(the_repository->objects, &oi,
-				batch_one_object_oi, &payload, &opts);
+	return odb_for_each_object_ext(the_repository->objects, &oi,
+				       batch_one_object_oi, &payload, &opts);
 }
 
 static int batch_objects(struct batch_options *opt)
@@ -1084,20 +1084,22 @@ static int batch_objects(struct batch_options *opt)
 
 			cb.seen = &seen;
 
-			batch_each_object(opt, batch_unordered_object,
-					  ODB_FOR_EACH_OBJECT_PACK_ORDER, &cb);
+			retval = batch_each_object(opt, batch_unordered_object,
+						   ODB_FOR_EACH_OBJECT_PACK_ORDER, &cb);
 
 			oidset_clear(&seen);
 		} else {
 			struct oid_array sa = OID_ARRAY_INIT;
 
-			batch_each_object(opt, collect_object, 0, &sa);
+			retval = batch_each_object(opt, collect_object, 0, &sa);
 			oid_array_for_each_unique(&sa, batch_object_cb, &cb);
 
 			oid_array_clear(&sa);
 		}
 
 		strbuf_release(&output);
+		if (retval)
+			return error(_("unable to enumerate all objects"));
 		return 0;
 	}
 
