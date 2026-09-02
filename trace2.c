@@ -560,14 +560,19 @@ void trace2_cmd_alias_fl(const char *file, int line, const char *alias,
 			 const char **argv)
 {
 	struct tr2_tgt *tgt_j;
+	const char **redacted;
 	int j;
 
 	if (!trace2_enabled)
 		return;
 
+	redacted = redact_argv(argv);
+
 	for_each_wanted_builtin (j, tgt_j)
 		if (tgt_j->pfn_alias_fl)
-			tgt_j->pfn_alias_fl(file, line, alias, argv);
+			tgt_j->pfn_alias_fl(file, line, alias, redacted);
+
+	free_redacted_argv(redacted, argv);
 }
 
 void trace2_cmd_list_config_fl(const char *file, int line)
