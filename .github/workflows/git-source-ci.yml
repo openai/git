@@ -1,0 +1,47 @@
+name: Test composed Git source
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Git test suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev \
+            libexpat1-dev libssl-dev zlib1g-dev libpcre2-dev gettext
+
+      - name: Build and test the exact candidate
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GIT_TEST_OPTS: --verbose-log -x
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cp config.mak.openai config.mak
+          make -j2 NO_RUST=YesPlease NO_GETTEXT=YesPlease NO_TCLTK=YesPlease test
+
+      - name: Retain test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: git-source-test-diagnostics
+          path: t/test-results/
+          retention-days: 7

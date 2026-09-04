@@ -4,6 +4,9 @@
 branch distributed with Codex. `codex-unstable` starts from the exact
 generated `codex` commit and adds preview topics.
 
+Distribution builds and completed-release manifests are described in
+[Git distribution releases](RELEASES.md).
+
 Both lane branches are outputs. Do not merge topic pull requests into them or
 push ordinary updates to them. The orphan `meta` branch is the source of
 truth and contains the controller, reusable workflows, ruleset recipes, and
