@@ -352,3 +352,7 @@ An unstable release records both
 `source_ref=refs/heads/codex-unstable` and its exact `source_sha` in the
 release body. New releases therefore say plainly that they came from the
 unstable lane.
+
+`codex-branch.sh assemble-plan` reuses pinned replay without admission or
+publication. It accepts an explicit base and ordered source boundaries,
+disables hooks and cached conflict resolutions, and preserves failed sessions.
