@@ -117,6 +117,12 @@ controller or workflow paths. A prerequisite change is deliberately not an
 alter: retire and re-add the topic under a newly reviewed ancestry, or extend
 the policy explicitly.
 
+The three inherited CI workflows may take the exact full-SHA replacements
+listed in `ci_workflow_pins_are_reviewed()`. Those entries allow the reviewed
+action pins without admitting other workflow edits or mode changes. A stable
+topic carries the replacements into both output lanes; changes to the
+approved workflow contents require another controller review.
+
 ## Day-to-day commands
 
 Start a production topic from `master`, or from its intended production
