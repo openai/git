@@ -69,7 +69,7 @@ jobs:
       upstream_tag: ${{ steps.version.outputs.upstream_tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -198,7 +198,7 @@ jobs:
       # Keep the packaging contract, dependency pins, and platform build logic
       # aligned with the artifacts already consumed by Codex and GitHub Desktop.
       - name: Check out Dugite Native
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: dreynaud-oai/dugite-native
           ref: b6f4473557acb85433fdf9deffe0854a34fd9cc5
@@ -207,7 +207,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out this Git revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: dugite-native/git
@@ -338,7 +338,7 @@ jobs:
 
       - name: Set up Git for Windows SDK
         if: matrix.target_platform == 'win32'
-        uses: git-for-windows/setup-git-for-windows-sdk@v2
+        uses: git-for-windows/setup-git-for-windows-sdk@335917db02da4280d3d5e87915d7b86196677f9f # v2
         with:
           architecture: ${{ matrix.sdk_arch }}
           flavor: ${{ matrix.sdk_flavor }}
@@ -517,7 +517,7 @@ jobs:
           test "$tar_bytes" -le "$MAX_TAR_BYTES"
 
       - name: Upload release assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: git-${{ matrix.asset_platform }}-${{ matrix.arch }}
           path: dugite-native/output/git-*
@@ -544,7 +544,7 @@ jobs:
       contents: write
     steps:
       - name: Download release assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: git-*
           path: artifacts
