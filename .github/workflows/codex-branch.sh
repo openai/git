@@ -347,12 +347,8 @@ legacy_control_paths_unchanged () (
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
-		.github/RELEASES.md \
-		.github/release \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
-		.github/rulesets/git-release-catalog.json.in \
-		.github/rulesets/git-release-tags.json.in \
 		.github/rulesets/codex-pins.json \
 		.github/rulesets/codex-pins-immutable.json \
 		.github/rulesets/codex-plan-branches.json \
@@ -373,8 +369,7 @@ legacy_control_paths_unchanged () (
 		codex-unstable.plan \
 		codex.release-recovery \
 		codex.config \
-		t/t9906-git-release.sh \
-		t/t9906 \
+		t/t9906-codex-replay.sh \
 		t/t9905-codex-branch.sh
 )
 
@@ -383,12 +378,8 @@ meta_control_paths_unchanged () (
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
-		.github/release \
-		.github/RELEASES.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
-		.github/rulesets/git-release-catalog.json.in \
-		.github/rulesets/git-release-tags.json.in \
 		.github/rulesets/codex-pins.json \
 		.github/rulesets/codex-pins-immutable.json \
 		.github/rulesets/codex-plan-branches.json \
@@ -410,8 +401,7 @@ meta_control_paths_unchanged () (
 		codex.release-recovery \
 		codex.config \
 		t/t9905-codex-branch.sh \
-		t/t9906-git-release.sh \
-		t/t9906 &&
+		t/t9906-codex-replay.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		':(glob).github/workflows/*.yml' \
 		':(glob).github/workflows/*.yaml' \
@@ -8205,12 +8195,8 @@ topic_control_paths_unchanged () (
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
-		.github/release \
-		.github/RELEASES.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
-		.github/rulesets/git-release-catalog.json.in \
-		.github/rulesets/git-release-tags.json.in \
 		.github/rulesets/codex-pins.json \
 		.github/rulesets/codex-pins-immutable.json \
 		.github/rulesets/codex-plan-branches.json \
@@ -8232,8 +8218,7 @@ topic_control_paths_unchanged () (
 		codex-unstable.plan \
 		codex.release-recovery \
 		codex.config \
-		t/t9906-git-release.sh \
-		t/t9906 \
+		t/t9906-codex-replay.sh \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		':(glob).github/workflows/*.yml' \
