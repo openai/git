@@ -1,0 +1,95 @@
+name: Publish a complete Git release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      recipe_sha:
+        required: true
+        type: string
+      import_workflows:
+        description: Private source imports can contain reviewed upstream workflow files.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Both channels update one catalog. Builds remain concurrent; serialize only
+# this short publication transaction, without cancelling an in-flight upload.
+concurrency:
+  group: git-release-publisher-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: git-release
+    steps:
+      - name: Limit workflow imports to private callers
+        if: inputs.import_workflows
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+        run: test "$PRIVATE" = true
+
+      - name: Create a publisher token for this repository only
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: publisher
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: read
+          permission-actions: read
+          permission-workflows: ${{ inputs.import_workflows && 'write' || '' }}
+
+      - name: Check out pinned publication code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: openai/git
+          ref: ${{ inputs.recipe_sha }}
+          path: release-tooling
+          persist-credentials: false
+
+      - name: Check out current reviewed configuration
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: meta
+          path: release-control
+          fetch-depth: 0
+          token: ${{ steps.publisher.outputs.token }}
+
+      - name: Download frozen release inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-inputs
+          path: release-inputs
+
+      - name: Download all native builds from this run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: git-${{ inputs.version }}-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify and publish immutable release assets
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git -C release-tooling rev-parse HEAD)" = "$RECIPE_SHA"
+          jq -e --arg version "$VERSION" --arg recipe "$RECIPE_SHA" --arg run "$GITHUB_RUN_ID" '
+            .version == $version and
+            .recipe == {repository:"openai/git",sha:$recipe} and
+            .run_id == $run' release-inputs/candidate.json
+          bash release-tooling/.github/release/release.sh \
+            --config release-control/.github/release/config.json --worktree release-control \
+            publish --candidate release-inputs/candidate.json --artifacts artifacts

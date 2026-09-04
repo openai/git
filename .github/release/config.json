@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "repository": "openai/git",
+  "visibility": "public",
+  "control_ref": "refs/heads/meta",
+  "catalog_ref": "refs/heads/release-catalog",
+  "recipe_repository": "openai/git",
+  "channels": {
+    "codex": {
+      "kind": "ledger",
+      "enabled": true,
+      "ref": "refs/heads/codex",
+      "ledger_path": "codex.config",
+      "ledger_key": "codex.output-tip",
+      "prerelease": true
+    },
+    "codex-unstable": {
+      "kind": "ledger",
+      "enabled": true,
+      "ref": "refs/heads/codex-unstable",
+      "ledger_path": "codex.config",
+      "ledger_key": "codex-unstable.output-tip",
+      "prerelease": true
+    }
+  },
+  "topic_sets": {}
+}

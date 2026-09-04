@@ -7,6 +7,7 @@ tmp_dir=
 temporary_worktree=
 preserve_worktree=
 timings_file=
+replay_rerere=true
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path=${CODEX_ENTRYPOINT:-$script_dir/$(basename "$0")}
 meta_config_path=codex.config
@@ -95,6 +96,8 @@ usage () {
 		[--codex <branch>] --inputs-oid <oid> [--worktree <path>]
 	   or: codex-branch continue --worktree <path>
 	   or: codex-branch publish-topics --worktree <path>
+	   or: codex-branch assemble-plan --base <oid> --name <channel>
+		--plan <path> --session <new-directory> --result <path>
 	EOF
 }
 
@@ -344,8 +347,12 @@ legacy_control_paths_unchanged () (
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
+		.github/RELEASES.md \
+		.github/release \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
+		.github/rulesets/git-release-catalog.json.in \
+		.github/rulesets/git-release-tags.json.in \
 		.github/rulesets/codex-pins.json \
 		.github/rulesets/codex-pins-immutable.json \
 		.github/rulesets/codex-plan-branches.json \
@@ -366,6 +373,8 @@ legacy_control_paths_unchanged () (
 		codex-unstable.plan \
 		codex.release-recovery \
 		codex.config \
+		t/t9906-git-release.sh \
+		t/t9906 \
 		t/t9905-codex-branch.sh
 )
 
@@ -374,8 +383,12 @@ meta_control_paths_unchanged () (
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
+		.github/release \
+		.github/RELEASES.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
+		.github/rulesets/git-release-catalog.json.in \
+		.github/rulesets/git-release-tags.json.in \
 		.github/rulesets/codex-pins.json \
 		.github/rulesets/codex-pins-immutable.json \
 		.github/rulesets/codex-plan-branches.json \
@@ -396,7 +409,9 @@ meta_control_paths_unchanged () (
 		codex-unstable.plan \
 		codex.release-recovery \
 		codex.config \
-		t/t9905-codex-branch.sh &&
+		t/t9905-codex-branch.sh \
+		t/t9906-git-release.sh \
+		t/t9906 &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		':(glob).github/workflows/*.yml' \
 		':(glob).github/workflows/*.yaml' \
@@ -3721,6 +3736,7 @@ rebase_in_progress () {
 }
 
 continue_rerere_resolution () {
+	test "$replay_rerere" = true || return 1
 	worktree=$1
 
 	while rebase_in_progress "$worktree" &&
@@ -3734,7 +3750,7 @@ continue_rerere_resolution () {
 			-c core.hooksPath=/dev/null \
 			-c core.fsmonitor=false \
 			-c commit.gpgSign=false \
-			-c rerere.enabled=true \
+			-c rerere.enabled="$replay_rerere" \
 			-c rerere.autoupdate=true \
 			rebase --continue
 		then
@@ -3819,7 +3835,7 @@ rebase_topic () {
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
-		-c rerere.enabled=true \
+		-c rerere.enabled="$replay_rerere" \
 		-c rerere.autoupdate=true \
 		rebase --merge --empty=drop --keep-empty --reapply-cherry-picks \
 		--no-autostash --no-update-refs \
@@ -4518,7 +4534,7 @@ process_merge_graph () (
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
-		-c rerere.enabled=true \
+		-c rerere.enabled="$replay_rerere" \
 		-c rerere.autoupdate=true \
 		rebase --rebase-merges=rebase-cousins --update-refs \
 		--empty=keep \
@@ -4981,7 +4997,7 @@ merge_topic () {
 		-c core.hooksPath=/dev/null \
 		-c core.fsmonitor=false \
 		-c commit.gpgSign=false \
-		-c rerere.enabled=true \
+		-c rerere.enabled="$replay_rerere" \
 		-c rerere.autoupdate=true \
 		merge --no-ff --no-log --no-edit --no-gpg-sign \
 		-m "$message" "$oid" >&2
@@ -8189,8 +8205,12 @@ topic_control_paths_unchanged () (
 	head_oid=$2
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		.github/CODEX.md \
+		.github/release \
+		.github/RELEASES.md \
 		.github/rulesets/codex-branch.json \
 		.github/rulesets/codex-meta.json \
+		.github/rulesets/git-release-catalog.json.in \
+		.github/rulesets/git-release-tags.json.in \
 		.github/rulesets/codex-pins.json \
 		.github/rulesets/codex-pins-immutable.json \
 		.github/rulesets/codex-plan-branches.json \
@@ -8212,6 +8232,8 @@ topic_control_paths_unchanged () (
 		codex-unstable.plan \
 		codex.release-recovery \
 		codex.config \
+		t/t9906-git-release.sh \
+		t/t9906 \
 		t/t9905-codex-branch.sh &&
 	git diff --quiet "$base_oid" "$head_oid" -- \
 		':(glob).github/workflows/*.yml' \
@@ -10528,6 +10550,127 @@ publish_topics () {
 	say "Topic refs updated. Run Refresh codex from the Actions page to rebuild codex."
 }
 
+# This local-only interface shares the pinned replay implementation with other
+# release channels. It cannot admit topics or update any published ref. Its
+# caller supplies an already reviewed, ordered plan and handles publication.
+assemble_release_plan () (
+	# A new release plan accepts reviewed source pins, not producer-local
+	# conflict resolutions that happen to be present in an rr-cache.
+	replay_rerere=false
+	# Propagate the same restrictions through every Git invocation, including
+	# the replay helpers and their isolated merge worktree.
+	GIT_CONFIG_COUNT=3
+	GIT_CONFIG_KEY_0=core.hooksPath
+	GIT_CONFIG_VALUE_0=/dev/null
+	GIT_CONFIG_KEY_1=core.fsmonitor
+	GIT_CONFIG_VALUE_1=false
+	GIT_CONFIG_KEY_2=commit.gpgSign
+	GIT_CONFIG_VALUE_2=false
+	export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 \
+		GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1 GIT_CONFIG_KEY_2 GIT_CONFIG_VALUE_2
+	release_base=
+	release_name=
+	release_plan=
+	release_session=
+	release_result=
+	while test $# -gt 0
+	do
+		require_arg "$@"
+		case "$1" in
+		--base) release_base=$2 ;;
+		--name) release_name=$2 ;;
+		--plan) release_plan=$2 ;;
+		--session) release_session=$2 ;;
+		--result) release_result=$2 ;;
+		*) die "unknown assemble-plan option '$1'" ;;
+		esac
+		shift 2
+	done
+	test -n "$release_base" && test -n "$release_name" &&
+		test -n "$release_plan" && test -n "$release_session" &&
+		test -n "$release_result" || die "assemble-plan needs all five options"
+	require_full_repository
+	require_full_commit_oid "$release_base"
+	git check-ref-format "refs/heads/$release_name" ||
+		die "invalid release channel"
+	test -f "$release_plan" || die "release plan is missing"
+	test ! -e "$release_result" || die "release result already exists"
+	test ! -e "$release_session" || die "release session already exists"
+	mkdir -m 700 "$release_session" || die "could not create release session"
+	release_session=$(CDPATH= cd "$release_session" && pwd)
+	release_state=$release_session/state
+	mkdir -m 700 "$release_state"
+	cp "$release_plan" "$release_state/reviewed-plan"
+	# name, full source tip, full reviewed boundary, prerequisite name (or
+	# release-base). Never infer a boundary from a moving generated branch.
+	awk -F '\t' '
+		NF != 4 || $1 == "release-base" || $1 == $4 || seen[$1]++ { exit 1 }
+		$4 != "release-base" && !seen[$4] { exit 1 }
+	' "$release_state/reviewed-plan" || die "invalid ordered release plan"
+	: >"$release_state/topics"
+	: >"$release_state/desired-prerequisites"
+	: >"$release_state/desired-source-bases"
+	: >"$release_state/desired-order"
+	while IFS="$tab" read -r release_topic release_tip release_boundary release_parent
+	do
+		test -n "$release_topic" || continue
+		git check-ref-format "refs/heads/$release_topic" ||
+			die "invalid release topic name"
+		require_full_commit_oid "$release_tip"
+		require_full_commit_oid "$release_boundary"
+		git merge-base --is-ancestor "$release_boundary" "$release_tip" ||
+			die "release topic is outside its reviewed boundary"
+		printf '%s\t%s\n' "$release_topic" "$release_tip" >>"$release_state/topics"
+		printf '%s\t%s\t%s\n' "$release_topic" "$release_tip" \
+			"$release_parent" >>"$release_state/desired-prerequisites"
+		printf '%s\t%s\n' "$release_topic" "$release_boundary" \
+			>>"$release_state/desired-source-bases"
+		printf '%s\n' "$release_topic" >>"$release_state/desired-order"
+	done <"$release_state/reviewed-plan"
+	for release_key in base-oid source-base-oid published-base-oid
+	do
+		printf '%s\n' "$release_base" >"$release_state/$release_key"
+	done
+	printf '%s\n' release-base >"$release_state/base-name"
+	printf '%s\n' "$release_name" >"$release_state/codex-name"
+	for release_key in pinned-plan-mode initializing require-automation \
+		published-topics published-source-topics
+	do
+		: >"$release_state/$release_key"
+	done
+	# Repeat preparation with identical pins without generating a new source
+	# identity merely because the wall clock moved.
+	release_epoch=$(git show -s --format=%ct "$release_base")
+	while IFS="$tab" read -r release_topic release_tip
+	do
+		release_topic_epoch=$(git show -s --format=%ct "$release_tip")
+		test "$release_epoch" -ge "$release_topic_epoch" ||
+			release_epoch=$release_topic_epoch
+	done <"$release_state/topics"
+	GIT_COMMITTER_DATE="@$((release_epoch + 1)) +0000"
+	GIT_AUTHOR_DATE=$GIT_COMMITTER_DATE
+	export GIT_COMMITTER_DATE GIT_AUTHOR_DATE
+	prepare_pinned_plan release-base "$release_base" \
+		"$release_state/topics" "$release_state"
+	release_worktree=$release_session/worktree
+	git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+		worktree add --detach "$release_worktree" "$release_base" >/dev/null
+	# A failed session remains inspectable. Recovery changes belong in a new
+	# reviewed source pin; retrying a release never publishes an ad-hoc edit.
+	if ! process_planned_graph "$release_worktree" "$release_state" ||
+		{ test -f "$release_state/merge-graph" &&
+		  ! verify_merge_topology "$release_base" "$release_state"; } ||
+		! assemble_candidate "$release_worktree" "$release_state" \
+			>"$release_state/assembly-output"
+	then
+		die "release composition stopped; inspect $release_session, review a source fix, then prepare a new session; no published refs were updated"
+	fi
+	release_candidate=$(git -C "$release_worktree" rev-parse HEAD)
+	printf '%s\n' "$release_candidate" >"$release_result"
+	git -c core.fsmonitor=false worktree remove --force "$release_worktree"
+	printf '%s\n' "$release_candidate"
+)
+
 test $# -gt 0 || { usage >&2; exit 129; }
 command=$1
 shift
@@ -10553,6 +10696,7 @@ publish-run) publish_run "$@" ;; # compatibility for previously printed commands
 resolve) resolve_rebase "$@" ;;
 continue) continue_rewrite "$@" ;;
 publish-topics) publish_topics "$@" ;;
+assemble-plan) assemble_release_plan "$@" ;;
 -h|--help) usage ;;
 *) usage >&2; die "unknown command '$command'" ;;
 esac

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Local GitHub fixture. Unknown repositories and requests always fail; this
+# executable never invokes the real gh or opens a network connection.
+set -euo pipefail
+root=${RELEASE_TEST_DIR:?}
+method=GET payload='' raw=false
+hash () { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
+missing () { printf 'gh: Not Found (HTTP 404)\n' >&2; exit 1; }
+if test "${1:-}" = release
+then
+	test "$2" = upload && test "$5" = --repo && test $# -eq 6
+	version=$3 file=$4 repo=$6
+	case "$repo" in example/distribution|example/upstream) ;; *) exit 99 ;; esac
+	store=$root/github/$repo
+	release=$store/releases/$version.json
+	test -f "$release"
+	if test -n "${RELEASE_TEST_FAIL_AFTER:-}" && test "$repo" = example/distribution
+	then test "$(jq '.assets | length' "$release")" -lt "$RELEASE_TEST_FAIL_AFTER" || { echo 'simulated interrupted upload' >&2; exit 1; }
+	fi
+	name=${file##*/}; jq -e --arg name "$name" 'all(.assets[]; .name != $name)' "$release" >/dev/null
+	id=$(cat "$store/next-asset" 2>/dev/null || echo 1)
+	mkdir -p "$store/assets"; cp "$file" "$store/assets/$id"
+	jq --arg name "$name" --argjson id "$id" --argjson size "$(wc -c <"$file")" --arg digest "sha256:$(hash "$file")" \
+		'.assets += [{name:$name,id:$id,size:$size,digest:$digest}]' "$release" >"$release.new"
+	mv "$release.new" "$release"; echo $((id + 1)) >"$store/next-asset"
+	printf 'upload %s %s\n' "$repo" "$name" >>"$root/events"
+	exit
+fi
+test "$1" = api; shift
+endpoint=''
+while test $# -gt 0
+do
+	case "$1" in
+	--hostname) test "$2" = github.com; shift 2 ;;
+	--method) method=$2; shift 2 ;;
+	--input) payload=$2; shift 2 ;;
+	-H) test "$2" != 'Accept: application/octet-stream' || raw=true; shift 2 ;;
+	*) test -z "$endpoint"; endpoint=$1; shift ;;
+	esac
+done
+case "$endpoint" in
+repos/example/distribution|repos/example/distribution/*) repo=example/distribution; database=$root/remote.git ;;
+repos/example/upstream|repos/example/upstream/*) repo=example/upstream; database=$root/upstream.git ;;
+*) echo "unexpected fixture request: $endpoint" >&2; exit 99 ;;
+esac
+path=${endpoint#repos/"$repo"}
+store=$root/github/$repo
+mkdir -p "$store/releases" "$store/assets"
+git_db () { "$RELEASE_REAL_GIT" --git-dir="$database" "$@"; }
+if test "$method" = GET
+then
+	case "$path" in
+	'')
+		visibility=private; test "$repo" != example/upstream || visibility=public
+		jq -n --arg repo "$repo" --arg visibility "${RELEASE_TEST_VISIBILITY:-$visibility}" '{full_name:$repo,visibility:$visibility}' ;;
+	/git/ref/*)
+		ref=refs/${path#/git/ref/}
+		sha=$(git_db rev-parse --verify "$ref" 2>/dev/null) || missing
+		jq -n --arg ref "$ref" --arg sha "$sha" '{ref:$ref,object:{sha:$sha}}' ;;
+	/git/commits/*)
+		sha=${path#/git/commits/}; tree=$(git_db rev-parse "$sha^{tree}")
+		jq -n --arg tree "$tree" '{tree:{sha:$tree}}' ;;
+	/git/tags/*)
+		sha=${path#/git/tags/}
+		test "$(git_db cat-file -t "$sha" 2>/dev/null)" = tag || missing
+		commit=$(git_db rev-parse "$sha^{}")
+		jq -n --arg sha "$commit" '{object:{sha:$sha,type:"commit"}}' ;;
+	/contents/*)
+		ref=${path##*\?ref=}; file=${path#/contents/}; file=${file%\?ref=*}
+		content=$(mktemp "$root/content.XXXXXX")
+		git_db show "$ref:$file" >"$content" 2>/dev/null || missing
+		jq -Rs '{type:"file",encoding:"base64",content:(. | @base64)}' "$content" ;;
+	/releases/tags/*)
+		file=$store/releases/${path#/releases/tags/}.json
+		test -f "$file" || missing; cat "$file" ;;
+	/releases/assets/*)
+		test "$raw" = true; file=$store/assets/${path#/releases/assets/}
+		test -f "$file" || missing; cat "$file" ;;
+	/actions/runs/*/jobs\?*)
+		if [[ "$path" == *'page=1' ]]
+		then jq -n --arg result "${RELEASE_TEST_SOURCE_RESULT:-success}" '{jobs:
+			(["macOS arm64","macOS x64","Linux arm64","Linux x64","Windows arm64","Windows x64"] |
+			 to_entries | map({id:(.key+1),name:("build / "+.value),conclusion:"success"})) +
+			[{id:7,name:"test / Git test suite",conclusion:$result}]}'
+		else echo '{"jobs":[]}'
+		fi ;;
+	/pulls/7) cat "$root/pr.json" ;;
+	/pulls/7/reviews\?*) cat "$root/reviews.json" ;;
+	/collaborators/*/permission) printf '{"permission":"write"}\n' ;;
+	*) echo "unexpected fixture GET: $path" >&2; exit 99 ;;
+	esac
+	exit
+fi
+printf '%s %s\n' "$method" "$endpoint" >>"$root/events"
+case "$method:$path" in
+POST:/releases)
+	version=$(jq -r .tag_name "$payload"); test ! -f "$store/releases/$version.json"
+	id=$(find "$store/releases" -name '*.json' | wc -l); id=$((id + 100))
+	jq --argjson id "$id" '. + {id:$id,assets:[]}' "$payload" >"$store/releases/$version.json"
+	cat "$store/releases/$version.json" ;;
+PATCH:/releases/*)
+	id=${path#/releases/}; found=false
+	for file in "$store/releases"/*.json
+	do
+		if test "$(jq -r .id "$file")" = "$id"
+		then
+			jq -s '.[0] + .[1]' "$file" "$payload" >"$file.new"; mv "$file.new" "$file"
+			git_db update-ref "refs/tags/$(jq -r .tag_name "$file")" "$(jq -r .target_commitish "$file")"
+			cat "$file"; found=true; break
+		fi
+	done
+	test "$found" = true ;;
+POST:/git/refs)
+	git_db update-ref "$(jq -r .ref "$payload")" "$(jq -r .sha "$payload")" ''
+	cat "$payload" ;;
+*) echo "unexpected fixture write: $method $path" >&2; exit 99 ;;
+esac
