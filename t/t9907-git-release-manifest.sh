@@ -69,4 +69,18 @@ test_expect_success 'recording rejects empty archives and unknown targets' '
 	if run_manifest record artifacts unknown; then return 1; fi
 '
 
+test_expect_success 'recording enforces the existing native package size limits' '
+	restore && file=artifacts/git-$VERSION-macOS-arm64.tar.gz &&
+	dd if=/dev/zero of="$file" bs=1048576 count=1 seek=64 2>/dev/null &&
+	hash "$file" >"$file.sha256" &&
+	if run_manifest record artifacts macOS-arm64; then return 1; fi &&
+	mv "$file" artifacts/git-$VERSION-windows-arm64.tar.gz &&
+	mv "$file.sha256" artifacts/git-$VERSION-windows-arm64.tar.gz.sha256 &&
+	run_manifest record artifacts windows-arm64 &&
+	file=artifacts/git-$VERSION-windows-arm64.tar.gz &&
+	dd if=/dev/zero of="$file" bs=1048576 count=1 seek=128 2>/dev/null &&
+	hash "$file" >"$file.sha256" &&
+	if run_manifest record artifacts windows-arm64; then return 1; fi
+'
+
 test_done

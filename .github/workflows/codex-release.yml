@@ -155,7 +155,6 @@ jobs:
             lto: thin
             profile_format: LLVM
             llvm_profdata: xcrun llvm-profdata
-            max_tar_bytes: 67108864
           - name: macOS x64
             os: macos-15-intel
             target_platform: macOS
@@ -167,7 +166,6 @@ jobs:
             lto: thin
             profile_format: LLVM
             llvm_profdata: xcrun llvm-profdata
-            max_tar_bytes: 67108864
           # Keep arm64 builds native so release smoke tests can execute them.
           - name: Linux arm64
             os: ubuntu-22.04-arm
@@ -179,7 +177,6 @@ jobs:
             has_gcm: false
             lto: auto
             profile_format: GCC
-            max_tar_bytes: 67108864
           - name: Linux x64
             os: ubuntu-22.04
             target_platform: ubuntu
@@ -190,7 +187,6 @@ jobs:
             has_gcm: false
             lto: auto
             profile_format: GCC
-            max_tar_bytes: 67108864
           - name: Windows arm64
             os: windows-11-arm
             target_platform: win32
@@ -202,7 +198,6 @@ jobs:
             lto: thin
             profile_format: LLVM
             llvm_profdata: llvm-profdata
-            max_tar_bytes: 134217728
             sdk_arch: aarch64
             sdk_flavor: full
             mingw_dir: clangarm64
@@ -220,7 +215,6 @@ jobs:
             has_gcm: true
             lto: auto
             profile_format: GCC
-            max_tar_bytes: 134217728
             sdk_arch: x86_64
             sdk_flavor: full
             mingw_dir: mingw64
@@ -525,7 +519,6 @@ jobs:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           TARGET_ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.version.outputs.version }}
-          MAX_TAR_BYTES: ${{ matrix.max_tar_bytes }}
         run: |
           set -euo pipefail
           script/package.sh
@@ -543,30 +536,8 @@ jobs:
             mv "${matches[0]}.sha256" "$destination.sha256"
           done
 
-          for checksum in output/*.sha256
-          do
-            archive="${checksum%.sha256}"
-            expected="$(tr -d '\r\n' <"$checksum")"
-            if command -v sha256sum >/dev/null 2>&1
-            then
-              actual="$(sha256sum "$archive" | awk '{print $1}')"
-            else
-              actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
-            fi
-            test "$actual" = "$expected"
-          done
-
-          tarball="output/git-$VERSION-$ASSET_PLATFORM-$TARGET_ARCH.tar.gz"
-          tar_bytes="$(wc -c <"$tarball")"
-          printf '%s bytes: %s\n' "$tar_bytes" "$tarball"
-          test "$tar_bytes" -le "$MAX_TAR_BYTES"
-
-      - name: Record the source and artifact checksums
-        shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          TARGET: ${{ matrix.asset_platform }}-${{ matrix.arch }}
-        run: bash release-tooling/.github/workflows/git-release-manifest.sh record dugite-native/output "$TARGET"
+          bash ../release-tooling/.github/workflows/git-release-manifest.sh \
+            record output "$ASSET_PLATFORM-$TARGET_ARCH"
 
       - name: Upload release assets
         uses: actions/upload-artifact@v7
