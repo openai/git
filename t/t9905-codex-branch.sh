@@ -286,6 +286,38 @@ write_dual_guarded_release_workflow () {
 	EOF
 }
 
+write_callable_release_workflow () {
+	write_dual_guarded_release_workflow "$1" &&
+	awk '
+		$0 == "on:" {
+			print
+			print "  workflow_call:"
+			print "    inputs:"
+			print "      source_sha:"
+			print "        required: true"
+			print "        type: string"
+			next
+		}
+		$0 == "    if: github.event.deleted == false" {
+			$0 = "    if: inputs.source_sha == \047\047 && github.event.deleted == false"
+		}
+		$0 == "    if: needs.publication.outputs.published == \047true\047" {
+			$0 = "    if: ${{ !cancelled() && (inputs.source_sha != \047\047 || needs.publication.outputs.published == \047true\047) }}"
+		}
+		{ print }
+		END {
+			print ""
+			print "  release:"
+			print "    if: inputs.source_sha == \047\047"
+			print "    needs: version"
+			print "    runs-on: ubuntu-24.04"
+			print "    steps:"
+			print "      - run: echo publish"
+		}
+	' "$1" >"$1.callable" &&
+	mv "$1.callable" "$1"
+}
+
 install_bootstrap_pin_guard_gh () {
 	directory=$1 &&
 	mkdir -p "$directory" &&
@@ -2733,7 +2765,7 @@ test_expect_success 'published release provenance gates cannot be removed' '
 	done
 '
 
-test_expect_success 'release publication guard has one exact dual-lane upgrade' '
+test_expect_success 'release publication guard permits reviewed workflow upgrades' '
 	git init --bare release-upgrade.git &&
 	test_create_repo release-upgrade-source &&
 	(
@@ -2761,6 +2793,43 @@ test_expect_success 'release publication guard has one exact dual-lane upgrade' 
 		git add .github/workflows/codex-release.yml &&
 		git commit -m "publish dual release guard" &&
 
+		git switch -c call-valid dual-valid &&
+		write_callable_release_workflow \
+			.github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "allow build-only workflow calls" &&
+		for job in publication version release
+		do
+			git switch -c "call-bad-$job" call-valid &&
+			awk -v target="  $job:" '\''
+				/^  [^[:space:]]/ { job = $0 }
+				/^    if:/ && job == target {
+					$0 = "    if: always()"
+				}
+				{ print }
+			'\'' .github/workflows/codex-release.yml >release.tmp &&
+			mv release.tmp .github/workflows/codex-release.yml &&
+			git add .github/workflows/codex-release.yml &&
+			git commit -m "drop $job call guard" || return 1
+		done &&
+		git switch -c call-extra-trigger call-valid &&
+		awk '\''
+			{ print }
+			$0 == "on:" { print "  workflow_dispatch:" }
+		'\'' .github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "add an unreviewed release trigger" &&
+
+		git switch -c call-duplicate-trigger call-valid &&
+		awk '\''
+			$0 == "  push:" { print "on:" }
+			{ print }
+		'\'' .github/workflows/codex-release.yml >release.tmp &&
+		mv release.tmp .github/workflows/codex-release.yml &&
+		git add .github/workflows/codex-release.yml &&
+		git commit -m "duplicate the release trigger mapping" &&
+
 		git switch -c dual-old-guard "$legacy" &&
 		awk '\''
 			{ print }
@@ -2787,31 +2856,43 @@ test_expect_success 'release publication guard has one exact dual-lane upgrade' 
 
 		git push origin master meta codex codex-unstable \
 			dual-valid:aa/codex/release \
-			dual-valid dual-old-guard dual-no-delete dual-wrong-key
+			dual-valid dual-old-guard dual-no-delete dual-wrong-key \
+			call-valid call-bad-publication call-bad-version \
+			call-bad-release call-extra-trigger call-duplicate-trigger
 	) &&
 	git clone release-upgrade.git release-upgrade-runner &&
 	(
 		cd release-upgrade-runner &&
 		fetch_all &&
-		snapshot_refs ../release-upgrade.git >before &&
-		sh "$codex_branch" rewrite --remote origin \
-			--base master --codex codex \
-			--result result --updates updates \
-			--inputs inputs --failure failure &&
-		candidate=$(cat result) &&
-		unstable=$(updated_tip codex-unstable updates) &&
-		write_dual_guarded_release_workflow expected-release.yml &&
-		git show "$candidate:.github/workflows/codex-release.yml" \
-			>actual-release.yml &&
-		test_cmp expected-release.yml actual-release.yml &&
-		stable_release=$(git rev-parse \
-			"$candidate:.github/workflows/codex-release.yml") &&
-		unstable_release=$(git rev-parse \
-			"$unstable:.github/workflows/codex-release.yml") &&
-		test "$stable_release" = "$unstable_release" &&
-		snapshot_refs ../release-upgrade.git >after &&
-		test_cmp before after &&
-		for variant in dual-old-guard dual-no-delete dual-wrong-key
+		for variant in dual-valid call-valid
+		do
+			oid=$(git rev-parse "origin/$variant") &&
+			git --git-dir=../release-upgrade.git update-ref \
+				refs/heads/aa/codex/release "$oid" &&
+			fetch_all &&
+			snapshot_refs ../release-upgrade.git >before &&
+			sh "$codex_branch" rewrite --remote origin \
+				--base master --codex codex \
+				--result result --updates updates \
+				--inputs inputs --failure failure &&
+			candidate=$(cat result) &&
+			unstable=$(updated_tip codex-unstable updates) &&
+			git show "$oid:.github/workflows/codex-release.yml" \
+				>expected-release.yml &&
+			git show "$candidate:.github/workflows/codex-release.yml" \
+				>actual-release.yml &&
+			test_cmp expected-release.yml actual-release.yml &&
+			stable_release=$(git rev-parse \
+				"$candidate:.github/workflows/codex-release.yml") &&
+			unstable_release=$(git rev-parse \
+				"$unstable:.github/workflows/codex-release.yml") &&
+			test "$stable_release" = "$unstable_release" &&
+			snapshot_refs ../release-upgrade.git >after &&
+			test_cmp before after || return 1
+		done &&
+		for variant in dual-old-guard dual-no-delete dual-wrong-key \
+			call-bad-publication call-bad-version call-bad-release \
+			call-extra-trigger call-duplicate-trigger
 		do
 			oid=$(git rev-parse "origin/$variant") &&
 			git --git-dir=../release-upgrade.git update-ref \
