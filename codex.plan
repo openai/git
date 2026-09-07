@@ -72,7 +72,7 @@
 [branch "tb/codex/release-tooling"]
 	remote = .
 	source-ref = refs/heads/tb/codex/release-tooling
-	source-tip = 8a710bf9b86c6500ecd56ccc5feee8cc8e0ba90a
+	source-tip = 3a54f5acc4df456497fb7d20ae9dfe19d9f7ac03
 	source-base = 67ba20645b1792f43c8c8ea69c716687bda87ec3
 	merge = refs/heads/tb/codex/lto-pgo
 
