@@ -11,6 +11,7 @@
 	topic = refs/heads/af/codex/pack-bytes
 	topic = refs/heads/tb/codex/parallel-packfile-uris
 	topic = refs/heads/tb/codex/release-tooling
+	topic = refs/heads/tb/codex/pin-ci-actions
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -73,4 +74,11 @@
 	source-ref = refs/heads/tb/codex/release-tooling
 	source-tip = 4209f5e2907f3e96266ce9eabe8db70653dbaef9
 	source-base = 88fcb4ac12c583bedf010e97ebf83cec240e3120
+	merge = refs/heads/tb/codex/lto-pgo
+
+[branch "tb/codex/pin-ci-actions"]
+	remote = .
+	source-ref = refs/heads/tb/codex/pin-ci-actions
+	source-tip = 34df167fbb27652ccf434a7fd5e66a9e2af14cfd
+	source-base = 67ba20645b1792f43c8c8ea69c716687bda87ec3
 	merge = refs/heads/tb/codex/lto-pgo
