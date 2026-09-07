@@ -852,12 +852,53 @@ automation_workflow_matches () {
 		"$tmp_dir/actual-automation.yml"
 }
 
-extract_release_trigger () {
+# Compare the push-only projection of a reusable workflow. Calls may skip
+# provenance checks to build another source, but must never publish it.
+read_release_workflow () (
 	head_oid=$1
 	output=$2
 	make_tmp_dir
 	git show "$head_oid:.github/workflows/codex-release.yml" \
-		>"$tmp_dir/codex-release.yml" 2>/dev/null || return 1
+		>"$output" 2>/dev/null || return 1
+	grep -F -x '  workflow_call:' "$output" >/dev/null || return 0
+	while IFS="$tab" read -r job condition
+	do
+		extract_release_job "$output" "$job" "$tmp_dir/call-job" ||
+			return 1
+		actual=$(sed -n '/^    if:/p' "$tmp_dir/call-job")
+		test "$actual" = "    if: $condition" || return 1
+	done <<-'EOF'
+	publication	inputs.source_sha == '' && github.event.deleted == false
+	version	${{ !cancelled() && (inputs.source_sha != '' || needs.publication.outputs.published == 'true') }}
+	release	inputs.source_sha == ''
+	EOF
+	awk '
+		$0 == "on:" { in_trigger = 1; skip = 0 }
+		in_trigger && /^  [^[:space:]]/ {
+			skip = ($0 == "  workflow_call:")
+		}
+		in_trigger && /^[^[:space:]]/ && $0 != "on:" {
+			in_trigger = skip = 0
+		}
+		skip { next }
+		$0 ~ /^  [^[:space:]]/ { job = $0 }
+		/^    if:/ && job == "  publication:" {
+			$0 = "    if: github.event.deleted == false"
+		}
+		/^    if:/ && job == "  version:" {
+			$0 = "    if: needs.publication.outputs.published == \047true\047"
+		}
+		{ print }
+	' "$output" >"$output.normalized" &&
+	mv "$output.normalized" "$output"
+)
+
+extract_release_trigger () {
+	head_oid=$1
+	output=$2
+	make_tmp_dir
+	read_release_workflow "$head_oid" "$tmp_dir/codex-release.yml" ||
+		return 1
 	test "$(grep -c '^on:$' "$tmp_dir/codex-release.yml")" = 1 || return 1
 	awk '
 		$0 == "on:" && !found {
@@ -1005,17 +1046,17 @@ release_publication_controls_preserved () (
 	make_tmp_dir
 	old_workflow=$tmp_dir/published-release.yml
 	new_workflow=$tmp_dir/candidate-release.yml
-	if ! git show "$published:.github/workflows/codex-release.yml" \
-		>"$old_workflow" 2>/dev/null
+	if ! git cat-file -e \
+		"$published:.github/workflows/codex-release.yml" 2>/dev/null
 	then
 		return 0
 	fi
+	read_release_workflow "$published" "$old_workflow" || return 1
 	if ! grep -F -x '  publication:' "$old_workflow" >/dev/null
 	then
 		return 0
 	fi
-	git show "$candidate:.github/workflows/codex-release.yml" \
-		>"$new_workflow" 2>/dev/null || return 1
+	read_release_workflow "$candidate" "$new_workflow" || return 1
 	extract_release_job "$old_workflow" publication \
 		"$tmp_dir/published-publication" || return 1
 	extract_release_job "$new_workflow" publication \
