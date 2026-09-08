@@ -318,10 +318,14 @@ test_midx_bitmap_cases () {
 			pack-$empty.idx
 			EOF
 
+			ls $objdir/pack >files.expect &&
 			git multi-pack-index write --bitmap --stdin-packs \
-				<packs &&
+				<packs >out 2>&1 &&
 
-			test_path_is_missing $midx
+			test_must_be_empty out &&
+			test_path_is_missing $midx &&
+			ls $objdir/pack >files.actual &&
+			test_cmp files.expect files.actual
 		)
 	'
 

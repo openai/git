@@ -60,12 +60,33 @@ test_expect_success 'skip non-incremental MIDX with no objects' '
 	(
 		cd empty.git &&
 		git pack-objects objects/pack/pack </dev/null &&
+		ls objects/pack >files.expect &&
 
-		for opt in "" --bitmap
+		for bitmap in "" --bitmap
 		do
-			git multi-pack-index write $opt &&
-			test_path_is_missing objects/pack/multi-pack-index || return 1
-		done
+			git multi-pack-index write $bitmap >out 2>&1 &&
+			test_must_be_empty out &&
+			test_path_is_missing objects/pack/multi-pack-index &&
+			ls objects/pack >files.actual &&
+			test_cmp files.expect files.actual || return 1
+		done &&
+
+		git multi-pack-index write --incremental --bitmap &&
+		test_dir_is_empty objects/pack/multi-pack-index.d &&
+
+		echo blob | git hash-object -w --stdin >in &&
+		git pack-objects objects/pack/pack <in &&
+		git multi-pack-index write --incremental --bitmap &&
+		test_line_count = 1 objects/pack/multi-pack-index.d/multi-pack-index-chain &&
+		git multi-pack-index verify &&
+
+		echo another | git hash-object -w --stdin >in &&
+		git pack-objects objects/pack/pack <in &&
+		git multi-pack-index write --bitmap &&
+		test_path_is_file objects/pack/multi-pack-index &&
+		midx="$(midx_checksum objects)" &&
+		test_path_is_file objects/pack/multi-pack-index-$midx.bitmap &&
+		git multi-pack-index verify
 	)
 '
 

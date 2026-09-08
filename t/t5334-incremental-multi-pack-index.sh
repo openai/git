@@ -195,7 +195,7 @@ test_expect_success 'non-incremental write with existing incremental chain' '
 	)
 '
 
-test_expect_success 'skip initial MIDX layer with empty pack' '
+test_expect_success 'skip initial MIDX layer with no objects' '
 	git init empty &&
 	(
 		cd empty &&
@@ -204,13 +204,18 @@ test_expect_success 'skip initial MIDX layer with empty pack' '
 
 		for bitmap in --bitmap --no-bitmap
 		do
-			git multi-pack-index write --incremental "$bitmap" &&
+			git multi-pack-index write --incremental "$bitmap" >out 2>&1 &&
+			test_must_be_empty out &&
 			test_dir_is_empty "$midxdir" || return 1
-		done
+		done &&
+
+		write_midx_layer &&
+		test_line_count = 1 "$midx_chain" &&
+		git multi-pack-index verify
 	)
 '
 
-test_expect_success 'skip intermediate MIDX layer with empty pack' '
+test_expect_success 'skip MIDX layer with empty pack' '
 	git init empty-pack &&
 	(
 		cd empty-pack &&
@@ -219,16 +224,25 @@ test_expect_success 'skip intermediate MIDX layer with empty pack' '
 
 		git pack-objects $packdir/pack </dev/null &&
 		cp "$midx_chain" chain.expect &&
+		ls "$packdir" "$midxdir" >files.expect &&
 
 		for bitmap in --bitmap --no-bitmap
 		do
-			git multi-pack-index write --incremental "$bitmap" &&
-			test_cmp chain.expect "$midx_chain" || return 1
-		done
+			git multi-pack-index write --incremental "$bitmap" >out 2>&1 &&
+			test_must_be_empty out &&
+			test_cmp chain.expect "$midx_chain" &&
+			ls "$packdir" "$midxdir" >files.actual &&
+			test_cmp files.expect files.actual || return 1
+		done &&
+
+		write_midx_layer &&
+		test_line_count = 2 "$midx_chain" &&
+		git multi-pack-index verify &&
+		git rev-list --test-bitmap 2.2
 	)
 '
 
-test_expect_success 'skip intermediate MIDX layer with duplicate pack' '
+test_expect_success 'skip MIDX layer with duplicate pack' '
 	git init duplicate-pack &&
 	(
 		cd duplicate-pack &&
@@ -238,12 +252,21 @@ test_expect_success 'skip intermediate MIDX layer with duplicate pack' '
 		git rev-parse HEAD^{tree} >in &&
 		git pack-objects $packdir/pack <in &&
 		cp "$midx_chain" chain.expect &&
+		ls "$packdir" "$midxdir" >files.expect &&
 
 		for bitmap in --bitmap --no-bitmap
 		do
-			git multi-pack-index write --incremental "$bitmap" &&
-			test_cmp chain.expect "$midx_chain" || return 1
-		done
+			git multi-pack-index write --incremental "$bitmap" >out 2>&1 &&
+			test_must_be_empty out &&
+			test_cmp chain.expect "$midx_chain" &&
+			ls "$packdir" "$midxdir" >files.actual &&
+			test_cmp files.expect files.actual || return 1
+		done &&
+
+		write_midx_layer &&
+		test_line_count = 2 "$midx_chain" &&
+		git multi-pack-index verify &&
+		git rev-list --test-bitmap 2.2
 	)
 '
 
