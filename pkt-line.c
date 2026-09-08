@@ -398,7 +398,11 @@ static const char *find_packfile_uri_path(const char *buffer)
 	if (!(len == 40 || len == 64) || buffer[len] != ' ')
 		return NULL; /* required "<hash>SP" not seen */
 
-	path = strstr(buffer + len + 1, URI_MARK);
+	buffer += len + 1;
+	if (buffer[0] == '/' && buffer[1] != '/')
+		return buffer + 1;
+
+	path = strstr(buffer, URI_MARK);
 	if (!path)
 		return NULL;
 

@@ -187,6 +187,7 @@ int cmd_fetch_pack(int argc,
 		dest = argv[i++];
 	else
 		usage(fetch_pack_usage);
+	args.url = dest;
 
 	/*
 	 * Copy refs from cmdline to growable list, then append any

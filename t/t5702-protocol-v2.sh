@@ -1247,9 +1247,109 @@ configure_exclusion () {
 	git -C "$1" pack-objects "$HTTPD_DOCUMENT_ROOT_PATH/mypack" <objh >packh &&
 	git -C "$1" config --add \
 		"uploadpack.blobpackfileuri" \
-		"$(cat objh) $(cat packh) $HTTPD_URL/dumb/mypack-$(cat packh).pack" &&
+		"$(cat objh) $(cat packh) ${3-$HTTPD_URL}/dumb/mypack-$(cat packh).pack" &&
 	cat objh
 }
+
+test_expect_success 'setup absolute-path packfile URIs' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/absolute-uri" &&
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	>absolute-pack-hashes &&
+	for name in one two
+	do
+		test_commit -C "$P" "$name" &&
+		configure_exclusion "$P" "$name.t" "" >/dev/null &&
+		cat packh >>absolute-pack-hashes || return 1
+	done
+'
+
+test_expect_success 'clone with absolute-path packfile URIs' '
+	test_when_finished "rm -rf absolute-child log" &&
+	GIT_TRACE_PACKET="$TRASH_DIRECTORY/log" GIT_TRACE_REDACT=0 \
+	GIT_TEST_SIDEBAND_ALL=1 \
+	git -c protocol.version=2 -c fetch.uriprotocols=http,https \
+		clone "$HTTPD_URL/smart/absolute-uri" absolute-child &&
+	while read hash
+	do
+		test_path_is_file \
+			"absolute-child/.git/objects/pack/pack-$hash.pack" &&
+		test_grep -F "clone< \\1$hash /dumb/mypack-$hash.pack" log ||
+		return 1
+	done <absolute-pack-hashes &&
+	test_grep "clone< fetch=.*packfile-uris-absolute-path" log &&
+	test_grep "clone> packfile-uris http,https$" log &&
+	test_grep "clone> packfile-uris-absolute-path$" log &&
+	git -C absolute-child fsck
+'
+
+test_expect_success 'absolute-path packfile URI fetch redacts the path' '
+	test_when_finished "rm -rf absolute-child log" &&
+	git init absolute-child &&
+	GIT_TRACE_PACKET="$TRASH_DIRECTORY/log" GIT_TEST_SIDEBAND_ALL=1 \
+	git -C absolute-child -c protocol.version=2 \
+		-c fetch.uriprotocols=http,https \
+		fetch "$HTTPD_URL/smart/absolute-uri" &&
+	while read hash
+	do
+		test_grep -F "fetch< \\1$hash /<redacted>" log || return 1
+	done <absolute-pack-hashes &&
+	test_grep ! /dumb/mypack- log
+'
+
+test_expect_success 'absolute-path packfile URIs require an allowed HTTP scheme' '
+	test_when_finished "rm -rf absolute-child log err" &&
+	case "$HTTPD_PROTO" in
+	http) other_protocol=https ;;
+	https) other_protocol=http ;;
+	esac &&
+	for url in "$HTTPD_URL/smart/absolute-uri" \
+		"file://$HTTPD_DOCUMENT_ROOT_PATH/absolute-uri"
+	do
+		test_must_fail env GIT_TRACE_PACKET="$TRASH_DIRECTORY/log" \
+			GIT_TEST_SIDEBAND_ALL=1 \
+		git -c protocol.version=2 -c fetch.uriprotocols=$other_protocol \
+			clone "$url" absolute-child 2>err &&
+		test_grep "packfile-uris $other_protocol$" log &&
+		test_grep ! "clone> packfile-uris-absolute-path" log &&
+		test_grep "client does not support absolute-path packfile URIs" err &&
+		rm -rf absolute-child log || return 1
+	done
+'
+
+test_expect_success 'absolute-path packfile URIs reject an unsupported client before packing' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/absolute-uri" &&
+	test_when_finished "rm -f absolute-pack-objects-ran" &&
+	write_script "$TRASH_DIRECTORY/absolute-pack-objects-hook" <<-EOF &&
+	>"$TRASH_DIRECTORY/absolute-pack-objects-ran"
+	exec "\$@"
+	EOF
+	test_config_global uploadpack.packObjectsHook \
+		"$TRASH_DIRECTORY/absolute-pack-objects-hook" &&
+	test-tool pkt-line pack >in <<-EOF &&
+	command=fetch
+	object-format=$(test_oid algo)
+	0001
+	want $(git -C "$P" rev-parse HEAD)
+	sideband-all
+	packfile-uris http,https
+	done
+	0000
+	EOF
+	test_must_fail env GIT_PROTOCOL=version=2 git -C "$P" \
+		upload-pack --stateless-rpc . <in >out 2>err &&
+	test_grep "client does not support absolute-path packfile URIs" err &&
+	test_path_is_missing absolute-pack-objects-ran
+'
+
+test_expect_success 'absolute-path URI configuration does not affect ordinary fetches' '
+	test_when_finished "rm -rf absolute-child log" &&
+	GIT_TRACE_PACKET="$TRASH_DIRECTORY/log" GIT_TEST_SIDEBAND_ALL=1 \
+	git -c protocol.version=2 -c fetch.uriprotocols= \
+		clone "$HTTPD_URL/smart/absolute-uri" absolute-child &&
+	test_grep ! "clone> packfile-uris" log &&
+	git -C absolute-child fsck
+'
 
 test_expect_success 'part of packfile response provided as URI' '
 	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
@@ -1271,6 +1371,8 @@ test_expect_success 'part of packfile response provided as URI' '
 	git -c protocol.version=2 \
 		-c fetch.uriprotocols=http,https \
 		clone "$HTTPD_URL/smart/http_parent" http_child &&
+	test_grep ! "clone< fetch=.*packfile-uris-absolute-path" log &&
+	test_grep ! "clone> packfile-uris-absolute-path" log &&
 
 	# Ensure that my-blob and other-blob are in separate packfiles.
 	for idx in http_child/.git/objects/pack/*.idx

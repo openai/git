@@ -37,6 +37,7 @@
 #include "mergesort.h"
 #include "prio-queue.h"
 #include "promisor-remote.h"
+#include "urlmatch.h"
 
 static int transfer_unpack_limit = -1;
 static int fetch_unpack_limit = -1;
@@ -1381,6 +1382,29 @@ static int add_haves(struct fetch_negotiator *negotiator,
 	return haves_added;
 }
 
+static char *get_packfile_uri_base(const char *url)
+{
+	struct url_info info;
+	char *base;
+
+	if (!url || !uri_protocols.nr)
+		return NULL;
+	base = url_normalize(url, &info);
+	if (!base)
+		return NULL;
+
+	/* An absolute path must not bypass the configured URI protocols. */
+	if ((starts_with(base, "http:") &&
+	     unsorted_string_list_has_string(&uri_protocols, "http")) ||
+	    (starts_with(base, "https:") &&
+	     unsorted_string_list_has_string(&uri_protocols, "https"))) {
+		base[info.path_off] = '\0';
+		return base;
+	}
+	free(base);
+	return NULL;
+}
+
 static int send_fetch_request(struct fetch_negotiator *negotiator, int fd_out,
 			      struct fetch_pack_args *args,
 			      const struct ref *wants, struct oidset *common,
@@ -1430,6 +1454,13 @@ static int send_fetch_request(struct fetch_negotiator *negotiator, int fd_out,
 			}
 		}
 		if (to_send.len) {
+			if (server_supports_feature("fetch", "packfile-uris-absolute-path", 0)) {
+				char *uri_base = get_packfile_uri_base(args->url);
+
+				if (uri_base)
+					packet_buf_write(&req_buf, "packfile-uris-absolute-path");
+				free(uri_base);
+			}
 			packet_buf_write(&req_buf, "packfile-uris %s",
 					 to_send.buf);
 			if (fetch_packfile_uri_jobs > 1 &&
@@ -1652,8 +1683,11 @@ static void receive_wanted_refs(struct packet_reader *reader,
 }
 
 static void receive_packfile_uris(struct packet_reader *reader,
-				  struct string_list *uris)
+				  struct string_list *uris,
+				  const char *url)
 {
+	char *uri_base = get_packfile_uri_base(url);
+
 	process_section_header(reader, "packfile-uris", 0);
 	while (packet_reader_read(reader) == PACKET_READ_NORMAL) {
 		struct object_id oid;
@@ -1662,10 +1696,19 @@ static void receive_packfile_uris(struct packet_reader *reader,
 		if (parse_oid_hex(reader->line, &oid, &end) || *end != ' ')
 			die("expected '<hash> <uri>', got: %s", reader->line);
 
-		string_list_append(uris, reader->line);
+		if (end[1] == '/') {
+			if (end[2] == '/' || !uri_base)
+				die("unexpected relative packfile URI");
+			string_list_append_nodup(uris,
+						 xstrfmt("%s %s%s", oid_to_hex(&oid),
+							 uri_base, end + 1));
+		} else {
+			string_list_append(uris, reader->line);
+		}
 	}
 	if (reader->status != PACKET_READ_DELIM)
 		die("expected DELIM");
+	free(uri_base);
 }
 
 static int index_pack_arg_is_keep(const char *arg)
@@ -2003,7 +2046,8 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 			if (git_env_bool("GIT_TRACE_REDACT", 1))
 				reader.options |= PACKET_READ_REDACT_URI_PATH;
 			if (process_section_header(&reader, "packfile-uris", 1))
-				receive_packfile_uris(&reader, &packfile_uris);
+				receive_packfile_uris(&reader, &packfile_uris,
+						      args->url);
 			/* We don't expect more URIs. Reset to avoid expensive URI check. */
 			reader.options &= ~PACKET_READ_REDACT_URI_PATH;
 
