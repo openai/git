@@ -56,9 +56,12 @@ test_expect_success 'receipts must match the requested source, recipe and origin
 	done
 '
 
-test_expect_success 'symlinks and unexpected files are rejected' '
+test_expect_success SYMLINKS 'symlinks are rejected' '
 	restore && file=artifacts/git-$VERSION-macOS-arm64.tar.gz &&
-	mv "$file" archive && ln -s "$TRASH_DIRECTORY/archive" "$file" && reject &&
+	mv "$file" archive && ln -s "$TRASH_DIRECTORY/archive" "$file" && reject
+'
+
+test_expect_success 'unexpected files are rejected' '
 	restore && touch artifacts/.unexpected && reject
 '
 
