@@ -56,7 +56,6 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 				  const char *url,
 				  const char **index_pack_args) {
 	struct http_pack_request *preq;
-	struct slot_results results;
 	int ret;
 
 	http_init(NULL, url, 0);
@@ -64,14 +63,12 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 	preq = new_direct_http_pack_request(packfile_hash->hash, xstrdup(url));
 	if (!preq)
 		die("couldn't create http pack request");
-	preq->slot->results = &results;
 	preq->index_pack_args = index_pack_args;
 	preq->preserve_index_pack_stdout = 1;
 
-	if (start_active_slot(preq->slot)) {
-		run_active_slot(preq->slot);
-		if (results.curl_result != CURLE_OK &&
-		    results.http_code != 416) {
+	ret = run_http_pack_request(preq);
+	if (ret != HTTP_START_FAILED) {
+		if (ret != HTTP_OK) {
 			struct url_info url;
 			char *nurl = url_normalize(preq->url, &url);
 			if (!nurl || !git_env_bool("GIT_TRACE_REDACT", 1)) {

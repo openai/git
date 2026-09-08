@@ -2749,6 +2749,98 @@ static void prepare_http_pack_request(struct http_pack_request *preq,
 		http_opt_request_remainder(preq->slot->curl, offset);
 }
 
+static void update_http_pack_url(void *data)
+{
+	struct http_pack_request *preq = data;
+	struct urlmatch_config config = URLMATCH_CONFIG_INIT;
+	struct strvec wwwauth;
+	char *url;
+
+	if (preq->slot->http_code != 401 ||
+	    curl_easy_getinfo(preq->slot->curl, CURLINFO_EFFECTIVE_URL, &url) != CURLE_OK ||
+	    !url || !strcmp(preq->url, url))
+		return;
+
+	/* Change credential context before run_one_slot() handles the 401. */
+	wwwauth = http_auth.wwwauth_headers;
+	http_auth.wwwauth_headers = (struct strvec)STRVEC_INIT;
+	free(preq->url);
+	preq->url = xstrdup(url);
+	credential_from_url(&http_auth, preq->url);
+	http_auth.wwwauth_headers = wwwauth;
+
+	/* A direct retry must not reuse headers scoped to the redirect source. */
+	string_list_clear(&extra_http_headers, 0);
+	config.section = "http";
+	config.key = "extraheader";
+	config.collect_fn = http_options;
+	url_normalize(preq->url, &config.url);
+	repo_config(the_repository, urlmatch_config_entry, &config);
+	free(config.url.url);
+	urlmatch_config_release(&config);
+}
+
+static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
+{
+	struct http_pack_request *preq = data;
+	long code;
+
+	if (curl_easy_getinfo(preq->slot->curl, CURLINFO_HTTP_CODE, &code) != CURLE_OK)
+		return 0;
+	/* Error bodies must not overwrite a partial pack shared with another fetch. */
+	if (code >= 300)
+		return size * nmemb;
+	return fwrite(ptr, size, nmemb, preq->packfile);
+}
+
+int run_http_pack_request(struct http_pack_request *preq)
+{
+	off_t offset = ftello(preq->packfile);
+	int attempts = 3;
+	int ret;
+
+	if (offset < 0)
+		return HTTP_START_FAILED;
+
+	for (;;) {
+		struct slot_results results = { .retry_after = -1 };
+
+		preq->headers = http_append_auth_header(&http_auth, preq->headers);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEHEADER, NULL);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_http_pack);
+		/* Older curl versions omit challenge headers with FAILONERROR. */
+		curl_easy_setopt(preq->slot->curl, CURLOPT_FAILONERROR, 0L);
+		if (http_follow_config == HTTP_FOLLOW_INITIAL)
+			curl_easy_setopt(preq->slot->curl, CURLOPT_FOLLOWLOCATION, 1L);
+		preq->slot->callback_func = update_http_pack_url;
+		preq->slot->callback_data = preq;
+		ret = run_one_slot(preq->slot, &results);
+		preq->slot->results = NULL;
+		preq->slot->callback_func = NULL;
+		preq->slot->callback_data = NULL;
+
+		if (ret != HTTP_START_FAILED && results.http_code == 416) {
+			ret = HTTP_OK;
+			break;
+		}
+
+		if (ret != HTTP_REAUTH || !--attempts)
+			break;
+
+		/* Never truncate a partial pack to recover from an error response. */
+		if (ftello(preq->packfile) != offset) {
+			ret = HTTP_ERROR;
+			break;
+		}
+		http_reauth_prepare(1);
+		prepare_http_pack_request(preq, offset);
+	}
+	return ret;
+}
+
 struct http_pack_request *new_direct_http_pack_request(
 	const unsigned char *packed_git_hash, char *url)
 {
