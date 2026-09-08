@@ -48,7 +48,8 @@ collect)
 		receipt=$directory/git-$VERSION-$target.build.json
 		test -f "$receipt" && test ! -L "$receipt"
 		record "$target" >"$scratch/$target.json"
-		cmp "$scratch/$target.json" "$receipt"
+		jq -S -a . "$receipt" >"$scratch/receipt"
+		cmp "$scratch/$target.json" "$scratch/receipt"
 	done
 	shopt -s nullglob dotglob
 	files=("$directory"/*)
