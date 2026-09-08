@@ -3797,6 +3797,13 @@ continue_rerere_resolution () {
 	while rebase_in_progress "$worktree" &&
 		test -z "$(git -C "$worktree" -c core.fsmonitor=false ls-files -u)"
 	do
+		# A failed octopus can leave a clean index without a resolution.
+		# Continuing in that state would skip the failed merge.
+		if git -C "$worktree" diff --cached --quiet &&
+			! git -C "$worktree" rev-parse --verify -q MERGE_HEAD >/dev/null
+		then
+			return 1
+		fi
 		before=$(git -C "$worktree" rev-parse --verify REBASE_HEAD \
 			2>/dev/null || :)
 		if ! GIT_COMMITTER_NAME=$bot_name \
