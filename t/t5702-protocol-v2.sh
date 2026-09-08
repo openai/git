@@ -1221,6 +1221,70 @@ configure_exclusion () {
 	cat objh
 }
 
+test_expect_success 'setup authenticated packfile URI' '
+	git init "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth" &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth" config uploadpack.allowsidebandall true &&
+	test_commit -C "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth" one &&
+	configure_exclusion "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth" one.t >uri-auth-oid &&
+	uri_auth_hash=$(cat packh) &&
+	mkdir -p "$HTTPD_DOCUMENT_ROOT_PATH/auth/dumb" &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/mypack-$uri_auth_hash.pack" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/auth/dumb/uri-auth.pack" &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth" config \
+		uploadpack.blobpackfileuri \
+		"$(cat uri-auth-oid) $uri_auth_hash $HTTPD_URL/auth/dumb/uri-auth.pack" &&
+	write_script uri-auth-helper <<-\EOF
+	echo "$1" >>"$HOME/uri-auth-operations"
+	cat >>"$HOME/uri-auth-input"
+	if test "$1" = get
+	then
+		echo username=user@host
+		echo password=pass@host
+	fi
+	EOF
+'
+
+test_expect_success 'packfile URI does not use a helper scoped to the remote host' '
+	test_config_global "credential.http://localhost:$LIB_HTTPD_PORT.helper" \
+		"!\"$TRASH_DIRECTORY/uri-auth-helper\"" &&
+	>uri-auth-operations &&
+	test_must_fail env GIT_TEST_SIDEBAND_ALL=1 \
+		git -c protocol.version=2 -c fetch.uriprotocols=http \
+		clone "http://localhost:$LIB_HTTPD_PORT/smart/uri-auth" uri-auth-other 2>err &&
+	test_must_be_empty uri-auth-operations
+'
+
+test_expect_success 'packfile URI uses credentials scoped to its own host' '
+	test_config_global "credential.$HTTPD_URL.helper" \
+		"!\"$TRASH_DIRECTORY/uri-auth-helper\"" &&
+	test_config_global credential.useHttpPath true &&
+	>uri-auth-operations &&
+	>uri-auth-input &&
+	GIT_TEST_SIDEBAND_ALL=1 git -c protocol.version=2 -c fetch.uriprotocols=http \
+		clone "http://localhost:$LIB_HTTPD_PORT/smart/uri-auth" uri-auth-own-host &&
+	test_cmp "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth/one.t" uri-auth-own-host/one.t &&
+	printf "get\nstore\n" >expect &&
+	test_cmp expect uri-auth-operations &&
+	test_grep "^path=auth/dumb/uri-auth.pack$" uri-auth-input
+'
+
+test_expect_success 'packfile URI resumes after a credential challenge' '
+	test_config_global credential.helper "!\"$TRASH_DIRECTORY/uri-auth-helper\"" &&
+	git init uri-auth-resume &&
+	mkdir -p uri-auth-resume/.git/objects/pack &&
+	dd if="$HTTPD_DOCUMENT_ROOT_PATH/auth/dumb/uri-auth.pack" \
+		of="uri-auth-resume/.git/objects/pack/pack-$uri_auth_hash.pack.temp" \
+		bs=1 count=12 &&
+	>uri-auth-operations &&
+	GIT_TEST_SIDEBAND_ALL=1 git -C uri-auth-resume \
+		-c protocol.version=2 -c fetch.uriprotocols=http \
+		fetch "$HTTPD_URL/smart/uri-auth" HEAD &&
+	git -C uri-auth-resume cat-file blob FETCH_HEAD:one.t >actual &&
+	test_cmp "$HTTPD_DOCUMENT_ROOT_PATH/uri-auth/one.t" actual &&
+	printf "get\nstore\n" >expect &&
+	test_cmp expect uri-auth-operations
+'
+
 test_expect_success 'part of packfile response provided as URI' '
 	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
 	rm -rf "$P" http_child log &&

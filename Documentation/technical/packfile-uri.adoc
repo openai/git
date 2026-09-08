@@ -50,6 +50,12 @@ Client design
 The client has a config variable `fetch.uriprotocols` that determines which
 protocols the end user is willing to use. By default, this is empty.
 
+HTTP(S) packfile downloads use the HTTP authentication and redirect
+configuration used for other Git HTTP requests. Credentials are looked up
+for the pack URL, including its path when `credential.useHttpPath` is
+enabled, rather than copied from the fetch negotiation. A pack served by
+another host can use credentials configured for that host.
+
 When the client downloads the given URIs, it should store them with "keep"
 files, just like it does with the packfile in the `packfile` section. These
 additional "keep" files can only be removed after the refs have been updated -
