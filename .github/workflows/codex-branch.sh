@@ -5265,6 +5265,19 @@ assemble_candidate () {
 			"$candidate" "$state" "$require_automation"
 	fi
 
+	if test -f "$state/unstable/topic-updates"
+	then
+		recovered=$(state_value "$state/unstable" base-oid)
+		git merge-base --is-ancestor "$base_oid" "$recovered" &&
+			test "$(git rev-parse "$candidate^{tree}")" = \
+			"$(git rev-parse "$recovered^{tree}")" &&
+			codex_has_expected_integrations "$state" "$recovered" ||
+			die "completed unstable recovery has a different stable base"
+		# Keep the exact base of the recovered graph after validating its
+		# tree and integrations against the freshly assembled candidate.
+		candidate=$recovered
+	fi
+
 	printf '%s\n' "$candidate"
 }
 

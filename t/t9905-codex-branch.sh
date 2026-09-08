@@ -9394,6 +9394,7 @@ test_expect_success 'pinned merge chain preserves recoverable overlap state' '
 		sh "$codex_branch" continue --worktree "$private" \
 			>continue.out 2>continue.err &&
 		test_grep "source refs unchanged" continue.out &&
+		test_tick &&
 		sh "$codex_branch" publish-topics --worktree resolution \
 			>publish.out 2>publish.err &&
 		test_grep "Pinned recovery session" publish.out &&
@@ -9401,6 +9402,7 @@ test_expect_success 'pinned merge chain preserves recoverable overlap state' '
 		session=$(sed -n \
 			"s/^Pinned recovery session: //p" publish.out) &&
 		test -n "$session" &&
+		test_cmp "$state/unstable/base-oid" "$session/codex-candidate" &&
 		sh "$codex_branch" verify-output \
 			--inputs "$session/codex-inputs" \
 			--updates "$session/codex-updates" \
