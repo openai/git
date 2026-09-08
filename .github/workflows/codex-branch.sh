@@ -377,20 +377,22 @@ ci_workflow_pins_are_reviewed () (
 	base_oid=$1
 	head_oid=$2
 
-	# Permit only the reviewed full-SHA replacements of the inherited CI
-	# workflows. Comparing tree entries also rejects mode changes, symlinks,
+	# Permit only the reviewed CI pins and optional image update.
+	# Comparing tree entries also rejects mode changes, symlinks,
 	# and deletions. New upstream workflow contents need a new review.
-	while read -r path old_blob new_blob
+	while read -r path old_blob new_blob updated_blob
 	do
 		old=$(git ls-tree "$base_oid" -- "$path") || return 1
 		new=$(git ls-tree "$head_oid" -- "$path") || return 1
 		test "$old" = "$new" && continue
-		test "$old" = "100644 blob $old_blob$tab$path" &&
-		test "$new" = "100644 blob $new_blob$tab$path" || return 1
+		{ test "$old" = "100644 blob $old_blob$tab$path" ||
+		  test "$old" = "100644 blob $new_blob$tab$path"; } &&
+		{ test "$new" = "100644 blob $new_blob$tab$path" ||
+		  test "$new" = "100644 blob $updated_blob$tab$path"; } || return 1
 	done <<-\EOF
 	.github/workflows/check-style.yml 108a2de903310cfd0f6327353ee700d99d54edc3 b265fe35cbfc51db4cd53729e602de5d36b6632e
 	.github/workflows/check-whitespace.yml ea6f49f742108e27812decc666e6839ab84080f1 3379f89a814abd439ac13efaa572264be5b75080
-	.github/workflows/main.yml 205325eb33b06444f24a11271a9e669841e29cb9 485e3be66581518bca55b62d97ebd2217be194b1
+	.github/workflows/main.yml 205325eb33b06444f24a11271a9e669841e29cb9 485e3be66581518bca55b62d97ebd2217be194b1 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8
 	EOF
 )
 

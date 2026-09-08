@@ -10870,4 +10870,37 @@ test_expect_success 'both release lanes start CI before either lane waits' '
 	)
 '
 
+test_expect_success SHA1 'reviewed CI image updates retain exact workflow entries' '
+	test_create_repo ci-image-policy &&
+	(
+		cd ci-image-policy &&
+		tab=$(printf "\t") &&
+		sed -n "/^ci_workflow_pins_are_reviewed () ($/,/^)/p" \
+			"$codex_branch" >policy.sh &&
+		. ./policy.sh &&
+		ci_tree () {
+			workflow=$(printf "%s blob %s\tmain.yml\n" \
+				"${2:-100644}" "$1" | git mktree --missing) &&
+			github=$(printf "040000 tree %s\tworkflows\n" \
+				"$workflow" | git mktree) &&
+			printf "040000 tree %s\t.github\n" "$github" |
+				git mktree
+		} &&
+		before=$(ci_tree 205325eb33b06444f24a11271a9e669841e29cb9) &&
+		pinned=$(ci_tree 485e3be66581518bca55b62d97ebd2217be194b1) &&
+		updated=$(ci_tree 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8) &&
+		unknown=$(ci_tree 1111111111111111111111111111111111111111) &&
+		mode=$(ci_tree 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8 100755) &&
+		empty=$(git mktree </dev/null) &&
+		ci_workflow_pins_are_reviewed "$before" "$pinned" &&
+		ci_workflow_pins_are_reviewed "$before" "$updated" &&
+		ci_workflow_pins_are_reviewed "$pinned" "$updated" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$pinned" "$unknown" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$unknown" "$updated" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$pinned" "$mode" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$pinned" "$empty" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$updated" "$pinned"
+	)
+'
+
 test_done
