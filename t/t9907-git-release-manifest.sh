@@ -38,6 +38,16 @@ test_expect_success 'manifest identifies the source, recipe and all 24 assets' '
 	jq -e --arg source "$SOURCE_SHA" --arg recipe "$RECIPE_SHA" ".source_sha==\$source and .recipe.sha==\$recipe and (.targets|length)==6 and ([.targets[][]]|length)==24 and all(.builds[]; .run_id==\"42\")" actual
 '
 
+test_expect_success 'Windows receipt line endings preserve the recorded provenance' '
+	restore &&
+	for receipt in artifacts/*-windows-*.build.json
+	do
+		append_cr <"$receipt" >crlf && mv crlf "$receipt" || return 1
+	done &&
+	run_manifest collect artifacts >actual &&
+	jq -e "(.targets|length)==6 and all(.builds[]; .run_id==\"42\")" actual
+'
+
 test_expect_success 'incomplete targets and mismatching sidecars are rejected' '
 	restore && rm artifacts/git-$VERSION-macOS-arm64.lzma && reject &&
 	restore && echo changed >artifacts/git-$VERSION-macOS-arm64.lzma && reject
