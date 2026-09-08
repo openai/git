@@ -2746,6 +2746,20 @@ struct http_pack_request *new_http_pack_request(
 					    strbuf_detach(&buf, NULL));
 }
 
+static void prepare_http_pack_request(struct http_pack_request *preq,
+				      off_t offset)
+{
+	preq->slot = get_active_slot();
+	curl_slist_free_all(preq->headers);
+	preq->headers = object_request_headers();
+	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_http_pack);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
+	if (offset > 0)
+		http_opt_request_remainder(preq->slot->curl, offset);
+}
+
 struct http_pack_request *new_direct_http_pack_request(
 	const unsigned char *packed_git_hash, char *url)
 {
@@ -2789,12 +2803,7 @@ struct http_pack_request *new_direct_http_pack_request(
 	}
 	preq->packfile = xfdopen(fd, "w");
 
-	preq->slot = get_active_slot();
-	preq->headers = object_request_headers();
-	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
-	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_http_pack);
-	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
-	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
+	prepare_http_pack_request(preq, prev_posn);
 
 	if (prev_posn > 0) {
 		if (http_is_verbose)
@@ -2802,7 +2811,6 @@ struct http_pack_request *new_direct_http_pack_request(
 				"Resuming fetch of pack %s at byte %"PRIuMAX"\n",
 				hash_to_hex(packed_git_hash),
 				(uintmax_t)prev_posn);
-		http_opt_request_remainder(preq->slot->curl, prev_posn);
 	}
 
 	return preq;
