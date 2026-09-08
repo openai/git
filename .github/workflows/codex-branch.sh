@@ -2121,20 +2121,27 @@ pinned_root_boundary () (
 	current_base=$1
 	published_base=$2
 	tip=$3
+	lane_base=$4
 	bases=$(git merge-base --all "$current_base" "$tip") ||
 		return 1
 	test -n "$bases" || return 1
 	test "$(printf '%s\n' "$bases" | wc -l | tr -d ' ')" = 1 ||
 		return 1
 	boundary=$(printf '%s\n' "$bases" | sed -n '1p')
-	git merge-base --is-ancestor "$published_base" "$boundary" ||
-		return 1
+	# Stable topics may start at an older upstream commit. Preview topics
+	# must still include the published production base.
+	if test "$lane_base" != "$base_name"
+	then
+		git merge-base --is-ancestor "$published_base" "$boundary" ||
+			return 1
+	fi
 	printf '%s\n' "$boundary"
 )
 
 select_nearest_plan_boundary () (
 	candidates=$1
 	tip=$2
+	root_name=${3:-}
 	selected_name=
 	selected_boundary=
 	while IFS="$tab" read -r name boundary
@@ -2150,8 +2157,15 @@ select_nearest_plan_boundary () (
 		fi
 		if test "$boundary" = "$selected_boundary"
 		then
-			test "$name" = "$selected_name" ||
+			# An upstreamed topic can share the lane root commit.
+			if test "$name" = "$root_name"
+			then
+				selected_name=$name
+			elif test "$selected_name" != "$root_name" &&
+			     test "$name" != "$selected_name"
+			then
 				die "pinned topic has two equally near prerequisites '$selected_name' and '$name'"
+			fi
 			continue
 		fi
 		if git merge-base --is-ancestor "$selected_boundary" \
@@ -2181,7 +2195,7 @@ infer_added_plan_boundary () (
 	candidates=$tmp_dir/add-boundary-candidates
 	: >"$candidates"
 	if boundary=$(pinned_root_boundary "$current_base" \
-		"$published_base" "$tip")
+		"$published_base" "$tip" "$lane_base")
 	then
 		printf '%s\t%s\n' "$lane_base" "$boundary" >>"$candidates"
 	fi
@@ -2193,7 +2207,7 @@ infer_added_plan_boundary () (
 			printf '%s\t%s\n' "$name" "$generated_tip" \
 				>>"$candidates"
 	done <"$rows"
-	select_nearest_plan_boundary "$candidates" "$tip" ||
+	select_nearest_plan_boundary "$candidates" "$tip" "$lane_base" ||
 		die "new pinned topic is not based on a unique lane boundary"
 )
 
@@ -2216,7 +2230,7 @@ infer_altered_plan_boundary () (
 	if test "$prerequisite" = "$lane_base"
 	then
 		if boundary=$(pinned_root_boundary "$current_base" \
-			"$published_base" "$tip")
+			"$published_base" "$tip" "$lane_base")
 		then
 			printf '%s\t%s\n' "$prerequisite" "$boundary" \
 				>>"$candidates"
