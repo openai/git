@@ -4513,6 +4513,55 @@ test_expect_success 'codex rerere history can resolve a topic rebase' '
 	)
 '
 
+test_expect_success 'rerere continuation stops at an aborted octopus merge' '
+	test_create_repo aborted-octopus &&
+	(
+		cd aborted-octopus &&
+		test_commit base shared &&
+		git switch -c side-a master &&
+		test_commit side-a shared &&
+		git switch -c side-b master &&
+		test_commit side-b side-file &&
+		git switch -c topic master &&
+		test_commit topic shared &&
+		write resolved shared &&
+		write side-b side-file &&
+		git add shared side-file &&
+		merge=$(git commit-tree "$(git write-tree)" \
+			-p HEAD -p side-a -p side-b -m "resolved octopus") &&
+		git reset --hard "$merge" &&
+		test_commit after-merge after-file &&
+		git switch -c onto master &&
+		test_commit onto onto-file &&
+		git switch topic &&
+		test_must_fail git -c rerere.enabled=true \
+			-c rerere.autoupdate=true \
+			rebase --rebase-merges --onto onto master \
+			>rebase.out 2>rebase.err &&
+		test "$merge" = "$(git rev-parse REBASE_HEAD)" &&
+		test -z "$(git ls-files -u)" &&
+		git diff --cached --exit-code &&
+		test_must_fail git rev-parse --verify -q MERGE_HEAD &&
+		git rev-parse HEAD >before &&
+		sed -n "/^rebase_in_progress () {$/,/^}/p;
+			/^continue_rerere_resolution () {$/,/^}/p" \
+			"$codex_branch" >../rerere-functions &&
+		test_expect_code 1 sh -c "
+			. ../rerere-functions
+			replay_rerere=true
+			bot_name=\"$codex_bot_name\"
+			bot_email=\"$codex_bot_email\"
+			continue_rerere_resolution .
+		" >continue.out 2>continue.err &&
+		git rev-parse HEAD >after &&
+		test_cmp before after &&
+		test "$merge" = "$(git rev-parse REBASE_HEAD)" &&
+		test_path_is_dir .git/rebase-merge &&
+		test_path_is_missing after-file &&
+		git rebase --abort
+	)
+'
+
 test_expect_success 'rewrite preserves a merge in an enrolled stable topic' '
 	git init --bare private.git &&
 	test_create_repo private-source &&
