@@ -63,7 +63,116 @@ test_expect_success 'setup repository' '
 	git push --mirror "$HTTPD_DOCUMENT_ROOT_PATH/repo.git"
 '
 
-test_expect_success 'access using basic auth' '
+test_expect_success 'setup pack for authenticated downloads' '
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" repack -ad &&
+	pack=$(echo "$HTTPD_DOCUMENT_ROOT_PATH/repo.git/objects/pack/"*.pack) &&
+	pack_hash=${pack##*/pack-} &&
+	pack_hash=${pack_hash%.pack} &&
+	pack_url="$HTTPD_URL/custom_auth/repo.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success 'packfile download bounds multistage authentication retries' '
+	test_when_finished per_test_cleanup &&
+	set_credential_reply get <<-EOF &&
+	capability[]=authtype
+	capability[]=state
+	authtype=Multistage
+	credential=first
+	state[]=helper:second
+	continue=1
+	EOF
+	set_credential_reply get second <<-EOF &&
+	capability[]=authtype
+	capability[]=state
+	authtype=Multistage
+	credential=second
+	state[]=helper:third
+	continue=1
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=default response=WWW-Authenticate: Multistage challenge="retry"
+	EOF
+	test_config_global credential.helper test-helper &&
+	test_must_fail git http-fetch --packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin "$pack_url" &&
+	test_path_is_file get-query.cred &&
+	test_path_is_file get-query-second.cred &&
+	test_path_is_missing get-query-third.cred &&
+	test_path_is_missing store-query.cred
+'
+
+test_expect_success 'packfile redirect does not reuse source-scoped headers' '
+	test_when_finished per_test_cleanup &&
+	set_credential_reply get <<-EOF &&
+	capability[]=authtype
+	authtype=Bearer
+	credential=destination-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Bearer source-token
+	id=2 creds=Bearer destination-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=302 response=Location: http://localhost:$LIB_HTTPD_PORT/custom_auth/repo.git/objects/pack/pack-$pack_hash.pack
+	id=2 status=200
+	id=default response=WWW-Authenticate: Bearer realm="destination"
+	EOF
+	test_config_global "http.$HTTPD_URL.extraHeader" "Authorization: Bearer source-token" &&
+	test_config_global credential.helper test-helper &&
+	test_config_global credential.useHttpPath true &&
+	git -c http.minSessions=0 http-fetch --packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin "$pack_url" &&
+	expect_credential_query get <<-EOF &&
+	capability[]=authtype
+	capability[]=state
+	protocol=http
+	host=localhost:$LIB_HTTPD_PORT
+	path=custom_auth/repo.git/objects/pack/pack-$pack_hash.pack
+	wwwauth[]=Bearer realm="destination"
+	EOF
+	expect_credential_query store <<-EOF
+	capability[]=authtype
+	authtype=Bearer
+	credential=destination-token
+	protocol=http
+	host=localhost:$LIB_HTTPD_PORT
+	path=custom_auth/repo.git/objects/pack/pack-$pack_hash.pack
+	EOF
+'
+
+test_expect_success 'packfile download honors http.followRedirects=false' '
+	test_when_finished per_test_cleanup &&
+	test_config_global credential.helper test-helper &&
+	test_must_fail git -c http.followRedirects=false \
+		http-fetch --packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$HTTPD_URL/redir-to/auth/dumb/repo.git/objects/pack/pack-$pack_hash.pack" &&
+	test_path_is_missing get-query.cred
+'
+
+test_expect_success 'public packfile download does not consult credential helpers' '
+	test_when_finished per_test_cleanup &&
+	test_config_global credential.helper test-helper &&
+	git http-fetch --packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$HTTPD_URL/dumb/repo.git/objects/pack/pack-$pack_hash.pack?signature=opaque" &&
+	test_path_is_missing get-query.cred
+'
+
+for request in refs pack
+do
+	case "$request" in
+	refs)
+		command=ls-remote
+		url="$HTTPD_URL/custom_auth/repo.git"
+		;;
+	pack)
+		command="http-fetch --packfile=$pack_hash --index-pack-arg=index-pack --index-pack-arg=--stdin"
+		url=$pack_url
+		;;
+	esac
+
+test_expect_success "$request: access using basic auth" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -82,7 +191,7 @@ test_expect_success 'access using basic auth' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -100,7 +209,7 @@ test_expect_success 'access using basic auth' '
 	EOF
 '
 
-test_expect_success 'access using basic auth via authtype' '
+test_expect_success "$request: access using basic auth via authtype" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -120,7 +229,7 @@ test_expect_success 'access using basic auth via authtype' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	GIT_CURL_VERBOSE=1 git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	GIT_CURL_VERBOSE=1 git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -139,7 +248,7 @@ test_expect_success 'access using basic auth via authtype' '
 	EOF
 '
 
-test_expect_success 'access using basic auth invalid credentials' '
+test_expect_success "$request: access using basic auth invalid credentials" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -158,7 +267,7 @@ test_expect_success 'access using basic auth invalid credentials' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	test_must_fail git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	test_must_fail git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -177,7 +286,7 @@ test_expect_success 'access using basic auth invalid credentials' '
 	EOF
 '
 
-test_expect_success 'access using basic proactive auth' '
+test_expect_success "$request: access using basic proactive auth" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -197,7 +306,7 @@ test_expect_success 'access using basic proactive auth' '
 
 	test_config_global credential.helper test-helper &&
 	test_config_global http.proactiveAuth basic &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -215,7 +324,7 @@ test_expect_success 'access using basic proactive auth' '
 	EOF
 '
 
-test_expect_success 'access using auto proactive auth with basic default' '
+test_expect_success "$request: access using auto proactive auth with basic default" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -235,7 +344,7 @@ test_expect_success 'access using auto proactive auth with basic default' '
 
 	test_config_global credential.helper test-helper &&
 	test_config_global http.proactiveAuth auto &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -252,7 +361,7 @@ test_expect_success 'access using auto proactive auth with basic default' '
 	EOF
 '
 
-test_expect_success 'access using auto proactive auth with authtype from credential helper' '
+test_expect_success "$request: access using auto proactive auth with authtype from credential helper" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -275,7 +384,7 @@ test_expect_success 'access using auto proactive auth with authtype from credent
 
 	test_config_global credential.helper test-helper &&
 	test_config_global http.proactiveAuth auto &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -293,7 +402,7 @@ test_expect_success 'access using auto proactive auth with authtype from credent
 	EOF
 '
 
-test_expect_success 'access using basic auth with extra challenges' '
+test_expect_success "$request: access using basic auth with extra challenges" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -314,7 +423,7 @@ test_expect_success 'access using basic auth with extra challenges' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -334,7 +443,7 @@ test_expect_success 'access using basic auth with extra challenges' '
 	EOF
 '
 
-test_expect_success 'access using basic auth mixed-case wwwauth header name' '
+test_expect_success "$request: access using basic auth mixed-case wwwauth header name" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -355,7 +464,7 @@ test_expect_success 'access using basic auth mixed-case wwwauth header name' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -375,7 +484,7 @@ test_expect_success 'access using basic auth mixed-case wwwauth header name' '
 	EOF
 '
 
-test_expect_success 'access using basic auth with wwwauth header continuations' '
+test_expect_success "$request: access using basic auth with wwwauth header continuations" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -401,7 +510,7 @@ test_expect_success 'access using basic auth with wwwauth header continuations' 
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -421,7 +530,7 @@ test_expect_success 'access using basic auth with wwwauth header continuations' 
 	EOF
 '
 
-test_expect_success 'access using basic auth with wwwauth header empty continuations' '
+test_expect_success "$request: access using basic auth with wwwauth header empty continuations" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -449,7 +558,7 @@ test_expect_success 'access using basic auth with wwwauth header empty continuat
 	printf "id=default response=WWW-Authenticate: Basic realm=\"example.com\"\r\n" >>"$CHALLENGE" &&
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -469,7 +578,7 @@ test_expect_success 'access using basic auth with wwwauth header empty continuat
 	EOF
 '
 
-test_expect_success 'access using basic auth with wwwauth header mixed continuations' '
+test_expect_success "$request: access using basic auth with wwwauth header mixed continuations" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -493,7 +602,7 @@ test_expect_success 'access using basic auth with wwwauth header mixed continuat
 	printf "id=default response=WWW-Authenticate: Basic realm=\"example.com\"\r\n" >>"$CHALLENGE" &&
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -512,7 +621,7 @@ test_expect_success 'access using basic auth with wwwauth header mixed continuat
 	EOF
 '
 
-test_expect_success 'access using bearer auth' '
+test_expect_success "$request: access using bearer auth" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -536,7 +645,7 @@ test_expect_success 'access using bearer auth' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -557,7 +666,7 @@ test_expect_success 'access using bearer auth' '
 	EOF
 '
 
-test_expect_success 'access using bearer auth with invalid credentials' '
+test_expect_success "$request: access using bearer auth with invalid credentials" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -581,7 +690,7 @@ test_expect_success 'access using bearer auth with invalid credentials' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	test_must_fail git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	test_must_fail git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -605,6 +714,8 @@ test_expect_success 'access using bearer auth with invalid credentials' '
 	EOF
 '
 
+if test "$request" = refs
+then
 test_expect_success 'clone with bearer auth and probe_rpc' '
 	test_when_finished "per_test_cleanup" &&
 	test_when_finished "rm -rf large.git" &&
@@ -649,8 +760,9 @@ test_expect_success 'clone with bearer auth and probe_rpc' '
 	test_config_global credential.helper test-helper &&
 	git clone "$HTTPD_URL/custom_auth/large.git" partial-auth-clone 2>clone-error
 '
+fi
 
-test_expect_success 'access using three-legged auth' '
+test_expect_success "$request: access using three-legged auth" '
 	test_when_finished "per_test_cleanup" &&
 
 	set_credential_reply get <<-EOF &&
@@ -686,7 +798,7 @@ test_expect_success 'access using three-legged auth' '
 	EOF
 
 	test_config_global credential.helper test-helper &&
-	git ls-remote "$HTTPD_URL/custom_auth/repo.git" &&
+	git $command "$url" &&
 
 	expect_credential_query get <<-EOF &&
 	capability[]=authtype
@@ -720,6 +832,8 @@ test_expect_success 'access using three-legged auth' '
 '
 
 test_lazy_prereq SPNEGO 'curl --version | grep -qi "SPNEGO\|GSS-API\|Kerberos\|negotiate"'
+
+done
 
 test_expect_success SPNEGO 'http.emptyAuth=auto attempts Negotiate before credential_fill' '
 	test_when_finished "per_test_cleanup" &&
