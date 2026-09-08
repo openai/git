@@ -3,7 +3,6 @@
 	lane = codex-unstable
 	base-ref = refs/heads/codex
 	topic = refs/heads/tb/codex/status-preview-unstable
-	topic = refs/heads/tb/codex/fsmonitor-hardlink-inodes-unstable
 
 [branch "tb/codex/status-preview-unstable"]
 	remote = .
@@ -11,10 +10,3 @@
 	source-tip = cbf6ae4e9b3c705182b1e2573cee19aae7d4b877
 	source-base = 00ee4fe98b17036715a005ff47027f00a646d099
 	merge = refs/heads/codex
-
-[branch "tb/codex/fsmonitor-hardlink-inodes-unstable"]
-	remote = .
-	source-ref = refs/heads/tb/codex/fsmonitor-hardlink-inodes-unstable
-	source-tip = 88fab89c5ecd0a6f75a77616ebada157396dd475
-	source-base = cbf6ae4e9b3c705182b1e2573cee19aae7d4b877
-	merge = refs/heads/tb/codex/status-preview-unstable
