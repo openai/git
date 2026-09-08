@@ -79,6 +79,6 @@
 [branch "tb/codex/pin-ci-actions"]
 	remote = .
 	source-ref = refs/heads/tb/codex/pin-ci-actions
-	source-tip = 34df167fbb27652ccf434a7fd5e66a9e2af14cfd
+	source-tip = 026ca78e79986a60637df0fec4f2089e84f19f7a
 	source-base = 67ba20645b1792f43c8c8ea69c716687bda87ec3
 	merge = refs/heads/tb/codex/lto-pgo
