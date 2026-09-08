@@ -2700,6 +2700,7 @@ int finish_http_pack_request(struct http_pack_request *preq)
 
 	ip.git_cmd = 1;
 	ip.in = tmpfile_fd;
+	ip.clean_on_exit = 1;
 	strvec_pushv(&ip.args, preq->index_pack_args ?
 		     preq->index_pack_args :
 		     default_index_pack_args);
