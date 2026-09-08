@@ -10905,4 +10905,63 @@ test_expect_success SHA1 'reviewed CI image updates retain exact workflow entrie
 	)
 '
 
+test_expect_success 'new stable topics may start before the published upstream base' '
+	test_create_repo older-topic-base &&
+	(
+		cd older-topic-base &&
+		test_commit base &&
+		old_base=$(git rev-parse HEAD) &&
+		git switch -c topic &&
+		test_commit topic &&
+		topic=$(git rev-parse HEAD) &&
+		git switch master &&
+		test_commit upstream &&
+		current_base=$(git rev-parse HEAD) &&
+		sed -n "/^pinned_root_boundary () ($/,/^)/p;
+			/^select_nearest_plan_boundary () ($/,/^)/p;
+			/^infer_added_plan_boundary () ($/,/^)/p;
+			/^published_tip () ($/,/^)/p" \
+			"$codex_branch" >boundary-functions &&
+		. ./boundary-functions &&
+		die () { echo "$*" >&2; exit 1; } &&
+		base_name=master &&
+		tab=$(printf "\t") &&
+		tmp_dir=$PWD &&
+		: >rows &&
+		: >published &&
+		infer_added_plan_boundary rows published master \
+			"$current_base" "$current_base" "$topic" >actual &&
+		printf "master\t%s\n" "$old_base" >expect &&
+		test_cmp expect actual &&
+		test_expect_code 1 infer_added_plan_boundary rows published codex \
+			"$current_base" "$current_base" "$topic" 2>err &&
+		test_grep "not based on a unique lane boundary" err
+	)
+'
+
+test_expect_success 'an upstreamed topic does not compete with the lane root' '
+	(
+		cd older-topic-base &&
+		. ./boundary-functions &&
+		die () { echo "$*" >&2; exit 1; } &&
+		base_name=master &&
+		tab=$(printf "\t") &&
+		tmp_dir=$PWD &&
+		current_base=$(git rev-parse master) &&
+		printf "aa/codex/upstreamed\t%s\tmaster\n" "$current_base" >rows &&
+		cp rows published &&
+		git switch -c new-topic master &&
+		test_commit new-topic &&
+		infer_added_plan_boundary rows published master \
+			"$current_base" "$current_base" HEAD >actual &&
+		printf "master\t%s\n" "$current_base" >expect &&
+		test_cmp expect actual &&
+		printf "aa/codex/one\t%s\nbb/codex/two\t%s\n" \
+			"$(git rev-parse HEAD)" "$(git rev-parse HEAD)" >candidates &&
+		test_expect_code 1 select_nearest_plan_boundary candidates HEAD master \
+			2>err &&
+		test_grep "two equally near prerequisites" err
+	)
+'
+
 test_done
