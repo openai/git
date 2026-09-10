@@ -37,6 +37,7 @@
 #include "mergesort.h"
 #include "prio-queue.h"
 #include "promisor-remote.h"
+#include "progress.h"
 
 static int transfer_unpack_limit = -1;
 static int fetch_unpack_limit = -1;
@@ -1708,6 +1709,9 @@ static void precreate_packfile_uri_keep(const struct object_id *oid,
 
 struct packfile_uri_task {
 	struct child_process cmd;
+	struct strbuf output;
+	uint64_t bytes;
+	int got_pack;
 	struct object_id oid;
 	const char *uri;
 };
@@ -1715,7 +1719,7 @@ struct packfile_uri_task {
 static void start_packfile_uri_task(
 	struct packfile_uri_task *task, const char *entry,
 	struct strvec *index_pack_args, struct string_list *pack_lockfiles,
-	int precreate_keeps)
+	int precreate_keeps, int progress)
 {
 	if (parse_oid_hex(entry, &task->oid, &task->uri) ||
 	    *task->uri++ != ' ')
@@ -1724,11 +1728,17 @@ static void start_packfile_uri_task(
 		precreate_packfile_uri_keep(&task->oid, pack_lockfiles);
 
 	child_process_init(&task->cmd);
+	strbuf_init(&task->output, 0);
+	task->bytes = 0;
+	task->got_pack = 0;
 	strvec_push(&task->cmd.args, "http-fetch");
+	if (progress)
+		strvec_push(&task->cmd.args, "--report-progress");
 	strvec_pushf(&task->cmd.args, "--packfile=%s",
 		     oid_to_hex(&task->oid));
 	for (size_t i = 0; i < index_pack_args->nr; i++) {
-		if (index_pack_arg_is_keep(index_pack_args->v[i]))
+		if (index_pack_arg_is_keep(index_pack_args->v[i]) ||
+		    !strcmp(index_pack_args->v[i], "-v"))
 			continue;
 		strvec_pushf(&task->cmd.args, "--index-pack-arg=%s",
 			     index_pack_args->v[i]);
@@ -1738,91 +1748,163 @@ static void start_packfile_uri_task(
 	task->cmd.no_stdin = 1;
 	task->cmd.clean_on_exit = 1;
 	task->cmd.out = -1;
+	task->cmd.err = -1;
 	if (start_command(&task->cmd))
 		die("fetch-pack: unable to spawn http-fetch");
 }
 
-static void finish_packfile_uri_task(struct packfile_uri_task *task,
-				     struct oidset *gitmodules_oids)
+static void read_packfile_uri_task(struct packfile_uri_task *task,
+				   struct oidset *gitmodules_oids,
+				   uint64_t *total_bytes)
 {
-	char packhash[GIT_MAX_HEXSZ + 1];
-	struct object_id oid;
+	char *eol;
+	size_t consumed = 0;
+	ssize_t n = strbuf_read_once(&task->output, task->cmd.out, 0);
 
-	if (read_in_full(task->cmd.out, packhash, 5) != 5 ||
-	    memcmp(packhash, "pack\t", 5))
-		die("fetch-pack: expected pack then TAB at start of http-fetch output");
-	if (read_in_full(task->cmd.out, packhash,
-			 the_hash_algo->hexsz + 1) != the_hash_algo->hexsz + 1 ||
-	    packhash[the_hash_algo->hexsz] != '\n')
-		die("fetch-pack: expected hash then LF in http-fetch output");
-	packhash[the_hash_algo->hexsz] = '\0';
-	if (get_oid_hex(packhash, &oid))
-		die("fetch-pack: expected hash then LF in http-fetch output");
+	if (n < 0)
+		die_errno("fetch-pack: unable to read http-fetch output");
+	if (!n) {
+		close(task->cmd.out);
+		task->cmd.out = -1;
+	}
 
-	parse_gitmodules_oids(task->cmd.out, gitmodules_oids);
-	close(task->cmd.out);
-	task->cmd.out = -1;
+	while ((eol = memchr(task->output.buf + consumed, '\n',
+			     task->output.len - consumed))) {
+		const char *line = task->output.buf + consumed;
+		const char *end;
+		struct object_id oid;
 
+		*eol = '\0';
+		if (!task->got_pack && skip_prefix(line, "bytes ", &line)) {
+			char *end;
+			uint64_t bytes;
+
+			errno = 0;
+			bytes = strtoumax(line, &end, 10);
+			if (!isdigit(*line) || end != eol || errno ||
+			    bytes < task->bytes ||
+			    UINT64_MAX - *total_bytes < bytes - task->bytes)
+				die("fetch-pack: invalid download byte count");
+			*total_bytes += bytes - task->bytes;
+			task->bytes = bytes;
+		} else {
+			if (!task->got_pack && !skip_prefix(line, "pack\t", &line))
+				die("fetch-pack: expected pack then TAB at start of http-fetch output");
+			if (parse_oid_hex(line, &oid, &end) || end != eol)
+				die("fetch-pack: invalid hash in http-fetch output");
+			if (task->got_pack)
+				oidset_insert(gitmodules_oids, &oid);
+			else if (!oideq(&task->oid, &oid))
+				die("fetch-pack: pack downloaded from %s does not match expected hash %s",
+				    task->uri, oid_to_hex(&task->oid));
+			task->got_pack = 1;
+		}
+		consumed = eol - task->output.buf + 1;
+	}
+	strbuf_remove(&task->output, 0, consumed);
+	if (task->output.len > GIT_MAX_HEXSZ + 5)
+		die("fetch-pack: invalid http-fetch output");
+}
+
+static void finish_packfile_uri_task(struct packfile_uri_task *task)
+{
 	if (finish_command(&task->cmd))
 		die("fetch-pack: unable to finish http-fetch");
-	if (!oideq(&task->oid, &oid))
-		die("fetch-pack: pack downloaded from %s does not match expected hash %s",
-		    task->uri, oid_to_hex(&task->oid));
+	if (!task->got_pack || task->output.len)
+		die("fetch-pack: incomplete http-fetch output");
+	strbuf_release(&task->output);
 }
 
 static void fetch_packfile_uris_parallel(
 	struct string_list *uris, struct strvec *index_pack_args,
-	struct string_list *pack_lockfiles, struct oidset *gitmodules_oids)
+	struct string_list *pack_lockfiles, struct oidset *gitmodules_oids,
+	int show_progress)
 {
 	size_t task_nr = uris->nr;
 	struct packfile_uri_task *tasks;
 	struct pollfd *pollfds;
 	int precreate_keeps = index_pack_args_have_keep(index_pack_args);
-	size_t next = 0, running = 0;
+	size_t next = 0, running = 0, completed = 0;
+	uint64_t total_bytes = 0;
+	struct progress *progress = NULL;
+	int diagnostic_incomplete = 0;
+
+	if (show_progress) {
+		progress = start_progress(the_repository, _("Fetching packs"), uris->nr);
+		display_throughput(progress, 0);
+		display_progress(progress, 0);
+	}
 
 	if (task_nr > (size_t)fetch_packfile_uri_jobs)
 		task_nr = fetch_packfile_uri_jobs;
 	CALLOC_ARRAY(tasks, task_nr);
-	CALLOC_ARRAY(pollfds, task_nr);
+	CALLOC_ARRAY(pollfds, 2 * task_nr);
 
 	for (; next < task_nr; next++)
 		start_packfile_uri_task(&tasks[next],
 					uris->items[next].string, index_pack_args,
-					pack_lockfiles, precreate_keeps);
+					pack_lockfiles, precreate_keeps, show_progress);
 	running = next;
 
 	while (running) {
-		size_t ready = task_nr;
 		int ret;
 
-		for (size_t i = 0; i < task_nr; i++) {
-			pollfds[i].fd = tasks[i].cmd.out;
-			pollfds[i].events = POLLIN | POLLHUP;
+		if (!diagnostic_incomplete) {
+			display_throughput(progress, total_bytes);
+			display_progress(progress, completed);
 		}
-		do
-			ret = poll(pollfds, task_nr, -1);
-		while (ret < 0 && errno == EINTR);
+
+		for (size_t i = 0; i < task_nr; i++) {
+			pollfds[2 * i].fd = tasks[i].cmd.out;
+			pollfds[2 * i + 1].fd = tasks[i].cmd.err;
+			pollfds[2 * i].events = pollfds[2 * i + 1].events = POLLIN | POLLHUP;
+		}
+		ret = poll(pollfds, 2 * task_nr, -1);
+		if (ret < 0 && errno == EINTR)
+			continue; /* Refresh progress after its timer fires. */
 		if (ret < 0)
 			die_errno("fetch-pack: unable to poll http-fetch");
 		for (size_t i = 0; i < task_nr; i++) {
-			if (pollfds[i].revents) {
-				ready = i;
-				break;
-			}
-		}
-		if (ready == task_nr)
-			BUG("poll returned without a ready http-fetch");
+			struct packfile_uri_task *task = &tasks[i];
 
-		finish_packfile_uri_task(&tasks[ready], gitmodules_oids);
-		if (next < uris->nr) {
-			start_packfile_uri_task(&tasks[ready],
-						uris->items[next].string,
+			if (!pollfds[2 * i].revents && !pollfds[2 * i + 1].revents)
+				continue;
+			if (pollfds[2 * i + 1].revents) {
+				char buf[8192];
+				ssize_t n = xread(task->cmd.err, buf, sizeof(buf));
+
+				if (n < 0)
+					die_errno("fetch-pack: unable to read http-fetch errors");
+				if (n) {
+					if (!diagnostic_incomplete)
+						clear_progress(progress);
+					write_or_die(2, buf, n);
+					diagnostic_incomplete = buf[n - 1] != '\n';
+				} else {
+					close(task->cmd.err);
+					task->cmd.err = -1;
+				}
+			}
+			if (pollfds[2 * i].revents)
+				read_packfile_uri_task(task, gitmodules_oids, &total_bytes);
+			if (task->cmd.out >= 0 || task->cmd.err >= 0)
+				continue;
+
+			finish_packfile_uri_task(task);
+			completed++;
+			if (next < uris->nr)
+				start_packfile_uri_task(task, uris->items[next++].string,
 						index_pack_args, pack_lockfiles,
-						precreate_keeps);
-			next++;
-		} else
-			running--;
+						precreate_keeps, show_progress);
+			else
+				running--;
+		}
 	}
+	if (diagnostic_incomplete)
+		fputc('\n', stderr);
+	display_throughput(progress, total_bytes);
+	display_progress(progress, completed);
+	stop_progress(&progress);
 
 	free(pollfds);
 	free(tasks);
@@ -2044,7 +2126,8 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 		strvec_push(&index_pack_args, "--threads=1");
 		fetch_packfile_uris_parallel(&packfile_uris, &index_pack_args,
 					    pack_lockfiles,
-					    &fsck_options.gitmodules_found);
+					    &fsck_options.gitmodules_found,
+					    !args->quiet && !args->no_progress);
 		goto packfile_uris_done;
 	}
 

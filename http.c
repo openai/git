@@ -2722,6 +2722,16 @@ void http_install_packfile(struct packed_git *p,
 	packfile_store_add_pack(files->packed, p);
 }
 
+static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
+{
+	struct http_pack_request *preq = data;
+	size_t written = fwrite(ptr, 1, st_mult(size, nmemb), preq->packfile);
+
+	if (preq->progress)
+		preq->progress(preq->progress_data, written);
+	return written;
+}
+
 struct http_pack_request *new_http_pack_request(
 	const unsigned char *packed_git_hash, const char *base_url) {
 
@@ -2779,8 +2789,8 @@ struct http_pack_request *new_direct_http_pack_request(
 
 	preq->slot = get_active_slot();
 	preq->headers = object_request_headers();
-	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq->packfile);
-	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
+	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_http_pack);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
 
