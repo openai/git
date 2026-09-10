@@ -972,6 +972,36 @@ test_expect_success 'reject client packfile-uris if not advertised' '
 		upload-pack client <input
 '
 
+test_expect_success 'fetch no-ref-delta requires advertisement' '
+	rm -rf no-ref-advertisement &&
+	git init no-ref-advertisement &&
+	test_commit -C no-ref-advertisement one &&
+	env GIT_CONFIG_COUNT=1 \
+		GIT_CONFIG_KEY_0=uploadpack.allowNoRefDelta \
+		GIT_CONFIG_VALUE_0=true \
+		test-tool -C no-ref-advertisement serve-v2 \
+		--advertise-capabilities \
+		>advertisement &&
+	test_grep "fetch=.*no-ref-delta" advertisement &&
+	{
+		packetize command=fetch &&
+		packetize object-format=$(test_oid algo) &&
+		printf 0001 &&
+		packetize no-ref-delta &&
+		packetize "want $(git -C no-ref-advertisement rev-parse HEAD)" &&
+		packetize done &&
+		printf 0000
+	} >input &&
+	test_must_fail env GIT_PROTOCOL=version=2 \
+		git upload-pack no-ref-advertisement <input &&
+	GIT_TRACE2_EVENT="$PWD/no-ref-upload.trace" \
+	GIT_PROTOCOL=version=2 \
+		git -c uploadpack.allowNoRefDelta=true \
+		upload-pack no-ref-advertisement <input >out &&
+	test_grep "\"event\":\"child_start\".*\"pack-objects\".*--no-ref-delta" \
+		no-ref-upload.trace
+'
+
 # Test protocol v2 with 'http://' transport
 #
 . "$TEST_DIRECTORY"/lib-httpd.sh
@@ -1268,6 +1298,38 @@ test_expect_success 'part of packfile response provided as URI' '
 	ls http_child/.git/objects/pack/*.pack \
 	    http_child/.git/objects/pack/*.idx >filelist &&
 	test_line_count = 6 filelist
+'
+
+test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
+	P="$HTTPD_DOCUMENT_ROOT_PATH/http_parent" &&
+	rm -rf "$P" http_child-no-ref no-ref-* &&
+	git init "$P" &&
+	git -C "$P" config uploadpack.allowsidebandall true &&
+	git -C "$P" config uploadpack.allowNoRefDelta true &&
+	echo one >"$P/one" &&
+	echo two >"$P/two" &&
+	echo three >"$P/three" &&
+	git -C "$P" add one two three &&
+	git -C "$P" commit -m objects &&
+	# A one-object pack cannot contain a delta.
+	configure_exclusion "$P" one >/dev/null &&
+	configure_exclusion "$P" two >/dev/null &&
+	configure_exclusion "$P" three >/dev/null &&
+
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/no-ref-index.trace" \
+	GIT_TRACE_PACKET="$TRASH_DIRECTORY/no-ref-packet.trace" \
+	GIT_TEST_SIDEBAND_ALL=1 \
+	git -c protocol.version=2 -c fetch.uriprotocols=http \
+		-c fetch.packfileUriJobs=2 \
+		clone "$HTTPD_URL/smart/http_parent" http_child-no-ref &&
+
+	test_grep "> no-ref-delta" no-ref-packet.trace &&
+	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta" \
+		no-ref-index.trace >no-ref-indexers &&
+	test_line_count = 4 no-ref-indexers &&
+	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=1" \
+		no-ref-index.trace >no-ref-uri-indexers &&
+	test_line_count = 3 no-ref-uri-indexers
 '
 
 test_expect_success 'packfile URIs with fetch instead of clone' '
