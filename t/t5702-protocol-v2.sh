@@ -1321,7 +1321,8 @@ test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
 	GIT_TEST_SIDEBAND_ALL=1 \
 	git -c protocol.version=2 -c fetch.uriprotocols=http \
 		-c fetch.packfileUriJobs=2 \
-		clone "$HTTPD_URL/smart/http_parent" http_child-no-ref &&
+		clone --progress "$HTTPD_URL/smart/http_parent" http_child-no-ref \
+		2>no-ref-progress &&
 
 	test_grep "> no-ref-delta" no-ref-packet.trace &&
 	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta" \
@@ -1329,7 +1330,42 @@ test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
 	test_line_count = 4 no-ref-indexers &&
 	grep "\"event\":\"child_start\".*\"index-pack\".*--no-ref-delta.*--threads=1" \
 		no-ref-index.trace >no-ref-uri-indexers &&
-	test_line_count = 3 no-ref-uri-indexers
+	test_line_count = 3 no-ref-uri-indexers &&
+	test_grep ! "\"-v\"" no-ref-uri-indexers &&
+	bytes=0 &&
+	git -C "$P" config --get-all uploadpack.blobpackfileuri >no-ref-uris &&
+	while read object pack uri
+	do
+		size=$(wc -c <"$HTTPD_DOCUMENT_ROOT_PATH/mypack-$pack.pack") &&
+		bytes=$((bytes + size)) || return 1
+	done <no-ref-uris &&
+	test_grep "Fetching packs: 100% (3/3), $bytes bytes |.*done" no-ref-progress &&
+	test_grep ! "^bytes " no-ref-progress
+'
+
+test_expect_success 'parallel URI progress respects quiet and no-progress' '
+	for option in --quiet --no-progress
+	do
+		GIT_TEST_SIDEBAND_ALL=1 \
+		git -c protocol.version=2 -c fetch.uriprotocols=http \
+			-c fetch.packfileUriJobs=2 clone "$option" \
+			"$HTTPD_URL/smart/http_parent" "http_child-$option" \
+			2>no-ref-progress &&
+		test_grep ! -E "Fetching packs|Receiving objects|^bytes " no-ref-progress ||
+		return 1
+	done
+'
+
+test_expect_success 'parallel URI progress preserves worker errors' '
+	test_when_finished "mv missing.pack \"$HTTPD_DOCUMENT_ROOT_PATH/mypack-$(cat packh).pack\"" &&
+	mv "$HTTPD_DOCUMENT_ROOT_PATH/mypack-$(cat packh).pack" missing.pack &&
+	test_must_fail env GIT_TEST_SIDEBAND_ALL=1 \
+		git -c protocol.version=2 -c fetch.uriprotocols=http \
+		-c fetch.packfileUriJobs=2 clone --progress \
+		"$HTTPD_URL/smart/http_parent" http_child-missing \
+		2>no-ref-error &&
+	test_grep "404" no-ref-error &&
+	test_grep ! "Fetching packs: 100%.*done" no-ref-error
 '
 
 test_expect_success 'packfile URIs with fetch instead of clone' '
