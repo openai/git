@@ -376,12 +376,34 @@ jobs:
           script/build.sh
 
       - name: Set up Git for Windows SDK
-        if: matrix.target_platform == 'win32'
+        if: matrix.target_platform == 'win32' && matrix.arch != 'x64'
         uses: git-for-windows/setup-git-for-windows-sdk@335917db02da4280d3d5e87915d7b86196677f9f # v2
         with:
           architecture: ${{ matrix.sdk_arch }}
           flavor: ${{ matrix.sdk_flavor }}
           cache: false
+
+      # Keep the MINGW64 toolchain paired with our pinned MinGit runtime.
+      # The SDK's main branch has moved to UCRT64.
+      - name: Check out the pinned Windows x64 SDK
+        if: matrix.target_platform == 'win32' && matrix.arch == 'x64'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: git-for-windows/git-sdk-64
+          ref: 7ca76c34e6aa2edcba062582a5338be2b50fe769
+          path: windows-sdk
+          persist-credentials: false
+
+      - name: Select the pinned Windows x64 SDK
+        if: matrix.target_platform == 'win32' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in usr/bin/core_perl usr/bin mingw64/bin
+          do
+            cygpath -w "$GITHUB_WORKSPACE/windows-sdk/$directory" >>"$GITHUB_PATH"
+          done
+          printf 'MSYSTEM=MINGW64\nLC_CTYPE=C.UTF-8\n' >>"$GITHUB_ENV"
 
       # Dugite Native compiles its Git submodule on macOS and Linux. On
       # Windows it starts from MinGit, so replace MinGit's Git programs with
