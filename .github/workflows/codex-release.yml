@@ -405,23 +405,6 @@ jobs:
           done
           printf 'MSYSTEM=MINGW64\nLC_CTYPE=C.UTF-8\n' >>"$GITHUB_ENV"
 
-      - name: Initialize the pinned Windows x64 SDK devices
-        if: matrix.target_platform == 'win32' && matrix.arch == 'x64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p /dev/mqueue /dev/shm
-          for device in fd stdin stdout stderr
-          do
-            case "$device" in
-              fd) target=fd ;;
-              stdin) target=fd/0 ;;
-              stdout) target=fd/1 ;;
-              stderr) target=fd/2 ;;
-            esac
-            MSYS=winsymlinks:sys ln -s "/proc/self/$target" "/dev/$device"
-          done
-
       # Dugite Native compiles its Git submodule on macOS and Linux. On
       # Windows it starts from MinGit, so replace MinGit's Git programs with
       # the build from this repository while retaining the portable runtime.
