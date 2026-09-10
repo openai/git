@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: codex-git-release-${{ github.repository }}-${{ inputs.source_sha || github.sha }}
+  group: sdk-pin-validation-${{ github.repository }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
