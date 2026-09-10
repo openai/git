@@ -67,7 +67,7 @@
 [branch "tb/codex/parallel-packfile-uris"]
 	remote = .
 	source-ref = refs/heads/tb/codex/parallel-packfile-uris
-	source-tip = a08b8d8bb7e3082e9d8e3d29e1535579234784be
+	source-tip = 6e4bb83123acb8fdb3d929c22bd446f8eb6a7b33
 	source-base = 4cc8b3223b233aa3b795b1265e6e7cf3d63c7170
 	merge = refs/heads/tb/codex/packfile-uri-concurrency
 
