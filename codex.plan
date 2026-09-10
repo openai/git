@@ -12,7 +12,6 @@
 	topic = refs/heads/tb/codex/parallel-packfile-uris
 	topic = refs/heads/tb/codex/release-tooling
 	topic = refs/heads/tb/codex/pin-ci-actions
-	topic = refs/heads/af/codex/packfile-uri-credentials
 	topic = refs/heads/dr/codex/trace2-redact-url-signatures
 
 [branch "tb/codex/automation"]
@@ -84,13 +83,6 @@
 	source-tip = 026ca78e79986a60637df0fec4f2089e84f19f7a
 	source-base = 67ba20645b1792f43c8c8ea69c716687bda87ec3
 	merge = refs/heads/tb/codex/lto-pgo
-
-[branch "af/codex/packfile-uri-credentials"]
-	remote = .
-	source-ref = refs/heads/af/codex/packfile-uri-credentials
-	source-tip = 409df2c11ff1465d7f587026ec3a0d9375c105ef
-	source-base = 2c3adbb2c475981e340c79fdc5e7f4f9b5d9054e
-	merge = refs/heads/master
 
 [branch "dr/codex/trace2-redact-url-signatures"]
 	remote = .
