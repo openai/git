@@ -14,6 +14,7 @@
 	topic = refs/heads/tb/codex/pin-ci-actions
 	topic = refs/heads/dr/codex/trace2-redact-url-signatures
 	topic = refs/heads/af/codex/packfile-uri-credentials
+	topic = refs/heads/tb/codex/pin-windows-sdk
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -98,3 +99,10 @@
 	source-tip = 51ad3937d18480ab9f149d568e70e34448e12d10
 	source-base = 6e4bb83123acb8fdb3d929c22bd446f8eb6a7b33
 	merge = refs/heads/tb/codex/parallel-packfile-uris
+
+[branch "tb/codex/pin-windows-sdk"]
+	remote = .
+	source-ref = refs/heads/tb/codex/pin-windows-sdk
+	source-tip = 7917434bd1c9936194f0126ddac10c795ed61f40
+	source-base = 66c1ed633a371bccb1abbe2297bfd3b27a498d87
+	merge = refs/heads/tb/codex/release-tooling
