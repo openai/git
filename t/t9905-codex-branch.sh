@@ -10899,9 +10899,14 @@ test_expect_success SHA1 'reviewed CI image updates retain exact workflow entrie
 		ci_workflow_pins_are_reviewed "$before" "$pinned" &&
 		ci_workflow_pins_are_reviewed "$before" "$updated" &&
 		ci_workflow_pins_are_reviewed "$pinned" "$updated" &&
+		ci_workflow_pins_are_reviewed "$before" "$sdk" &&
+		ci_workflow_pins_are_reviewed "$pinned" "$sdk" &&
 		ci_workflow_pins_are_reviewed "$updated" "$sdk" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$unknown" "$sdk" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$before" "$sdk_mode" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$updated" "$sdk_mode" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$sdk" "$before" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$sdk" "$pinned" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$sdk" "$updated" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$pinned" "$unknown" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$unknown" "$updated" &&

@@ -386,7 +386,9 @@ ci_workflow_pins_are_reviewed () (
 		new=$(git ls-tree "$head_oid" -- "$path") || return 1
 		test "$old" = "$new" && continue
 		if test "$path" = .github/workflows/main.yml &&
-		   test "$old" = "100644 blob 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8$tab$path" &&
+		   { test "$old" = "100644 blob $old_blob$tab$path" ||
+		     test "$old" = "100644 blob $new_blob$tab$path" ||
+		     test "$old" = "100644 blob $updated_blob$tab$path"; } &&
 		   test "$new" = "100644 blob 44337a67422e019f41a3c8404062487c3d603dfb$tab$path"
 		then
 			continue
