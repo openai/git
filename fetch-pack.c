@@ -37,6 +37,7 @@
 #include "mergesort.h"
 #include "prio-queue.h"
 #include "promisor-remote.h"
+#include "progress.h"
 
 static int transfer_unpack_limit = -1;
 static int fetch_unpack_limit = -1;
@@ -49,6 +50,7 @@ static int fetch_fsck_objects = -1;
 static int transfer_fsck_objects = -1;
 static int agent_supported;
 static int server_supports_filtering;
+static int fetch_packfile_uri_jobs = 1;
 static struct shallow_lock shallow_lock;
 static const char *alternate_shallow_file;
 static struct strbuf fsck_msg_types = STRBUF_INIT;
@@ -960,6 +962,7 @@ static void add_index_pack_keep_option(struct strvec *args)
 static int get_pack(struct fetch_pack_args *args,
 		    int xd[2], struct string_list *pack_lockfiles,
 		    struct strvec *index_pack_args,
+		    int no_ref_delta,
 		    struct ref **sought, int nr_sought,
 		    struct oidset *gitmodules_oids)
 {
@@ -988,7 +991,8 @@ static int get_pack(struct fetch_pack_args *args,
 	else
 		demux.out = xd[0];
 
-	if (!args->keep_pack && unpack_limit && !index_pack_args) {
+	if (!args->keep_pack && unpack_limit && !index_pack_args &&
+	    !no_ref_delta) {
 
 		if (read_pack_header(demux.out, &header))
 			die(_("protocol error: bad pack header"));
@@ -1006,12 +1010,15 @@ static int get_pack(struct fetch_pack_args *args,
 
 	fsck_objects = fetch_pack_fsck_objects();
 
-	if (do_keep || args->from_promisor || index_pack_args || fsck_objects) {
+	if (do_keep || args->from_promisor || index_pack_args ||
+	    no_ref_delta || fsck_objects) {
 		if (pack_lockfiles || fsck_objects)
 			cmd.out = -1;
 		cmd_name = "index-pack";
 		strvec_push(&cmd.args, cmd_name);
 		strvec_push(&cmd.args, "--stdin");
+		if (no_ref_delta)
+			strvec_push(&cmd.args, "--no-ref-delta");
 		if (!args->quiet && !args->no_progress)
 			strvec_push(&cmd.args, "-v");
 		if (args->use_thin_pack)
@@ -1264,7 +1271,7 @@ static struct ref *do_fetch_pack(struct fetch_pack_args *args,
 		alternate_shallow_file = NULL;
 
 	fsck_options_init(&fsck_options, the_repository, FSCK_OPTIONS_MISSING_GITMODULES);
-	if (get_pack(args, fd, pack_lockfiles, NULL, sought, nr_sought,
+	if (get_pack(args, fd, pack_lockfiles, NULL, 0, sought, nr_sought,
 		     &fsck_options.gitmodules_found))
 		die(_("git fetch-pack: fetch failed."));
 	if (fsck_finish(&fsck_options))
@@ -1380,7 +1387,8 @@ static int send_fetch_request(struct fetch_negotiator *negotiator, int fd_out,
 			      const struct ref *wants, struct oidset *common,
 			      int *haves_to_send, int *in_vain,
 			      int sideband_all, int seen_ack,
-			      struct oidset *negotiation_include_oids)
+			      struct oidset *negotiation_include_oids,
+			      int *no_ref_delta)
 {
 	int haves_added;
 	int done_sent = 0;
@@ -1425,6 +1433,12 @@ static int send_fetch_request(struct fetch_negotiator *negotiator, int fd_out,
 		if (to_send.len) {
 			packet_buf_write(&req_buf, "packfile-uris %s",
 					 to_send.buf);
+			if (fetch_packfile_uri_jobs > 1 &&
+			    server_supports_feature(
+				    "fetch", "no-ref-delta", 0)) {
+				packet_buf_write(&req_buf, "no-ref-delta");
+				*no_ref_delta = 1;
+			}
 			strbuf_release(&to_send);
 		}
 	}
@@ -1643,14 +1657,257 @@ static void receive_packfile_uris(struct packet_reader *reader,
 {
 	process_section_header(reader, "packfile-uris", 0);
 	while (packet_reader_read(reader) == PACKET_READ_NORMAL) {
-		if (reader->pktlen < the_hash_algo->hexsz ||
-		    reader->line[the_hash_algo->hexsz] != ' ')
+		struct object_id oid;
+		const char *end;
+
+		if (parse_oid_hex(reader->line, &oid, &end) || *end != ' ')
 			die("expected '<hash> <uri>', got: %s", reader->line);
 
 		string_list_append(uris, reader->line);
 	}
 	if (reader->status != PACKET_READ_DELIM)
 		die("expected DELIM");
+}
+
+static int index_pack_arg_is_keep(const char *arg)
+{
+	const char *suffix;
+
+	return skip_prefix(arg, "--keep", &suffix) &&
+		(!*suffix || *suffix == '=');
+}
+
+static int index_pack_args_have_keep(struct strvec *index_pack_args)
+{
+	for (size_t i = 0; i < index_pack_args->nr; i++)
+		if (index_pack_arg_is_keep(index_pack_args->v[i]))
+			return 1;
+
+	return 0;
+}
+
+static void precreate_packfile_uri_keep(const struct object_id *oid,
+					struct string_list *pack_lockfiles)
+{
+	struct strbuf keep = STRBUF_INIT;
+	int keep_fd;
+
+	odb_pack_name(the_repository, &keep, oid->hash, "keep");
+	keep_fd = safe_create_file_with_leading_directories(the_repository,
+							    keep.buf);
+	if (keep_fd < 0) {
+		if (errno != EEXIST)
+			die_errno("fetch-pack: unable to create URI keep");
+		strbuf_release(&keep);
+		return;
+	}
+	string_list_append_nodup(pack_lockfiles,
+				 strbuf_detach(&keep, NULL));
+	if (close(keep_fd))
+		die_errno("fetch-pack: unable to close URI keep");
+}
+
+struct packfile_uri_task {
+	struct child_process cmd;
+	struct strbuf output;
+	uint64_t bytes;
+	int got_pack;
+	struct object_id oid;
+	const char *uri;
+};
+
+static void start_packfile_uri_task(
+	struct packfile_uri_task *task, const char *entry,
+	struct strvec *index_pack_args, struct string_list *pack_lockfiles,
+	int precreate_keeps, int progress)
+{
+	if (parse_oid_hex(entry, &task->oid, &task->uri) ||
+	    *task->uri++ != ' ')
+		BUG("invalid packfile URI entry");
+	if (precreate_keeps)
+		precreate_packfile_uri_keep(&task->oid, pack_lockfiles);
+
+	child_process_init(&task->cmd);
+	strbuf_init(&task->output, 0);
+	task->bytes = 0;
+	task->got_pack = 0;
+	strvec_push(&task->cmd.args, "http-fetch");
+	if (progress)
+		strvec_push(&task->cmd.args, "--report-progress");
+	strvec_pushf(&task->cmd.args, "--packfile=%s",
+		     oid_to_hex(&task->oid));
+	for (size_t i = 0; i < index_pack_args->nr; i++) {
+		if (index_pack_arg_is_keep(index_pack_args->v[i]) ||
+		    !strcmp(index_pack_args->v[i], "-v"))
+			continue;
+		strvec_pushf(&task->cmd.args, "--index-pack-arg=%s",
+			     index_pack_args->v[i]);
+	}
+	strvec_push(&task->cmd.args, task->uri);
+	task->cmd.git_cmd = 1;
+	task->cmd.no_stdin = 1;
+	task->cmd.clean_on_exit = 1;
+	task->cmd.out = -1;
+	task->cmd.err = -1;
+	if (start_command(&task->cmd))
+		die("fetch-pack: unable to spawn http-fetch");
+}
+
+static void read_packfile_uri_task(struct packfile_uri_task *task,
+				   struct oidset *gitmodules_oids,
+				   uint64_t *total_bytes)
+{
+	char *eol;
+	size_t consumed = 0;
+	ssize_t n = strbuf_read_once(&task->output, task->cmd.out, 0);
+
+	if (n < 0)
+		die_errno("fetch-pack: unable to read http-fetch output");
+	if (!n) {
+		close(task->cmd.out);
+		task->cmd.out = -1;
+	}
+
+	while ((eol = memchr(task->output.buf + consumed, '\n',
+			     task->output.len - consumed))) {
+		const char *line = task->output.buf + consumed;
+		const char *end;
+		struct object_id oid;
+
+		*eol = '\0';
+		if (!task->got_pack && skip_prefix(line, "bytes ", &line)) {
+			char *end;
+			uint64_t bytes;
+
+			errno = 0;
+			bytes = strtoumax(line, &end, 10);
+			if (!isdigit(*line) || end != eol || errno ||
+			    bytes < task->bytes ||
+			    UINT64_MAX - *total_bytes < bytes - task->bytes)
+				die("fetch-pack: invalid download byte count");
+			*total_bytes += bytes - task->bytes;
+			task->bytes = bytes;
+		} else {
+			if (!task->got_pack && !skip_prefix(line, "pack\t", &line))
+				die("fetch-pack: expected pack then TAB at start of http-fetch output");
+			if (parse_oid_hex(line, &oid, &end) || end != eol)
+				die("fetch-pack: invalid hash in http-fetch output");
+			if (task->got_pack)
+				oidset_insert(gitmodules_oids, &oid);
+			else if (!oideq(&task->oid, &oid))
+				die("fetch-pack: pack downloaded from %s does not match expected hash %s",
+				    task->uri, oid_to_hex(&task->oid));
+			task->got_pack = 1;
+		}
+		consumed = eol - task->output.buf + 1;
+	}
+	strbuf_remove(&task->output, 0, consumed);
+	if (task->output.len > GIT_MAX_HEXSZ + 5)
+		die("fetch-pack: invalid http-fetch output");
+}
+
+static void finish_packfile_uri_task(struct packfile_uri_task *task)
+{
+	if (finish_command(&task->cmd))
+		die("fetch-pack: unable to finish http-fetch");
+	if (!task->got_pack || task->output.len)
+		die("fetch-pack: incomplete http-fetch output");
+	strbuf_release(&task->output);
+}
+
+static void fetch_packfile_uris_parallel(
+	struct string_list *uris, struct strvec *index_pack_args,
+	struct string_list *pack_lockfiles, struct oidset *gitmodules_oids,
+	int show_progress)
+{
+	size_t task_nr = uris->nr;
+	struct packfile_uri_task *tasks;
+	struct pollfd *pollfds;
+	int precreate_keeps = index_pack_args_have_keep(index_pack_args);
+	size_t next = 0, running = 0, completed = 0;
+	uint64_t total_bytes = 0;
+	struct progress *progress = NULL;
+	int diagnostic_incomplete = 0;
+
+	if (show_progress) {
+		progress = start_progress(the_repository, _("Fetching packs"), uris->nr);
+		display_throughput(progress, 0);
+		display_progress(progress, 0);
+	}
+
+	if (task_nr > (size_t)fetch_packfile_uri_jobs)
+		task_nr = fetch_packfile_uri_jobs;
+	CALLOC_ARRAY(tasks, task_nr);
+	CALLOC_ARRAY(pollfds, 2 * task_nr);
+
+	for (; next < task_nr; next++)
+		start_packfile_uri_task(&tasks[next],
+					uris->items[next].string, index_pack_args,
+					pack_lockfiles, precreate_keeps, show_progress);
+	running = next;
+
+	while (running) {
+		int ret;
+
+		if (!diagnostic_incomplete) {
+			display_throughput(progress, total_bytes);
+			display_progress(progress, completed);
+		}
+
+		for (size_t i = 0; i < task_nr; i++) {
+			pollfds[2 * i].fd = tasks[i].cmd.out;
+			pollfds[2 * i + 1].fd = tasks[i].cmd.err;
+			pollfds[2 * i].events = pollfds[2 * i + 1].events = POLLIN | POLLHUP;
+		}
+		ret = poll(pollfds, 2 * task_nr, -1);
+		if (ret < 0 && errno == EINTR)
+			continue; /* Refresh progress after its timer fires. */
+		if (ret < 0)
+			die_errno("fetch-pack: unable to poll http-fetch");
+		for (size_t i = 0; i < task_nr; i++) {
+			struct packfile_uri_task *task = &tasks[i];
+
+			if (!pollfds[2 * i].revents && !pollfds[2 * i + 1].revents)
+				continue;
+			if (pollfds[2 * i + 1].revents) {
+				char buf[8192];
+				ssize_t n = xread(task->cmd.err, buf, sizeof(buf));
+
+				if (n < 0)
+					die_errno("fetch-pack: unable to read http-fetch errors");
+				if (n) {
+					if (!diagnostic_incomplete)
+						clear_progress(progress);
+					write_or_die(2, buf, n);
+					diagnostic_incomplete = buf[n - 1] != '\n';
+				} else {
+					close(task->cmd.err);
+					task->cmd.err = -1;
+				}
+			}
+			if (pollfds[2 * i].revents)
+				read_packfile_uri_task(task, gitmodules_oids, &total_bytes);
+			if (task->cmd.out >= 0 || task->cmd.err >= 0)
+				continue;
+
+			finish_packfile_uri_task(task);
+			completed++;
+			if (next < uris->nr)
+				start_packfile_uri_task(task, uris->items[next++].string,
+						index_pack_args, pack_lockfiles,
+						precreate_keeps, show_progress);
+			else
+				running--;
+		}
+	}
+	if (diagnostic_incomplete)
+		fputc('\n', stderr);
+	display_throughput(progress, total_bytes);
+	display_progress(progress, completed);
+	stop_progress(&progress);
+
+	free(pollfds);
+	free(tasks);
 }
 
 enum fetch_state {
@@ -1691,8 +1948,9 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 	int seen_ack = 0;
 	struct object_id common_oid;
 	int received_ready = 0;
+	int no_ref_delta = 0;
 	struct string_list packfile_uris = STRING_LIST_INIT_DUP;
-	int i;
+	int parallel_uri_indexing;
 	struct strvec index_pack_args = STRVEC_INIT;
 	const char *promisor_remote_config;
 
@@ -1777,7 +2035,8 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 					       &haves_to_send, &in_vain,
 					       reader.use_sideband,
 					       seen_ack,
-					       &negotiation_include_oids)) {
+					       &negotiation_include_oids,
+					       &no_ref_delta)) {
 				trace2_region_leave_printf("negotiation_v2", "round",
 							   the_repository, "%d",
 							   negotiation_round);
@@ -1842,6 +2101,7 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 
 			if (get_pack(args, fd, pack_lockfiles,
 				     packfile_uris.nr ? &index_pack_args : NULL,
+				     no_ref_delta,
 				     sought, nr_sought, &fsck_options.gitmodules_found))
 				die(_("git fetch-pack: fetch failed."));
 			do_check_stateless_delimiter(args->stateless_rpc, &reader);
@@ -1853,9 +2113,26 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 		}
 	}
 
-	for (i = 0; i < packfile_uris.nr; i++) {
+	parallel_uri_indexing = no_ref_delta &&
+		pack_lockfiles &&
+		fetch_packfile_uri_jobs > 1 &&
+		packfile_uris.nr > 1;
+	if (parallel_uri_indexing) {
+		/*
+		 * Bound total indexer threads by the number of URI jobs. The
+		 * URI packs are independent, so each indexer can stay single
+		 * threaded while several indexers run at once.
+		 */
+		strvec_push(&index_pack_args, "--threads=1");
+		fetch_packfile_uris_parallel(&packfile_uris, &index_pack_args,
+					    pack_lockfiles,
+					    &fsck_options.gitmodules_found,
+					    !args->quiet && !args->no_progress);
+		goto packfile_uris_done;
+	}
+
+	for (size_t i = 0; i < packfile_uris.nr; i++) {
 		bool created_keep;
-		int j;
 		struct child_process cmd = CHILD_PROCESS_INIT;
 		char packhash[GIT_MAX_HEXSZ + 1];
 		const char *uri = packfile_uris.items[i].string +
@@ -1865,7 +2142,7 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 		strvec_pushf(&cmd.args, "--packfile=%.*s",
 			     (int) the_hash_algo->hexsz,
 			     packfile_uris.items[i].string);
-		for (j = 0; j < index_pack_args.nr; j++)
+		for (size_t j = 0; j < index_pack_args.nr; j++)
 			strvec_pushf(&cmd.args, "--index-pack-arg=%s",
 				     index_pack_args.v[j]);
 		strvec_push(&cmd.args, uri);
@@ -1906,6 +2183,8 @@ static struct ref *do_fetch_pack_v2(struct fetch_pack_args *args,
 							 repo_get_object_directory(the_repository),
 							 packhash));
 	}
+
+packfile_uris_done:
 	string_list_clear(&packfile_uris, 0);
 	strvec_clear(&index_pack_args);
 
@@ -1956,6 +2235,12 @@ static int fetch_pack_config_cb(const char *var, const char *value,
 				const struct config_context *ctx, void *cb)
 {
 	int ret = fetch_pack_fsck_config(var, value, &fsck_msg_types);
+
+	if (!strcmp(var, "fetch.packfileurijobs")) {
+		fetch_packfile_uri_jobs = git_config_int(var, value, ctx->kvi);
+		return 0;
+	}
+
 	if (ret > 0)
 		return git_default_config(var, value, ctx, cb);
 
