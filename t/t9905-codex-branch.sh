@@ -10891,12 +10891,18 @@ test_expect_success SHA1 'reviewed CI image updates retain exact workflow entrie
 		before=$(ci_tree 205325eb33b06444f24a11271a9e669841e29cb9) &&
 		pinned=$(ci_tree 485e3be66581518bca55b62d97ebd2217be194b1) &&
 		updated=$(ci_tree 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8) &&
+		sdk=$(ci_tree 44337a67422e019f41a3c8404062487c3d603dfb) &&
+		sdk_mode=$(ci_tree 44337a67422e019f41a3c8404062487c3d603dfb 100755) &&
 		unknown=$(ci_tree 1111111111111111111111111111111111111111) &&
 		mode=$(ci_tree 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8 100755) &&
 		empty=$(git mktree </dev/null) &&
 		ci_workflow_pins_are_reviewed "$before" "$pinned" &&
 		ci_workflow_pins_are_reviewed "$before" "$updated" &&
 		ci_workflow_pins_are_reviewed "$pinned" "$updated" &&
+		ci_workflow_pins_are_reviewed "$updated" "$sdk" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$unknown" "$sdk" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$updated" "$sdk_mode" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$sdk" "$updated" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$pinned" "$unknown" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$unknown" "$updated" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$pinned" "$mode" &&
