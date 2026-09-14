@@ -518,7 +518,7 @@ fetching protocol. Each reference obj-id and name on the server is sent
 in packet-line format to the client, followed by a flush-pkt.  The only
 real difference is that the capability listing is different - the only
 possible values are 'report-status', 'report-status-v2', 'delete-refs',
-'ofs-delta', 'atomic' and 'push-options'.
+'ofs-delta', 'atomic', 'push-options' and 'explicit-haves'.
 
 Reference Update Request and Packfile Transfer
 ----------------------------------------------
@@ -579,6 +579,13 @@ MUST be the same, modulo the prefix.
 After that the packfile that
 should contain all the objects that the server will need to complete the new
 references will be sent.
+
+When 'explicit-haves' is in effect, the client MUST NOT infer pack
+prerequisites from the object IDs of named refs in the reference
+advertisement. Only ".have" pseudo-refs and common objects explicitly
+acknowledged by push negotiation may be used as pack prerequisites. The
+advertised object ID of a named ref is still used as the old-id in the
+corresponding update command.
 
 ----
   packfile          =  "PACK" 28*(OCTET)

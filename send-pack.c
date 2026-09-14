@@ -61,6 +61,7 @@ static void append_negative_object(struct repository *r,
 static int pack_objects(struct repository *r,
 			int fd, struct ref *refs, struct oid_array *advertised,
 			struct oid_array *negotiated,
+			int use_explicit_haves,
 			struct send_pack_args *args)
 {
 	struct odb_generate_pack_options opts = ODB_GENERATE_PACK_OPTIONS_INIT;
@@ -90,7 +91,11 @@ static int pack_objects(struct repository *r,
 		append_negative_object(r, &opts.haves, &negotiated->oid[i]);
 
 	while (refs) {
-		if (!is_null_oid(&refs->old_oid))
+		/*
+		 * Named refs still describe the remote state for update checks,
+		 * but are not pack prerequisites under explicit-haves.
+		 */
+		if (!use_explicit_haves && !is_null_oid(&refs->old_oid))
 			append_negative_object(r, &opts.haves, &refs->old_oid);
 		if (!is_null_oid(&refs->new_oid))
 			oid_array_append(&opts.wants, &refs->new_oid);
@@ -500,6 +505,7 @@ int send_pack(struct repository *r,
 	int use_push_options = 0;
 	int push_options_supported = 0;
 	int object_format_supported = 0;
+	int use_explicit_haves = 0;
 	unsigned cmds_sent = 0;
 	int ret;
 	struct async demux;
@@ -540,6 +546,8 @@ int send_pack(struct repository *r,
 		args->use_ofs_delta = 1;
 	if (server_supports("no-ref-delta"))
 		args->no_ref_delta = 1;
+	if (server_supports("explicit-haves"))
+		use_explicit_haves = 1;
 	if (server_supports("side-band-64k"))
 		use_sideband = 1;
 	if (server_supports("quiet"))
@@ -596,6 +604,8 @@ int send_pack(struct repository *r,
 		strbuf_addstr(&cap_buf, " atomic");
 	if (use_push_options)
 		strbuf_addstr(&cap_buf, " push-options");
+	if (use_explicit_haves)
+		strbuf_addstr(&cap_buf, " explicit-haves");
 	if (object_format_supported)
 		strbuf_addf(&cap_buf, " object-format=%s", r->hash_algo->name);
 	if (agent_supported)
@@ -713,7 +723,8 @@ int send_pack(struct repository *r,
 			   PACKET_READ_DIE_ON_ERR_PACKET);
 
 	if (need_pack_data && cmds_sent) {
-		if (pack_objects(r, out, remote_refs, extra_have, &commons, args) < 0) {
+		if (pack_objects(r, out, remote_refs, extra_have, &commons,
+				 use_explicit_haves, args) < 0) {
 			if (args->stateless_rpc)
 				close(out);
 			if (git_connection_is_socket(conn))
