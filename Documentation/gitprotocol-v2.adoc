@@ -376,6 +376,18 @@ to the server.
 	client should download from all given URIs. Currently, the
 	protocols supported are "http" and "https".
 
+If the 'no-ref-delta' feature is advertised, the following argument can
+be included in the client's request:
+
+    no-ref-delta
+	Indicates that the server MUST NOT include a `REF_DELTA` entry in
+	the inline `packfile` section or any pack named by a
+	`packfile-uris` section.
++
+`no-ref-delta` does not imply `ofs-delta`. The server may use `OFS_DELTA`
+only when the client also requests `ofs-delta`. By definition, an
+`OFS_DELTA` refers to an earlier entry in the same pack.
+
 If the 'wait-for-done' feature is advertised, the following argument
 can be included in the client's request.
 
