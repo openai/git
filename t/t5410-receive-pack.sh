@@ -97,4 +97,61 @@ test_expect_success TEE_DOES_NOT_HANG \
 	test_must_fail git -C remote.git rev-list $(git -C repo rev-parse HEAD)
 '
 
+test_expect_success 'explicit-haves does not infer haves from named refs' '
+	test_when_finished "rm -rf explicit-haves-*" &&
+
+	git init explicit-haves-src &&
+	test_commit -C explicit-haves-src B &&
+	git init --bare explicit-haves-base.git &&
+	git -C explicit-haves-src push ../explicit-haves-base.git \
+		B:refs/heads/main &&
+	test_commit -C explicit-haves-src F1 &&
+	test_commit -C explicit-haves-src F2 &&
+	git -C explicit-haves-src reset --hard F1 &&
+	test_commit -C explicit-haves-src F3 &&
+	B=$(git -C explicit-haves-src rev-parse B) &&
+	F1=$(git -C explicit-haves-src rev-parse F1) &&
+	F2=$(git -C explicit-haves-src rev-parse F2) &&
+	git clone --bare --shared explicit-haves-base.git \
+		explicit-haves-remote.git &&
+	git -C explicit-haves-remote.git update-ref -d refs/heads/main &&
+	old_pack=$(printf "F2\n^B\n" | \
+		git -C explicit-haves-src pack-objects --revs \
+		../explicit-haves-remote.git/objects/pack/old) &&
+	git -C explicit-haves-remote.git update-ref \
+		refs/heads/feature "$F2" &&
+	git -C explicit-haves-remote.git update-ref \
+		refs/heads/unchanged "$F2" &&
+	git -C explicit-haves-remote.git config receive.unpackLimit 0 &&
+	git -C explicit-haves-remote.git config maintenance.auto false &&
+
+	# The advertised ref is still used to reject a stale lease.
+	test_must_fail git -C explicit-haves-src push --no-thin \
+		--force-with-lease=refs/heads/feature:$F1 \
+		--receive-pack="git receive-pack --advertise-explicit-haves-for-testing" \
+		../explicit-haves-remote.git F3:refs/heads/feature \
+		2>explicit-haves-stale.err &&
+	test_grep "stale info" explicit-haves-stale.err &&
+
+	# With the capability, only B is negative and only F3 is positive.
+	# The new pack is complete after replacing the old F2 pack.
+	rcvpck="unset GIT_TRACE_PACKET GIT_TRACE2_EVENT; git receive-pack --advertise-explicit-haves-for-testing" &&
+	GIT_TRACE_PACKET="$(pwd)/explicit-haves.trace" \
+	GIT_TRACE2_EVENT="$(pwd)/explicit-haves.event" \
+	git -C explicit-haves-src push --no-thin \
+		--force-with-lease=refs/heads/feature:$F2 \
+		--receive-pack="$rcvpck" \
+		../explicit-haves-remote.git F3:refs/heads/feature \
+		F2:refs/heads/unchanged &&
+	test_grep "push< $B \\.have" explicit-haves.trace &&
+	test_grep "push> .* explicit-haves" explicit-haves.trace &&
+	test_grep "write_pack_file/wrote.*\"value\":\"6\"" \
+		explicit-haves.event &&
+	git -C explicit-haves-remote.git update-ref -d \
+		refs/heads/unchanged &&
+	rm explicit-haves-remote.git/objects/pack/old-"$old_pack".pack \
+		explicit-haves-remote.git/objects/pack/old-"$old_pack".idx &&
+	git -C explicit-haves-remote.git fsck --full
+'
+
 test_done
