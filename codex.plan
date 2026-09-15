@@ -15,6 +15,7 @@
 	topic = refs/heads/dr/codex/trace2-redact-url-signatures
 	topic = refs/heads/af/codex/packfile-uri-credentials
 	topic = refs/heads/tb/codex/pin-windows-sdk
+	topic = refs/heads/tb/codex/explicit-haves
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -106,3 +107,10 @@
 	source-tip = 7917434bd1c9936194f0126ddac10c795ed61f40
 	source-base = 66c1ed633a371bccb1abbe2297bfd3b27a498d87
 	merge = refs/heads/tb/codex/release-tooling
+
+[branch "tb/codex/explicit-haves"]
+	remote = .
+	source-ref = refs/heads/tb/codex/explicit-haves
+	source-tip = a3eae730133768ea334731d2f48a80aff724fb5d
+	source-base = 4867165b201cf355e24de85c186ae867a097e0b1
+	merge = refs/heads/tb/codex/parallel-packfile-uris
