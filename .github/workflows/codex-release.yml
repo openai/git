@@ -1,6 +1,22 @@
 name: Codex Git release
 
 on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Full source commit in the caller repository; build only.
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      upstream_tag:
+        required: true
+        type: string
+      recipe_sha:
+        description: Full commit used to call this workflow.
+        required: true
+        type: string
   push:
     branches:
       - codex
@@ -10,14 +26,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: codex-git-release-${{ github.sha }}
+  group: codex-git-release-${{ github.repository }}-${{ inputs.source_sha || github.sha }}
   cancel-in-progress: false
 
 jobs:
   publication:
     name: Verify controller publication
     runs-on: ubuntu-24.04
-    if: github.event.deleted == false
+    if: inputs.source_sha == '' && github.event.deleted == false
     outputs:
       published: ${{ steps.verify.outputs.published }}
     steps:
@@ -62,19 +78,21 @@ jobs:
   version:
     name: Determine version
     needs: publication
-    if: needs.publication.outputs.published == 'true'
+    if: ${{ !cancelled() && (inputs.source_sha != '' || needs.publication.outputs.published == 'true') }}
     runs-on: ubuntu-24.04
     outputs:
       describe: ${{ steps.version.outputs.describe }}
-      upstream_tag: ${{ steps.version.outputs.upstream_tag }}
-      version: ${{ steps.version.outputs.version }}
+      upstream_tag: ${{ inputs.upstream_tag || steps.version.outputs.upstream_tag }}
+      version: ${{ inputs.version || steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: inputs.source_sha == ''
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Derive OpenAI version from git describe
+        if: inputs.source_sha == ''
         id: version
         shell: bash
         run: |
@@ -95,16 +113,33 @@ jobs:
             upstream_tag=
             version="openai-$describe"
           fi
+          if test "$GITHUB_REF_NAME" = codex-unstable
+          then version="$version.codex-unstable"
+          fi
           git check-ref-format "refs/tags/$version"
           printf 'describe=%s\n' "$describe" | tee -a "$GITHUB_OUTPUT"
           printf 'upstream_tag=%s\n' "$upstream_tag" | tee -a "$GITHUB_OUTPUT"
           printf 'version=%s\n' "$version" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Validate requested build inputs
+        if: inputs.source_sha != ''
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RECIPE_SHA: ${{ inputs.recipe_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$RECIPE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+
   build:
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+      RECIPE_SHA: ${{ inputs.recipe_sha || github.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +155,6 @@ jobs:
             lto: thin
             profile_format: LLVM
             llvm_profdata: xcrun llvm-profdata
-            max_tar_bytes: 67108864
           - name: macOS x64
             os: macos-15-intel
             target_platform: macOS
@@ -132,7 +166,6 @@ jobs:
             lto: thin
             profile_format: LLVM
             llvm_profdata: xcrun llvm-profdata
-            max_tar_bytes: 67108864
           # Keep arm64 builds native so release smoke tests can execute them.
           - name: Linux arm64
             os: ubuntu-22.04-arm
@@ -144,7 +177,6 @@ jobs:
             has_gcm: false
             lto: auto
             profile_format: GCC
-            max_tar_bytes: 67108864
           - name: Linux x64
             os: ubuntu-22.04
             target_platform: ubuntu
@@ -155,7 +187,6 @@ jobs:
             has_gcm: false
             lto: auto
             profile_format: GCC
-            max_tar_bytes: 67108864
           - name: Windows arm64
             os: windows-11-arm
             target_platform: win32
@@ -167,7 +198,6 @@ jobs:
             lto: thin
             profile_format: LLVM
             llvm_profdata: llvm-profdata
-            max_tar_bytes: 134217728
             sdk_arch: aarch64
             sdk_flavor: full
             mingw_dir: clangarm64
@@ -185,7 +215,6 @@ jobs:
             has_gcm: true
             lto: auto
             profile_format: GCC
-            max_tar_bytes: 134217728
             sdk_arch: x86_64
             sdk_flavor: full
             mingw_dir: mingw64
@@ -195,10 +224,20 @@ jobs:
             mingit_sha256: e3ea2944cea4b3fabcd69c7c1669ef69b1b66c05ac7806d81224d0abad2dec31
 
     steps:
+      - name: Check out the manifest helper from the recipe
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: openai/git
+          ref: ${{ inputs.recipe_sha || github.sha }}
+          path: release-tooling
+          sparse-checkout: .github/workflows/git-release-manifest.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       # Keep the packaging contract, dependency pins, and platform build logic
       # aligned with the artifacts already consumed by Codex and GitHub Desktop.
       - name: Check out Dugite Native
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: dreynaud-oai/dugite-native
           ref: b6f4473557acb85433fdf9deffe0854a34fd9cc5
@@ -207,9 +246,9 @@ jobs:
           persist-credentials: false
 
       - name: Check out this Git revision
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_sha || github.sha }}
           path: dugite-native/git
           fetch-depth: 1
           persist-credentials: false
@@ -338,7 +377,7 @@ jobs:
 
       - name: Set up Git for Windows SDK
         if: matrix.target_platform == 'win32'
-        uses: git-for-windows/setup-git-for-windows-sdk@v2
+        uses: git-for-windows/setup-git-for-windows-sdk@335917db02da4280d3d5e87915d7b86196677f9f # v2
         with:
           architecture: ${{ matrix.sdk_arch }}
           flavor: ${{ matrix.sdk_flavor }}
@@ -411,7 +450,7 @@ jobs:
 
           file "$GIT_BINARY" | tee /tmp/git-file-type
           grep -E "$FILE_PATTERN" /tmp/git-file-type
-          strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
+          strings "$GIT_BINARY" | grep -F "$SOURCE_SHA"
           grep -F -- "-flto=$LTO" dugite-native/git/GIT-CFLAGS
           if test "$PROFILE_FORMAT" = LLVM
           then
@@ -456,7 +495,7 @@ jobs:
 
           build_options="$(env "${git_env[@]}" "$git_binary" --version --build-options)"
           printf '%s\n' "$build_options"
-          grep -F "built from commit: $GITHUB_SHA" <<<"$build_options"
+          grep -F "built from commit: $SOURCE_SHA" <<<"$build_options"
           env "${git_env[@]}" "$git_binary" lfs version
           if test "$HAS_GCM" = true
           then
@@ -480,7 +519,6 @@ jobs:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           TARGET_ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.version.outputs.version }}
-          MAX_TAR_BYTES: ${{ matrix.max_tar_bytes }}
         run: |
           set -euo pipefail
           script/package.sh
@@ -498,28 +536,13 @@ jobs:
             mv "${matches[0]}.sha256" "$destination.sha256"
           done
 
-          for checksum in output/*.sha256
-          do
-            archive="${checksum%.sha256}"
-            expected="$(tr -d '\r\n' <"$checksum")"
-            if command -v sha256sum >/dev/null 2>&1
-            then
-              actual="$(sha256sum "$archive" | awk '{print $1}')"
-            else
-              actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
-            fi
-            test "$actual" = "$expected"
-          done
-
-          tarball="output/git-$VERSION-$ASSET_PLATFORM-$TARGET_ARCH.tar.gz"
-          tar_bytes="$(wc -c <"$tarball")"
-          printf '%s bytes: %s\n' "$tar_bytes" "$tarball"
-          test "$tar_bytes" -le "$MAX_TAR_BYTES"
+          bash ../release-tooling/.github/workflows/git-release-manifest.sh \
+            record output "$ASSET_PLATFORM-$TARGET_ARCH"
 
       - name: Upload release assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: git-${{ matrix.asset_platform }}-${{ matrix.arch }}
+          name: git-${{ needs.version.outputs.version }}-${{ matrix.asset_platform }}-${{ matrix.arch }}
           path: dugite-native/output/git-*
           if-no-files-found: error
           retention-days: 7
@@ -534,6 +557,7 @@ jobs:
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
   release:
+    if: inputs.source_sha == ''
     name: Publish GitHub prerelease
     needs:
       - version
@@ -543,12 +567,30 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download release assets
-        uses: actions/download-artifact@v8
+      - name: Check out the manifest helper
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          pattern: git-*
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/workflows/git-release-manifest.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: git-${{ needs.version.outputs.version }}-*
           path: artifacts
           merge-multiple: true
+
+      - name: Combine the verified native receipts
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RECIPE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.version.outputs.version }}
+          UPSTREAM_TAG: ${{ needs.version.outputs.upstream_tag }}
+          CHANNEL: ${{ github.ref_name }}
+          VISIBILITY: public
+        run: bash .github/workflows/git-release-manifest.sh collect artifacts >manifest.json
 
       - name: Publish immutable prerelease
         env:
@@ -558,7 +600,12 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          assets=(artifacts/git-*)
+          assets=(manifest.json)
+          for file in artifacts/git-*
+          do
+            case "$file" in *.build.json) continue ;; esac
+            assets+=("$file")
+          done
           release_notes=$(
             printf '%s\n' \
               "source_ref=$SOURCE_REF" \
