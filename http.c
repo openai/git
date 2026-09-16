@@ -2674,9 +2674,15 @@ void release_http_pack_request(struct http_pack_request *preq)
 		fclose(preq->packfile);
 		preq->packfile = NULL;
 	}
+	if (preq->slot && preq->direct_connect) {
+		curl_easy_setopt(preq->slot->curl, CURLOPT_CONNECT_TO, NULL);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_RESOLVE,
+				 host_resolutions);
+	}
 	preq->slot = NULL;
 	strbuf_release(&preq->tmpfile);
 	curl_slist_free_all(preq->headers);
+	curl_slist_free_all(preq->direct_connect);
 	free(preq->url);
 	free(preq);
 }
@@ -2798,6 +2804,29 @@ static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 	return written;
 }
 
+static int pack_headers_override_authority(const struct curl_slist *headers)
+{
+	for (; headers; headers = headers->next) {
+		const char *header = headers->data;
+		const char *name = header, *end;
+
+		if (*header == ' ' || *header == '\t' || strpbrk(header, "\r\n"))
+			return 1;
+		if (*name == ':')
+			name++;
+		end = strpbrk(name, ":;");
+		if (!end)
+			continue;
+		while (end > name && (end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+		if ((end - name == 4 && !strncasecmp(name, "host", 4)) ||
+		    (*header == ':' && end - name == 9 &&
+		     !strncasecmp(name, "authority", 9)))
+			return 1;
+	}
+	return 0;
+}
+
 int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
@@ -2810,7 +2839,22 @@ int run_http_pack_request(struct http_pack_request *preq)
 	for (;;) {
 		struct slot_results results = { .retry_after = -1 };
 
+		/* Override URL-scoped and environment routes on the initial request and retries. */
+		if (preq->direct_connect &&
+		    (curl_easy_setopt(preq->slot->curl, CURLOPT_PROXY, "") != CURLE_OK ||
+		     curl_easy_setopt(preq->slot->curl, CURLOPT_RESOLVE, NULL) != CURLE_OK ||
+		     curl_easy_setopt(preq->slot->curl, CURLOPT_CONNECT_TO,
+				      preq->direct_connect) != CURLE_OK ||
+		     curl_easy_setopt(preq->slot->curl, CURLOPT_IPRESOLVE,
+				      (long)CURL_IPRESOLVE_V4) != CURLE_OK))
+			return HTTP_START_FAILED;
+		if (preq->direct_connect &&
+		    strpbrk(user_agent ? user_agent : git_user_agent(), "\r\n"))
+			die("plain HTTP pack User-Agent may not contain a newline");
+
 		preq->headers = http_append_auth_header(&http_auth, preq->headers);
+		if (preq->direct_connect && pack_headers_override_authority(preq->headers))
+			die("plain HTTP pack headers may not override the approved URL authority");
 		curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEHEADER, NULL);
