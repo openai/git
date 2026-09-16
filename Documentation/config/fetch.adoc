@@ -104,6 +104,26 @@ client requests the `no-ref-delta` promise. Each URI pack is then checked
 with `index-pack --no-ref-delta` before it is accepted.
 Responses with one URI retain the serial path.
 
+`fetch.packfileUriHttpOrigin`::
+	Require a server-advertised packfile URI to use HTTPS or this exact
+	plain HTTP origin (scheme, DNS or IPv4 host, and port). Use this only
+	when traffic is independently encrypted, such as by a service mesh.
+	The value cannot contain credentials, a path, a query, or a fragment;
+	HTTP pack URIs with credentials are rejected. Pack downloads cannot
+	follow redirects, even over HTTPS, so signed URIs stay at their origin.
+	Plain HTTP requires `fetch.packfileUriHttpAddress`; HTTPS keeps its
+	ordinary proxy and resolution. Other HTTP requests are unaffected;
+	unsetting this preserves existing pack URI behavior.
+	`git http-fetch --supports-packfile-uri-http-origin` reports support.
+
+`fetch.packfileUriHttpAddress`::
+	The literal IPv4 address of the independently encrypted route for the
+	origin above. Plain HTTP pack requests connect directly to this address
+	without a proxy or configured address override, including authentication
+	retries. Custom `Host` or `:authority` headers are rejected so libcurl
+	uses the approved URL's authority. A missing or invalid address rejects
+	the plain HTTP pack before sending a request.
+
 `fetch.writeCommitGraph`::
 	Set to true to write a commit-graph after every `git fetch` command
 	that downloads a pack-file from a remote. Using the `--split` option,

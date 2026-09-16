@@ -293,6 +293,193 @@ test_expect_success 'http-fetch --packfile' '
 	git -C packfileclient cat-file -e "$HASH"
 '
 
+test_expect_success 'restrict plain HTTP packs to one origin before sending a request' '
+	nongit git http-fetch --supports-packfile-uri-http-origin &&
+	git init packfileclient-http-origin &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/plain-origin-denied.pack" &&
+	denied="http://localhost:$LIB_HTTPD_PORT/dumb/plain-origin-denied.pack?private-grant-fixture" &&
+	test_must_fail git -C packfileclient-http-origin \
+		-c fetch.packfileUriHttpOrigin="$HTTPD_URL" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		-c "http.http://localhost:$LIB_HTTPD_PORT/dumb/plain-origin-denied.pack.proxy=" \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$denied" 2>err &&
+	test_grep "packfile URI is not HTTPS or the configured plain HTTP origin" err &&
+	test_grep ! "private-grant-fixture" err &&
+	test_grep ! "plain-origin-denied.pack" "$HTTPD_ROOT_PATH/access.log" &&
+	test_must_fail git -C packfileclient-http-origin cat-file -e "$HASH" &&
+	git -C packfileclient-http-origin \
+		-c fetch.packfileUriHttpOrigin="$HTTPD_URL" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$HTTPD_URL/dumb/repo_pack.git/$p" >out &&
+	git -C packfileclient-http-origin cat-file -e "$HASH" &&
+	test_must_fail git -C packfileclient-http-origin \
+		-c fetch.packfileUriHttpOrigin="$HTTPD_URL/not-an-origin?private-grant-fixture" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$HTTPD_URL/dumb/repo_pack.git/$p" 2>err &&
+	test_grep "fetch.packfileUriHttpOrigin must be a plain HTTP origin" err &&
+	test_grep ! "private-grant-fixture" err
+'
+
+test_expect_success 'restricted pack downloads do not follow redirects' '
+	git init packfileclient-http-origin-redirect &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/plain-origin-redirect-target.pack" &&
+	test_must_fail git -C packfileclient-http-origin-redirect \
+		-c fetch.packfileUriHttpOrigin="$HTTPD_URL" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		-c http.followRedirects=true \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$HTTPD_URL/redir-to/dumb/plain-origin-redirect-target.pack?private-grant-fixture" 2>err &&
+	test_grep "GET /redir-to/dumb/plain-origin-redirect-target.pack" \
+		"$HTTPD_ROOT_PATH/access.log" &&
+	test_grep ! "GET /really-redir-to?path=dumb/plain-origin-redirect-target.pack" \
+		"$HTTPD_ROOT_PATH/access.log" &&
+	test_grep ! "GET /dumb/plain-origin-redirect-target.pack" \
+		"$HTTPD_ROOT_PATH/access.log" &&
+	test_must_fail git -C packfileclient-http-origin-redirect cat-file -e "$HASH"
+'
+
+test_expect_success 'plain HTTP packs use the direct address despite scoped proxy and resolution' '
+	git init packfileclient-http-direct &&
+	mkdir "$HTTPD_DOCUMENT_ROOT_PATH/direct-pin" &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/direct-pin/physical-pin.pack" &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/direct-pin/no-pin.pack" &&
+	origin="http://localhost:$LIB_HTTPD_PORT" &&
+	base="$origin/dumb/direct-pin" &&
+	git -C packfileclient-http-direct \
+		-c fetch.packfileUriHttpOrigin="$origin" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		-c "http.$base.proxy=http://127.0.0.1:9" \
+		-c "http.$base.curloptResolve=localhost:$LIB_HTTPD_PORT:127.0.0.254" \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$base/physical-pin.pack?private-grant-fixture" >out &&
+	test_grep "GET /dumb/direct-pin/physical-pin.pack" "$HTTPD_ROOT_PATH/access.log" &&
+	git -C packfileclient-http-direct cat-file -e "$HASH" &&
+	git init packfileclient-http-no-direct &&
+	test_must_fail git -C packfileclient-http-no-direct \
+		-c fetch.packfileUriHttpOrigin="$origin" \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$base/no-pin.pack?private-grant-fixture" 2>err &&
+	test_grep "fetch.packfileUriHttpAddress must be a literal IPv4" err &&
+	test_grep ! "private-grant-fixture" err &&
+	test_must_fail git -C packfileclient-http-no-direct \
+		-c fetch.packfileUriHttpOrigin="$origin" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1,127.0.0.254 \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$base/no-pin.pack?private-grant-fixture" 2>err &&
+	test_grep "fetch.packfileUriHttpAddress must be a literal IPv4" err &&
+	test_grep ! "private-grant-fixture" err &&
+	test_grep ! "no-pin.pack" "$HTTPD_ROOT_PATH/access.log" &&
+	test_must_fail git -C packfileclient-http-no-direct cat-file -e "$HASH"
+'
+
+test_expect_success 'guarded HTTP authentication retries stay on the pinned address' '
+	git init packfileclient-http-retry &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/auth/dumb/guarded-retry.pack" &&
+	base="$HTTPD_URL/auth/dumb" &&
+	set_askpass user@host pass@host &&
+	git -C packfileclient-http-retry \
+		-c credential.helper= \
+		-c fetch.packfileUriHttpOrigin="$HTTPD_URL" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		-c "http.$base.proxy=http://127.0.0.1:9" \
+		-c "http.$base.curloptResolve=127.0.0.1:$LIB_HTTPD_PORT:127.0.0.254" \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$base/guarded-retry.pack?private-grant-fixture" >out &&
+	expect_askpass both user%40host &&
+	test_grep -E "guarded-retry[.]pack[^\"]*\" 401" "$HTTPD_ROOT_PATH/access.log" &&
+	test_grep -E "guarded-retry[.]pack[^\"]*\" 200" "$HTTPD_ROOT_PATH/access.log" &&
+	git -C packfileclient-http-retry cat-file -e "$HASH"
+'
+
+test_expect_success 'guarded HTTP packs reject custom authority before sending' '
+	git init packfileclient-http-authority &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/direct-pin/blocked-host.pack" &&
+	origin="http://localhost:$LIB_HTTPD_PORT" &&
+	base="$origin/dumb/direct-pin" &&
+	for header in "hOsT: foreign.invalid" "Host;" ":authority: foreign.invalid"
+	do
+		test_must_fail git -C packfileclient-http-authority \
+			-c fetch.packfileUriHttpOrigin="$origin" \
+			-c fetch.packfileUriHttpAddress=127.0.0.1 \
+			-c "http.$base.extraHeader=$header" \
+			http-fetch --packfile="$ARBITRARY" \
+			--index-pack-arg=index-pack --index-pack-arg=--stdin \
+			"$base/blocked-host.pack?private-grant-fixture" 2>err &&
+		test_grep "plain HTTP pack headers may not override the approved URL authority" err &&
+		test_grep ! "private-grant-fixture" err || return 1
+	done &&
+	test_grep ! "blocked-host.pack" "$HTTPD_ROOT_PATH/access.log" &&
+	test_must_fail git -C packfileclient-http-authority cat-file -e "$HASH"
+'
+
+test_expect_success 'guarded HTTP packs reject an injected User-Agent before sending' '
+	git init packfileclient-http-user-agent &&
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/direct-pin/blocked-user-agent.pack" &&
+	origin="http://localhost:$LIB_HTTPD_PORT" &&
+	url="$origin/dumb/direct-pin/blocked-user-agent.pack?private-grant-fixture" &&
+	bad_agent=$(printf "client\r\nHost: foreign.invalid") &&
+	test_must_fail git -C packfileclient-http-user-agent \
+		-c fetch.packfileUriHttpOrigin="$origin" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		-c http.userAgent="$bad_agent" \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$url" 2>err &&
+	test_grep "plain HTTP pack User-Agent may not contain a newline" err &&
+	test_grep ! "private-grant-fixture" err &&
+	test_must_fail env GIT_HTTP_USER_AGENT="$bad_agent" \
+		git -C packfileclient-http-user-agent \
+		-c fetch.packfileUriHttpOrigin="$origin" \
+		-c fetch.packfileUriHttpAddress=127.0.0.1 \
+		http-fetch --packfile="$ARBITRARY" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$url" 2>err &&
+	test_grep "plain HTTP pack User-Agent may not contain a newline" err &&
+	test_grep ! "private-grant-fixture" err &&
+	test_grep ! "blocked-user-agent.pack" "$HTTPD_ROOT_PATH/access.log" &&
+	test_must_fail git -C packfileclient-http-user-agent cat-file -e "$HASH"
+'
+
+test_expect_success 'alternate numeric HTTP hosts and destination resolver cannot evade the pin' '
+	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" \
+		"$HTTPD_DOCUMENT_ROOT_PATH/direct-pin/numeric-host.pack" &&
+	i=0 &&
+	for host in 0177.0.0.2 127.000.000.002 0x7f000002 2130706434
+	do
+		i=$((i + 1)) &&
+		client="packfileclient-http-numeric-$i" &&
+		git init "$client" &&
+		origin="http://$host:$LIB_HTTPD_PORT" &&
+		git -C "$client" \
+			-c fetch.packfileUriHttpOrigin="$origin" \
+			-c fetch.packfileUriHttpAddress=127.0.0.1 \
+			-c "http.$origin.curloptResolve=127.0.0.1:$LIB_HTTPD_PORT:127.0.0.254" \
+			http-fetch --packfile="$ARBITRARY" \
+			--index-pack-arg=index-pack --index-pack-arg=--stdin \
+			"$origin/dumb/direct-pin/numeric-host.pack?private-grant-fixture" >out &&
+		git -C "$client" cat-file -e "$HASH" || return 1
+	done &&
+	test_grep "GET /dumb/direct-pin/numeric-host.pack" "$HTTPD_ROOT_PATH/access.log"
+'
+
 test_expect_success 'http-fetch --packfile accepts an already complete partial' '
 	git init packfileclient-complete &&
 	p=$(cd "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git &&

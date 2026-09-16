@@ -228,6 +228,7 @@ struct http_pack_request {
 	struct strbuf tmpfile;
 	struct active_request_slot *slot;
 	struct curl_slist *headers;
+	struct curl_slist *direct_connect;
 };
 
 struct http_pack_request *new_http_pack_request(

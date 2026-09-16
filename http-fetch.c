@@ -75,6 +75,74 @@ static void update_packfile_progress(void *data, size_t bytes)
 		report_packfile_progress(progress);
 }
 
+static int valid_packfile_uri_http_address(const char *address)
+{
+	const char *p = address;
+	int octets = 0;
+
+	while (octets < 4) {
+		const char *start = p;
+		unsigned value = 0, digits = 0;
+
+		while (*p >= '0' && *p <= '9') {
+			if (++digits > 3)
+				return 0;
+			value = value * 10 + (*p++ - '0');
+		}
+		if (!digits || value > 255 || (digits > 1 && *start == '0'))
+			return 0;
+		octets++;
+		if (*p != '.')
+			return !*p && octets == 4;
+		p++;
+	}
+	return 0;
+}
+
+static int check_packfile_uri_http_origin(const char *url, char **direct_connect)
+{
+	struct url_info approved, requested;
+	char *configured, *approved_url, *requested_url;
+	int allowed;
+
+	if (repo_config_get_string(the_repository, "fetch.packfileurihttporigin",
+				   &configured))
+		return 0;
+	approved_url = url_normalize(configured, &approved);
+	free(configured);
+	if (!approved_url || approved.scheme_len != 4 ||
+	    memcmp(approved_url, "http", 4) || approved.user_off ||
+	    !approved.host_len || approved_url[approved.host_off] == '[' ||
+	    approved.path_len != 1 ||
+	    approved.url_len != approved.path_off + 1)
+		die("fetch.packfileUriHttpOrigin must be a plain HTTP origin with a DNS name or IPv4 host");
+
+	requested_url = url_normalize(url, &requested);
+	allowed = requested_url && requested.scheme_len == 5 &&
+		!memcmp(requested_url, "https", 5);
+	if (requested_url && requested.scheme_len == 4 &&
+	    !memcmp(requested_url, "http", 4) && !requested.user_off &&
+	    requested.path_off == approved.path_off &&
+	    !memcmp(requested_url, approved_url, requested.path_off)) {
+		char *address;
+
+		if (repo_config_get_string(the_repository,
+					   "fetch.packfileurihttpaddress", &address))
+			die("fetch.packfileUriHttpAddress must be a literal IPv4 address for a plain HTTP pack");
+		if (!valid_packfile_uri_http_address(address))
+			die("fetch.packfileUriHttpAddress must be a literal IPv4 address for a plain HTTP pack");
+		/* Match any spelling libcurl canonicalizes; the URL origin was checked above. */
+		*direct_connect = xstrfmt("::%s:", address);
+		free(address);
+		allowed = 1;
+	}
+	free(requested_url);
+	free(approved_url);
+	if (!allowed)
+		die("packfile URI is not HTTPS or the configured plain HTTP origin");
+	return 1;
+}
+
 static void fetch_single_packfile(struct object_id *packfile_hash,
 				  const char *url,
 				  const char **index_pack_args,
@@ -82,13 +150,24 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 {
 	struct http_pack_request *preq;
 	struct packfile_progress progress = { 0 };
+	char *direct_connect = NULL;
+	int restricted = check_packfile_uri_http_origin(url, &direct_connect);
 	int ret;
 
 	http_init(NULL, url, 0);
+	if (restricted)
+		/* A redirect could carry a signed pack URL to a different origin. */
+		http_follow_config = HTTP_FOLLOW_NONE;
 
 	preq = new_direct_http_pack_request(packfile_hash->hash, xstrdup(url));
 	if (!preq)
 		die("couldn't create http pack request");
+	if (direct_connect) {
+		preq->direct_connect = curl_slist_append(NULL, direct_connect);
+		free(direct_connect);
+		if (!preq->direct_connect)
+			die("couldn't pin the plain HTTP pack connection");
+	}
 	preq->index_pack_args = index_pack_args;
 	preq->preserve_index_pack_stdout = 1;
 	if (report_progress) {
@@ -141,6 +220,9 @@ int cmd_main(int argc, const char **argv)
 	struct object_id packfile_hash;
 	struct strvec index_pack_args = STRVEC_INIT;
 	int ret;
+
+	if (argc == 2 && !strcmp(argv[1], "--supports-packfile-uri-http-origin"))
+		return 0;
 
 	setup_git_directory_gently(the_repository, &nongit);
 
