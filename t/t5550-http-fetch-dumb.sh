@@ -468,16 +468,25 @@ test_expect_success 'alternate numeric HTTP hosts and destination resolver canno
 		client="packfileclient-http-numeric-$i" &&
 		git init "$client" &&
 		origin="http://$host:$LIB_HTTPD_PORT" &&
-		git -C "$client" \
+		# Some HTTP stacks reject these Host spellings; check the connection either way.
+		if GIT_TRACE_CURL="$TRASH_DIRECTORY/numeric-$i.trace" \
+			GIT_TRACE_CURL_NO_DATA=1 \
+			git -C "$client" \
 			-c fetch.packfileUriHttpOrigin="$origin" \
 			-c fetch.packfileUriHttpAddress=127.0.0.1 \
 			-c "http.$origin.curloptResolve=127.0.0.1:$LIB_HTTPD_PORT:127.0.0.254" \
 			http-fetch --packfile="$ARBITRARY" \
 			--index-pack-arg=index-pack --index-pack-arg=--stdin \
-			"$origin/dumb/direct-pin/numeric-host.pack?private-grant-fixture" >out &&
-		git -C "$client" cat-file -e "$HASH" || return 1
-	done &&
-	test_grep "GET /dumb/direct-pin/numeric-host.pack" "$HTTPD_ROOT_PATH/access.log"
+			"$origin/dumb/direct-pin/numeric-host.pack?private-grant-fixture" >out 2>err
+		then
+			git -C "$client" cat-file -e "$HASH"
+		else
+			test_grep "The requested URL returned error: 400" err &&
+			test_must_fail git -C "$client" cat-file -e "$HASH"
+		fi &&
+		test_grep -E "Trying 127[.]0[.]0[.]1:$LIB_HTTPD_PORT([^0-9]|$)" "numeric-$i.trace" &&
+		test_grep ! -E "Trying 127[.]0[.]0[.](2|254):$LIB_HTTPD_PORT([^0-9]|$)" "numeric-$i.trace" || return 1
+	done
 '
 
 test_expect_success 'http-fetch --packfile accepts an already complete partial' '
