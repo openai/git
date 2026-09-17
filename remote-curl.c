@@ -501,7 +501,16 @@ static struct discovery *discover_refs(const char *service, int for_push)
 		version = protocol_v0;
 
 	/* Add the extra Git-Protocol header */
-	if (get_protocol_http_header(version, &protocol_header))
+	get_protocol_http_header(version, &protocol_header);
+	if (maybe_smart && !strcmp(service, "git-receive-pack")) {
+		if (protocol_header.len)
+			strbuf_addch(&protocol_header, ':');
+		else
+			strbuf_addstr(&protocol_header, GIT_PROTOCOL_HEADER ": ");
+		/* The server may need this before deciding which refs to advertise. */
+		strbuf_addstr(&protocol_header, "explicit-haves");
+	}
+	if (protocol_header.len)
 		string_list_append(&extra_headers, protocol_header.buf);
 
 	memset(&http_options, 0, sizeof(http_options));
