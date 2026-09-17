@@ -774,6 +774,9 @@ struct odb_generate_pack_options {
 	/* Use offset deltas instead of reference deltas. */
 	unsigned ofs_delta:1;
 
+	/* Omit deltas that refer to their bases by object ID. */
+	unsigned no_ref_delta:1;
+
 	/* Include unasked-for annotated tags of packed objects. */
 	unsigned include_tag:1;
 

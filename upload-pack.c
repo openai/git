@@ -120,6 +120,8 @@ struct upload_pack_data {
 	unsigned allow_sideband_all : 1;			/* v2 only */
 	unsigned seen_haves : 1;				/* v2 only */
 	unsigned allow_packfile_uris : 1;			/* v2 only */
+	unsigned allow_no_ref_delta : 1;			/* v2 only */
+	unsigned use_no_ref_delta : 1;			/* v2 only */
 	unsigned advertise_sid : 1;
 	unsigned sent_capabilities : 1;
 };
@@ -327,6 +329,7 @@ static void create_pack_file(struct upload_pack_data *pack_data,
 	if (!pack_data->no_progress)
 		opts.progress = ODB_GENERATE_PACK_PROGRESS_STANDARD;
 	opts.ofs_delta = pack_data->use_ofs_delta;
+	opts.no_ref_delta = pack_data->use_no_ref_delta;
 	opts.include_tag = pack_data->use_include_tag;
 	opts.missing_allow_promisor = repo_has_accepted_promisor_remote(the_repository);
 	if (pack_data->filter_options.choice)
@@ -1328,6 +1331,8 @@ static int upload_pack_config(const char *var, const char *value,
 		data->allow_ref_in_want = git_config_bool(var, value);
 	} else if (!strcmp("uploadpack.allowsidebandall", var)) {
 		data->allow_sideband_all = git_config_bool(var, value);
+	} else if (!strcmp("uploadpack.allownorefdelta", var)) {
+		data->allow_no_ref_delta = git_config_bool(var, value);
 	} else if (!strcmp("uploadpack.blobpackfileuri", var)) {
 		if (value)
 			data->allow_packfile_uris = 1;
@@ -1633,6 +1638,11 @@ static void process_args(struct packet_reader *request,
 			string_list_split(&data->uri_protocols, p, ",", -1);
 			continue;
 		}
+		if (data->allow_no_ref_delta &&
+		    !strcmp(arg, "no-ref-delta")) {
+			data->use_no_ref_delta = 1;
+			continue;
+		}
 
 		/* ignore unknown lines maybe? */
 		die("unexpected line: '%s'", arg);
@@ -1819,6 +1829,9 @@ int upload_pack_advertise(struct repository *r,
 
 		if (data.allow_packfile_uris)
 			strbuf_addstr(value, " packfile-uris");
+
+		if (data.allow_no_ref_delta)
+			strbuf_addstr(value, " no-ref-delta");
 	}
 
 	upload_pack_data_clear(&data);
