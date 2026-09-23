@@ -73,9 +73,14 @@ Parameters", and are supported by the Git, SSH, and HTTP protocols.
 Each Extra Parameter takes the form of `<key>=<value>` or `<key>`.
 
 Servers that receive any such Extra Parameters MUST ignore all
-unrecognized keys. Currently, the only Extra Parameter recognized is
-"version" with a value of '1' or '2'.  See linkgit:gitprotocol-v2[5] for more
-information on protocol version 2.
+unrecognized keys. The "version" Extra Parameter takes a value of '1' or
+'2'. See linkgit:gitprotocol-v2[5] for more information on protocol
+version 2.
+
+For smart HTTP receive-pack discovery, a client that supports the
+'explicit-haves' capability can send the bare 'explicit-haves' Extra
+Parameter before the server advertises refs. See linkgit:gitprotocol-capabilities[5]
+for how this parameter relates to the receive-pack capability of the same name.
 
 Git Transport
 -------------
