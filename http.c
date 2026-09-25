@@ -2437,6 +2437,8 @@ static int http_request_recoverable(const char *url,
 	while ((ret == HTTP_REAUTH && --i) ||
 	       (ret == HTTP_RATE_LIMITED && --rate_limit_retries)) {
 		long retry_delay = -1;
+		char *asked;
+
 		/*
 		 * The previous request may have put cruft into our output stream; we
 		 * should clear it out before making our next request.
@@ -2476,7 +2478,18 @@ static int http_request_recoverable(const char *url,
 			http_reauth_prepare(1);
 		}
 
-		ret = http_request(url, result, target, options);
+		/* url may point into effective_url, which http_request updates. */
+		asked = xstrdup(url);
+		ret = http_request(asked, result, target, options);
+		if ((ret == HTTP_OK || ret == HTTP_REAUTH ||
+		     ret == HTTP_RATE_LIMITED) &&
+		    options->effective_url && options->base_url) {
+			if (update_url_from_redirect(options->base_url, asked,
+					     options->effective_url))
+				credential_from_url(&http_auth, options->base_url->buf);
+			url = options->effective_url->buf;
+		}
+		free(asked);
 	}
 	if (ret == HTTP_RATE_LIMITED) {
 		trace2_data_string("http", the_repository,

@@ -63,6 +63,55 @@ test_expect_success 'setup repository' '
 	git push --mirror "$HTTPD_DOCUMENT_ROOT_PATH/repo.git"
 '
 
+for auth in challenged preauthenticated
+do
+test_expect_success "push uses discovery redirect after $auth authentication" '
+	test_when_finished per_test_cleanup &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" config http.receivepack true &&
+	set_credential_reply get <<-EOF &&
+	capability[]=authtype
+	authtype=Bearer
+	credential=redirect-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Bearer redirect-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=302 response=Location: $HTTPD_URL/smart/repo.git/info/refs?service=git-receive-pack
+	id=default response=WWW-Authenticate: Bearer realm="example.com"
+	EOF
+	test_config_global credential.helper test-helper &&
+	if test "$auth" = preauthenticated
+	then
+		test_config_global http.extraHeader "Authorization: Bearer redirect-token"
+	else
+		echo "GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -"
+	fi >expect &&
+	cat >>expect <<-EOF &&
+	GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -
+	GET  /smart/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200
+	POST /smart/repo.git/git-receive-pack HTTP/1.1 200
+	EOF
+	>"$HTTPD_ROOT_PATH/access.log" &&
+	GIT_TRACE_CURL="$TRASH_DIRECTORY/redirect-$auth.trace" \
+	git -c http.followRedirects=initial push \
+		"$HTTPD_URL/custom_auth/repo.git" HEAD:refs/heads/redirect-$auth &&
+	# Apache does not record the status written by the NPH CGI.
+	test_grep "Recv header: HTTP/1.1 302" "redirect-$auth.trace" &&
+	if test "$auth" = challenged
+	then
+		test_grep "Recv header: HTTP/1.1 401" "redirect-$auth.trace"
+	else
+		test_grep ! "Recv header: HTTP/1.1 401" "redirect-$auth.trace"
+	fi &&
+	check_access_log expect &&
+	git rev-parse HEAD >expect-oid &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" \
+		rev-parse refs/heads/redirect-$auth >actual-oid &&
+	test_cmp expect-oid actual-oid
+'
+done
+
 test_expect_success 'setup pack for authenticated downloads' '
 	git -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" repack -ad &&
 	pack=$(echo "$HTTPD_DOCUMENT_ROOT_PATH/repo.git/objects/pack/"*.pack) &&
