@@ -1008,15 +1008,16 @@ int verify_midx_file(struct odb_source_packed *source, unsigned flags)
 	if (flags & MIDX_PROGRESS)
 		progress = start_sparse_progress(r,
 						 _("Sorting objects by packfile"),
-						 m->num_objects);
+						 m->num_objects + m->num_objects_in_base);
 	display_progress(progress, 0); /* TODO: Measure QSORT() progress */
-	QSORT(pairs, m->num_objects, compare_pair_pos_vs_id);
+	QSORT(pairs, m->num_objects + m->num_objects_in_base,
+	      compare_pair_pos_vs_id);
 	stop_progress(&progress);
 
 	if (flags & MIDX_PROGRESS)
 		progress = start_sparse_progress(r,
 						 _("Verifying object offsets"),
-						 m->num_objects);
+						 m->num_objects + m->num_objects_in_base);
 	for (i = 0; i < m->num_objects + m->num_objects_in_base; i++) {
 		struct object_id oid;
 		struct pack_entry e;
