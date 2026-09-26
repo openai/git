@@ -445,7 +445,8 @@ static void compute_sorted_entries(struct write_midx_context *ctx,
 			if (cur_object && oideq(&fanout.entries[cur_object - 1].oid,
 						&fanout.entries[cur_object].oid))
 				continue;
-			if (ctx->incremental && ctx->base_midx &&
+			/* Compacted layers already exclude objects in their base. */
+			if (ctx->incremental && !ctx->compact && ctx->base_midx &&
 			    midx_has_oid(ctx->base_midx,
 					 &fanout.entries[cur_object].oid))
 				continue;
