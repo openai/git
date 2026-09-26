@@ -322,8 +322,14 @@ static struct multi_pack_index *load_midx_chain_fd_st(struct odb_source_packed *
 		struct multi_pack_index *m;
 		struct object_id layer;
 
-		if (strbuf_getline_lf(&buf, fp) == EOF)
+		if (strbuf_getline_lf(&buf, fp) == EOF || ferror(fp)) {
+			if (ferror(fp))
+				warning_errno(_("unable to read multi-pack-index chain"));
+			else
+				warning(_("unexpected end of multi-pack-index chain"));
+			valid = 0;
 			break;
+		}
 
 		if (get_oid_hex_algop(buf.buf, &layer, hash_algo)) {
 			warning(_("invalid multi-pack-index chain: line '%s' "
