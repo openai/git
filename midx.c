@@ -947,8 +947,9 @@ int verify_midx_file(struct odb_source_packed *source, unsigned flags)
 		return result;
 	}
 
-	if (!midx_checksum_valid(m))
-		midx_report(_("incorrect checksum"));
+	for (curr = m; curr; curr = curr->base_midx)
+		if (!midx_checksum_valid(curr))
+			midx_report(_("incorrect checksum"));
 
 	if (flags & MIDX_PROGRESS)
 		progress = start_delayed_progress(r,
@@ -962,26 +963,26 @@ int verify_midx_file(struct odb_source_packed *source, unsigned flags)
 	}
 	stop_progress(&progress);
 
-	if (m->num_objects == 0) {
-		midx_report(_("the midx contains no oid"));
-		/*
-		 * Remaining tests assume that we have objects, so we can
-		 * return here.
-		 */
-		goto cleanup;
-	}
-
-	if (flags & MIDX_PROGRESS)
-		progress = start_sparse_progress(r,
-						 _("Verifying OID order in multi-pack-index"),
-						 m->num_objects - 1);
-
 	for (curr = m; curr; curr = curr->base_midx) {
-		for (i = 0; i < m->num_objects - 1; i++) {
+		if (curr->num_objects == 0) {
+			midx_report(_("the midx contains no oid"));
+			/*
+			 * Remaining tests assume that we have objects, so we can
+			 * return here.
+			 */
+			goto cleanup;
+		}
+
+		if (flags & MIDX_PROGRESS)
+			progress = start_sparse_progress(r,
+							 _("Verifying OID order in multi-pack-index"),
+							 curr->num_objects - 1);
+
+		for (i = 0; i < curr->num_objects - 1; i++) {
 			struct object_id oid1, oid2;
 
-			nth_midxed_object_oid(&oid1, m, m->num_objects_in_base + i);
-			nth_midxed_object_oid(&oid2, m, m->num_objects_in_base + i + 1);
+			nth_midxed_object_oid(&oid1, curr, curr->num_objects_in_base + i);
+			nth_midxed_object_oid(&oid2, curr, curr->num_objects_in_base + i + 1);
 
 			if (oidcmp(&oid1, &oid2) >= 0)
 				midx_report(_("oid lookup out of order: oid[%d] = %s >= %s = oid[%d]"),
@@ -989,8 +990,8 @@ int verify_midx_file(struct odb_source_packed *source, unsigned flags)
 
 			midx_display_sparse_progress(progress, i + 1);
 		}
+		stop_progress(&progress);
 	}
-	stop_progress(&progress);
 
 	/*
 	 * Create an array mapping each object to its packfile id.  Sort it

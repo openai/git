@@ -4,6 +4,7 @@ test_description='incremental multi-pack-index'
 
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-midx.sh
+. "$TEST_DIRECTORY"/lib-chunk.sh
 
 GIT_TEST_MULTI_PACK_INDEX=0
 export GIT_TEST_MULTI_PACK_INDEX
@@ -78,6 +79,42 @@ test_expect_success 'midx verify with multiple layers' '
 	test_line_count = 2 "$midx_chain" &&
 
 	git multi-pack-index verify
+'
+
+
+test_expect_success 'verify checksum of base MIDX' '
+	midx="$midxdir/multi-pack-index-$(sed -n 1p "$midx_chain").midx" &&
+	cp "$midx" midx.bak &&
+	test_when_finished "mv midx.bak \"$midx\"" &&
+	chmod u+w "$midx" &&
+	echo extra >>"$midx" &&
+	test_must_fail git multi-pack-index verify 2>err &&
+	test_grep "incorrect checksum" err
+'
+
+test_expect_success PERL_TEST_HELPERS 'verify OID order of base MIDX' '
+	midx="$midxdir/multi-pack-index-$(sed -n 1p "$midx_chain").midx" &&
+	cp "$midx" midx.bak &&
+	test_when_finished "mv midx.bak \"$midx\"" &&
+	corrupt_chunk_file "$midx" OIDL "$(test_oid rawsz)" "$(test_oid zero)" &&
+	test_must_fail git multi-pack-index verify 2>err &&
+	test_grep "oid lookup out of order" err
+'
+
+test_expect_success SHA1 'reject empty base MIDX layer' '
+	cp "$midx_chain" chain.bak &&
+	test_when_finished "mv chain.bak \"$midx_chain\"" &&
+	cp "$TEST_DIRECTORY"/t5319/no-objects.midx $packdir/multi-pack-index &&
+	test_when_finished "rm -f $packdir/multi-pack-index" &&
+	empty=$(midx_checksum "$objdir") &&
+	mv $packdir/multi-pack-index "$midxdir/multi-pack-index-$empty.midx" &&
+	test_when_finished "rm -f \"$midxdir/multi-pack-index-$empty.midx\"" &&
+	{
+		echo "$empty" &&
+		cat chain.bak
+	} >"$midx_chain" &&
+	test_must_fail git multi-pack-index verify 2>err &&
+	test_grep "the midx contains no oid" err
 '
 
 test_expect_success 'read bitmap from second MIDX layer' '
