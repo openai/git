@@ -1164,6 +1164,14 @@ static bool midx_needs_update(struct multi_pack_index *midx, struct write_midx_c
 	bool needed = true;
 
 	/*
+	 * Incremental writes either add a new pack or bail out later when
+	 * there is nothing to add. Compaction always requires an update.
+	 * Neither can reuse the existing MIDX unchanged.
+	 */
+	if (ctx->incremental || ctx->compact)
+		return true;
+
+	/*
 	 * Ensure that we have a valid checksum before consulting the
 	 * existing MIDX in order to determine if we can avoid an
 	 * update.
@@ -1182,17 +1190,6 @@ static bool midx_needs_update(struct multi_pack_index *midx, struct write_midx_c
 	 */
 	if (midx->version != ctx->version)
 		goto out;
-
-	/*
-	 * Ignore incremental updates for now. The assumption is that any
-	 * incremental update would be either empty (in which case we will bail
-	 * out later) or it would actually cover at least one new pack.
-	 */
-	if (ctx->incremental)
-		goto out;
-
-	if (ctx->compact)
-		goto out; /* Compaction always requires an update. */
 
 	/*
 	 * Otherwise, we need to verify that the packs covered by the existing
