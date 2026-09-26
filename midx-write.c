@@ -1088,6 +1088,27 @@ static struct {
 	{MIDX_EXT_REV, MIDX_EXT_REV},
 };
 
+static int link_midx_file(const char *from, const char *to)
+{
+	struct stat from_stat, to_stat;
+	int saved_errno;
+
+	if (!link(from, to) || errno == ENOENT)
+		return 0;
+	saved_errno = errno;
+
+	/* An interrupted promotion may have linked this file already. */
+	if (saved_errno == EEXIST &&
+	    !lstat(from, &from_stat) && !lstat(to, &to_stat) &&
+	    from_stat.st_ino &&
+	    from_stat.st_dev == to_stat.st_dev &&
+	    from_stat.st_ino == to_stat.st_ino)
+		return 0;
+
+	errno = saved_errno;
+	return error_errno(_("unable to link '%s' to '%s'"), from, to);
+}
+
 static int link_midx_to_chain(struct multi_pack_index *m)
 {
 	struct strbuf from = STRBUF_INIT;
@@ -1112,11 +1133,9 @@ static int link_midx_to_chain(struct multi_pack_index *m)
 		get_split_midx_filename_ext(m->source, &to, hash,
 					    midx_exts[i].split);
 
-		if (link(from.buf, to.buf) < 0 && errno != ENOENT) {
-			ret = error_errno(_("unable to link '%s' to '%s'"),
-					  from.buf, to.buf);
+		ret = link_midx_file(from.buf, to.buf);
+		if (ret)
 			goto done;
-		}
 
 		strbuf_reset(&from);
 		strbuf_reset(&to);

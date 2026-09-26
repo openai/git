@@ -265,6 +265,47 @@ test_expect_success 'relink existing MIDX layer' '
 
 '
 
+
+test_expect_success POSIXPERM 'retry interrupted monolithic MIDX promotion' '
+	git init interrupted-promotion &&
+	(
+		cd interrupted-promotion &&
+		test_commit base &&
+		git repack -ad &&
+		GIT_TEST_MIDX_WRITE_REV=1 git multi-pack-index write --bitmap &&
+		hash=$(midx_checksum $objdir) &&
+		mkdir "$midxdir" &&
+		ln "$packdir/multi-pack-index" "$midxdir/multi-pack-index-$hash.midx" &&
+		ln "$packdir/multi-pack-index-$hash.bitmap" "$midxdir/multi-pack-index-$hash.bitmap" &&
+		ln "$packdir/multi-pack-index-$hash.rev" "$midxdir/multi-pack-index-$hash.rev" &&
+		test_commit other &&
+		git repack -d &&
+		git multi-pack-index write --incremental --bitmap &&
+		test_line_count = 2 "$midx_chain" &&
+		git multi-pack-index verify
+	)
+'
+
+test_expect_success 'do not replace an unrelated MIDX during promotion' '
+	git init unrelated-promotion &&
+	(
+		cd unrelated-promotion &&
+		test_commit base &&
+		git repack -ad &&
+		git multi-pack-index write &&
+		hash=$(midx_checksum $objdir) &&
+		mkdir "$midxdir" &&
+		echo unrelated >expect &&
+		cp expect "$midxdir/multi-pack-index-$hash.midx" &&
+		test_commit other &&
+		git repack -d &&
+		test_must_fail git multi-pack-index write --incremental 2>err &&
+		test_grep "unable to link" err &&
+		test_cmp expect "$midxdir/multi-pack-index-$hash.midx" &&
+		test_path_is_missing "$midx_chain"
+	)
+'
+
 test_expect_success 'non-incremental write with existing incremental chain' '
 	git init non-incremental-write-with-existing &&
 	test_when_finished "rm -fr non-incremental-write-with-existing" &&
