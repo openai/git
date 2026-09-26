@@ -130,6 +130,19 @@ do
 	'
 done
 
+
+test_expect_success 'verify premature end of MIDX chain' '
+	cp "$midx_chain" chain.bak &&
+	test_when_finished "mv chain.bak \"$midx_chain\"" &&
+	tr "\n" " " <chain.bak >"$midx_chain" &&
+	echo >>"$midx_chain" &&
+	test_must_fail git multi-pack-index verify 2>err &&
+	test_grep "unexpected end of multi-pack-index chain" err &&
+	test_grep "one or more multi-pack-index chain files could not be loaded" err &&
+	git cat-file -e 1.1 &&
+	git cat-file -e 2.2
+'
+
 test_expect_success 'read bitmap from second MIDX layer' '
 	git rev-list --test-bitmap 2.2
 '
