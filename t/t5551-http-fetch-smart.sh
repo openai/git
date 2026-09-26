@@ -25,7 +25,7 @@ test_lazy_prereq HAVE_CURL_HTTP2_BUG "
 	test_have_prereq HTTP2 &&
 	build_option libcurl |
 	awk -F. '
-		($1 == 7 && $2 >= 88) || ($1 == 8 && $2 < 3) { broken = 1 }
+		(\$1 == 7 && \$2 >= 88) || (\$1 == 8 && \$2 < 3) { broken = 1 }
 		END { exit !broken }
 	'
 "
