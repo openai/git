@@ -1035,6 +1035,8 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 					     ctx->compact_to);
 
 	ALLOC_GROW(ctx->info, packs_nr, ctx->alloc);
+	/* Layers are visited newest first, leaving holes until the end. */
+	memset(ctx->info, 0, st_mult(packs_nr, sizeof(*ctx->info)));
 
 	while (m != ctx->compact_from->base_midx) {
 		uint32_t pack_int_id, preferred_pack_id;
@@ -1051,7 +1053,7 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 
 		if (fill_pack_from_midx(&ctx->info[pack_int_id++], m,
 					preferred_pack_id) < 0)
-			return -1;
+			goto error;
 
 		for (i = m->num_packs_in_base;
 		     i < m->num_packs_in_base + m->num_packs; i++) {
@@ -1060,7 +1062,7 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 
 			if (fill_pack_from_midx(&ctx->info[pack_int_id++], m,
 						i) < 0)
-				return -1;
+				goto error;
 		}
 
 		ctx->nr += m->num_packs;
@@ -1070,6 +1072,11 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 	ASSERT(ctx->nr == packs_nr);
 
 	return 0;
+
+error:
+	/* Include initialized slots beyond the completed layers in cleanup. */
+	ctx->nr = packs_nr;
+	return -1;
 }
 
 static struct {
@@ -1404,7 +1411,8 @@ static int write_midx_internal(struct write_midx_opts *opts)
 		else if (opts->flags & (MIDX_WRITE_REV_INDEX | MIDX_WRITE_BITMAP))
 			bitmap_order |= 1;
 
-		fill_packs_from_midx_range(&ctx, bitmap_order);
+		if (fill_packs_from_midx_range(&ctx, bitmap_order) < 0)
+			goto cleanup;
 	} else {
 		ctx.to_include = opts->packs_to_include;
 		for_each_file_in_pack_dir(opts->source->base.path, add_pack_to_midx, &ctx);
