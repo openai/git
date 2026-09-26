@@ -117,6 +117,19 @@ test_expect_success SHA1 'reject empty base MIDX layer' '
 	test_grep "the midx contains no oid" err
 '
 
+for missing in 1 2
+do
+	test_expect_success "verify missing MIDX layer $missing" '
+		midx="$midxdir/multi-pack-index-$(sed -n "${missing}p" "$midx_chain").midx" &&
+		mv "$midx" missing.midx &&
+		test_when_finished "mv missing.midx \"$midx\"" &&
+		test_must_fail git multi-pack-index verify 2>err &&
+		test_grep "one or more multi-pack-index chain files could not be loaded" err &&
+		git cat-file -e 1.1 &&
+		git cat-file -e 2.2
+	'
+done
+
 test_expect_success 'read bitmap from second MIDX layer' '
 	git rev-list --test-bitmap 2.2
 '

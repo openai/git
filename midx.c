@@ -361,7 +361,8 @@ static struct multi_pack_index *load_midx_chain_fd_st(struct odb_source_packed *
 	return midx_chain;
 }
 
-static struct multi_pack_index *load_multi_pack_index_chain(struct odb_source_packed *source)
+static struct multi_pack_index *load_multi_pack_index_chain(struct odb_source_packed *source,
+							  int *incomplete_chain)
 {
 	struct strbuf chain_file = STRBUF_INIT;
 	struct stat st;
@@ -371,29 +372,38 @@ static struct multi_pack_index *load_multi_pack_index_chain(struct odb_source_pa
 	get_midx_chain_filename(source, &chain_file);
 	if (open_multi_pack_index_chain(source->base.odb->repo->hash_algo,
 					chain_file.buf, &fd, &st)) {
-		int incomplete;
 		/* ownership of fd is taken over by load function */
-		m = load_midx_chain_fd_st(source, fd, &st, &incomplete);
+		m = load_midx_chain_fd_st(source, fd, &st, incomplete_chain);
+	} else if (errno != ENOENT) {
+		*incomplete_chain = 1;
 	}
 
 	strbuf_release(&chain_file);
 	return m;
 }
 
-struct multi_pack_index *load_multi_pack_index(struct odb_source_packed *source)
+static struct multi_pack_index *load_multi_pack_index_with_status(struct odb_source_packed *source,
+								int *incomplete_chain)
 {
 	struct strbuf midx_name = STRBUF_INIT;
 	struct multi_pack_index *m;
 
+	*incomplete_chain = 0;
 	get_midx_filename(source, &midx_name);
 
 	m = load_multi_pack_index_one(source, midx_name.buf);
 	if (!m)
-		m = load_multi_pack_index_chain(source);
+		m = load_multi_pack_index_chain(source, incomplete_chain);
 
 	strbuf_release(&midx_name);
 
 	return m;
+}
+
+struct multi_pack_index *load_multi_pack_index(struct odb_source_packed *source)
+{
+	int incomplete_chain;
+	return load_multi_pack_index_with_status(source, &incomplete_chain);
 }
 
 void close_midx(struct multi_pack_index *m)
@@ -928,12 +938,17 @@ int verify_midx_file(struct odb_source_packed *source, unsigned flags)
 	struct pair_pos_vs_id *pairs = NULL;
 	uint32_t i;
 	struct progress *progress = NULL;
-	struct multi_pack_index *m = load_multi_pack_index(source);
+	int incomplete_chain;
+	struct multi_pack_index *m = load_multi_pack_index_with_status(source,
+								    &incomplete_chain);
 	struct multi_pack_index *curr;
 	verify_midx_error = 0;
 
+	if (incomplete_chain)
+		midx_report(_("one or more multi-pack-index chain files could not be loaded"));
+
 	if (!m) {
-		int result = 0;
+		int result = verify_midx_error;
 		struct stat sb;
 		struct strbuf filename = STRBUF_INIT;
 
