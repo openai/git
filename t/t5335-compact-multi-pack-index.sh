@@ -109,6 +109,27 @@ test_expect_success 'setup for bogus MIDX compaction scenarios' '
 	)
 '
 
+
+for missing in A C
+do
+	test_expect_success "MIDX compaction with missing pack $missing" '
+		pack=$(echo midx-compact-bogus/$packdir/pack-$missing-*.pack) &&
+		mv "$pack" missing.pack &&
+		test_when_finished "test ! -f missing.pack || mv missing.pack \"$pack\"" &&
+		(
+			cd midx-compact-bogus &&
+			cp "$midx_chain" chain.expect &&
+			test_must_fail git multi-pack-index compact --incremental \
+				"$(nth_line 1 "$midx_chain")" \
+				"$(nth_line 3 "$midx_chain")" 2>err &&
+			test_grep "could not load pack" err &&
+			test_cmp chain.expect "$midx_chain"
+		) &&
+		mv missing.pack "$pack" &&
+		git -C midx-compact-bogus multi-pack-index verify
+	'
+done
+
 test_expect_success 'MIDX compaction with missing endpoints' '
 	(
 		cd midx-compact-bogus &&
