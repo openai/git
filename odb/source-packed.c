@@ -343,7 +343,8 @@ static int odb_source_packed_for_each_prefixed_object(
 
 	store->skip_mru_updates = true;
 
-	m = get_multi_pack_index(store);
+	/* A MIDX owner need not be the copy that satisfies the pack flags. */
+	m = opts->flags ? NULL : get_multi_pack_index(store);
 	if (m) {
 		ret = for_each_prefixed_object_in_midx(store, m, opts, data);
 		if (ret)
@@ -351,7 +352,7 @@ static int odb_source_packed_for_each_prefixed_object(
 	}
 
 	for (e = packfile_store_get_packs(store); e; e = e->next) {
-		if (e->pack->multi_pack_index)
+		if (m && e->pack->multi_pack_index)
 			continue;
 		if (should_exclude_pack(e->pack, opts->flags))
 			continue;
