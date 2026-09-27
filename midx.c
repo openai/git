@@ -500,6 +500,14 @@ int prepare_midx_pack(struct multi_pack_index *m,
 	return 0;
 }
 
+void clear_midx_pack_errors(struct multi_pack_index *m)
+{
+	for (; m; m = m->base_midx)
+		for (uint32_t i = 0; i < m->num_packs; i++)
+			if (m->packs[i] == MIDX_PACK_ERROR)
+				m->packs[i] = NULL;
+}
+
 struct packed_git *nth_midxed_pack(struct multi_pack_index *m,
 				   uint32_t pack_int_id)
 {
