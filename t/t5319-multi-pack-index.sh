@@ -1468,4 +1468,38 @@ test_expect_success 'lookup recovers object whose midx-owning pack was removed' 
 	)
 '
 
+test_expect_success PIPE 'refresh retries a restored MIDX pack' '
+	test_when_finished "rm -fr repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		victim=$(echo victim | git hash-object -w --stdin) &&
+		pack=$(echo "$victim" | git pack-objects $objdir/pack/pack) &&
+		git multi-pack-index write --incremental &&
+		prime=$(echo prime | git hash-object -w --stdin) &&
+		echo "$prime" | git pack-objects $objdir/pack/pack &&
+		git prune-packed &&
+		git multi-pack-index write --incremental &&
+
+		mkfifo in out &&
+		(git cat-file --batch-check="%(objecttype)" <in >out &) &&
+		exec 9>in &&
+		exec 8<out &&
+		echo "$prime" >&9 &&
+		read response <&8 &&
+		test "$response" = blob &&
+
+		mv $objdir/pack/pack-$pack.pack saved.pack &&
+		echo "$victim" >&9 &&
+		read response <&8 &&
+		test "$response" = "$victim missing" &&
+		mv saved.pack $objdir/pack/pack-$pack.pack &&
+		echo "$victim" >&9 &&
+		read response <&8 &&
+		test "$response" = blob &&
+		exec 9>&- &&
+		exec 8<&-
+	)
+'
+
 test_done
