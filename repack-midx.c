@@ -775,7 +775,9 @@ static int repack_make_midx_compaction_plan(struct repack_write_midx_opts *opts,
 			break;
 		}
 
-		if (midx_preferred_pack(m, &preferred_pack_idx) < 0) {
+		preferred_pack_idx = m->num_packs_in_base;
+		if (opts->write_bitmaps &&
+		    midx_preferred_pack(m, &preferred_pack_idx) < 0) {
 			ret = error(_("could not find preferred pack for MIDX "
 				      "%s"), midx_get_checksum_hex(m));
 			goto out;

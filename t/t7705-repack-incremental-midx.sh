@@ -601,4 +601,25 @@ test_expect_success 'repacking duplicates does not append an empty layer' '
 	)
 '
 
+test_expect_success 'repacking layers without reverse indexes' '
+	git init no-reverse-index &&
+	(
+		cd no-reverse-index &&
+		for i in 1 2 3 4
+		do
+			echo "$i" | git hash-object -w --stdin >oid &&
+			git pack-objects "$packdir/pack" <oid &&
+			if test "$i" -le 2
+			then
+				git multi-pack-index write --incremental
+			fi || return 1
+		done &&
+		git -c repack.midxNewLayerThreshold=100 repack \
+			--geometric=2 -d --write-midx=incremental &&
+		test_line_count = 1 "$midx_chain" &&
+		git multi-pack-index verify &&
+		git fsck
+	)
+'
+
 test_done
