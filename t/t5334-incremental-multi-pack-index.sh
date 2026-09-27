@@ -151,6 +151,29 @@ test_expect_success 'read earlier bitmap from second MIDX layer' '
 	git rev-list --test-bitmap 1.2
 '
 
+test_expect_success 'bitmap falls back when a pack in the tip layer is missing' '
+	git init missing-pack &&
+	(
+		cd missing-pack &&
+		for i in 1 2 3
+		do
+			echo "$i" | git hash-object -w --stdin >oid &&
+			git pack-objects "$packdir/pack" <oid || return 1
+		done &&
+		git multi-pack-index write --incremental --bitmap &&
+
+		echo tip | git hash-object -w --stdin >oid &&
+		pack=$(git pack-objects "$packdir/pack" <oid) &&
+		git multi-pack-index write --incremental --bitmap &&
+		rm "$packdir/pack-$pack.pack" "$packdir/pack-$pack.idx" &&
+
+		git rev-list --use-bitmap-index --objects --no-object-names \
+			--stdin <oid >actual 2>err &&
+		test_cmp oid actual &&
+		test_grep "could not open pack pack-$pack.idx" err
+	)
+'
+
 test_expect_success 'show object from first pack' '
 	git cat-file -p 1.1
 '
