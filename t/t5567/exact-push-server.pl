@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use IO::Socket::INET;
 
-# Each case supplies an initial advertisement and an exact response. Requests
+# Each case supplies an initial advertisement and a point-query response. Requests
 # are saved before replying so tests can distinguish rejection from a push.
 my ($root, $ready) = @ARGV;
 my $listening = 0;
@@ -148,9 +148,13 @@ while (my $client = $server->accept()) {
 		my ($lines, $end) = packets($body);
 		$end == length($body) or die "trailing query bytes";
 		write_file("$dir/query", join("\n", @$lines) . "\n");
-		my @refs = split /\n/, read_file("$dir/exact");
+		my @prefixes = map { /^ref-prefix (.*)$/ ? $1 : () } @$lines;
+		my $selected = @prefixes == 1 && $prefixes[0] eq 'refs/';
+		my $source = $selected && -e "$dir/selected" ? 'selected' : 'exact';
+		my @refs = split /\n/, read_file("$dir/$source");
+		write_file("$dir/query-selected", join("\n", @$lines) . "\n") if $selected;
 		if ($mode =~ /^batch/) {
-			my @names = map { /^pando-exact-ref (.*)$/ ? $1 : () } @$lines;
+			my @names = map { /^ref-prefix (.*)$/ ? $1 : () } @$lines;
 			@names <= 128 or die "too many exact candidates";
 			my %requested = map { $_ => 1 } @names;
 			my $count = -e "$dir/query-count" ? read_file("$dir/query-count") : 0;
@@ -160,6 +164,7 @@ while (my $client = $server->accept()) {
 			@refs = grep { /^\S+ (.*)$/ && $requested{$1} } @refs;
 			$mode = 'error' if $mode eq 'batch-error' && $count == 2;
 		}
+		$mode = 'error' if $mode eq 'selected-point-error' && !$selected;
 		my $response = join('', map { packet("$_\n") } @refs) . '0000';
 		$response = packet("$refs[0]\n") . $response if $mode eq 'duplicate';
 		$response = packet("$zero refs/heads/unrequested\n") . $response

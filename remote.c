@@ -1296,10 +1296,6 @@ int prepare_exact_push_refs(struct ref *src, const struct refspec *rs,
 	struct ref *ref;
 	int i;
 
-	/* These modes also depend on refs that have no local source. */
-	if (flags & (MATCH_REFS_MIRROR | MATCH_REFS_PRUNE | MATCH_REFS_FOLLOW_TAGS))
-		return 0;
-
 	for (i = 0; i < rs->nr; i++) {
 		struct refspec_item *item = &rs->items[i];
 		struct ref *matched_src = NULL;
@@ -1348,8 +1344,15 @@ int prepare_exact_push_refs(struct ref *src, const struct refspec *rs,
 	 * still applies their exclusions after resolving all positive entries.
 	 */
 	for (ref = src; ref; ref = ref->next) {
-		char *dst = get_ref_match(normalized, ref, 0, FROM_SRC, NULL);
+		char *dst = get_ref_match(normalized, ref,
+					 !!(flags & MATCH_REFS_MIRROR), FROM_SRC, NULL);
 		struct ref *candidate;
+
+		/* Existing annotated tags must not become creations from a sparse view. */
+		if ((flags & MATCH_REFS_FOLLOW_TAGS) &&
+		    starts_with(ref->name, "refs/tags/") &&
+		    odb_read_object_info(the_repository->objects, &ref->new_oid, NULL) == OBJ_TAG)
+			string_list_append(&candidates, ref->name);
 
 		if (!dst)
 			continue;

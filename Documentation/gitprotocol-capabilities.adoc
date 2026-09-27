@@ -440,38 +440,49 @@ A receive-pack server may advertise `pando-exact-refs` together with
 `explicit-haves` to support exact push ref discovery over smart HTTP.
 The capability authorizes a protocol v2 `ls-refs` POST to `git-upload-pack`
 under the same repository URL, including any receive-pack discovery redirect.
-The client sends `Git-Protocol: version=2:explicit-haves` and repeated
-`pando-exact-ref <name>` arguments instead of `ref-prefix` arguments.
+The client sends `Git-Protocol: version=2:explicit-haves` and standard
+`ref-prefix <name>` arguments to `ls-refs`.
 No separate upload-pack discovery request is required. After successful
 exact discovery, the client echoes `pando-exact-refs` with `explicit-haves`
 in the receive-pack command capabilities. The server must reject the push
 if it can no longer honor this contract when processing the command.
 
-Each argument names a complete ref under `refs/`. The response contains
-exactly one `<oid> <name>` pkt-line for each requested ref visible to the
-push operation, followed by a flush packet. A requested ref absent from
-the authorized push namespace has no response record. A denied, unavailable or incomplete lookup must fail the
-whole request rather than imply absence. The server must finish all
-requested lookups before sending the flush.
+When a prefix names a complete ref under `refs/`, the server refreshes that
+name before returning its selected refs. A ref absent from the authorized
+push namespace has no response record. An unavailable or incomplete lookup
+must fail the request rather than imply absence. The server must finish all
+requested lookups before sending the flush. Standard `ls-refs` response
+semantics apply: a prefix can match several refs, and the server may return
+additional refs. The client filters point observations by full-name equality;
+prefix neighbors do not become destination matches merely by appearing in
+the response.
 The server must apply the repository, authorization and ref visibility of
 the receive-pack operation. Upload-pack visibility alone is insufficient.
-The response has no peeled or symbolic-ref attributes.
+Named refs and their optional attributes carry no object-retention promise.
 
 The client sends at most 128 distinct candidate names per request. Larger
 candidate sets use consecutive requests under the same receive session URL;
 the client must finish every request before either push matching pass sees
-the results. For C distinct candidates, discovery makes ceiling(C / 128)
-requests and stores at most C observations. Request and response sizes are
-bounded by the names in that batch, independently of the remote ref count.
-A response may contain only names requested in its own batch. A failure
-in any batch aborts the push without using earlier batches or the initial
-advertisement as a fallback.
+the results. For C distinct candidates, point discovery makes ceiling(C / 128)
+requests and stores at most C point observations. A prefix response can
+contain more than 128 refs; its size depends on the server's selected view.
+A failure in any batch aborts the push without using earlier batches or the
+initial advertisement as a fallback.
 
-Git computes candidate names after applying configured push refspecs and defaults. Explicit refspecs
-use Git's normal destination matching candidates. Matching refspecs, `--all`
+Git computes candidate names after applying configured push refspecs and
+defaults. Explicit refspecs use Git's normal destination matching candidates.
+Matching refspecs, `--all`
 and wildcard refspecs use destinations derived from local refs. `--mirror`,
-`--prune` and effective `--follow-tags` require discovery beyond these names
-and are rejected when this capability is selected.
+`--prune` and effective `--follow-tags` first request `ref-prefix refs/` to
+refresh the server's selected ref view, then apply point observations for
+local destinations. Mirror includes all local refs; follow-tags checks local
+annotated tag names. Native matching operates on the resulting selected
+view. This does not require the server to enumerate a backing repository's
+entire namespace. With S selected refs, these modes retain O(S + C) refs and
+make one additional request. Selected ref OIDs remain separate from PACK
+omission authority. Selected refs outside the point candidates are not
+individually refreshed from a backing repository; stale values can cause
+the usual old-OID rejection when an update reaches that repository.
 
 The response replaces the initial advertisement for every requested name,
 including names absent from the response. It does not reserve a ref value.

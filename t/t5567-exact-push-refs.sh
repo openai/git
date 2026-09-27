@@ -79,7 +79,7 @@ test_expect_success 'exact discovery precedes matching and replaces cached send-
 	test_cmp expect server/replace/requests &&
 	test_grep "^command=ls-refs$" server/replace/query &&
 	test_grep "^object-format=$(test_oid algo)$" server/replace/query &&
-	test_grep "^pando-exact-ref refs/heads/topic$" server/replace/query &&
+	test_grep "^ref-prefix refs/heads/topic$" server/replace/query &&
 	test_grep "explicit-haves" server/replace/receive-capabilities &&
 	test_grep "pando-exact-refs" server/replace/receive-capabilities
 '
@@ -178,21 +178,32 @@ test_expect_success 'exact discovery preserves ambiguity of a short destination'
 
 for state in present absent
 do
-	test_expect_success "exact discovery rejects valid prefix neighbor when foo is $state" '
+	test_expect_success "point-prefix discovery ignores valid prefix neighbor when foo is $state" '
 		setup_case "prefix-$state" &&
 		printf "%s refs/heads/foobar\n" "$old" >"server/$case_name/exact" &&
+		expected_old=$ZERO_OID &&
 		if test "$state" = present
 		then
-			printf "%s refs/heads/foo\n" "$old" >>"server/$case_name/exact"
+			printf "%s refs/heads/foo\n" "$old" >>"server/$case_name/exact" &&
+			expected_old=$old
 		fi &&
-		test_must_fail git push "$case_url" HEAD:refs/heads/foo 2>err &&
-		test_grep "invalid exact push ref discovery response" err &&
-		test_grep "^pando-exact-ref refs/heads/foo$" "server/$case_name/query" &&
-		test_grep ! "^pando-exact-ref refs/heads/foobar$" "server/$case_name/query" &&
-		test_grep ! "^ref-prefix " "server/$case_name/query" &&
-		expect_no_push
+		git push "$case_url" HEAD:refs/heads/foo &&
+		expect_command "$expected_old" "$new" refs/heads/foo &&
+		test_grep "^ref-prefix refs/heads/foo$" "server/$case_name/query" &&
+		test_grep ! "^ref-prefix refs/heads/foobar$" "server/$case_name/query" &&
+		test_grep ! "^pando-exact-ref " "server/$case_name/query"
 	'
 done
+
+test_expect_success 'valid prefix extras do not impose a candidate-derived response size limit' '
+	setup_case many-extras &&
+	for i in $(test_seq 20000)
+	do
+		printf "%s refs/heads/topic-neighbor-%s\n" "$old" "$i" || return 1
+	done >>server/many-extras/exact &&
+	git push "$case_url" HEAD:refs/heads/topic &&
+	expect_command "$old" "$new" refs/heads/topic
+'
 
 test_expect_success 'all explicit destinations are discovered before matching' '
 	setup_case multiple &&
@@ -202,8 +213,8 @@ test_expect_success 'all explicit destinations are discovered before matching' '
 		"$stale" "$new" "$old" "$new" >expect &&
 	sort server/multiple/commands >actual &&
 	test_cmp expect actual &&
-	test_grep "^pando-exact-ref refs/heads/topic$" server/multiple/query &&
-	test_grep "^pando-exact-ref refs/heads/other$" server/multiple/query &&
+	test_grep "^ref-prefix refs/heads/topic$" server/multiple/query &&
+	test_grep "^ref-prefix refs/heads/other$" server/multiple/query &&
 	sort server/multiple/query | uniq -d >duplicates &&
 	test_must_be_empty duplicates
 '
@@ -240,18 +251,61 @@ test_expect_success 'exact capability requires explicit-haves' '
 	expect_no_push
 '
 
-for mode in mirror prune follow-tags
+test_expect_success 'mirror deletes remote-only selected refs without discovering unselected refs' '
+	setup_case mirror &&
+	printf "%s refs/heads/stale-selection\n" "$stale" >server/mirror/initial &&
+	printf "%s refs/heads/remote-only\n" "$old" >server/mirror/selected &&
+	printf "%s refs/heads/unselected\n" "$old" >server/mirror/exact &&
+	printf "%s refs/heads/remote-only\n" "$old" >>server/mirror/exact &&
+	git push --mirror "$case_url" &&
+	test_grep "^ref-prefix refs/$" server/mirror/query-selected &&
+	test_grep "^$old $ZERO_OID refs/heads/remote-only$" server/mirror/commands &&
+	test_grep "^$ZERO_OID $new $(git symbolic-ref HEAD)$" server/mirror/commands &&
+	test_grep ! "refs/heads/unselected" server/mirror/commands &&
+	test_grep ! "refs/heads/stale-selection" server/mirror/commands
+'
+
+test_expect_success 'prune deletes selected refs only in the mapped namespace' '
+	setup_case prune &&
+	{
+		printf "%s refs/heads/mapped/remote-only\n" "$old" &&
+		printf "%s refs/heads/outside\n" "$old" &&
+		printf "%s refs/tags/protected\n" "$old"
+	} >server/prune/selected &&
+	cp server/prune/selected server/prune/exact &&
+	git push --prune "$case_url" "refs/heads/*:refs/heads/mapped/*" &&
+	test_grep "^ref-prefix refs/$" server/prune/query-selected &&
+	test_grep "^$old $ZERO_OID refs/heads/mapped/remote-only$" server/prune/commands &&
+	test_grep "^$ZERO_OID $new refs/heads/mapped/$(git symbolic-ref --short HEAD)$" server/prune/commands &&
+	test_grep ! "refs/heads/outside" server/prune/commands &&
+	test_grep ! "refs/tags/protected" server/prune/commands
+'
+
+for configured in no yes
 do
-	test_expect_success "incomplete destination set ($mode) cannot use sparse advertisement" '
-		setup_case "unsupported-$mode" &&
-		case "$mode" in
-		mirror) set -- --mirror ;;
-		prune) set -- --prune HEAD:refs/heads/topic ;;
-		follow-tags) set -- --follow-tags HEAD:refs/heads/topic ;;
-		esac &&
-		test_must_fail git push "$case_url" "$@" 2>err &&
-		expect_no_push &&
-		test_path_is_missing "server/$case_name/query"
+	test_expect_success "follow-tags includes tags reachable only from selected remote tips (configured=$configured)" '
+		setup_case "follow-tags-$configured" &&
+		remote_tip=$(echo remote-only | git commit-tree "HEAD^{tree}") &&
+		git tag -a -m remote-only remote-only-tag "$remote_tip" &&
+		test_when_finished "git tag -d remote-only-tag" &&
+		unreachable_tip=$(echo unreachable | git commit-tree "HEAD^{tree}") &&
+		git tag -a -m unreachable unreachable-tag "$unreachable_tip" &&
+		test_when_finished "git tag -d unreachable-tag" &&
+		tag_oid=$(git rev-parse refs/tags/remote-only-tag) &&
+		printf "%s refs/heads/remote-tip\n" "$remote_tip" >"server/$case_name/selected" &&
+		printf "%s refs/heads/topic\n" "$old" >>"server/$case_name/selected" &&
+		cp "server/$case_name/selected" "server/$case_name/exact" &&
+		if test "$configured" = yes
+		then
+			git -c push.followTags=true push "$case_url" HEAD:refs/heads/topic
+		else
+			git push --follow-tags "$case_url" HEAD:refs/heads/topic
+		fi &&
+		test_grep "^ref-prefix refs/$" "server/$case_name/query-selected" &&
+		test_grep "^$old $new refs/heads/topic$" "server/$case_name/commands" &&
+		test_grep "^$ZERO_OID $tag_oid refs/tags/remote-only-tag$" "server/$case_name/commands" &&
+		test_grep ! "refs/heads/remote-tip$" "server/$case_name/commands" &&
+		test_grep ! "refs/tags/unreachable-tag$" "server/$case_name/commands"
 	'
 done
 
@@ -267,7 +321,7 @@ do
 		wildcard) set -- "refs/heads/*:refs/heads/*" ;;
 		esac &&
 		git push "$case_url" "$@" &&
-		test_grep "^pando-exact-ref refs/heads/topic$" "server/$case_name/query" &&
+		test_grep "^ref-prefix refs/heads/topic$" "server/$case_name/query" &&
 		printf "%s %s refs/heads/topic\n" "$old" "$new" >expect &&
 		if test "$mode" != matching
 		then
@@ -346,10 +400,19 @@ test_expect_success 'a later batch error exposes no partial remote-helper ref li
 	expect_no_push
 '
 
-test_expect_success 'configured follow-tags also rejects incomplete discovery' '
-	setup_case configured-follow-tags &&
-	test_must_fail git -c push.followTags=true push \
-		"$case_url" HEAD:refs/heads/topic 2>err &&
+test_expect_success 'a failed point query exposes none of the preceding selected view' '
+	setup_case selected-point-error selected-point-error &&
+	printf "%s refs/heads/remote-only\n" "$old" >server/selected-point-error/selected &&
+	cat >helper-input <<-EOF &&
+	option push-exact-refs selected
+	option push-exact-ref refs/heads/topic
+	list for-push
+	EOF
+	test_must_fail git remote-http origin "$case_url" <helper-input >helper-output 2>err &&
+	test_grep "exact refs unavailable" err &&
+	test_path_is_file server/selected-point-error/query-selected &&
+	test_grep ! "^:push-exact-refs$" helper-output &&
+	test_grep ! "refs/heads/" helper-output &&
 	expect_no_push
 '
 

@@ -1508,6 +1508,8 @@ int transport_push(struct repository *r,
 	if (exact_plan < 0)
 		goto done;
 	transport_options.exact_refs_complete = exact_plan;
+	transport_options.exact_refs_selected = !!(match_flags &
+		(MATCH_REFS_MIRROR | MATCH_REFS_PRUNE | MATCH_REFS_FOLLOW_TAGS));
 
 	refspec_ref_prefixes(rs, &transport_options.ref_prefixes);
 

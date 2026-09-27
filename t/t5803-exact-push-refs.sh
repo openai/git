@@ -48,7 +48,7 @@ test_expect_success 'setup recording remote helper' '
 				git symbolic-ref HEAD "$EXACT_REFS_SWITCH_HEAD" || exit 1
 			fi
 			cat "$EXACT_REFS_ADVERTISEMENT"
-			if test "$complete" = true &&
+			if test "$complete" != false &&
 			   test -z "$EXACT_REFS_FALLBACK"
 			then
 				printf ":push-exact-refs\n"
@@ -242,12 +242,10 @@ test_expect_success 'invalid local source is rejected before helper discovery' '
 
 for mode in --mirror --prune --follow-tags
  do
-	test_expect_success "$mode does not claim complete exact discovery" '
+	test_expect_success "$mode requests selected-view discovery" '
 		reset_helper &&
 		git push "$mode" target &&
-		test_grep "^option push-exact-refs false$" "$EXACT_REFS_LOG" &&
-		exact_candidates &&
-		test_must_be_empty actual
+		test_grep "^option push-exact-refs selected$" "$EXACT_REFS_LOG"
 	'
 done
 

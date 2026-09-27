@@ -64,15 +64,18 @@ static struct string_list cas_options = STRING_LIST_INIT_DUP;
 /* Candidate names belong to the next list-for-push operation. */
 static struct string_list push_exact_refs = STRING_LIST_INIT_DUP;
 static int push_exact_refs_complete;
+static int push_exact_refs_selected;
 
 
 static int set_option(const char *name, size_t namelen, const char *value)
 {
 	if (namelen == strlen("push-exact-refs") &&
 	    !strncmp(name, "push-exact-refs", namelen)) {
-		if (strcmp(value, "true") && strcmp(value, "false"))
+		if (strcmp(value, "true") && strcmp(value, "false") &&
+		    strcmp(value, "selected"))
 			return -1;
-		push_exact_refs_complete = !strcmp(value, "true");
+		push_exact_refs_complete = strcmp(value, "false") != 0;
+		push_exact_refs_selected = !strcmp(value, "selected");
 		string_list_clear(&push_exact_refs, 0);
 		return 0;
 	} else if (namelen == strlen("push-exact-ref") &&
@@ -672,9 +675,8 @@ struct rpc_state {
 	int in;
 	int out;
 	int any_written;
-	/* Exact discovery buffers a bounded response instead of writing to a child. */
+	/* Ref discovery buffers its response before either push matching pass. */
 	struct strbuf *response;
-	size_t response_limit;
 	unsigned gzip_request : 1;
 	unsigned initial_buffer : 1;
 
@@ -895,8 +897,6 @@ static size_t rpc_in(char *ptr, size_t eltsize,
 	if (data->check_pktline)
 		check_pktline(&data->pktline_state, ptr, size);
 	if (data->rpc->response) {
-		if (size > data->rpc->response_limit - data->rpc->response->len)
-			return 0;
 		strbuf_add(data->rpc->response, ptr, size);
 	} else {
 		write_or_die(data->rpc->in, ptr, size);
@@ -1193,6 +1193,7 @@ static void replace_exact_push_refs(struct discovery *heads,
 			die(_("invalid receive-pack advertisement"));
 		name++;
 		if (!strcmp(name, "capabilities^{}") ||
+		    (push_exact_refs_selected && starts_with(name, "refs/")) ||
 		    string_list_has_string(&push_exact_refs, name))
 			continue;
 		string_list_append(&records, line);
@@ -1235,18 +1236,22 @@ static void replace_exact_push_refs(struct discovery *heads,
 }
 
 static void discover_exact_push_refs_batch(size_t begin, size_t end,
+					  int selected,
 					  struct string_list *observed)
 {
 	struct rpc_state rpc = RPC_STATE_INIT;
 	struct strbuf request = STRBUF_INIT;
 	struct strbuf response = STRBUF_INIT;
 	struct packet_reader reader;
+	struct string_list batch = STRING_LIST_INIT_DUP;
 
 	packet_buf_write(&request, "command=ls-refs\n");
 	packet_buf_write(&request, "object-format=%s\n", options.hash_algo->name);
 	packet_buf_delim(&request);
+	if (selected)
+		packet_buf_write(&request, "ref-prefix refs/\n");
 	for (size_t i = begin; i < end; i++)
-		packet_buf_write(&request, "pando-exact-ref %s\n", push_exact_refs.items[i].string);
+		packet_buf_write(&request, "ref-prefix %s\n", push_exact_refs.items[i].string);
 	packet_buf_flush(&request);
 
 	/* The receive capability authorizes this command on the same session URL. */
@@ -1258,11 +1263,6 @@ static void discover_exact_push_refs_batch(size_t begin, size_t end,
 	rpc.buf = request.buf;
 	rpc.len = request.len;
 	rpc.response = &response;
-	/* At most one oid/name pkt-line per candidate, followed by a flush. */
-	rpc.response_limit = 4;
-	for (size_t i = begin; i < end; i++)
-		rpc.response_limit += options.hash_algo->hexsz +
-			strlen(push_exact_refs.items[i].string) + 6;
 	if (post_rpc(&rpc, 0, 1))
 		die(_("exact push ref discovery failed"));
 
@@ -1272,23 +1272,43 @@ static void discover_exact_push_refs_batch(size_t begin, size_t end,
 	while (packet_reader_read(&reader) == PACKET_READ_NORMAL) {
 		struct object_id oid;
 		const char *name;
+		char *refname, *attributes;
 		struct string_list_item *item, *requested;
 
 		if (parse_oid_hex_algop(reader.line, &oid, &name, options.hash_algo) ||
 		    *name++ != ' ' || is_null_oid(&oid) ||
 		    strlen(reader.line) != reader.pktlen)
 			die(_("invalid exact push ref discovery response"));
-		requested = string_list_lookup(&push_exact_refs, name);
-		/* A different batch does not authorize a record in this response. */
-		if (!requested || requested < push_exact_refs.items + begin ||
-		    requested >= push_exact_refs.items + end ||
-		    string_list_has_string(observed, name))
+		refname = xstrdup(name);
+		attributes = strchr(refname, ' ');
+		if (attributes)
+			*attributes = '\0';
+		if (check_refname_format(refname, REFNAME_ALLOW_ONELEVEL))
 			die(_("invalid exact push ref discovery response"));
-		item = string_list_insert(observed, name);
+		requested = string_list_lookup(&push_exact_refs, refname);
+		/* ref-prefix is an optimization; servers may include other refs. */
+		if (!starts_with(refname, "refs/") ||
+		    (!selected && (!requested || requested < push_exact_refs.items + begin ||
+				   requested >= push_exact_refs.items + end))) {
+			free(refname);
+			continue;
+		}
+		if (string_list_has_string(&batch, refname))
+			die(_("invalid exact push ref discovery response"));
+		item = string_list_insert(&batch, refname);
 		item->util = xstrdup(oid_to_hex(&oid));
+		free(refname);
 	}
 	if (reader.status != PACKET_READ_FLUSH || reader.src_len)
 		die(_("incomplete exact push ref discovery response"));
+	for (size_t i = begin; i < end; i++)
+		string_list_remove(observed, push_exact_refs.items[i].string, 1);
+	for (size_t i = 0; i < batch.nr; i++) {
+		struct string_list_item *item = string_list_insert(observed, batch.items[i].string);
+
+		item->util = batch.items[i].util;
+	}
+	string_list_clear(&batch, 0);
 	strbuf_release(&request);
 	strbuf_release(&response);
 	free(rpc.service_url);
@@ -1304,11 +1324,13 @@ static void discover_exact_push_refs(struct discovery *heads)
 	if (!server_supports("explicit-haves"))
 		die(_("exact push ref discovery requires explicit-haves"));
 	if (!push_exact_refs_complete)
-		die(_("this server does not support --mirror, --prune or --follow-tags pushes"));
+		die(_("incomplete push ref discovery request"));
 
 	/* No local source can produce an update for an empty finite plan. */
-	if (!push_exact_refs.nr)
+	if (!push_exact_refs.nr && !push_exact_refs_selected)
 		return;
+	if (push_exact_refs_selected)
+		discover_exact_push_refs_batch(0, 0, 1, &observed);
 
 	for (size_t begin = 0; begin < push_exact_refs.nr;) {
 		size_t count = push_exact_refs.nr - begin;
@@ -1316,7 +1338,7 @@ static void discover_exact_push_refs(struct discovery *heads)
 		if (count > MAX_EXACT_PUSH_REFS)
 			count = MAX_EXACT_PUSH_REFS;
 
-		discover_exact_push_refs_batch(begin, begin + count, &observed);
+		discover_exact_push_refs_batch(begin, begin + count, 0, &observed);
 		begin += count;
 	}
 	/* Both matching passes must see results only after every batch succeeds. */

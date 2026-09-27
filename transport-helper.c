@@ -1282,8 +1282,11 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 
 	if (for_push && data->push_exact_refs) {
 		int complete = transport_options && transport_options->exact_refs_complete;
+		const char *mode = complete ? "true" : "false";
 
-		if (set_helper_option(transport, "push-exact-refs", complete ? "true" : "false"))
+		if (complete && transport_options->exact_refs_selected)
+			mode = "selected";
+		if (set_helper_option(transport, "push-exact-refs", mode))
 			die(_("remote helper refused exact push ref discovery"));
 		if (complete) {
 			for (size_t i = 0; i < transport_options->exact_refs.nr; i++)

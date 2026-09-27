@@ -278,8 +278,9 @@ int check_push_refs(struct ref *src, struct refspec *rs);
 #define MAX_EXACT_PUSH_REFS 128
 /*
  * Prepare a per-transport copy of push refspecs and all exact remote
- * names needed to resolve their destinations. Return 1 for a complete list,
- * 0 for modes requiring broader discovery, or -1 for invalid local sources.
+ * names needed to resolve their destinations. Return 1 for success or -1
+ * for invalid local sources. Mirror, prune and follow-tags also need the
+ * server's selected refs, which the transport requests separately.
  * The caller owns and releases both initialized output containers.
  */
 int prepare_exact_push_refs(struct ref *src, const struct refspec *rs,

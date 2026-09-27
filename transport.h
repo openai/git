@@ -282,6 +282,8 @@ struct transport_ls_refs_options {
 	 */
 	struct strvec exact_refs;
 	unsigned exact_refs_complete : 1;
+	/* Refresh the server's selected ref view before applying point observations. */
+	unsigned exact_refs_selected : 1;
 	/* Set by the transport only after successful exact discovery. */
 	unsigned exact_refs_used : 1;
 
