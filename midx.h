@@ -103,6 +103,7 @@ void get_split_midx_filename_ext(struct odb_source_packed *source, struct strbuf
 struct multi_pack_index *get_multi_pack_index(struct odb_source_packed *source);
 struct multi_pack_index *load_multi_pack_index(struct odb_source_packed *source);
 int prepare_midx_pack(struct multi_pack_index *m, uint32_t pack_int_id);
+void clear_midx_pack_errors(struct multi_pack_index *m);
 struct packed_git *nth_midxed_pack(struct multi_pack_index *m,
 				   uint32_t pack_int_id);
 int nth_bitmapped_pack(struct multi_pack_index *m,
