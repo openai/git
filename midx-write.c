@@ -115,6 +115,7 @@ struct write_midx_context {
 	struct multi_pack_index *compact_from;
 	struct multi_pack_index *compact_to;
 	int compact;
+	int compact_reuse;
 
 	struct string_list *to_include;
 
@@ -385,6 +386,19 @@ static void midx_fanout_add_compact(struct midx_fanout *fanout,
 
 	ASSERT(ctx->compact);
 
+	if (!ctx->compact_reuse) {
+		for (uint32_t i = 0; i < ctx->nr; i++) {
+			size_t start = fanout->nr;
+
+			midx_fanout_add_pack_fanout(fanout, ctx->info, i,
+						    i == ctx->preferred_pack_idx,
+						    cur_fanout);
+			for (size_t j = start; j < fanout->nr; j++)
+				fanout->entries[j].pack_int_id = ctx->info[i].orig_pack_int_id;
+		}
+		return;
+	}
+
 	while (m && m != ctx->compact_from->base_midx) {
 		midx_fanout_add_midx_fanout_1(fanout, m, cur_fanout,
 					      NO_PREFERRED_PACK);
@@ -445,8 +459,8 @@ static void compute_sorted_entries(struct write_midx_context *ctx,
 			if (cur_object && oideq(&fanout.entries[cur_object - 1].oid,
 						&fanout.entries[cur_object].oid))
 				continue;
-			/* Compacted layers already exclude objects in their base. */
-			if (ctx->incremental && !ctx->compact && ctx->base_midx &&
+			/* Reused entries already exclude objects in their base. */
+			if (ctx->incremental && !ctx->compact_reuse && ctx->base_midx &&
 			    midx_has_oid(ctx->base_midx,
 					 &fanout.entries[cur_object].oid))
 				continue;
@@ -689,7 +703,7 @@ static uint32_t *midx_pack_order(struct write_midx_context *ctx)
 		struct pack_midx_entry *e = &ctx->entries[i];
 		data[i].nr = i;
 		data[i].pack = midx_pack_perm(ctx, e->pack_int_id);
-		if (!e->preferred || ctx->compact)
+		if (!e->preferred || ctx->compact_reuse)
 			data[i].pack |= (1U << 31);
 		data[i].offset = e->offset;
 	}
@@ -1071,6 +1085,16 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 
 	ASSERT(ctx->nr == packs_nr);
 
+	if (!ctx->compact_reuse) {
+		for (size_t i = 0; i < ctx->nr; i++) {
+			if (open_pack_index(ctx->info[i].p)) {
+				error(_("failed to open pack-index '%s'"),
+				      ctx->info[i].pack_name);
+				goto error;
+			}
+		}
+	}
+
 	return 0;
 
 error:
@@ -1391,6 +1415,21 @@ static int write_midx_internal(struct write_midx_opts *opts)
 				      opts->incremental_base);
 				goto cleanup;
 			}
+		}
+	}
+
+	if (ctx.compact) {
+		/* A standalone MIDX must index every object in its packs. */
+		if (!ctx.incremental)
+			ctx.base_midx = NULL;
+		ctx.compact_reuse = ctx.base_midx == ctx.compact_from->base_midx;
+
+		/* Retained layers depend on their original bitmap positions. */
+		if (!ctx.compact_reuse && ctx.incremental &&
+		    !(opts->flags & MIDX_WRITE_NO_CHAIN) &&
+		    ctx.compact_to != ctx.m) {
+			error(_("cannot change the base when retaining layers above the compacted range"));
+			goto cleanup;
 		}
 	}
 

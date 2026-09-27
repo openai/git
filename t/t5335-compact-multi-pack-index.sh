@@ -402,6 +402,88 @@ test_expect_success 'MIDX compaction with --base=none' '
 	)
 '
 
+test_expect_success 'setup compaction with duplicate objects' '
+	git init compact-duplicates &&
+	(
+		cd compact-duplicates &&
+		git config maintenance.auto false &&
+		write_packs A B &&
+		test_commit C &&
+		git pack-objects --all $packdir/pack-C &&
+		git prune-packed &&
+		git multi-pack-index write --incremental --bitmap &&
+		test_commit D &&
+		{
+			git rev-list --objects --no-object-names B &&
+			git rev-list --objects --no-object-names D ^C
+		} >objects &&
+		git pack-objects $packdir/pack-D <objects &&
+		git prune-packed &&
+		git multi-pack-index write --incremental --bitmap
+	)
+'
+
+for mode in standalone root custom
+do
+	test_expect_success "compaction preserves duplicates with $mode base" '
+		cp -R compact-duplicates compact-$mode &&
+		(
+			cd compact-$mode &&
+			# Prefer D, leaving holes among the selected objects in C.
+			test-tool chmtime =-10 $packdir/pack-D-*.pack &&
+			case "$mode" in
+			standalone) set -- ;;
+			root) set -- --incremental --base=none ;;
+			custom) set -- --incremental --base="$(nth_line 1 "$midx_chain")" ;;
+			esac &&
+			oid=$(git rev-parse B) &&
+			git cat-file commit "$oid" >expect &&
+			git rev-list --objects --no-object-names --all >objects &&
+			sort objects >objects.expect &&
+			rm $packdir/pack-B-* &&
+			git multi-pack-index compact --bitmap "$@" \
+				"$(nth_line 3 "$midx_chain")" \
+				"$(nth_line 4 "$midx_chain")" &&
+			git cat-file commit "$oid" >actual &&
+			test_cmp expect actual &&
+			git multi-pack-index verify &&
+			git rev-list --test-bitmap D &&
+			GIT_TRACE2_EVENT="$PWD/trace" \
+				git -c pack.allowPackReuse=multi pack-objects \
+				--all --use-bitmap-index --delta-base-offset --stdout \
+				>reuse.pack &&
+			test_trace2_data pack-objects packs-reused "[23]" <trace &&
+			git index-pack --strict reuse.pack &&
+			git show-index <reuse.idx >objects &&
+			cut -d" " -f2 objects | sort >objects.actual &&
+			test_cmp objects.expect objects.actual &&
+			if test "$mode" != standalone
+			then
+				test_midx_layer_object_uniqueness
+			fi
+		)
+	'
+done
+
+test_expect_success 'reject changing compaction base below retained layers' '
+	(
+		cd compact-duplicates &&
+		cp "$midx_chain" chain.before &&
+		test_must_fail git multi-pack-index compact --incremental \
+			--base=none \
+			"$(nth_line 2 "$midx_chain")" \
+			"$(nth_line 3 "$midx_chain")" 2>err &&
+		test_grep "cannot change the base when retaining layers" err &&
+		test_cmp chain.before "$midx_chain" &&
+		git multi-pack-index compact --incremental \
+			--no-write-chain-file --base=none \
+			"$(nth_line 2 "$midx_chain")" \
+			"$(nth_line 3 "$midx_chain")" >layer &&
+		test_line_count = 1 layer &&
+		test_cmp chain.before "$midx_chain"
+	)
+'
+
 test_expect_success 'MIDX compaction with bogus --base checksum' '
 	git init midx-compact-bogus-base &&
 	(
