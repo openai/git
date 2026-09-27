@@ -176,6 +176,24 @@ test_expect_success 'exact discovery preserves ambiguity of a short destination'
 	expect_no_push
 '
 
+for state in present absent
+do
+	test_expect_success "exact discovery rejects valid prefix neighbor when foo is $state" '
+		setup_case "prefix-$state" &&
+		printf "%s refs/heads/foobar\n" "$old" >"server/$case_name/exact" &&
+		if test "$state" = present
+		then
+			printf "%s refs/heads/foo\n" "$old" >>"server/$case_name/exact"
+		fi &&
+		test_must_fail git push "$case_url" HEAD:refs/heads/foo 2>err &&
+		test_grep "invalid exact push ref discovery response" err &&
+		test_grep "^pando-exact-ref refs/heads/foo$" "server/$case_name/query" &&
+		test_grep ! "^pando-exact-ref refs/heads/foobar$" "server/$case_name/query" &&
+		test_grep ! "^ref-prefix " "server/$case_name/query" &&
+		expect_no_push
+	'
+done
+
 test_expect_success 'all explicit destinations are discovered before matching' '
 	setup_case multiple &&
 	printf "%s refs/heads/other\n" "$stale" >>server/multiple/exact &&
