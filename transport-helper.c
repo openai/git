@@ -39,7 +39,8 @@ struct helper_data {
 		check_connectivity : 1,
 		no_disconnect_req : 1,
 		no_private_update : 1,
-		object_format : 1;
+		object_format : 1,
+		push_exact_refs : 1;
 
 	/*
 	 * As an optimization, the transport code may invoke fetch before
@@ -201,6 +202,8 @@ static struct child_process *get_helper(struct transport *transport)
 			data->fetch = 1;
 		else if (!strcmp(capname, "option"))
 			data->option = 1;
+		else if (!strcmp(capname, "push-exact-refs"))
+			data->push_exact_refs = 1;
 		else if (!strcmp(capname, "push"))
 			data->push = 1;
 		else if (!strcmp(capname, "import"))
@@ -714,7 +717,8 @@ static int connect_helper(struct transport *transport, enum git_connect_service 
 }
 
 static struct ref *get_refs_list_using_list(struct transport *transport,
-					    int for_push);
+					    int for_push,
+					    struct transport_ls_refs_options *transport_options);
 
 static int fetch_refs(struct transport *transport,
 		      int nr_heads, struct ref **to_fetch)
@@ -742,7 +746,7 @@ static int fetch_refs(struct transport *transport,
 		 * We do not care about the list of refs returned, but only
 		 * that the "list" command was sent.
 		 */
-		struct ref *dummy = get_refs_list_using_list(transport, 0);
+		struct ref *dummy = get_refs_list_using_list(transport, 0, NULL);
 		free_refs(dummy);
 	}
 
@@ -1256,11 +1260,12 @@ static struct ref *get_refs_list(struct transport *transport, int for_push,
 		return transport->vtable->get_refs_list(transport, for_push,
 							transport_options);
 
-	return get_refs_list_using_list(transport, for_push);
+	return get_refs_list_using_list(transport, for_push, transport_options);
 }
 
 static struct ref *get_refs_list_using_list(struct transport *transport,
-					    int for_push)
+					    int for_push,
+					    struct transport_ls_refs_options *transport_options)
 {
 	struct helper_data *data = transport->data;
 	struct child_process *helper;
@@ -1274,6 +1279,19 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 
 	if (data->object_format)
 		set_helper_option(transport, "object-format", "true");
+
+	if (for_push && data->push_exact_refs) {
+		int complete = transport_options && transport_options->exact_refs_complete;
+
+		if (set_helper_option(transport, "push-exact-refs", complete ? "true" : "false"))
+			die(_("remote helper refused exact push ref discovery"));
+		if (complete) {
+			for (size_t i = 0; i < transport_options->exact_refs.nr; i++)
+				if (set_helper_option(transport, "push-exact-ref",
+						      transport_options->exact_refs.v[i]))
+					die(_("remote helper refused exact push ref discovery"));
+		}
+	}
 
 	if (data->push && for_push)
 		write_constant(helper->in, "list for-push\n");
@@ -1289,7 +1307,12 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 			break;
 		else if (buf.buf[0] == ':') {
 			const char *value;
-			if (skip_prefix(buf.buf, ":object-format ", &value)) {
+			if (!strcmp(buf.buf, ":push-exact-refs")) {
+				if (!for_push || !data->push_exact_refs || !transport_options ||
+				    !transport_options->exact_refs_complete)
+					die(_("unexpected exact push ref discovery response"));
+				transport_options->exact_refs_used = 1;
+			} else if (skip_prefix(buf.buf, ":object-format ", &value)) {
 				int algo = hash_algo_by_name(value);
 				if (algo == GIT_HASH_UNKNOWN)
 					die(_("unsupported object format '%s'"),

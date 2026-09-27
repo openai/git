@@ -276,6 +276,16 @@ struct transport_ls_refs_options {
 	struct strvec ref_prefixes;
 
 	/*
+	 * Exact receive-pack destination candidates, including all native
+	 * refname disambiguation alternatives. An incomplete list must never
+	 * imply absence. A complete empty list means no possible ref updates.
+	 */
+	struct strvec exact_refs;
+	unsigned exact_refs_complete : 1;
+	/* Set by the transport only after successful exact discovery. */
+	unsigned exact_refs_used : 1;
+
+	/*
 	 * If unborn_head_target is not NULL, and the remote reports HEAD as
 	 * pointing to an unborn branch, transport_get_remote_refs() stores the
 	 * unborn branch in unborn_head_target.
@@ -284,6 +294,7 @@ struct transport_ls_refs_options {
 };
 #define TRANSPORT_LS_REFS_OPTIONS_INIT { \
 	.ref_prefixes = STRVEC_INIT, \
+	.exact_refs = STRVEC_INIT, \
 }
 
 /**

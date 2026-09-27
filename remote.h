@@ -274,8 +274,23 @@ int resolve_remote_symref(struct ref *ref, struct ref *list);
 struct ref *ref_remove_duplicates(struct ref *ref_map);
 
 int check_push_refs(struct ref *src, struct refspec *rs);
+/* Bound the exact-name request independently of the remote ref population. */
+#define MAX_EXACT_PUSH_REFS 128
+/*
+ * Prepare a per-transport copy of push refspecs and all exact remote
+ * names needed to resolve their destinations. Return 1 for a complete list,
+ * 0 for modes requiring broader discovery, or -1 for invalid local sources.
+ * The caller owns and releases both initialized output containers.
+ */
+int prepare_exact_push_refs(struct ref *src, const struct refspec *rs,
+			    int flags, struct refspec *normalized,
+			    struct strvec *names);
 int match_push_refs(struct ref *src, struct ref **dst,
 		    struct refspec *rs, int flags);
+/* Reject local destination changes since prepare_exact_push_refs(). */
+int match_exact_push_refs(struct ref *src, struct ref **dst,
+			  struct refspec *rs, int flags,
+			  const struct refspec *expected);
 void set_ref_status_for_push(struct ref *remote_refs, int send_mirror,
 	int force_update);
 

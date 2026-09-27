@@ -1477,6 +1477,8 @@ int transport_push(struct repository *r,
 	int ret = -1;
 	struct transport_ls_refs_options transport_options =
 		TRANSPORT_LS_REFS_OPTIONS_INIT;
+	struct refspec exact_refspecs = REFSPEC_INIT_PUSH(r->hash_algo);
+	int exact_plan;
 
 	*reject_reasons = 0;
 
@@ -1491,15 +1493,6 @@ int transport_push(struct repository *r,
 	if (check_push_refs(local_refs, rs) < 0)
 		goto done;
 
-	refspec_ref_prefixes(rs, &transport_options.ref_prefixes);
-
-	trace2_region_enter("transport_push", "get_refs_list", r);
-	remote_refs = transport->vtable->get_refs_list(transport, 1,
-						       &transport_options);
-	trace2_region_leave("transport_push", "get_refs_list", r);
-
-	transport_ls_refs_options_release(&transport_options);
-
 	if (flags & TRANSPORT_PUSH_ALL)
 		match_flags |= MATCH_REFS_ALL;
 	if (flags & TRANSPORT_PUSH_MIRROR)
@@ -1509,7 +1502,23 @@ int transport_push(struct repository *r,
 	if (flags & TRANSPORT_PUSH_FOLLOW_TAGS)
 		match_flags |= MATCH_REFS_FOLLOW_TAGS;
 
-	if (match_push_refs(local_refs, &remote_refs, rs, match_flags))
+	exact_plan = prepare_exact_push_refs(local_refs, rs, match_flags,
+					     &exact_refspecs,
+					     &transport_options.exact_refs);
+	if (exact_plan < 0)
+		goto done;
+	transport_options.exact_refs_complete = exact_plan;
+
+	refspec_ref_prefixes(rs, &transport_options.ref_prefixes);
+
+	trace2_region_enter("transport_push", "get_refs_list", r);
+	remote_refs = transport->vtable->get_refs_list(transport, 1,
+						       &transport_options);
+	trace2_region_leave("transport_push", "get_refs_list", r);
+
+	if (transport_options.exact_refs_used ?
+	    match_exact_push_refs(local_refs, &remote_refs, rs, match_flags, &exact_refspecs) :
+	    match_push_refs(local_refs, &remote_refs, rs, match_flags))
 		goto done;
 
 	if (transport->smart_options &&
@@ -1613,6 +1622,8 @@ int transport_push(struct repository *r,
 		fprintf(stderr, "Everything up-to-date\n");
 
 done:
+	transport_ls_refs_options_release(&transport_options);
+	refspec_clear(&exact_refspecs);
 	free_refs(local_refs);
 	free_refs(remote_refs);
 	return ret;
@@ -1634,6 +1645,7 @@ const struct ref *transport_get_remote_refs(struct transport *transport,
 void transport_ls_refs_options_release(struct transport_ls_refs_options *opts)
 {
 	strvec_clear(&opts->ref_prefixes);
+	strvec_clear(&opts->exact_refs);
 	free((char *)opts->unborn_head_target);
 }
 

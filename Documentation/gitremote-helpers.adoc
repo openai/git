@@ -241,6 +241,12 @@ the remote repository.
 	`--signed-tags=verbatim` to linkgit:git-fast-export[1].  In the
 	absence of this capability, Git will use `--signed-tags=warn-strip`.
 
+'push-exact-refs'::
+	Supports `option push-exact-refs` and repeated `option push-exact-ref`
+	before `list for-push`. The helper may use the supplied complete set of
+	candidate names for authoritative exact discovery. This capability
+	requires `option` and `push`.
+
 'object-format'::
 	This indicates that the helper is able to interact with the remote
 	side using an explicit hash algorithm extension.
@@ -449,6 +455,15 @@ attributes are defined.
 REF LIST KEYWORDS
 -----------------
 
+'push-exact-refs'::
+	The line `:push-exact-refs` reports that `list for-push` successfully
+	performed exact discovery for all supplied candidates. Emit it only
+	after `option push-exact-refs true`. Every supplied name must have
+	an authoritative value or absence; errors must fail the command.
+	The helper must use the same values and absences during the subsequent
+	push, including any advertisement passed to `send-pack`.
+
+
 The 'list' command may produce a list of key-value pairs.
 The following keys are defined.
 
@@ -460,6 +475,19 @@ The following keys are defined.
 
 OPTIONS
 -------
+
+'option push-exact-refs' 'true'|'false'::
+	Clears previously supplied candidate names. `true` means subsequent
+	`push-exact-ref` options form the complete set of names that could
+	affect this push. `false` means the operation needs broader discovery.
+	A helper may still use full discovery and omit `:push-exact-refs`.
+	A helper that requires exact discovery must reject incomplete plans.
+
+'option push-exact-ref' <name>::
+	Adds a complete ref name to the candidate set for `list for-push`.
+	The name uses the usual C-style quoting for helper option values.
+	This option requires the `push-exact-refs` capability.
+
 
 The following options are defined and (under suitable circumstances)
 set by Git if the remote helper has the 'option' capability.

@@ -433,6 +433,49 @@ current implementation uses trace2 session IDs (see
 link:technical/api-trace2.html[api-trace2] for details), but this may change
 and users of the session ID should not rely on this fact.
 
+pando-exact-refs
+---------------
+
+A receive-pack server may advertise `pando-exact-refs` together with
+`explicit-haves` to support exact push ref discovery over smart HTTP.
+The capability authorizes a protocol v2 `ls-refs` POST to `git-upload-pack`
+under the same repository URL, including any receive-pack discovery redirect.
+The client sends `Git-Protocol: version=2:explicit-haves` and repeated
+`pando-exact-ref <name>` arguments instead of `ref-prefix` arguments.
+No separate upload-pack discovery request is required.
+
+Each argument names a complete ref under `refs/`. The response contains
+exactly one `<oid> <name>` pkt-line for each requested ref visible to the
+push operation, followed by a flush packet. A requested ref absent from
+the authorized push namespace has no response record. A denied, unavailable or incomplete lookup must fail the
+whole request rather than imply absence. The server must finish all
+requested lookups before sending the flush.
+The server must apply the repository, authorization and ref visibility of
+the receive-pack operation. Upload-pack visibility alone is insufficient.
+The response has no peeled or symbolic-ref attributes.
+
+The client accepts at most 128 distinct candidate names. Git computes these
+names after applying configured push refspecs and defaults. Explicit refspecs
+use Git's normal destination matching candidates. Matching refspecs, `--all`
+and wildcard refspecs use destinations derived from local refs. `--mirror`,
+`--prune` and effective `--follow-tags` require discovery beyond these names
+and are rejected when this capability is selected.
+
+The response replaces the initial advertisement for every requested name,
+including names absent from the response. It does not reserve a ref value.
+If the observed object ID already equals the local tip, Git may report no
+update even if the server ref changes after discovery; there is no command
+for receive-pack to check in that case. When Git sends an update, the final
+receive-pack command carries the old object ID used for the usual
+compare-and-swap update. Named ref object IDs do not authorize excluding
+objects from the outgoing pack under `explicit-haves`; existing `.have`
+records and separately negotiated common objects retain that role.
+
+Clients do not issue this command without the capability. Servers without
+the capability retain normal push discovery. Once selected, failure of the
+exact command is fatal; the client must not treat a partial response or an
+older server's rejection as authoritative absence.
+
 GIT
 ---
 Part of the linkgit:git[1] suite

@@ -22,6 +22,7 @@
 #include "setup.h"
 #include "protocol.h"
 #include "quote.h"
+#include "refs.h"
 #include "trace2.h"
 #include "transport.h"
 #include "url.h"
@@ -60,10 +61,41 @@ struct options {
 };
 static struct options options;
 static struct string_list cas_options = STRING_LIST_INIT_DUP;
+/* Candidate names belong to the next list-for-push operation. */
+static struct string_list push_exact_refs = STRING_LIST_INIT_DUP;
+static int push_exact_refs_complete;
+
 
 static int set_option(const char *name, size_t namelen, const char *value)
 {
-	if (!strncmp(name, "verbosity", namelen)) {
+	if (namelen == strlen("push-exact-refs") &&
+	    !strncmp(name, "push-exact-refs", namelen)) {
+		if (strcmp(value, "true") && strcmp(value, "false"))
+			return -1;
+		push_exact_refs_complete = !strcmp(value, "true");
+		string_list_clear(&push_exact_refs, 0);
+		return 0;
+	} else if (namelen == strlen("push-exact-ref") &&
+		   !strncmp(name, "push-exact-ref", namelen)) {
+		struct strbuf ref = STRBUF_INIT;
+
+		if (*value == '"') {
+			if (unquote_c_style(&ref, value, NULL)) {
+				strbuf_release(&ref);
+				return -1;
+			}
+		} else {
+			strbuf_addstr(&ref, value);
+		}
+		if (!starts_with(ref.buf, "refs/") ||
+		    check_refname_format(ref.buf, 0)) {
+			strbuf_release(&ref);
+			return -1;
+		}
+		string_list_insert(&push_exact_refs, ref.buf);
+		strbuf_release(&ref);
+		return 0;
+	} else if (!strncmp(name, "verbosity", namelen)) {
 		char *end;
 		int v = strtol(value, &end, 10);
 		if (value == end || *end)
@@ -585,6 +617,8 @@ static struct discovery *discover_refs(const char *service, int for_push)
 	return last;
 }
 
+static void discover_exact_push_refs(struct discovery *heads);
+
 static struct ref *get_refs(int for_push)
 {
 	struct discovery *heads;
@@ -594,6 +628,10 @@ static struct ref *get_refs(int for_push)
 	else
 		heads = discover_refs("git-upload-pack", for_push);
 
+	if (for_push && heads->proto_git && server_supports("pando-exact-refs")) {
+		discover_exact_push_refs(heads);
+		printf(":push-exact-refs\n");
+	}
 	return heads->refs;
 }
 
@@ -631,6 +669,9 @@ struct rpc_state {
 	int in;
 	int out;
 	int any_written;
+	/* Exact discovery buffers a bounded response instead of writing to a child. */
+	struct strbuf *response;
+	size_t response_limit;
 	unsigned gzip_request : 1;
 	unsigned initial_buffer : 1;
 
@@ -850,7 +891,13 @@ static size_t rpc_in(char *ptr, size_t eltsize,
 		data->rpc->any_written = 1;
 	if (data->check_pktline)
 		check_pktline(&data->pktline_state, ptr, size);
-	write_or_die(data->rpc->in, ptr, size);
+	if (data->rpc->response) {
+		if (size > data->rpc->response_limit - data->rpc->response->len)
+			return 0;
+		strbuf_add(data->rpc->response, ptr, size);
+	} else {
+		write_or_die(data->rpc->in, ptr, size);
+	}
 	return size;
 }
 
@@ -1099,6 +1146,159 @@ retry:
 	curl_slist_free_all(headers);
 	free(gzip_body);
 	return err;
+}
+
+/*
+ * Replace every requested ref, including refs absent from the response. Keep
+ * .have records separate: named ref state is not evidence of object possession.
+ * send-pack reparses this buffer, so updating only heads->refs is insufficient.
+ */
+static void replace_exact_push_refs(struct discovery *heads,
+				    struct string_list *observed)
+{
+	struct packet_reader reader;
+	struct string_list records = STRING_LIST_INIT_DUP;
+	struct string_list shallow = STRING_LIST_INIT_DUP;
+	struct strbuf advertisement = STRBUF_INIT;
+	char *capabilities = NULL;
+	int first = 1;
+
+	packet_reader_init(&reader, -1, heads->buf, heads->len,
+			   PACKET_READ_GENTLE_ON_EOF);
+	while (packet_reader_read(&reader) == PACKET_READ_NORMAL) {
+		char *line = reader.line;
+		size_t len = strlen(line);
+		const char *name;
+
+		if (len < reader.pktlen) {
+			free(capabilities);
+			capabilities = xmemdupz(line + len + 1, reader.pktlen - len - 1);
+			capabilities[strcspn(capabilities, "\n")] = '\0';
+		}
+		if (len && line[len - 1] == '\n')
+			line[len - 1] = '\0';
+		if (!strcmp(line, "version 1")) {
+			packet_buf_write(&advertisement, "%s\n", line);
+			continue;
+		}
+		if (starts_with(line, "shallow ")) {
+			string_list_append(&shallow, line);
+			continue;
+		}
+		name = strchr(line, ' ');
+		if (!name)
+			die(_("invalid receive-pack advertisement"));
+		name++;
+		if (!strcmp(name, "capabilities^{}") ||
+		    string_list_has_string(&push_exact_refs, name))
+			continue;
+		string_list_append(&records, line);
+	}
+	if (reader.status != PACKET_READ_FLUSH || reader.src_len)
+		die(_("incomplete receive-pack advertisement"));
+	for (size_t i = 0; i < observed->nr; i++) {
+		struct strbuf record = STRBUF_INIT;
+		strbuf_addf(&record, "%s %s", (char *)observed->items[i].util,
+			    observed->items[i].string);
+		string_list_append(&records, record.buf);
+		strbuf_release(&record);
+	}
+	if (!records.nr) {
+		struct strbuf record = STRBUF_INIT;
+		strbuf_addf(&record, "%s capabilities^{}", oid_to_hex(null_oid(options.hash_algo)));
+		string_list_append(&records, record.buf);
+		strbuf_release(&record);
+	}
+	for (size_t i = 0; i < records.nr; i++) {
+		if (first && capabilities)
+			packet_buf_write(&advertisement, "%s%c%s\n",
+					 records.items[i].string, 0, capabilities);
+		else
+			packet_buf_write(&advertisement, "%s\n", records.items[i].string);
+		first = 0;
+	}
+	for (size_t i = 0; i < shallow.nr; i++)
+		packet_buf_write(&advertisement, "%s\n", shallow.items[i].string);
+	packet_buf_flush(&advertisement);
+	free(heads->buf_alloc);
+	heads->buf_alloc = strbuf_detach(&advertisement, &heads->len);
+	heads->buf = heads->buf_alloc;
+	free_refs(heads->refs);
+	oid_array_clear(&heads->shallow);
+	heads->refs = parse_git_refs(heads, 1);
+	free(capabilities);
+	string_list_clear(&records, 0);
+	string_list_clear(&shallow, 0);
+}
+
+static void discover_exact_push_refs(struct discovery *heads)
+{
+	struct rpc_state rpc = RPC_STATE_INIT;
+	struct strbuf request = STRBUF_INIT;
+	struct strbuf response = STRBUF_INIT;
+	struct packet_reader reader;
+	struct string_list observed = STRING_LIST_INIT_DUP;
+
+	if (!server_supports("explicit-haves"))
+		die(_("exact push ref discovery requires explicit-haves"));
+	if (!push_exact_refs_complete)
+		die(_("this server does not support --mirror, --prune or --follow-tags pushes"));
+	if (push_exact_refs.nr > MAX_EXACT_PUSH_REFS)
+		die(_("too many exact push ref candidates (maximum %d)"), MAX_EXACT_PUSH_REFS);
+
+	/* No local source can produce an update for an empty finite plan. */
+	if (!push_exact_refs.nr) {
+		return;
+	}
+
+	packet_buf_write(&request, "command=ls-refs\n");
+	packet_buf_write(&request, "object-format=%s\n", options.hash_algo->name);
+	packet_buf_delim(&request);
+	for (size_t i = 0; i < push_exact_refs.nr; i++)
+		packet_buf_write(&request, "pando-exact-ref %s\n", push_exact_refs.items[i].string);
+	packet_buf_flush(&request);
+
+	/* The receive capability authorizes this command on the same session URL. */
+	rpc.service_name = "git-upload-pack";
+	rpc.service_url = xstrfmt("%sgit-upload-pack", url.buf);
+	rpc.hdr_content_type = "Content-Type: application/x-git-upload-pack-request";
+	rpc.hdr_accept = "Accept: application/x-git-upload-pack-result";
+	rpc.protocol_header = "Git-Protocol: version=2:explicit-haves";
+	rpc.buf = request.buf;
+	rpc.len = request.len;
+	rpc.response = &response;
+	/* At most one oid/name pkt-line per candidate, followed by a flush. */
+	rpc.response_limit = 4;
+	for (size_t i = 0; i < push_exact_refs.nr; i++)
+		rpc.response_limit += options.hash_algo->hexsz +
+			strlen(push_exact_refs.items[i].string) + 6;
+	if (post_rpc(&rpc, 0, 1))
+		die(_("exact push ref discovery failed"));
+
+	packet_reader_init(&reader, -1, response.buf, response.len,
+			   PACKET_READ_CHOMP_NEWLINE | PACKET_READ_GENTLE_ON_EOF |
+			   PACKET_READ_DIE_ON_ERR_PACKET);
+	while (packet_reader_read(&reader) == PACKET_READ_NORMAL) {
+		struct object_id oid;
+		const char *name;
+		struct string_list_item *item;
+
+		if (parse_oid_hex_algop(reader.line, &oid, &name, options.hash_algo) ||
+		    *name++ != ' ' || is_null_oid(&oid) ||
+		    strlen(reader.line) != reader.pktlen ||
+		    !string_list_has_string(&push_exact_refs, name) ||
+		    string_list_has_string(&observed, name))
+			die(_("invalid exact push ref discovery response"));
+		item = string_list_insert(&observed, name);
+		item->util = xstrdup(oid_to_hex(&oid));
+	}
+	if (reader.status != PACKET_READ_FLUSH || reader.src_len)
+		die(_("incomplete exact push ref discovery response"));
+	replace_exact_push_refs(heads, &observed);
+	string_list_clear(&observed, 1);
+	strbuf_release(&request);
+	strbuf_release(&response);
+	free(rpc.service_url);
 }
 
 static int rpc_service(struct rpc_state *rpc, struct discovery *heads,
@@ -1655,6 +1855,7 @@ int cmd_main(int argc, const char **argv)
 			printf("get\n");
 			printf("option\n");
 			printf("push\n");
+			printf("push-exact-refs\n");
 			printf("check-connectivity\n");
 			printf("object-format\n");
 			printf("\n");

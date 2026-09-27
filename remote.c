@@ -1265,9 +1265,113 @@ static void show_push_unqualified_ref_name_error(const char *dst_value,
 	}
 }
 
+static const char *explicit_push_dst(const struct refspec_item *rs,
+				     const struct ref *matched_src)
+{
+	const char *dst_value = rs->dst;
+	int flag;
+
+	if (dst_value)
+		return dst_value;
+
+	dst_value = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
+					  matched_src->name, RESOLVE_REF_READING,
+					  NULL, &flag);
+	if (!dst_value ||
+	    ((flag & REF_ISSYMREF) && !starts_with(dst_value, "refs/heads/")))
+		die(_("%s cannot be resolved to branch"), matched_src->name);
+	return dst_value;
+}
+
+static char *get_ref_match(const struct refspec *rs, const struct ref *ref,
+			   int send_mirror, int direction,
+			   const struct refspec_item **ret_pat);
+
+int prepare_exact_push_refs(struct ref *src, const struct refspec *rs,
+			    int flags, struct refspec *normalized,
+			    struct strvec *names)
+{
+	struct string_list candidates = STRING_LIST_INIT_DUP;
+	struct string_list_item *candidate;
+	struct ref *ref;
+	int i;
+
+	/* These modes also depend on refs that have no local source. */
+	if (flags & (MATCH_REFS_MIRROR | MATCH_REFS_PRUNE | MATCH_REFS_FOLLOW_TAGS))
+		return 0;
+
+	for (i = 0; i < rs->nr; i++) {
+		struct refspec_item *item = &rs->items[i];
+		struct ref *matched_src = NULL;
+		struct strvec expanded = STRVEC_INIT;
+		int allocated_src;
+		char *dst;
+
+		if (item->pattern || item->matching || item->negative) {
+			refspec_append(normalized, item->raw);
+			continue;
+		}
+
+		if (match_explicit_lhs(src, item, &matched_src, &allocated_src) < 0) {
+			string_list_clear(&candidates, 0);
+			return -1;
+		}
+		dst = xstrdup(explicit_push_dst(item, matched_src));
+		/*
+		 * Record the resolved destination for comparison during matching.
+		 * Keep the original source spelling: qualifying it can introduce
+		 * matches against other local refs that did not match originally.
+		 */
+		refspec_appendf(normalized, "%s%s:%s", item->force ? "+" : "",
+				item->src, dst);
+		expand_ref_prefix(&expanded, dst);
+		for (size_t j = 0; j < expanded.nr; j++) {
+			struct ref *ref = alloc_ref(expanded.v[j]);
+			/* Match the receive-pack advertisement's namespace filter. */
+			if (check_ref_type(ref, REF_NORMAL))
+				string_list_append(&candidates, ref->name);
+			free_one_ref(ref);
+		}
+		strvec_clear(&expanded);
+		free(dst);
+		if (allocated_src)
+			free_one_ref(matched_src);
+	}
+
+	/* Match the implicit ":" inserted by match_push_refs(). */
+	if (!normalized->nr)
+		refspec_append(normalized, ":");
+
+	/*
+	 * Matching and wildcard refspecs select exact names from local refs.
+	 * Query a superset when negative refspecs are present; native matching
+	 * still applies their exclusions after resolving all positive entries.
+	 */
+	for (ref = src; ref; ref = ref->next) {
+		char *dst = get_ref_match(normalized, ref, 0, FROM_SRC, NULL);
+		struct ref *candidate;
+
+		if (!dst)
+			continue;
+		candidate = alloc_ref(dst);
+		if (check_ref_type(candidate, REF_NORMAL))
+			string_list_append_nodup(&candidates, dst);
+		else
+			free(dst);
+		free_one_ref(candidate);
+	}
+
+	string_list_sort(&candidates);
+	string_list_remove_duplicates(&candidates, 0);
+	for_each_string_list_item(candidate, &candidates)
+		strvec_push(names, candidate->string);
+	string_list_clear(&candidates, 0);
+	return 1;
+}
+
 static int match_explicit(struct ref *src, struct ref *dst,
 			  struct ref ***dst_tail,
-			  struct refspec_item *rs)
+			  struct refspec_item *rs, const char *expected_dst)
 {
 	struct ref *matched_src = NULL, *matched_dst = NULL;
 	int allocated_src = 0, ret;
@@ -1285,18 +1389,12 @@ static int match_explicit(struct ref *src, struct ref *dst,
 		goto out;
 	}
 
-	if (!dst_value) {
-		int flag;
-
-		dst_value = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
-						    matched_src->name,
-						    RESOLVE_REF_READING,
-						    NULL, &flag);
-		if (!dst_value ||
-		    ((flag & REF_ISSYMREF) &&
-		     !starts_with(dst_value, "refs/heads/")))
-			die(_("%s cannot be resolved to branch"),
-			    matched_src->name);
+	dst_value = explicit_push_dst(rs, matched_src);
+	/* A changed symbolic source must not turn unqueried refs into absence. */
+	if (expected_dst && strcmp(expected_dst, dst_value)) {
+		ret = error(_("push destination for '%s' changed during discovery"),
+			    rs->src);
+		goto out;
 	}
 
 	switch (count_refspec_match(dst_value, dst, &matched_dst)) {
@@ -1349,11 +1447,13 @@ out:
 }
 
 static int match_explicit_refs(struct ref *src, struct ref *dst,
-			       struct ref ***dst_tail, struct refspec *rs)
+			       struct ref ***dst_tail, struct refspec *rs,
+			       const struct refspec *expected)
 {
 	int i, errs;
 	for (i = errs = 0; i < rs->nr; i++)
-		errs += match_explicit(src, dst, dst_tail, &rs->items[i]);
+		errs += match_explicit(src, dst, dst_tail, &rs->items[i],
+				       expected ? expected->items[i].dst : NULL);
 	return errs;
 }
 
@@ -1587,8 +1687,9 @@ int check_push_refs(struct ref *src, struct refspec *rs)
  * forced) in elements of "dst". The function may add new elements to
  * dst (e.g. pushing to a new branch, done in match_explicit_refs).
  */
-int match_push_refs(struct ref *src, struct ref **dst,
-		    struct refspec *rs, int flags)
+static int match_push_refs_internal(struct ref *src, struct ref **dst,
+				    struct refspec *rs, int flags,
+				    const struct refspec *expected)
 {
 	int send_all = flags & MATCH_REFS_ALL;
 	int send_mirror = flags & MATCH_REFS_MIRROR;
@@ -1600,8 +1701,10 @@ int match_push_refs(struct ref *src, struct ref **dst,
 	/* If no refspec is provided, use the default ":" */
 	if (!rs->nr)
 		refspec_append(rs, ":");
+	if (expected && rs->nr != expected->nr)
+		BUG("exact push discovery requires a destination for every refspec");
 
-	errs = match_explicit_refs(src, *dst, &dst_tail, rs);
+	errs = match_explicit_refs(src, *dst, &dst_tail, rs, expected);
 
 	/* pick the remainder */
 	for (ref = src; ref; ref = ref->next) {
@@ -1677,6 +1780,19 @@ int match_push_refs(struct ref *src, struct ref **dst,
 	if (errs)
 		return -1;
 	return 0;
+}
+
+int match_push_refs(struct ref *src, struct ref **dst,
+		    struct refspec *rs, int flags)
+{
+	return match_push_refs_internal(src, dst, rs, flags, NULL);
+}
+
+int match_exact_push_refs(struct ref *src, struct ref **dst,
+			  struct refspec *rs, int flags,
+			  const struct refspec *expected)
+{
+	return match_push_refs_internal(src, dst, rs, flags, expected);
 }
 
 void set_ref_status_for_push(struct ref *remote_refs, int send_mirror,
