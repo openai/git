@@ -1133,6 +1133,23 @@ static int link_midx_file(const char *from, const char *to)
 	return error_errno(_("unable to link '%s' to '%s'"), from, to);
 }
 
+static int check_midx_link(struct multi_pack_index *m, const char *path)
+{
+	const struct git_hash_algo *algop = m->source->base.odb->repo->hash_algo;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int fd, ret = 0;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return error_errno(_("unable to open promoted multi-pack-index '%s'"), path);
+	if (lseek(fd, -(off_t)algop->rawsz, SEEK_END) < 0 ||
+	    read_in_full(fd, hash, algop->rawsz) != (ssize_t)algop->rawsz ||
+	    hashcmp(hash, midx_get_checksum_hash(m), algop))
+		ret = error(_("multi-pack-index changed during promotion"));
+	close(fd);
+	return ret;
+}
+
 static int link_midx_to_chain(struct multi_pack_index *m)
 {
 	struct strbuf from = STRBUF_INIT;
@@ -1158,6 +1175,8 @@ static int link_midx_to_chain(struct multi_pack_index *m)
 					    midx_exts[i].split);
 
 		ret = link_midx_file(from.buf, to.buf);
+		if (!ret && !midx_exts[i].non_split)
+			ret = check_midx_link(m, to.buf);
 		if (ret)
 			goto done;
 
