@@ -347,6 +347,11 @@ static struct multi_pack_index *load_midx_chain_fd_st(struct odb_source_packed *
 		get_split_midx_filename_ext(source, &buf,
 					    layer.hash, MIDX_EXT_MIDX);
 		m = load_multi_pack_index_one(source, buf.buf);
+		if (m && hashcmp(layer.hash, midx_get_checksum_hash(m), hash_algo)) {
+			warning(_("multi-pack-index checksum does not match chain"));
+			close_midx(m);
+			m = NULL;
+		}
 
 		if (m) {
 			if (add_midx_to_chain(m, midx_chain)) {

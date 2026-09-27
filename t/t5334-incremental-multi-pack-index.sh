@@ -89,7 +89,7 @@ test_expect_success 'verify checksum of base MIDX' '
 	chmod u+w "$midx" &&
 	echo extra >>"$midx" &&
 	test_must_fail git multi-pack-index verify 2>err &&
-	test_grep "incorrect checksum" err
+	test_grep "multi-pack-index checksum does not match chain" err
 '
 
 test_expect_success PERL_TEST_HELPERS 'verify OID order of base MIDX' '
@@ -475,6 +475,27 @@ test_expect_success 'MIDX maintenance shares a writer lock' '
 		rm "$packdir/multi-pack-index-write.lock" &&
 		git repack -d --write-midx=incremental &&
 		test_path_is_missing "$packdir/multi-pack-index-write.lock" &&
+		git multi-pack-index verify
+	)
+'
+
+test_expect_success 'layer checksum must match the chain filename' '
+	git init misnamed-layer &&
+	(
+		cd misnamed-layer &&
+		test_commit base &&
+		git repack -d &&
+		git multi-pack-index write --incremental &&
+		layer=$(cat "$midx_chain") &&
+		zero=$(test_oid zero) &&
+		mv "$midxdir/multi-pack-index-$layer.midx" \
+			"$midxdir/multi-pack-index-$zero.midx" &&
+		echo "$zero" >"$midx_chain" &&
+		test_must_fail git multi-pack-index verify 2>err &&
+		test_grep "checksum does not match chain" err &&
+		mv "$midxdir/multi-pack-index-$zero.midx" \
+			"$midxdir/multi-pack-index-$layer.midx" &&
+		echo "$layer" >"$midx_chain" &&
 		git multi-pack-index verify
 	)
 '
