@@ -467,7 +467,7 @@ static int midx_compaction_step_exec_write(struct midx_compaction_step *step,
 	}
 
 	ret = repack_fill_midx_stdin_packs(&cmd, &step->u.write, &hash);
-	if (ret)
+	if (ret || !hash.nr)
 		goto out;
 	if (hash.nr != 1) {
 		ret = error(_("expected exactly one line during MIDX write, "
@@ -995,6 +995,9 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 	i = steps_nr;
 	while (i--) {
 		struct midx_compaction_step *step = &steps[i];
+		/* A write containing only base objects produces no layer. */
+		if (!step->csum && step->type == MIDX_COMPACTION_STEP_WRITE)
+			continue;
 		if (!step->csum)
 			BUG("missing result for compaction step %"PRIuMAX,
 			    (uintmax_t)i);

@@ -580,4 +580,25 @@ test_expect_success ULIMIT_FSIZE 'failed chain publication leaves the old chain 
 	)
 '
 
+test_expect_success 'repacking duplicates does not append an empty layer' '
+	git init duplicate-packs &&
+	(
+		cd duplicate-packs &&
+		test_commit_bulk 10 &&
+		git multi-pack-index write --incremental &&
+		cp "$midx_chain" before &&
+		for rev in HEAD HEAD^{tree}
+		do
+			git rev-parse "$rev" >oid &&
+			git pack-objects "$packdir/pack" <oid || return 1
+		done &&
+
+		git -c repack.midxNewLayerThreshold=100 repack \
+			--geometric=2 -d --write-midx=incremental &&
+		test_cmp before "$midx_chain" &&
+		git multi-pack-index verify &&
+		git fsck
+	)
+'
+
 test_done
