@@ -121,6 +121,34 @@ test_expect_success 'partial fetch does not spawn rev-list connectivity check' '
 	test_subcommand_flex git rev-list --objects --stdin <full.trace
 '
 
+for owner in present missing
+do
+	test_expect_success "promisor connectivity with a $owner MIDX owner" '
+		test_when_finished "rm -rf connectivity-remote connectivity-client" &&
+		git init connectivity-remote &&
+		test_commit -C connectivity-remote one &&
+		git -C connectivity-remote config uploadpack.allowfilter 1 &&
+		git clone --no-checkout --filter=blob:none \
+			"file://$(pwd)/connectivity-remote" connectivity-client &&
+		(
+			cd connectivity-client &&
+			packdir=.git/objects/pack &&
+			git rev-parse HEAD >oid &&
+			pack=$(git pack-objects "$packdir/pack" <oid) &&
+			echo "pack-$pack.idx" >packs &&
+			git multi-pack-index write --incremental --stdin-packs <packs &&
+			git multi-pack-index write --incremental &&
+			if test "$owner" = missing
+			then
+				rm "$packdir/pack-$pack.pack" "$packdir/pack-$pack.idx" ||
+				return 1
+			fi &&
+			GIT_TRACE2_EVENT="$(pwd)/fetch.trace" git fetch origin &&
+			test_subcommand_flex ! git rev-list --objects --stdin <fetch.trace
+		)
+	'
+done
+
 # force dynamic object fetch using diff.
 # we should only get 1 new blob (for the file in origin/main).
 test_expect_success 'verify diff causes dynamic object fetch' '
