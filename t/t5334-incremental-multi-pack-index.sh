@@ -174,6 +174,14 @@ test_expect_success 'bitmap falls back when a pack in the tip layer is missing' 
 	)
 '
 
+test_expect_success 'blob:limit filters loose objects above an incremental bitmap' '
+	blob=$(echo loose | git hash-object -w --stdin) &&
+	git rev-list --use-bitmap-index --objects --no-object-names \
+		--filter=blob:limit=1 --filter-provided-objects \
+		2.2:2.2.t "$blob" >actual &&
+	test_must_be_empty actual
+'
+
 test_expect_success 'show object from first pack' '
 	git cat-file -p 1.1
 '
