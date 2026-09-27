@@ -745,6 +745,7 @@ static void report_pack_garbage(struct string_list *list)
 struct prepare_pack_data {
 	struct odb_source_packed *source;
 	struct string_list *garbage;
+	struct strset midx_packs;
 };
 
 static void prepare_pack(const char *full_name, size_t full_name_len,
@@ -754,8 +755,7 @@ static void prepare_pack(const char *full_name, size_t full_name_len,
 	size_t base_len = full_name_len;
 
 	if (strip_suffix_mem(full_name, &base_len, ".idx") &&
-	    !(data->source->midx &&
-	      midx_contains_pack(data->source->midx, file_name))) {
+	    !strset_contains(&data->midx_packs, file_name)) {
 		char *trimmed_path = xstrndup(full_name, full_name_len);
 		packfile_store_load_pack(data->source,
 					 trimmed_path, data->source->base.local);
@@ -789,12 +789,19 @@ static void prepare_packed_git_one(struct odb_source_packed *source)
 	struct prepare_pack_data data = {
 		.source = source,
 		.garbage = &garbage,
+		.midx_packs = STRSET_INIT,
 	};
+	struct multi_pack_index *m;
+
+	for (m = source->midx; m; m = m->base_midx)
+		for (uint32_t i = 0; i < m->num_packs; i++)
+			strset_add(&data.midx_packs, m->pack_names[i]);
 
 	for_each_file_in_pack_dir(source->base.path, prepare_pack, &data);
 
 	report_pack_garbage(data.garbage);
 	string_list_clear(data.garbage, 0);
+	strset_clear(&data.midx_packs);
 }
 
 DEFINE_LIST_SORT(static, sort_packs, struct packfile_list_entry, next);
