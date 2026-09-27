@@ -1478,7 +1478,7 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	}
 	stop_progress(&ctx.progress);
 
-	if (!opts->packs_to_drop) {
+	if (!opts->packs_to_drop && !ctx.incremental && !ctx.compact) {
 		/*
 		 * If there is no MIDX then either it doesn't exist, or we're
 		 * doing a geometric repack. Try to load it from the source to
