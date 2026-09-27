@@ -182,6 +182,14 @@ test_expect_success 'blob:limit filters loose objects above an incremental bitma
 	test_must_be_empty actual
 '
 
+test_expect_success 'filtered enumeration covers the whole MIDX chain' '
+	git -c core.multiPackIndex=false cat-file --batch-all-objects \
+		--filter=object:type=tree --batch-check="%(objectname)" >expect &&
+	git cat-file --batch-all-objects \
+		--filter=object:type=tree --batch-check="%(objectname)" >actual &&
+	test_cmp expect actual
+'
+
 test_expect_success 'show object from first pack' '
 	git cat-file -p 1.1
 '
