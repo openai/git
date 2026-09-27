@@ -1502,4 +1502,22 @@ test_expect_success PIPE 'refresh retries a restored MIDX pack' '
 	)
 '
 
+test_expect_success 'lookup recovers from a corrupt MIDX-selected copy' '
+	test_when_finished "rm -fr repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit one &&
+		blob=$(git rev-parse HEAD:one.t) &&
+		git repack -ad &&
+		pack=$(echo "$blob" | git pack-objects $objdir/pack/pack) &&
+		git multi-pack-index write --preferred-pack="pack-$pack.idx" &&
+		chmod u+w $objdir/pack/pack-$pack.pack &&
+		# The four-byte blob has a one-byte pack header.
+		corrupt_data $objdir/pack/pack-$pack.pack 13 &&
+		git cat-file blob "$blob" >actual &&
+		test_cmp one.t actual
+	)
+'
+
 test_done

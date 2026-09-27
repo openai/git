@@ -646,7 +646,7 @@ enum midx_fill_result midx_fill_entry(struct multi_pack_index *m,
 	    oidset_contains(&p->bad_objects, oid)) {
 		if (bad_pack && !*bad_pack)
 			*bad_pack = p;
-		return MIDX_FILL_MISS;
+		return MIDX_FILL_OWNER_UNAVAILABLE;
 	}
 
 	e->offset = nth_midxed_offset(m, pos);
