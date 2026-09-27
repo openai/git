@@ -3,6 +3,31 @@
 VALID_CREDS_FILE=custom-auth.valid
 CHALLENGE_FILE=custom-auth.challenge
 
+# Optional routes select separate credentials for a host and PATH_INFO prefix.
+# Each line contains a prefix and a basename for .valid and .challenge files.
+if test -f custom-auth.routes
+then
+	while read -r prefix config
+	do
+		case "$HTTP_HOST$PATH_INFO" in
+		"$prefix"*)
+			VALID_CREDS_FILE=$config.valid
+			CHALLENGE_FILE=$config.challenge
+			break
+			;;
+		esac
+	done <custom-auth.routes
+fi
+
+# Tests create this file when they need to check the first redirected request.
+if test -f custom-auth.requests
+then
+	printf "%s %s %s|%s|%s|%s\n" \
+		"$REQUEST_METHOD" "$HTTP_HOST" "$PATH_INFO" \
+		"$HTTP_AUTHORIZATION" "$HTTP_X_ORIGIN_SECRET" \
+		"$HTTP_X_DESTINATION_SECRET" >>custom-auth.requests
+fi
+
 #
 # If $VALID_CREDS_FILE exists in $HTTPD_ROOT_PATH, consider each line as a valid
 # credential for the current request. Each line in the file is considered a
