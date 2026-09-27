@@ -122,10 +122,10 @@ struct object_id *nth_midxed_object_oid(struct object_id *oid,
  * Result of looking an object up in a multi-pack-index.  MIDX_FILL_HIT means
  * "e was filled in"; the two miss variants distinguish an object the midx does
  * not know about (MIDX_FILL_MISS) from one it does know about but whose owning
- * pack we can no longer open (MIDX_FILL_OWNER_UNAVAILABLE -- the signature of a
- * concurrent repack having removed that pack).  A known-bad (corrupt) object
- * reports MIDX_FILL_MISS but also sets *bad_pack, if provided, to the owning
- * pack so the caller can tell "corrupt" apart from "absent".
+ * pack is unavailable or whose selected copy is corrupt
+ * (MIDX_FILL_OWNER_UNAVAILABLE). A known-bad object also sets *bad_pack, if
+ * provided, to the owning pack so the caller can tell "corrupt" apart from
+ * "absent".
  */
 enum midx_fill_result {
 	MIDX_FILL_MISS = 0,

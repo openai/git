@@ -46,11 +46,11 @@ static int find_pack_entry(struct odb_source_packed *store,
 	}
 
 	/*
-	 * Recovery for a concurrent-repack race: a stale MIDX may still name a
-	 * vanished owning pack even though the object survives in another pack
-	 * the same MIDX covers.  The regular fallback above skips MIDX-covered
-	 * packs, and repreparing the on-disk pack set does not reload the
-	 * borrowed, cached MIDX, so scan its packs directly for the survivor.
+	 * A stale MIDX may name a vanished owning pack, or its selected copy
+	 * may be corrupt, even though another covered pack has a usable copy.
+	 * The regular fallback above skips MIDX-covered packs, and repreparing
+	 * the on-disk pack set does not reload the borrowed, cached MIDX, so
+	 * scan its packs directly for the survivor.
 	 *
 	 * Skip the scan for quick lookups, which are expected to accept false
 	 * negatives in favor of speed.
