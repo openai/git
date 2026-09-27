@@ -2,6 +2,8 @@
 
 #include "git-compat-util.h"
 #include "config.h"
+#include "lockfile.h"
+#include "path.h"
 #include "dir.h"
 #include "hex.h"
 #include "packfile.h"
@@ -849,6 +851,38 @@ void clear_incremental_midx_files_ext(struct odb_source_packed *source, const ch
 
 	strbuf_release(&buf);
 	strset_clear(&data.keep);
+}
+
+void hold_midx_write_lock(struct odb_source_packed *source,
+			  struct lock_file *lock)
+{
+	struct repository *r = source->base.odb->repo;
+	struct strbuf path = STRBUF_INIT;
+
+	strbuf_addf(&path, "%s/pack/multi-pack-index-write", source->base.path);
+	if (safe_create_leading_directories(r, path.buf))
+		die_errno(_("unable to create leading directories of %s"), path.buf);
+	repo_hold_lock_file_for_update(r, lock, path.buf, LOCK_DIE_ON_ERROR);
+	strbuf_release(&path);
+
+	if (source->midx) {
+		struct multi_pack_index *cached = source->midx;
+		struct multi_pack_index *current, *m;
+		int incomplete;
+
+		current = m = load_multi_pack_index_with_status(source, &incomplete);
+		while (cached && m && cached->has_chain == m->has_chain &&
+		       !hashcmp(midx_get_checksum_hash(cached),
+				midx_get_checksum_hash(m), r->hash_algo)) {
+			cached = cached->base_midx;
+			m = m->base_midx;
+		}
+		if (incomplete || cached || m)
+			die(_("multi-pack-index changed while acquiring writer lock"));
+		close_midx(current);
+	}
+	/* Pick up packs added before we acquired the lock. */
+	source->initialized = false;
 }
 
 void clear_midx_file(struct repository *r)

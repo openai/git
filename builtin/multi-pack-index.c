@@ -6,6 +6,7 @@
 #include "gettext.h"
 #include "parse-options.h"
 #include "midx.h"
+#include "lockfile.h"
 #include "strbuf.h"
 #include "trace2.h"
 #include "odb.h"
@@ -101,6 +102,9 @@ static struct option common_opts[] = {
 	  parse_object_dir),
 	OPT_BIT(0, "progress", &opts.flags, N_("force progress reporting"),
 		MIDX_PROGRESS),
+	OPT_BIT_F(0, "write-lock-held", &opts.flags,
+		  N_("the caller holds the MIDX writer lock"),
+		  MIDX_WRITE_LOCK_HELD, PARSE_OPT_HIDDEN | PARSE_OPT_NONEG),
 	OPT_END(),
 };
 
@@ -240,6 +244,7 @@ static int cmd_multi_pack_index_compact(int argc, const char **argv,
 	struct multi_pack_index *from_midx = NULL;
 	struct multi_pack_index *to_midx = NULL;
 	struct odb_source_files *source;
+	struct lock_file write_lock = LOCK_INIT;
 	int ret;
 
 	struct option *options;
@@ -284,6 +289,11 @@ static int cmd_multi_pack_index_compact(int argc, const char **argv,
 
 	FREE_AND_NULL(options);
 
+	if (!(opts.flags & MIDX_WRITE_LOCK_HELD)) {
+		hold_midx_write_lock(source->packed, &write_lock);
+		opts.flags |= MIDX_WRITE_LOCK_HELD;
+	}
+
 	m = get_multi_pack_index(source->packed);
 
 	for (cur = m; cur && !(from_midx && to_midx); cur = cur->base_midx) {
@@ -310,6 +320,7 @@ static int cmd_multi_pack_index_compact(int argc, const char **argv,
 	ret = write_midx_file_compact(source->packed, from_midx, to_midx,
 				      opts.incremental_base, opts.flags);
 
+	rollback_lock_file(&write_lock);
 	return ret;
 }
 
