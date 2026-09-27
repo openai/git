@@ -80,7 +80,8 @@ test_expect_success 'exact discovery precedes matching and replaces cached send-
 	test_grep "^command=ls-refs$" server/replace/query &&
 	test_grep "^object-format=$(test_oid algo)$" server/replace/query &&
 	test_grep "^pando-exact-ref refs/heads/topic$" server/replace/query &&
-	test_grep "explicit-haves" server/replace/receive-capabilities
+	test_grep "explicit-haves" server/replace/receive-capabilities &&
+	test_grep "pando-exact-refs" server/replace/receive-capabilities
 '
 
 test_expect_success 'each remote-helper push listing performs exact discovery' '
@@ -163,7 +164,8 @@ test_expect_success 'exact presence rejects a stale force-with-lease before uplo
 test_expect_success 'short delete uses the exact branch OID' '
 	setup_case delete &&
 	git push -d "$case_url" topic &&
-	expect_command "$old" "$ZERO_OID" refs/heads/topic
+	expect_command "$old" "$ZERO_OID" refs/heads/topic &&
+	test_grep "pando-exact-refs" server/delete/receive-capabilities
 '
 
 test_expect_success 'exact discovery preserves ambiguity of a short destination' '
@@ -278,12 +280,37 @@ test_expect_success 'configured follow-tags also rejects incomplete discovery' '
 	expect_no_push
 '
 
+test_expect_success 'receive-pack rejection of the exact contract fails the push' '
+	setup_case receive-reject receive-reject &&
+	test_must_fail git push "$case_url" HEAD:refs/heads/topic 2>err &&
+	test_path_is_file server/receive-reject/query &&
+	expect_command "$old" "$new" refs/heads/topic &&
+	test_grep "pando-exact-refs" server/receive-reject/receive-capabilities &&
+	test_grep "exact contract unavailable" err
+'
+
+for capability in explicit-haves pando-exact-refs
+do
+	test_expect_success "send-pack exact mode requires both capabilities ($capability alone)" '
+		{
+			printf "%s refs/heads/topic\0report-status %s object-format=%s\n" \
+				"$old" "$capability" "$(test_oid algo)" | packetize_raw &&
+			printf 0000
+		} >advertisement &&
+		test_must_fail git send-pack --stateless-rpc --push-exact-refs \
+			example.invalid HEAD:refs/heads/topic <advertisement >sent 2>err &&
+		test_grep "exact push ref discovery capabilities are no longer available" err &&
+		test_must_be_empty sent
+	'
+done
+
 test_expect_success 'stock receive-pack keeps its advertised old OID' '
 	setup_case stock stock &&
 	git push --force-with-lease=refs/heads/topic:$stale \
 		"$case_url" HEAD:refs/heads/topic &&
 	expect_command "$stale" "$new" refs/heads/topic &&
-	test_path_is_missing server/stock/query
+	test_path_is_missing server/stock/query &&
+	test_grep ! "pando-exact-refs" server/stock/receive-capabilities
 '
 
 test_expect_success 'stock receive-pack still supports broad refspecs' '

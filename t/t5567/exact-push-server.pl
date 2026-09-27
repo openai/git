@@ -173,7 +173,9 @@ while (my $client = $server->accept()) {
 			push @commands, $command;
 			my ($old, $new, $name) = split / /, $command;
 			defined($name) or die "invalid receive command";
-			$result .= packet("ok $name\n");
+			$result .= $mode eq 'receive-reject'
+				? packet("ng $name exact contract unavailable\n")
+				: packet("ok $name\n");
 		}
 		write_file("$dir/commands", join("\n", @commands) . "\n");
 		write_file("$dir/pack", substr($body, $end));

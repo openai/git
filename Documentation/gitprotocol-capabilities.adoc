@@ -434,7 +434,7 @@ link:technical/api-trace2.html[api-trace2] for details), but this may change
 and users of the session ID should not rely on this fact.
 
 pando-exact-refs
----------------
+----------------
 
 A receive-pack server may advertise `pando-exact-refs` together with
 `explicit-haves` to support exact push ref discovery over smart HTTP.
@@ -442,7 +442,10 @@ The capability authorizes a protocol v2 `ls-refs` POST to `git-upload-pack`
 under the same repository URL, including any receive-pack discovery redirect.
 The client sends `Git-Protocol: version=2:explicit-haves` and repeated
 `pando-exact-ref <name>` arguments instead of `ref-prefix` arguments.
-No separate upload-pack discovery request is required.
+No separate upload-pack discovery request is required. After successful
+exact discovery, the client echoes `pando-exact-refs` with `explicit-haves`
+in the receive-pack command capabilities. The server must reject the push
+if it can no longer honor this contract when processing the command.
 
 Each argument names a complete ref under `refs/`. The response contains
 exactly one `<oid> <name>` pkt-line for each requested ref visible to the

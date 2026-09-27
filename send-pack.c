@@ -552,6 +552,9 @@ int send_pack(struct repository *r,
 		args->no_ref_delta = 1;
 	if (server_supports("explicit-haves"))
 		use_explicit_haves = 1;
+	if (args->push_exact_refs &&
+	    (!use_explicit_haves || !server_supports("pando-exact-refs")))
+		die(_("exact push ref discovery capabilities are no longer available"));
 	if (server_supports("side-band-64k"))
 		use_sideband = 1;
 	if (server_supports("quiet"))
@@ -610,6 +613,8 @@ int send_pack(struct repository *r,
 		strbuf_addstr(&cap_buf, " push-options");
 	if (use_explicit_haves)
 		strbuf_addstr(&cap_buf, " explicit-haves");
+	if (args->push_exact_refs)
+		strbuf_addstr(&cap_buf, " pando-exact-refs");
 	if (object_format_supported)
 		strbuf_addf(&cap_buf, " object-format=%s", r->hash_algo->name);
 	if (agent_supported)

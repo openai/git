@@ -176,6 +176,7 @@ int cmd_send_pack(int argc,
 	unsigned use_thin_pack = 0;
 	unsigned atomic = 0;
 	unsigned stateless_rpc = 0;
+	int push_exact_refs = 0;
 	int flags;
 	unsigned int reject_reasons;
 	int progress = -1;
@@ -202,6 +203,7 @@ int cmd_send_pack(int argc,
 		OPT_BOOL(0, "thin", &use_thin_pack, N_("use thin pack")),
 		OPT_BOOL(0, "atomic", &atomic, N_("request atomic transaction on remote side")),
 		OPT_BOOL(0, "stateless-rpc", &stateless_rpc, N_("use stateless RPC protocol")),
+		OPT_HIDDEN_BOOL(0, "push-exact-refs", &push_exact_refs, NULL),
 		OPT_BOOL(0, "stdin", &from_stdin, N_("read refs from stdin")),
 		OPT_BOOL(0, "helper-status", &helper_status, N_("print status from remote helper")),
 		OPT_CALLBACK_F(0, "force-with-lease", &cas, N_("<refname>:<expect>"),
@@ -235,6 +237,7 @@ int cmd_send_pack(int argc,
 	args.use_thin_pack = use_thin_pack;
 	args.atomic = atomic;
 	args.stateless_rpc = stateless_rpc;
+	args.push_exact_refs = push_exact_refs;
 	args.push_options = push_options.nr ? &push_options : NULL;
 	args.url = dest;
 

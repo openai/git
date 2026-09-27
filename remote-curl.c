@@ -265,6 +265,8 @@ struct discovery {
 	struct oid_array shallow;
 	enum protocol_version version;
 	unsigned proto_git : 1;
+	/* The cached advertisement contains successfully queried push ref state. */
+	unsigned exact_push_refs : 1;
 };
 static struct discovery *last_discovery;
 
@@ -630,6 +632,7 @@ static struct ref *get_refs(int for_push)
 
 	if (for_push && heads->proto_git && server_supports("pando-exact-refs")) {
 		discover_exact_push_refs(heads);
+		heads->exact_push_refs = 1;
 		printf(":push-exact-refs\n");
 	}
 	return heads->refs;
@@ -1261,9 +1264,9 @@ static void discover_exact_push_refs(struct discovery *heads)
 	/* The receive capability authorizes this command on the same session URL. */
 	rpc.service_name = "git-upload-pack";
 	rpc.service_url = xstrfmt("%sgit-upload-pack", url.buf);
-	rpc.hdr_content_type = "Content-Type: application/x-git-upload-pack-request";
-	rpc.hdr_accept = "Accept: application/x-git-upload-pack-result";
-	rpc.protocol_header = "Git-Protocol: version=2:explicit-haves";
+	rpc.hdr_content_type = xstrdup("Content-Type: application/x-git-upload-pack-request");
+	rpc.hdr_accept = xstrdup("Accept: application/x-git-upload-pack-result");
+	rpc.protocol_header = xstrdup("Git-Protocol: version=2:explicit-haves");
 	rpc.buf = request.buf;
 	rpc.len = request.len;
 	rpc.response = &response;
@@ -1299,6 +1302,9 @@ static void discover_exact_push_refs(struct discovery *heads)
 	strbuf_release(&request);
 	strbuf_release(&response);
 	free(rpc.service_url);
+	free(rpc.hdr_content_type);
+	free(rpc.hdr_accept);
+	free(rpc.protocol_header);
 }
 
 static int rpc_service(struct rpc_state *rpc, struct discovery *heads,
@@ -1582,6 +1588,8 @@ static int push_git(struct discovery *heads, const char **specs)
 	strvec_pushl(&args, "send-pack", "--stateless-rpc", "--helper-status",
 		     NULL);
 
+	if (heads->exact_push_refs)
+		strvec_push(&args, "--push-exact-refs");
 	if (options.thin)
 		strvec_push(&args, "--thin");
 	if (options.dry_run)

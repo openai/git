@@ -33,6 +33,8 @@ struct send_pack_args {
 		/* One of the SEND_PACK_PUSH_CERT_* constants. */
 		push_cert:2,
 		stateless_rpc:1,
+		/* The HTTP helper completed authoritative exact ref discovery. */
+		push_exact_refs:1,
 		atomic:1,
 		disable_bitmaps:1;
 	const struct string_list *push_options;
