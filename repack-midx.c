@@ -947,7 +947,7 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 	struct odb_source_files *files = odb_source_files_downcast(opts->existing->source);
 	struct midx_compaction_step *steps = NULL;
 	struct strbuf lock_name = STRBUF_INIT;
-	struct lock_file lf;
+	struct lock_file lf = LOCK_INIT;
 	struct strvec keep_hashes = STRVEC_INIT;
 	size_t steps_nr = 0;
 	size_t i;
@@ -1002,11 +1002,15 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 		strvec_push(&keep_hashes, step->csum);
 	}
 
-	commit_lock_file(&lf);
+	if (commit_lock_file(&lf)) {
+		ret = error_errno(_("could not write multi-pack-index chain"));
+		goto done;
+	}
 
 	clear_incremental_midx_files(opts->existing->repo, &keep_hashes);
 
 done:
+	rollback_lock_file(&lf);
 	strvec_clear(&keep_hashes);
 	strbuf_release(&lock_name);
 	for (i = 0; i < steps_nr; i++)
