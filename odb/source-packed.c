@@ -89,6 +89,7 @@ static enum odb_read_status odb_source_packed_read_object_info(struct odb_source
 	if (flags & OBJECT_INFO_SECOND_READ)
 		odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
 
+retry:
 	if (!find_pack_entry(packed, oid, &e, flags, &bad_pack)) {
 		/*
 		 * The lookup may have failed because the object is known to be
@@ -117,7 +118,7 @@ static enum odb_read_status odb_source_packed_read_object_info(struct odb_source
 	if (ret < 0) {
 		bad_pack = e.p;
 		mark_bad_packed_object(e.p, oid);
-		goto out;
+		goto retry;
 	}
 
 	ret = 0;

@@ -1520,4 +1520,36 @@ test_expect_success 'lookup recovers from a corrupt MIDX-selected copy' '
 	)
 '
 
+test_expect_success 'lookup tries all copies after corrupt packed objects' '
+	test_when_finished "rm -fr repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit one &&
+		blob=$(git rev-parse HEAD:one.t) &&
+		pack1=$(echo "$blob" | git pack-objects $objdir/pack/pack) &&
+		git multi-pack-index write --incremental &&
+		test_commit two &&
+		{
+			echo "$blob" &&
+			git rev-parse HEAD:two.t
+		} >oids &&
+		pack2=$(git pack-objects $objdir/pack/pack <oids) &&
+		git multi-pack-index write --incremental &&
+		git pack-objects --all $objdir/pack/pack &&
+		git prune-packed &&
+		git multi-pack-index write --incremental &&
+		for pack in $pack1 $pack2
+		do
+			git show-index <$objdir/pack/pack-$pack.idx >index &&
+			offset=$(grep " $blob " index | cut -d" " -f1) &&
+			chmod u+w $objdir/pack/pack-$pack.pack &&
+			corrupt_data $objdir/pack/pack-$pack.pack $((offset + 1)) ||
+			return 1
+		done &&
+		git cat-file blob "$blob" >actual &&
+		test_cmp one.t actual
+	)
+'
+
 test_done
