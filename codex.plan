@@ -18,6 +18,7 @@
 	topic = refs/heads/tb/codex/explicit-haves
 	topic = refs/heads/tb/codex/remote-curl-gzip-reauth
 	topic = refs/heads/af/codex/receive-pack-explicit-haves-discovery
+	topic = refs/heads/af/codex/http-auth-retry-redirect-v2
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -130,3 +131,10 @@
 	source-tip = fe89199a7385df44f4c0f76b8c299678cae33b67
 	source-base = a3eae730133768ea334731d2f48a80aff724fb5d
 	merge = refs/heads/tb/codex/explicit-haves
+
+[branch "af/codex/http-auth-retry-redirect-v2"]
+	remote = .
+	source-ref = refs/heads/af/codex/http-auth-retry-redirect-v2
+	source-tip = b81ca645fdf0bf70789691823f9d7a4abbb05697
+	source-base = b8242b093d9e941a34460d715e3ce616a34ac3fe
+	merge = refs/heads/master
