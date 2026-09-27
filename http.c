@@ -124,6 +124,8 @@ static char *curl_cookie_file;
 static int curl_save_cookies;
 struct credential http_auth = CREDENTIAL_INIT;
 static enum proactive_auth http_proactive_auth;
+/* The caller's fallback when no proactive authentication method is selected. */
+static int http_proactive_auth_from_caller;
 static char *user_agent;
 static int curl_empty_auth = -1;
 
@@ -1168,8 +1170,7 @@ static CURL *get_curl_handle(void)
 	if (http_proactive_auth != PROACTIVE_AUTH_NONE)
 		init_curl_http_auth(result);
 
-	if (getenv("GIT_SSL_VERSION"))
-		ssl_version = getenv("GIT_SSL_VERSION");
+	var_override(&ssl_version, getenv("GIT_SSL_VERSION"));
 	if (ssl_version && *ssl_version) {
 		int i;
 		for (i = 0; i < ARRAY_SIZE(sslversions); i++) {
@@ -1184,8 +1185,7 @@ static CURL *get_curl_handle(void)
 				ssl_version);
 	}
 
-	if (getenv("GIT_SSL_CIPHER_LIST"))
-		ssl_cipherlist = getenv("GIT_SSL_CIPHER_LIST");
+	var_override(&ssl_cipherlist, getenv("GIT_SSL_CIPHER_LIST"));
 	if (ssl_cipherlist != NULL && *ssl_cipherlist)
 		curl_easy_setopt(result, CURLOPT_SSL_CIPHER_LIST,
 				ssl_cipherlist);
@@ -1296,13 +1296,16 @@ static CURL *get_curl_handle(void)
 	} else if (curl_http_proxy) {
 		struct strbuf proxy = STRBUF_INIT;
 
-		if (strstr(curl_http_proxy, "://"))
-			credential_from_url(&proxy_auth, curl_http_proxy);
-		else {
-			struct strbuf url = STRBUF_INIT;
-			strbuf_addf(&url, "http://%s", curl_http_proxy);
-			credential_from_url(&proxy_auth, url.buf);
-			strbuf_release(&url);
+		/* Rebuilding a destination handle does not change its proxy. */
+		if (!proxy_auth.host) {
+			if (strstr(curl_http_proxy, "://"))
+				credential_from_url(&proxy_auth, curl_http_proxy);
+			else {
+				struct strbuf url = STRBUF_INIT;
+				strbuf_addf(&url, "http://%s", curl_http_proxy);
+				credential_from_url(&proxy_auth, url.buf);
+				strbuf_release(&url);
+			}
 		}
 
 		if (set_curl_proxy_type(result, proxy_auth.protocol) < 0)
@@ -1386,10 +1389,153 @@ static void set_long_from_env(long *var, const char *envname)
 	}
 }
 
+static int equal_nullable_strings(const char *a, const char *b)
+{
+	return a && b ? !strcmp(a, b) : a == b;
+}
+
+static int http_redirect_options(const char *var, const char *value,
+				 const struct config_context *ctx, void *data)
+{
+	static const char * const names[] = {
+		"http.proactiveauth", "http.emptyauth", "http.extraheader",
+		"http.sslverify", "http.sslcert", "http.sslcerttype",
+		"http.sslkey", "http.sslkeytype", "http.sslcapath",
+		"http.sslcainfo", "http.sslcertpasswordprotected",
+		"http.sslversion", "http.sslcipherlist", "http.pinnedpubkey",
+		"http.schannelcheckrevoke", "http.schannelusesslcainfo",
+		"http.delegation"
+	};
+	size_t i;
+
+	if (!strcmp(var, "http.sslbackend"))
+		return git_config_string(data, var, value);
+	for (i = 0; i < ARRAY_SIZE(names); i++)
+		if (!strcmp(var, names[i]))
+			return http_options(var, value, ctx, NULL);
+	return 0;
+}
+
+/* Preserve cookies without carrying a connection or TLS session to a new context. */
+static CURL *http_redirect_handle(CURL *old, CURL *new)
+{
+	struct curl_slist *cookies = NULL, *cookie;
+
+	if (curl_easy_getinfo(old, CURLINFO_COOKIELIST, &cookies) != CURLE_OK)
+		die(_("unable to preserve HTTP cookies after a redirect"));
+	for (cookie = cookies; cookie; cookie = cookie->next)
+		if (curl_easy_setopt(new, CURLOPT_COOKIELIST, cookie->data) != CURLE_OK)
+			die(_("unable to restore HTTP cookies after a redirect"));
+	curl_slist_free_all(cookies);
+	curl_easy_cleanup(old);
+	return new;
+}
+
+/* Discovery is serial; no request may retain the previous destination's settings. */
+static void http_redirect_config(const char *url)
+{
+	struct urlmatch_config config = URLMATCH_CONFIG_INIT;
+	struct active_request_slot *slot;
+	char *normalized_url, *backend = NULL;
+	char *old_cert = xstrdup_or_null(ssl_cert);
+	char *old_key = xstrdup_or_null(ssl_key);
+	char *old_cert_type = xstrdup_or_null(ssl_cert_type);
+	char *old_key_type = xstrdup_or_null(ssl_key_type);
+	int old_password_required = ssl_cert_password_required;
+	CURL *new_default;
+
+	if (active_requests)
+		BUG("HTTP redirect configuration changed during an active request");
+	for (slot = active_queue_head; slot; slot = slot->next)
+		if (slot->in_use)
+			BUG("HTTP redirect configuration changed with a reserved slot");
+
+	FREE_AND_NULL(ssl_cert);
+	FREE_AND_NULL(ssl_cert_type);
+	FREE_AND_NULL(ssl_key);
+	FREE_AND_NULL(ssl_key_type);
+	FREE_AND_NULL(ssl_capath);
+	FREE_AND_NULL(ssl_cainfo);
+	FREE_AND_NULL(ssl_version);
+	FREE_AND_NULL(ssl_cipherlist);
+	FREE_AND_NULL(ssl_pinnedkey);
+#ifdef CURLGSSAPI_DELEGATION_FLAG
+	FREE_AND_NULL(curl_deleg);
+#endif
+	curl_ssl_verify = 1;
+	ssl_cert_password_required = 0;
+	http_schannel_check_revoke = 1;
+	http_schannel_use_ssl_cainfo = 0;
+	http_proactive_auth = PROACTIVE_AUTH_NONE;
+	curl_empty_auth = -1;
+	string_list_clear(&extra_http_headers, 0);
+
+	config.section = "http";
+	config.collect_fn = http_redirect_options;
+	config.cb = &backend;
+	normalized_url = url_normalize(url, &config.url);
+	if (!normalized_url)
+		die(_("invalid HTTP redirect URL"));
+	repo_config(the_repository, urlmatch_config_entry, &config);
+	free(normalized_url);
+	string_list_clear(&config.vars, 1);
+	if (!equal_nullable_strings(backend, http_ssl_backend))
+		die(_("cannot change the SSL backend after an HTTP redirect"));
+	free(backend);
+	if (http_proactive_auth_from_caller &&
+	    http_proactive_auth == PROACTIVE_AUTH_NONE)
+		http_proactive_auth = PROACTIVE_AUTH_IF_CREDENTIALS;
+
+	if (getenv("GIT_SSL_NO_VERIFY"))
+		curl_ssl_verify = 0;
+	set_from_env(&ssl_cert, "GIT_SSL_CERT");
+	set_from_env(&ssl_cert_type, "GIT_SSL_CERT_TYPE");
+	set_from_env(&ssl_key, "GIT_SSL_KEY");
+	set_from_env(&ssl_key_type, "GIT_SSL_KEY_TYPE");
+	set_from_env(&ssl_capath, "GIT_SSL_CAPATH");
+	set_from_env(&ssl_cainfo, "GIT_SSL_CAINFO");
+	if (getenv("GIT_SSL_CERT_PASSWORD_PROTECTED") &&
+	    starts_with(url, "https://"))
+		ssl_cert_password_required = 1;
+	if (!equal_nullable_strings(old_cert, ssl_cert) ||
+	    !equal_nullable_strings(old_key, ssl_key) ||
+	    !equal_nullable_strings(old_cert_type, ssl_cert_type) ||
+	    !equal_nullable_strings(old_key_type, ssl_key_type) ||
+	    old_password_required != ssl_cert_password_required)
+		credential_clear(&cert_auth);
+	free(old_cert);
+	free(old_key);
+	free(old_cert_type);
+	free(old_key_type);
+
+	/* The multi handle owns connections shared by the easy handles. */
+	curl_multi_cleanup(curlm);
+	curlm = curl_multi_init();
+	if (!curlm)
+		die("curl_multi_init failed");
+	new_default = get_curl_handle();
+	for (slot = active_queue_head; slot; slot = slot->next) {
+		CURL *new;
+
+		if (!slot->curl)
+			continue;
+		new = curl_easy_duphandle(new_default);
+		if (!new)
+			die("curl_easy_duphandle failed");
+		slot->curl = http_redirect_handle(slot->curl, new);
+	}
+	curl_default = http_redirect_handle(curl_default, new_default);
+	curl_slist_free_all(pragma_header);
+	pragma_header = curl_slist_append(http_copy_default_headers(),
+					"Pragma: no-cache");
+}
+
 void http_init(struct remote *remote, const char *url, int proactive_auth)
 {
 	char *normalized_url;
 	struct urlmatch_config config = URLMATCH_CONFIG_INIT;
+
+	http_proactive_auth_from_caller = proactive_auth;
 
 	config.section = "http";
 	config.key = NULL;
@@ -1656,7 +1802,11 @@ struct active_request_slot *get_active_slot(void)
 
 	curl_easy_setopt(slot->curl, CURLOPT_IPRESOLVE, git_curl_ipresolve);
 	curl_easy_setopt(slot->curl, CURLOPT_HTTPAUTH, http_auth_methods);
-	if (http_auth.password || http_auth.credential || curl_empty_auth_enabled())
+	/* Credentials from a previous request must not survive a context change. */
+	curl_easy_setopt(slot->curl, CURLOPT_USERNAME, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_PASSWORD, NULL);
+	if (http_auth.password || http_auth.credential || curl_empty_auth_enabled() ||
+	    always_auth_proactively())
 		init_curl_http_auth(slot->curl);
 
 	return slot;
@@ -2223,9 +2373,13 @@ static void http_opt_request_remainder(CURL *curl, off_t pos)
 #define HTTP_REQUEST_STRBUF	0
 #define HTTP_REQUEST_FILE	1
 
+/* An unfollowed discovery redirect, handled before configuring its destination. */
+#define HTTP_REDIRECT 8
+
 static int http_request(const char *url,
 			void *result, int target,
-			struct http_get_options *options)
+			struct http_get_options *options,
+			struct strbuf *redirect)
 {
 	struct active_request_slot *slot;
 	struct slot_results results = { .retry_after = -1 };
@@ -2267,6 +2421,8 @@ static int http_request(const char *url,
 	if (options->initial_request &&
 	    http_follow_config == HTTP_FOLLOW_INITIAL)
 		curl_easy_setopt(slot->curl, CURLOPT_FOLLOWLOCATION, 1L);
+	if (redirect)
+		curl_easy_setopt(slot->curl, CURLOPT_FOLLOWLOCATION, 0L);
 
 	headers = curl_slist_append(headers, buf.buf);
 
@@ -2285,6 +2441,16 @@ static int http_request(const char *url,
 	curl_easy_setopt(slot->curl, CURLOPT_FAILONERROR, 0L);
 
 	ret = run_one_slot(slot, &results);
+	if (redirect &&
+	    (results.http_code == 301 || results.http_code == 302 ||
+	     results.http_code == 303 || results.http_code == 307 ||
+	     results.http_code == 308) &&
+	    (results.curl_result == CURLE_OK ||
+	     results.curl_result == CURLE_HTTP_RETURNED_ERROR)) {
+		curlinfo_strbuf(slot->curl, CURLINFO_REDIRECT_URL, redirect);
+		if (redirect->len)
+			ret = HTTP_REDIRECT;
+	}
 
 #ifdef GIT_CURL_HAVE_CURLINFO_RETRY_AFTER
 	if (ret == HTTP_RATE_LIMITED) {
@@ -2402,6 +2568,114 @@ static long handle_rate_limit_retry(long slot_retry_after)
 	}
 }
 
+/* Discard response bodies before following a redirect or retrying a request. */
+static int http_request_rewind(void *result, int target)
+{
+	if (!result)
+		return 0;
+	switch (target) {
+	case HTTP_REQUEST_STRBUF:
+		strbuf_reset(result);
+		return 0;
+	case HTTP_REQUEST_FILE: {
+		FILE *f = result;
+		if (fflush(f))
+			return error_errno("unable to flush a file");
+		rewind(f);
+		if (ftruncate(fileno(f), 0) < 0)
+			return error_errno("unable to truncate a file");
+		return 0;
+	}
+	default:
+		BUG("Unknown http_request target");
+	}
+}
+
+/*
+ * Discovery redirects must select credentials before, not after, the next
+ * request. In particular, curl cannot enforce credential.useHttpPath or select
+ * URL-specific helpers, headers and client certificates while following one.
+ */
+static int http_request_with_redirects(const char *url, void *result, int target,
+				       struct http_get_options *options)
+{
+	struct strbuf current = STRBUF_INIT;
+	struct strbuf redirect = STRBUF_INIT;
+	struct strbuf auth_url = STRBUF_INIT;
+	const char *tail;
+	char *asked = xstrdup(url);
+	int ret, redirects = 0;
+	int follow = options->base_url && options->effective_url &&
+		(http_follow_config == HTTP_FOLLOW_ALWAYS ||
+		 (options->initial_request && http_follow_config == HTTP_FOLLOW_INITIAL));
+
+	if (!follow) {
+		ret = http_request(asked, result, target, options, NULL);
+		goto out;
+	}
+	if (!skip_prefix(asked, options->base_url->buf, &tail))
+		BUG("discovery URL does not start with its repository URL");
+	strbuf_addstr(&current, asked);
+	strbuf_addbuf(&auth_url, options->base_url);
+	for (;;) {
+		struct url_info info;
+		char *normalized, *protocol;
+		size_t len;
+
+		strbuf_reset(&redirect);
+		ret = http_request(current.buf, result, target, options, &redirect);
+		if (ret != HTTP_REDIRECT)
+			break;
+		if (++redirects > 20) {
+			xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+				  "Maximum (20) redirects followed");
+			ret = HTTP_ERROR;
+			break;
+		}
+		normalized = url_normalize(redirect.buf, &info);
+		if (!normalized)
+			die(_("invalid HTTP redirect URL"));
+		protocol = xmemdupz(normalized, info.scheme_len);
+		if ((strcmp(protocol, "http") && strcmp(protocol, "https") &&
+		     strcmp(protocol, "ftp") && strcmp(protocol, "ftps")) ||
+		    !is_transport_allowed(protocol, 0))
+			die(_("transport '%s' not allowed in HTTP redirect"), protocol);
+		free(protocol);
+		free(normalized);
+
+		/* Preserve the repository-level credential path when possible. */
+		len = redirect.len;
+		strip_suffix_mem(redirect.buf, &len, tail);
+		{
+			char *next_auth_url = xmemdupz(redirect.buf, len);
+			if (credential_update_url(the_repository, &http_auth,
+						  auth_url.buf, next_auth_url)) {
+				http_auth_methods = CURLAUTH_ANY;
+				http_auth_methods_restricted = 0;
+				empty_auth_try_negotiate = 0;
+			}
+			strvec_clear(&http_auth.wwwauth_headers);
+			http_redirect_config(next_auth_url);
+			strbuf_reset(&auth_url);
+			strbuf_addstr(&auth_url, next_auth_url);
+			free(next_auth_url);
+		}
+		if (http_request_rewind(result, target)) {
+			ret = HTTP_START_FAILED;
+			break;
+		}
+		strbuf_swap(&current, &redirect);
+	}
+	if (ret == HTTP_OK || ret == HTTP_REAUTH || ret == HTTP_RATE_LIMITED)
+		update_url_from_redirect(options->base_url, asked, options->effective_url);
+out:
+	free(asked);
+	strbuf_release(&current);
+	strbuf_release(&redirect);
+	strbuf_release(&auth_url);
+	return ret;
+}
+
 static int http_request_recoverable(const char *url,
 			       void *result, int target,
 			       struct http_get_options *options)
@@ -2417,7 +2691,7 @@ static int http_request_recoverable(const char *url,
 	if (always_auth_proactively())
 		credential_fill(the_repository, &http_auth, 1);
 
-	ret = http_request(url, result, target, options);
+	ret = http_request_with_redirects(url, result, target, options);
 
 	if (ret != HTTP_OK && ret != HTTP_REAUTH && ret != HTTP_RATE_LIMITED)
 		return ret;
@@ -2426,41 +2700,14 @@ static int http_request_recoverable(const char *url,
 	if (ret == HTTP_RATE_LIMITED && !http_max_retries)
 		return HTTP_ERROR;
 
-	if (options->effective_url && options->base_url) {
-		if (update_url_from_redirect(options->base_url,
-					     url, options->effective_url)) {
-			credential_from_url(&http_auth, options->base_url->buf);
-			url = options->effective_url->buf;
-		}
-	}
+	if (options->effective_url && options->base_url)
+		url = options->effective_url->buf;
 
 	while ((ret == HTTP_REAUTH && --i) ||
 	       (ret == HTTP_RATE_LIMITED && --rate_limit_retries)) {
 		long retry_delay = -1;
-		/*
-		 * The previous request may have put cruft into our output stream; we
-		 * should clear it out before making our next request.
-		 */
-		switch (target) {
-		case HTTP_REQUEST_STRBUF:
-			strbuf_reset(result);
-			break;
-		case HTTP_REQUEST_FILE: {
-			FILE *f = result;
-			if (fflush(f)) {
-				error_errno("unable to flush a file");
-				return HTTP_START_FAILED;
-			}
-			rewind(f);
-			if (ftruncate(fileno(f), 0) < 0) {
-				error_errno("unable to truncate a file");
-				return HTTP_START_FAILED;
-			}
-			break;
-		}
-		default:
-			BUG("Unknown http_request target");
-		}
+		if (http_request_rewind(result, target))
+			return HTTP_START_FAILED;
 		if (ret == HTTP_RATE_LIMITED) {
 			retry_delay = handle_rate_limit_retry(options->retry_after);
 			if (retry_delay < 0)
@@ -2476,7 +2723,9 @@ static int http_request_recoverable(const char *url,
 			http_reauth_prepare(1);
 		}
 
-		ret = http_request(url, result, target, options);
+		ret = http_request_with_redirects(url, result, target, options);
+		if (options->effective_url && options->base_url)
+			url = options->effective_url->buf;
 	}
 	if (ret == HTTP_RATE_LIMITED) {
 		trace2_data_string("http", the_repository,
