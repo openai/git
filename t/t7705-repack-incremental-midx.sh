@@ -547,4 +547,37 @@ test_expect_success 'failed MIDX write does not publish its checksum' '
 	)
 '
 
+test_lazy_prereq ULIMIT_FSIZE '
+	(ulimit -f 1 && trap "" XFSZ)
+'
+
+with_small_file_limit () (
+	ulimit -f 1 &&
+	trap "" XFSZ &&
+	"$@"
+)
+
+test_expect_success ULIMIT_FSIZE 'failed chain publication leaves the old chain intact' '
+	git init failed-chain-write &&
+	(
+		cd failed-chain-write &&
+		for i in $(test_seq 1 26)
+		do
+			echo "$i" | git hash-object -w --stdin >oid &&
+			git pack-objects "$packdir/pack" <oid &&
+			git multi-pack-index write --incremental || return 1
+		done &&
+		cp "$midx_chain" before &&
+		ls "$packdir"/pack-*.pack >packs.before &&
+		test_expect_code 255 with_small_file_limit \
+			git repack --write-midx=incremental >/dev/null 2>err &&
+		test_grep "could not write multi-pack-index chain" err &&
+		test_cmp before "$midx_chain" &&
+		ls "$packdir"/pack-*.pack >packs.after &&
+		test_cmp packs.before packs.after &&
+		test_path_is_missing "$midx_chain.lock" &&
+		git multi-pack-index verify
+	)
+'
+
 test_done
