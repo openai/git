@@ -165,10 +165,10 @@ static int should_include_pack(const struct write_midx_context *ctx,
 	 * filtering those packs too, but currently don't. Incremental
 	 * writes instead exclude only packs covered by ctx->base_midx.
 	 */
-	if (m && midx_contains_pack(m, file_name))
+	if (ctx->to_include &&
+	    !string_list_has_string(ctx->to_include, file_name))
 		return 0;
-	else if (ctx->to_include &&
-		 !string_list_has_string(ctx->to_include, file_name))
+	if (m && midx_contains_pack(m, file_name))
 		return 0;
 	return 1;
 }
