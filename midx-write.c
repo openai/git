@@ -1190,11 +1190,8 @@ static void clear_midx_files(struct odb_source_packed *source,
 
 	for (i = 0; i < ARRAY_SIZE(exts); i++) {
 		clear_incremental_midx_files_ext(source, exts[i], hashes);
-		if (hashes) {
-			for (size_t j = 0; j < hashes->nr; j++)
-				clear_midx_files_ext(source, exts[i],
-						     hashes->v[j]);
-		}
+		clear_midx_files_ext(source, exts[i],
+				    incremental ? NULL : hashes->v[0]);
 	}
 
 	if (incremental)
