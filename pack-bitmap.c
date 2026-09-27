@@ -2091,7 +2091,7 @@ int for_each_bitmapped_object(struct bitmap_index *bitmap_git,
 		goto out;
 	}
 
-	objects_nr = bitmap_num_objects(bitmap_git);
+	objects_nr = bitmap_num_objects_total(bitmap_git);
 	full_word_count = objects_nr / BITS_IN_EWORD;
 
 	/* We start from the all-1 bitmap and then filter down from there. */
