@@ -467,6 +467,8 @@ static int midx_compaction_step_exec_write(struct midx_compaction_step *step,
 	}
 
 	ret = repack_fill_midx_stdin_packs(&cmd, &step->u.write, &hash);
+	if (ret)
+		goto out;
 	if (hash.nr != 1) {
 		ret = error(_("expected exactly one line during MIDX write, "
 			      "got: %"PRIuMAX),
@@ -514,6 +516,8 @@ static int midx_compaction_step_exec_compact(struct midx_compaction_step *step,
 	}
 
 	ret = finish_command(&cmd);
+	if (!ret && !step->csum)
+		ret = error(_("missing MIDX output during compaction"));
 
 out:
 	if (out)
@@ -978,7 +982,7 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 		if (i + 1 < steps_nr)
 			base = xstrdup(midx_compaction_step_base(&steps[i + 1]));
 
-		if (midx_compaction_step_exec(step, opts, base) < 0) {
+		if (midx_compaction_step_exec(step, opts, base)) {
 			ret = error(_("unable to execute compaction step %"PRIuMAX),
 				    (uintmax_t)i);
 			free(base);

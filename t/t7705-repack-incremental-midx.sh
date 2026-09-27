@@ -522,4 +522,29 @@ test_expect_success 'repack rejects invalid midxNewLayerThreshold' '
 	)
 '
 
+test_expect_success 'failed MIDX write does not publish its checksum' '
+	git init failed-midx-write &&
+	(
+		cd failed-midx-write &&
+		test_commit_bulk 3 &&
+		git multi-pack-index write --incremental &&
+		cp "$midx_chain" before &&
+		test_commit extra &&
+		git repack -d &&
+		layer=$(git multi-pack-index write --incremental --no-write-chain-file) &&
+		rm "$midxdir/multi-pack-index-$layer.midx" &&
+		mkdir "$midxdir/multi-pack-index-$layer.midx" &&
+		ls "$packdir"/pack-*.pack >packs.before &&
+
+		test_must_fail git -c repack.midxNewLayerThreshold=100 \
+			repack --geometric=2 -d --write-midx=incremental 2>err &&
+		test_grep "unable to execute compaction step" err &&
+		test_cmp before "$midx_chain" &&
+		ls "$packdir"/pack-*.pack >packs.after &&
+		test_cmp packs.before packs.after &&
+		rmdir "$midxdir/multi-pack-index-$layer.midx" &&
+		git multi-pack-index verify
+	)
+'
+
 test_done
