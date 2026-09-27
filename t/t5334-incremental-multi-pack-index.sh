@@ -449,4 +449,34 @@ test_expect_success 'skip MIDX layer with duplicate pack' '
 	)
 '
 
+test_expect_success 'MIDX maintenance shares a writer lock' '
+	git init writer-lock &&
+	(
+		cd writer-lock &&
+		test_commit base &&
+		git repack -d &&
+		git multi-pack-index write &&
+		cp "$packdir/multi-pack-index" before &&
+		touch "$packdir/multi-pack-index-write.lock" &&
+		for cmd in write expire repack
+		do
+			test_must_fail git multi-pack-index $cmd 2>err &&
+			test_grep "multi-pack-index-write.lock" err || return 1
+		done &&
+		test_must_fail git multi-pack-index write --incremental \
+			--no-write-chain-file 2>err &&
+		test_grep "multi-pack-index-write.lock" err &&
+		test_must_fail git multi-pack-index compact \
+			"$(test_oid zero)" "$(test_oid zero)" 2>err &&
+		test_grep "multi-pack-index-write.lock" err &&
+		test_must_fail git repack -ad 2>err &&
+		test_grep "multi-pack-index-write.lock" err &&
+		test_cmp before "$packdir/multi-pack-index" &&
+		rm "$packdir/multi-pack-index-write.lock" &&
+		git repack -d --write-midx=incremental &&
+		test_path_is_missing "$packdir/multi-pack-index-write.lock" &&
+		git multi-pack-index verify
+	)
+'
+
 test_done

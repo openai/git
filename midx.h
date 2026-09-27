@@ -10,6 +10,7 @@ struct bitmapped_pack;
 struct git_hash_algo;
 struct odb_source;
 struct strvec;
+struct lock_file;
 
 #define MIDX_SIGNATURE 0x4d494458 /* "MIDX" */
 #define MIDX_VERSION_V1 1
@@ -85,6 +86,8 @@ struct multi_pack_index {
 #define MIDX_WRITE_INCREMENTAL (1 << 5)
 #define MIDX_WRITE_COMPACT (1 << 6)
 #define MIDX_WRITE_NO_CHAIN (1 << 7)
+/* Internal: the caller holds the object store's MIDX writer lock. */
+#define MIDX_WRITE_LOCK_HELD (1 << 8)
 
 #define MIDX_EXT_REV "rev"
 #define MIDX_EXT_BITMAP "bitmap"
@@ -162,6 +165,9 @@ int write_midx_file_compact(struct odb_source_packed *source,
 			    struct multi_pack_index *to,
 			    const char *incremental_base,
 			    unsigned flags);
+void hold_midx_write_lock(struct odb_source_packed *source,
+			  struct lock_file *lock);
+/* The caller must hold the MIDX writer lock while clearing files. */
 void clear_midx_file(struct repository *r);
 void clear_incremental_midx_files(struct repository *r,
 				  const struct strvec *keep_hashes);
