@@ -387,6 +387,7 @@ static struct multi_pack_index *load_multi_pack_index_chain(struct odb_source_pa
 					chain_file.buf, &fd, &st)) {
 		/* ownership of fd is taken over by load function */
 		m = load_midx_chain_fd_st(source, fd, &st, incomplete_chain);
+
 	} else if (errno != ENOENT) {
 		*incomplete_chain = 1;
 	}
@@ -401,12 +402,18 @@ static struct multi_pack_index *load_multi_pack_index_with_status(struct odb_sou
 	struct strbuf midx_name = STRBUF_INIT;
 	struct multi_pack_index *m;
 
-	*incomplete_chain = 0;
 	get_midx_filename(source, &midx_name);
 
-	m = load_multi_pack_index_one(source, midx_name.buf);
-	if (!m)
-		m = load_multi_pack_index_chain(source, incomplete_chain);
+	for (int attempt = 0; ; attempt++) {
+		*incomplete_chain = 0;
+		m = load_multi_pack_index_one(source, midx_name.buf);
+		if (!m)
+			m = load_multi_pack_index_chain(source, incomplete_chain);
+		if (!*incomplete_chain || attempt)
+			break;
+		/* A writer may have retired layers after we opened its old chain. */
+		close_midx(m);
+	}
 
 	strbuf_release(&midx_name);
 
