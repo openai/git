@@ -457,8 +457,17 @@ The server must apply the repository, authorization and ref visibility of
 the receive-pack operation. Upload-pack visibility alone is insufficient.
 The response has no peeled or symbolic-ref attributes.
 
-The client accepts at most 128 distinct candidate names. Git computes these
-names after applying configured push refspecs and defaults. Explicit refspecs
+The client sends at most 128 distinct candidate names per request. Larger
+candidate sets use consecutive requests under the same receive session URL;
+the client must finish every request before either push matching pass sees
+the results. For C distinct candidates, discovery makes ceiling(C / 128)
+requests and stores at most C observations. Request and response sizes are
+bounded by the names in that batch, independently of the remote ref count.
+A response may contain only names requested in its own batch. A failure
+in any batch aborts the push without using earlier batches or the initial
+advertisement as a fallback.
+
+Git computes candidate names after applying configured push refspecs and defaults. Explicit refspecs
 use Git's normal destination matching candidates. Matching refspecs, `--all`
 and wildcard refspecs use destinations derived from local refs. `--mirror`,
 `--prune` and effective `--follow-tags` require discovery beyond these names

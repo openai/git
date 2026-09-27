@@ -279,16 +279,71 @@ do
 	'
 done
 
-test_expect_success 'candidate overflow fails before exact query or upload' '
-	setup_case overflow &&
+test_expect_success 'more than 128 candidates use bounded exact requests before matching' '
+	setup_case batches batch &&
+	: >server/batches/initial &&
+	: >server/batches/exact &&
+	: >expect &&
+	set -- &&
+	for i in $(test_seq 129)
+	do
+		set -- "$@" "HEAD:refs/heads/topic-$i" &&
+		printf "%s refs/heads/topic-%s\n" "$new" "$i" >>server/batches/initial &&
+		printf "%s refs/heads/topic-%s\n" "$old" "$i" >>server/batches/exact &&
+		printf "%s %s refs/heads/topic-%s\n" "$old" "$new" "$i" >>expect || return 1
+	done &&
+	git push "$case_url" "$@" &&
+	sort expect >expect.sorted &&
+	sort server/batches/commands >actual &&
+	test_cmp expect.sorted actual &&
+	cat server/batches/query-[0-9]* | sort >queried &&
+	test_line_count = 774 queried &&
+	uniq -d queried >duplicates &&
+	test_must_be_empty duplicates &&
+	for query in server/batches/query-[0-9]*
+	do
+		test_line_count -le 128 "$query" || return 1
+	done &&
+	grep "^POST /batches/session/git-upload-pack$" server/batches/requests >requests &&
+	test_line_count = 7 requests &&
+	git init --bare batch-pack-check.git &&
+	git -C batch-pack-check.git index-pack --stdin <server/batches/pack &&
+	git -C batch-pack-check.git fsck --full --no-dangling "$new"
+'
+
+test_expect_success 'a later exact batch error aborts before matching or upload' '
+	setup_case batch-error batch-error &&
+	cp server/batches/initial server/batch-error/initial &&
+	cp server/batches/exact server/batch-error/exact &&
 	set -- &&
 	for i in $(test_seq 129)
 	do
 		set -- "$@" "HEAD:refs/heads/topic-$i" || return 1
 	done &&
 	test_must_fail git push "$case_url" "$@" 2>err &&
+	test_grep "exact refs unavailable" err &&
 	expect_no_push &&
-	test_path_is_missing server/overflow/query
+	printf "2\n" >expect &&
+	test_cmp expect server/batch-error/query-count
+'
+
+test_expect_success 'a later batch error exposes no partial remote-helper ref list' '
+	setup_case batch-list-error batch-error &&
+	cp server/batches/initial server/batch-list-error/initial &&
+	cp server/batches/exact server/batch-list-error/exact &&
+	{
+		echo "option push-exact-refs true" &&
+		for i in $(test_seq 129)
+		do
+			echo "option push-exact-ref refs/heads/topic-$i" || return 1
+		done &&
+		echo "list for-push"
+	} >helper-input &&
+	test_must_fail git remote-http origin "$case_url" <helper-input >helper-output 2>err &&
+	test_grep "exact refs unavailable" err &&
+	test_grep ! "^:push-exact-refs$" helper-output &&
+	test_grep ! "refs/heads/" helper-output &&
+	expect_no_push
 '
 
 test_expect_success 'configured follow-tags also rejects incomplete discovery' '

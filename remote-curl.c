@@ -1234,30 +1234,18 @@ static void replace_exact_push_refs(struct discovery *heads,
 	string_list_clear(&shallow, 0);
 }
 
-static void discover_exact_push_refs(struct discovery *heads)
+static void discover_exact_push_refs_batch(size_t begin, size_t end,
+					  struct string_list *observed)
 {
 	struct rpc_state rpc = RPC_STATE_INIT;
 	struct strbuf request = STRBUF_INIT;
 	struct strbuf response = STRBUF_INIT;
 	struct packet_reader reader;
-	struct string_list observed = STRING_LIST_INIT_DUP;
-
-	if (!server_supports("explicit-haves"))
-		die(_("exact push ref discovery requires explicit-haves"));
-	if (!push_exact_refs_complete)
-		die(_("this server does not support --mirror, --prune or --follow-tags pushes"));
-	if (push_exact_refs.nr > MAX_EXACT_PUSH_REFS)
-		die(_("too many exact push ref candidates (maximum %d)"), MAX_EXACT_PUSH_REFS);
-
-	/* No local source can produce an update for an empty finite plan. */
-	if (!push_exact_refs.nr) {
-		return;
-	}
 
 	packet_buf_write(&request, "command=ls-refs\n");
 	packet_buf_write(&request, "object-format=%s\n", options.hash_algo->name);
 	packet_buf_delim(&request);
-	for (size_t i = 0; i < push_exact_refs.nr; i++)
+	for (size_t i = begin; i < end; i++)
 		packet_buf_write(&request, "pando-exact-ref %s\n", push_exact_refs.items[i].string);
 	packet_buf_flush(&request);
 
@@ -1272,7 +1260,7 @@ static void discover_exact_push_refs(struct discovery *heads)
 	rpc.response = &response;
 	/* At most one oid/name pkt-line per candidate, followed by a flush. */
 	rpc.response_limit = 4;
-	for (size_t i = 0; i < push_exact_refs.nr; i++)
+	for (size_t i = begin; i < end; i++)
 		rpc.response_limit += options.hash_algo->hexsz +
 			strlen(push_exact_refs.items[i].string) + 6;
 	if (post_rpc(&rpc, 0, 1))
@@ -1284,27 +1272,56 @@ static void discover_exact_push_refs(struct discovery *heads)
 	while (packet_reader_read(&reader) == PACKET_READ_NORMAL) {
 		struct object_id oid;
 		const char *name;
-		struct string_list_item *item;
+		struct string_list_item *item, *requested;
 
 		if (parse_oid_hex_algop(reader.line, &oid, &name, options.hash_algo) ||
 		    *name++ != ' ' || is_null_oid(&oid) ||
-		    strlen(reader.line) != reader.pktlen ||
-		    !string_list_has_string(&push_exact_refs, name) ||
-		    string_list_has_string(&observed, name))
+		    strlen(reader.line) != reader.pktlen)
 			die(_("invalid exact push ref discovery response"));
-		item = string_list_insert(&observed, name);
+		requested = string_list_lookup(&push_exact_refs, name);
+		/* A different batch does not authorize a record in this response. */
+		if (!requested || requested < push_exact_refs.items + begin ||
+		    requested >= push_exact_refs.items + end ||
+		    string_list_has_string(observed, name))
+			die(_("invalid exact push ref discovery response"));
+		item = string_list_insert(observed, name);
 		item->util = xstrdup(oid_to_hex(&oid));
 	}
 	if (reader.status != PACKET_READ_FLUSH || reader.src_len)
 		die(_("incomplete exact push ref discovery response"));
-	replace_exact_push_refs(heads, &observed);
-	string_list_clear(&observed, 1);
 	strbuf_release(&request);
 	strbuf_release(&response);
 	free(rpc.service_url);
 	free(rpc.hdr_content_type);
 	free(rpc.hdr_accept);
 	free(rpc.protocol_header);
+}
+
+static void discover_exact_push_refs(struct discovery *heads)
+{
+	struct string_list observed = STRING_LIST_INIT_DUP;
+
+	if (!server_supports("explicit-haves"))
+		die(_("exact push ref discovery requires explicit-haves"));
+	if (!push_exact_refs_complete)
+		die(_("this server does not support --mirror, --prune or --follow-tags pushes"));
+
+	/* No local source can produce an update for an empty finite plan. */
+	if (!push_exact_refs.nr)
+		return;
+
+	for (size_t begin = 0; begin < push_exact_refs.nr;) {
+		size_t count = push_exact_refs.nr - begin;
+
+		if (count > MAX_EXACT_PUSH_REFS)
+			count = MAX_EXACT_PUSH_REFS;
+
+		discover_exact_push_refs_batch(begin, begin + count, &observed);
+		begin += count;
+	}
+	/* Both matching passes must see results only after every batch succeeds. */
+	replace_exact_push_refs(heads, &observed);
+	string_list_clear(&observed, 1);
 }
 
 static int rpc_service(struct rpc_state *rpc, struct discovery *heads,

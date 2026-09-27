@@ -274,7 +274,7 @@ int resolve_remote_symref(struct ref *ref, struct ref *list);
 struct ref *ref_remove_duplicates(struct ref *ref_map);
 
 int check_push_refs(struct ref *src, struct refspec *rs);
-/* Bound the exact-name request independently of the remote ref population. */
+/* Bound each exact-name request independently of the remote ref population. */
 #define MAX_EXACT_PUSH_REFS 128
 /*
  * Prepare a per-transport copy of push refspecs and all exact remote
