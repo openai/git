@@ -285,7 +285,8 @@ static void repack_prepare_midx_command(struct child_process *cmd,
 {
 	cmd->git_cmd = 1;
 
-	strvec_pushl(&cmd->args, "multi-pack-index", subcommand, NULL);
+	strvec_pushl(&cmd->args, "multi-pack-index", subcommand,
+		     "--write-lock-held", NULL);
 
 	if (opts->show_progress)
 		strvec_push(&cmd->args, "--progress");

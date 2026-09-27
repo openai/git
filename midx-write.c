@@ -1320,6 +1320,7 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	uint32_t start_pack;
 	struct hashfile *f = NULL;
 	struct lock_file lk = LOCK_INIT;
+	struct lock_file write_lock = LOCK_INIT;
 	struct tempfile *incr;
 	struct write_midx_context ctx = {
 		.preferred_pack_idx = NO_PREFERRED_PACK,
@@ -1333,6 +1334,9 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	struct chunkfile *cf;
 
 	trace2_region_enter("midx", "write_midx_internal", r);
+
+	if (!(opts->flags & MIDX_WRITE_LOCK_HELD))
+		hold_midx_write_lock(opts->source, &write_lock);
 
 	ctx.repo = r;
 	ctx.source = opts->source;
@@ -1903,6 +1907,8 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	result = 0;
 
 cleanup:
+	rollback_lock_file(&lk);
+	rollback_lock_file(&write_lock);
 	for (size_t i = 0; i < ctx.nr; i++) {
 		if (ctx.info[i].p) {
 			close_pack(ctx.info[i].p);
@@ -1981,11 +1987,14 @@ int expire_midx_packs(struct odb_source_packed *source, unsigned flags)
 {
 	uint32_t i, *count, result = 0;
 	struct string_list packs_to_drop = STRING_LIST_INIT_DUP;
-	struct multi_pack_index *m = get_multi_pack_index(source);
+	struct multi_pack_index *m;
+	struct lock_file write_lock = LOCK_INIT;
 	struct progress *progress = NULL;
 
+	hold_midx_write_lock(source, &write_lock);
+	m = get_multi_pack_index(source);
 	if (!m)
-		return 0;
+		goto cleanup;
 
 	if (m->base_midx)
 		die(_("cannot expire packs from an incremental multi-pack-index"));
@@ -2037,11 +2046,13 @@ int expire_midx_packs(struct odb_source_packed *source, unsigned flags)
 		struct write_midx_opts opts = {
 			.source = source,
 			.packs_to_drop = &packs_to_drop,
-			.flags = flags & MIDX_PROGRESS,
+			.flags = (flags & MIDX_PROGRESS) | MIDX_WRITE_LOCK_HELD,
 		};
 		result = write_midx_internal(&opts);
 	}
 
+cleanup:
+	rollback_lock_file(&write_lock);
 	string_list_clear(&packs_to_drop, 0);
 
 	return result;
@@ -2169,13 +2180,14 @@ int midx_repack(struct odb_source_packed *source, size_t batch_size, unsigned fl
 	struct repository *r = source->base.odb->repo;
 	int result = 0;
 	uint32_t i, packs_to_repack = 0;
-	unsigned char *include_pack;
+	unsigned char *include_pack = NULL;
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	FILE *cmd_in;
-	struct multi_pack_index *m = get_multi_pack_index(source);
+	struct multi_pack_index *m;
+	struct lock_file write_lock = LOCK_INIT;
 	struct write_midx_opts opts = {
 		.source = source,
-		.flags = flags,
+		.flags = flags | MIDX_WRITE_LOCK_HELD,
 	};
 
 	/*
@@ -2186,8 +2198,10 @@ int midx_repack(struct odb_source_packed *source, size_t batch_size, unsigned fl
 	int delta_base_offset = 1;
 	int use_delta_islands = 0;
 
+	hold_midx_write_lock(source, &write_lock);
+	m = get_multi_pack_index(source);
 	if (!m)
-		return 0;
+		goto cleanup;
 	if (m->base_midx)
 		die(_("cannot repack an incremental multi-pack-index"));
 
@@ -2254,6 +2268,7 @@ int midx_repack(struct odb_source_packed *source, size_t batch_size, unsigned fl
 	result = write_midx_internal(&opts);
 
 cleanup:
+	rollback_lock_file(&write_lock);
 	free(include_pack);
 	return result;
 }
