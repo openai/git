@@ -14,6 +14,7 @@ void progress_test_force_update(void);
 #endif
 
 void display_throughput(struct progress *progress, uint64_t total);
+void clear_progress(struct progress *progress);
 void display_progress(struct progress *progress, uint64_t n);
 struct progress *start_progress(struct repository *r,
 				const char *title, uint64_t total);

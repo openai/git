@@ -71,6 +71,7 @@ static int pack_objects(struct repository *r,
 
 	opts.thin = args->use_thin_pack;
 	opts.ofs_delta = args->use_ofs_delta;
+	opts.no_ref_delta = args->no_ref_delta;
 	if (args->progress)
 		opts.progress = ODB_GENERATE_PACK_PROGRESS_VERBOSE;
 	opts.shallow = is_repository_shallow(r);
@@ -537,6 +538,8 @@ int send_pack(struct repository *r,
 		allow_deleting_refs = 1;
 	if (server_supports("ofs-delta"))
 		args->use_ofs_delta = 1;
+	if (server_supports("no-ref-delta"))
+		args->no_ref_delta = 1;
 	if (server_supports("side-band-64k"))
 		use_sideband = 1;
 	if (server_supports("quiet"))

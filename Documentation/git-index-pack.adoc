@@ -9,8 +9,10 @@ git-index-pack - Build pack index file for an existing packed archive
 SYNOPSIS
 --------
 [verse]
-'git index-pack' [-v] [-o <index-file>] [--[no-]rev-index] <pack-file>
-'git index-pack' --stdin [--fix-thin] [--keep] [-v] [-o <index-file>]
+'git index-pack' [-v] [-o <index-file>] [--no-ref-delta]
+		[--[no-]rev-index] <pack-file>
+'git index-pack' --stdin [--fix-thin] [--keep] [--no-ref-delta]
+		[-v] [-o <index-file>]
 		  [--[no-]rev-index] [<pack-file>]
 
 
@@ -59,6 +61,11 @@ OPTIONS
 	linkgit:git-pack-objects[1] for details) by adding the
 	excluded objects the deltified objects are based on to the
 	pack. This option only makes sense in conjunction with --stdin.
+
+--no-ref-delta::
+	Reject a pack containing a `REF_DELTA` entry. `OFS_DELTA` entries
+	are accepted. This option can be used to verify a protocol promise
+	that a pack contains no `REF_DELTA` entries.
 
 --keep::
 	Before moving the index into its final destination
