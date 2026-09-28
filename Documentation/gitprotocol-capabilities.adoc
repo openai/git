@@ -207,6 +207,15 @@ A client that supports 'explicit-haves' SHOULD request it whenever the
 server advertises it. A server that relies on this behavior MUST verify
 that the client requested the capability before accepting the pack.
 
+For smart HTTP, such a client SHOULD also send the bare 'explicit-haves'
+Extra Parameter in its initial receive-pack discovery request, before
+the server advertises refs. This lets a server choose which refs it can
+advertise to that client. The Extra Parameter does not activate the
+capability: the server must still advertise it, and the client must
+still request it in the update command. A server that ignores the Extra
+Parameter and does not advertise the capability retains the usual pack
+prerequisite behavior.
+
 agent
 -----
 
