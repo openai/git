@@ -35,8 +35,8 @@ and server advertised.  As a consequence of these rules, server MUST
 NOT advertise capabilities it does not understand.
 
 The 'atomic', 'report-status', 'report-status-v2', 'delete-refs',
-'no-ref-delta', 'quiet', and 'push-cert' capabilities are sent and
-recognized by the receive-pack (push to server) process.
+'explicit-haves', 'no-ref-delta', 'quiet', and 'push-cert' capabilities
+are sent and recognized by the receive-pack (push to server) process.
 
 The 'ofs-delta' and 'side-band-64k' capabilities are sent and recognized
 by both upload-pack and receive-pack protocols.  The 'agent' and 'session-id'
@@ -188,6 +188,24 @@ that is negotiated separately with the 'ofs-delta' capability.
 Protocol v2 `fetch` uses the same name for the corresponding
 upload-pack request. There, the promise covers both the inline pack and
 any packs named by a `packfile-uris` section.
+
+explicit-haves
+--------------
+
+The receive-pack server can advertise 'explicit-haves' to indicate that
+the object IDs of its named refs are not necessarily pack prerequisites.
+When a client requests this capability, it MUST NOT treat an object as a
+pack prerequisite merely because the server advertised a named ref that
+points to it.
+
+Objects named by ".have" pseudo-refs and common objects explicitly
+acknowledged by push negotiation remain valid pack prerequisites. This
+capability does not otherwise change how the client uses advertised refs,
+including for reference matching and update preconditions.
+
+A client that supports 'explicit-haves' SHOULD request it whenever the
+server advertises it. A server that relies on this behavior MUST verify
+that the client requested the capability before accepting the pack.
 
 agent
 -----
