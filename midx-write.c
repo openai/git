@@ -1856,6 +1856,7 @@ static int write_midx_internal(struct write_midx_opts *opts)
 
 		if (rename_tempfile(&incr, final_midx_name.buf) < 0) {
 			error_errno(_("unable to rename new multi-pack-index layer"));
+			strbuf_release(&final_midx_name);
 			goto cleanup;
 		}
 
