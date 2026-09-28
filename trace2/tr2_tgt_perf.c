@@ -241,6 +241,7 @@ static void fn_error_va_fl(const char *file, int line, const char *fmt,
 	struct strbuf buf_payload = STRBUF_INIT;
 
 	maybe_append_string_va(&buf_payload, fmt, ap);
+	tr2_redact_error(&buf_payload, 0);
 
 	perf_io_write_fl(file, line, event_name, NULL, NULL, NULL, NULL,
 			 &buf_payload);
