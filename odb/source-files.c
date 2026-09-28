@@ -576,7 +576,7 @@ bool odb_source_files_optimize_required(struct odb_source *source,
 		 * When we'd merge at least two packs with one another we always
 		 * perform the repack.
 		 */
-		if (geometry.split) {
+		if (geometry.split || geometry.promisor_split) {
 			ret = true;
 			goto out;
 		}
@@ -710,7 +710,8 @@ int odb_source_files_optimize(struct odb_source *source,
 		pack_geometry_init(&geometry, &existing_packs, &po_args);
 		pack_geometry_split(&geometry);
 
-		if (geometry.split < geometry.pack_nr) {
+		if (geometry.split < geometry.pack_nr ||
+		    geometry.promisor_split < geometry.promisor_pack_nr) {
 			strvec_pushf(&repack_cmd.args, "--geometric=%d",
 				     geometry.split_factor);
 		} else {
