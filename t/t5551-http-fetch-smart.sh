@@ -233,6 +233,19 @@ test_expect_success 'clone from auth-only-for-objects repository' '
 	test_cmp expect actual
 '
 
+test_expect_success 'http auth retries gzip-encoded requests' '
+	server_option=$(test-tool genzeros 1024 | tr "\000" x) &&
+	set_askpass user@host pass@host &&
+	GIT_TRACE_CURL="$TRASH_DIRECTORY/trace" \
+	GIT_TEST_PROTOCOL_VERSION=2 \
+	git -c protocol.version=2 ls-remote \
+		--server-option="$server_option" \
+		"$HTTPD_URL/auth-fetch/smart/repo.git" >/dev/null &&
+	expect_askpass both user%40host &&
+	grep -i "=> Send header: content-encoding: gzip" trace >gzip.headers &&
+	test_line_count = 2 gzip.headers
+'
+
 test_expect_success 'no-op half-auth fetch does not require a password' '
 	set_askpass wrong &&
 
