@@ -125,6 +125,10 @@ compact::
 		as the base for the compacted result, instead of using
 		the immediate parent of `<from>`. The special value
 		`none` indicates that the result should have no base.
+		When updating a chain, changing the base requires `<to>`
+		to be the tip. Layers above `<to>` cannot retain their
+		bitmap positions when the base changes. Use
+		`--no-write-chain-file` to write the layer separately.
 --
 +
 Note that the compact command requires writing a version-2 midx that
