@@ -421,6 +421,16 @@ if the URL is `https://user@example.com/foo/bar` a config key match of
 All URLs are normalized before attempting any matching (the password part,
 if embedded in the URL, is always ignored for matching purposes) so that
 equivalent URLs that are simply spelled differently will match properly.
-Environment variable settings always override any matches.  The URLs that are
-matched against are those given directly to Git commands.  This means any URLs
-visited as a result of a redirection do not participate in matching.
+Environment variable settings always override any matches. The URLs matched
+against are normally those given directly to Git commands.
++
+During repository discovery, Git matches each redirect destination before
+contacting it to select credentials, proactive authentication, additional
+headers, and TLS authentication and verification settings. Proxy selection and
+other HTTP settings continue to use the original URL. Changing
+`http.sslBackend` during a redirect is not supported.
++
+Credential helpers are selected using the destination's `credential.*`
+settings, including `credential.useHttpPath`. If the credential identity and
+configuration are unchanged, Git retains the existing credentials and helper
+state.

@@ -305,6 +305,17 @@ void credential_write(const struct credential *, FILE *,
 void credential_from_url(struct credential *, const char *url);
 int credential_from_url_gently(struct credential *, const char *url, int quiet);
 
+/*
+ * Replace a credential with the configured context for new_url only if its
+ * identity or credential configuration differs from old_url. No helpers are run.
+ * Return 1 when replaced, or 0 when credentials and helper state are retained.
+ * old_url must be the URL that established the current credential context,
+ * rather than a URL reconstructed from helper-supplied credential fields.
+ * The caller must preserve any response headers needed after replacement.
+ */
+int credential_update_url(struct repository *, struct credential *,
+			  const char *old_url, const char *new_url);
+
 int credential_match(const struct credential *want,
 		     const struct credential *have, int match_password);
 

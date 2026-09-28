@@ -207,6 +207,44 @@ static void credential_apply_config(struct repository *r, struct credential *c)
 	}
 }
 
+int credential_update_url(struct repository *r, struct credential *c,
+			  const char *old_url, const char *new_url)
+{
+	struct credential old = CREDENTIAL_INIT;
+	struct credential new = CREDENTIAL_INIT;
+	char *old_normalized = url_normalize(old_url, NULL);
+	char *new_normalized = url_normalize(new_url, NULL);
+	int changed;
+	size_t i;
+
+	if (!old_normalized || !new_normalized ||
+	    credential_from_url_gently(&old, old_normalized, 1) ||
+	    credential_from_url_gently(&new, new_normalized, 1))
+		die(_("unable to parse credential URL after redirection"));
+
+	/* Helpers may have changed c's identity, so compare the URL contexts. */
+	credential_apply_config(r, &old);
+	credential_apply_config(r, &new);
+	changed = !credential_match(&old, &new, 1) ||
+		!credential_match(&new, &old, 1) ||
+		old.use_http_path != new.use_http_path ||
+		old.username_from_proto != new.username_from_proto ||
+		old.sanitize_prompt != new.sanitize_prompt ||
+		old.protect_protocol != new.protect_protocol ||
+		old.helpers.nr != new.helpers.nr;
+	for (i = 0; !changed && i < old.helpers.nr; i++)
+		changed = strcmp(old.helpers.items[i].string,
+				 new.helpers.items[i].string);
+
+	if (changed)
+		SWAP(*c, new);
+	credential_clear(&old);
+	credential_clear(&new);
+	free(old_normalized);
+	free(new_normalized);
+	return !!changed;
+}
+
 static void credential_describe(struct credential *c, struct strbuf *out)
 {
 	if (!c->protocol)
