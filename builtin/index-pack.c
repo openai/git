@@ -31,6 +31,7 @@
 #include "run-command.h"
 #include "setup.h"
 #include "strvec.h"
+#include "trace2.h"
 
 static const char index_pack_usage[] =
 "git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] [--no-ref-delta] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
@@ -2091,6 +2092,10 @@ int cmd_index_pack(int argc,
 		CALLOC_ARRAY(obj_stat, st_add(nr_objects, 1));
 	CALLOC_ARRAY(ofs_deltas, nr_objects);
 	parse_pack_objects(pack_hash);
+	trace2_data_intmax("index-pack", the_repository,
+			   "input/bytes", consumed_bytes);
+	trace2_data_intmax("index-pack", the_repository,
+			   "input/objects", nr_objects);
 	if (report_end_of_input)
 		write_in_full(2, "\0", 1);
 	resolve_deltas(&opts);
