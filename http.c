@@ -3030,6 +3030,38 @@ static void update_http_pack_url(void *data)
 	urlmatch_config_release(&config);
 }
 
+static void finish_http_pack_slot(void *data)
+{
+#ifdef GIT_CURL_HAVE_CURLINFO_RETRY_AFTER
+	struct http_pack_request *preq = data;
+	curl_off_t retry_after;
+
+	/* The curl handle may be released before run_one_slot() returns. */
+	if (curl_easy_getinfo(preq->slot->curl, CURLINFO_RETRY_AFTER,
+			      &retry_after) == CURLE_OK && retry_after > 0)
+		preq->slot->results->retry_after = MIN(retry_after, LONG_MAX);
+#endif
+	update_http_pack_url(data);
+}
+
+static int http_pack_retry_delay(const struct slot_results *results, int retry)
+{
+	int delay;
+
+	if (results->curl_result != CURLE_HTTP_RETURNED_ERROR ||
+	    (results->http_code != 502 && results->http_code != 503 &&
+	     results->http_code != 504))
+		return -1;
+
+	/* Do not retry earlier than requested, or wait indefinitely. */
+	if (results->retry_after > 10)
+		return -1;
+	delay = (1000 << retry) + git_rand(0) % 1000;
+	if (results->retry_after > 0)
+		delay = MAX(delay, results->retry_after * 1000);
+	return delay;
+}
+
 static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 {
 	struct http_pack_request *preq = data;
@@ -3050,7 +3082,7 @@ static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
-	int attempts = 3;
+	int auth_attempts = 3, retries = 0;
 	int ret;
 
 	if (offset < 0)
@@ -3058,6 +3090,7 @@ int run_http_pack_request(struct http_pack_request *preq)
 
 	for (;;) {
 		struct slot_results results = { .retry_after = -1 };
+		int delay;
 
 		preq->headers = http_append_auth_header(&http_auth, preq->headers);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
@@ -3069,7 +3102,7 @@ int run_http_pack_request(struct http_pack_request *preq)
 		curl_easy_setopt(preq->slot->curl, CURLOPT_FAILONERROR, 0L);
 		if (http_follow_config == HTTP_FOLLOW_INITIAL)
 			curl_easy_setopt(preq->slot->curl, CURLOPT_FOLLOWLOCATION, 1L);
-		preq->slot->callback_func = update_http_pack_url;
+		preq->slot->callback_func = finish_http_pack_slot;
 		preq->slot->callback_data = preq;
 		ret = run_one_slot(preq->slot, &results);
 		preq->slot->results = NULL;
@@ -3081,15 +3114,27 @@ int run_http_pack_request(struct http_pack_request *preq)
 			break;
 		}
 
-		if (ret != HTTP_REAUTH || !--attempts)
+		/* Never truncate a partial pack to recover from an error response. */
+		if (ret == HTTP_OK || ftello(preq->packfile) != offset)
 			break;
 
-		/* Never truncate a partial pack to recover from an error response. */
-		if (ftello(preq->packfile) != offset) {
-			ret = HTTP_ERROR;
-			break;
+		if (ret == HTTP_REAUTH) {
+			if (!--auth_attempts)
+				break;
+			http_reauth_prepare(1);
+		} else {
+			if (ret != HTTP_ERROR || retries == 2 ||
+			    (delay = http_pack_retry_delay(&results, retries)) < 0)
+				break;
+			retries++;
+			trace2_data_intmax("http", the_repository,
+					  "http/pack-retry", retries);
+			trace2_data_intmax("http", the_repository, "http/pack-retry-status",
+					  results.http_code);
+			trace2_data_intmax("http", the_repository,
+					  "http/pack-retry-delay-ms", delay);
+			sleep_millisec(delay);
 		}
-		http_reauth_prepare(1);
 		prepare_http_pack_request(preq, offset);
 	}
 	return ret;

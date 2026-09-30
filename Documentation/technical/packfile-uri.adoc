@@ -63,6 +63,15 @@ for the pack URL, including its path when `credential.useHttpPath` is
 enabled, rather than copied from the fetch negotiation. A pack served by
 another host can use credentials configured for that host.
 
+Pack downloads retry HTTP 502, 503, and 504 responses up to twice, separately
+from authentication retries. The delays are one and two seconds, each with
+up to one additional second of jitter. With libcurl 7.66.0 or newer, a
+`Retry-After` delay is honored up to ten seconds; a longer requested delay
+fails the download without retrying.
+Retries preserve any existing partial pack and its byte-range request, and
+only occur if the failed response has not written pack data. Transport
+failures after a download has begun are not retried.
+
 When the client downloads the given URIs, it should store them with "keep"
 files, just like it does with the packfile in the `packfile` section. These
 additional "keep" files can only be removed after the refs have been updated -
