@@ -50,6 +50,68 @@ test_expect_success 'both packs should be identical' '
 	cmp "test-1-${pack1}.pack" "test-2-${pack2}.pack"
 '
 
+test_expect_success 'index-pack traces input size and object count' '
+	pack="test-1-${pack1}.pack" &&
+	bytes=$(test_file_size "$pack") &&
+	objects=$(sed -n "$=" obj-list) &&
+
+	GIT_TRACE2_EVENT="$PWD/index-pack.trace" \
+		git index-pack --verify "$pack" &&
+	test_trace2_data_singular index-pack input/bytes "$bytes" \
+		<index-pack.trace &&
+	test_trace2_data_singular index-pack input/objects "$objects" \
+		<index-pack.trace &&
+
+	dd if="$pack" bs=1 skip=12 of=pack.body 2>/dev/null &&
+	GIT_TRACE2_EVENT="$PWD/header.trace" \
+		git index-pack --stdin --pack_header=2,$objects \
+		reconstructed.pack <pack.body &&
+	test_trace2_data_singular index-pack input/bytes "$bytes" \
+		<header.trace &&
+	test_trace2_data_singular index-pack input/objects "$objects" \
+		<header.trace
+'
+
+test_expect_success 'index-pack traces an empty pack' '
+	git pack-objects --stdout </dev/null >empty.pack &&
+	bytes=$(test_file_size empty.pack) &&
+	GIT_TRACE2_EVENT="$PWD/empty.trace" \
+		git index-pack --stdin empty-received.pack <empty.pack &&
+	test_trace2_data_singular index-pack input/bytes "$bytes" \
+		<empty.trace &&
+	test_trace2_data_singular index-pack input/objects 0 \
+		<empty.trace
+'
+
+test_expect_success 'index-pack does not trace incomplete input' '
+	pack="test-1-${pack1}.pack" &&
+	bytes=$(test_file_size "$pack") &&
+	test_copy_bytes $((bytes - 1)) <"$pack" >truncated.pack &&
+	test_must_fail env GIT_TRACE2_EVENT="$PWD/incomplete.trace" \
+		git index-pack truncated.pack &&
+	test_grep ! input/bytes incomplete.trace &&
+	test_grep ! input/objects incomplete.trace
+'
+
+test_expect_success 'index-pack traces thin input before repair' '
+	test_when_finished "git reset --hard $commit && git prune --expire=now" &&
+	echo changed >>file_001 &&
+	git update-index file_001 &&
+	thin_tree=$(git write-tree) &&
+	thin_commit=$(git commit-tree $thin_tree -p $commit </dev/null) &&
+	{
+		echo $thin_commit &&
+		echo ^$commit
+	} | git pack-objects --thin --stdout --revs >thin.pack &&
+	bytes=$(test_file_size thin.pack) &&
+	GIT_TRACE2_EVENT="$PWD/thin.trace" \
+		git index-pack --fix-thin --stdin thin-fixed.pack \
+		<thin.pack &&
+	test_trace2_data_singular index-pack input/bytes "$bytes" \
+		<thin.trace &&
+	test "$(test_file_size thin-fixed.pack)" -gt "$bytes"
+'
+
 test_expect_success 'index v1 and index v2 should be different' '
 	! cmp "test-1-${pack1}.idx" "test-2-${pack2}.idx"
 '
