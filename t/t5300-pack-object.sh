@@ -602,6 +602,164 @@ test_expect_success 'cleanup for --strict and --fsck-objects downgrading fsck ms
 	rm -rf strict
 '
 
+test_expect_success 'setup packs with zero-padded file modes and malformed trees' '
+	git init zero-padded-source &&
+	(
+		cd zero-padded-source &&
+		blob=$(echo content | git hash-object -w --stdin) &&
+		tree=$(printf "100644 blob %s\tfile\n" "$blob" | git mktree) &&
+		git cat-file tree "$tree" >normal.tree &&
+		{
+			printf 0 &&
+			cat normal.tree
+		} >zero-padded.tree &&
+		cat normal.tree normal.tree >duplicateEntries.tree &&
+		tree=$(printf "100644 blob %s\t..\n" "$blob" | git mktree) &&
+		git cat-file tree "$tree" >hasDotdot.tree &&
+		for mode in 0100000 0100664 0300644
+		do
+			{
+				printf "%s" "$mode" &&
+				dd if=normal.tree bs=1 skip=6 2>/dev/null
+			} >"$mode.tree" || return 1
+		done &&
+		missing=$(echo missing | git hash-object --stdin) &&
+		tree=$(printf "100644 blob %s\tfile\n" "$missing" | git mktree --missing) &&
+		git cat-file tree "$tree" >missing.tree &&
+		{
+			printf 0 &&
+			dd if=missing.tree bs=1 skip=6 2>/dev/null
+		} >0.tree &&
+		for kind in normal zero-padded hasDotdot duplicateEntries \
+			0 0100000 0100664 0300644
+		do
+			tree=$(git hash-object --literally -w -t tree "$kind.tree") &&
+			commit=$(git commit-tree "$tree" -m "$kind") &&
+			test_write_lines "$commit" "$tree" "$blob" >"$kind.objects" &&
+			git pack-objects "$kind" <"$kind.objects" >"$kind.name" || return 1
+		done
+	) &&
+	zero_padded_pack=$(cat zero-padded-source/zero-padded.name) &&
+	git init zero-padded &&
+	git -C zero-padded index-pack --stdin \
+		<zero-padded-source/zero-padded-$zero_padded_pack.pack &&
+	commit=$(head -n 1 zero-padded-source/zero-padded.objects) &&
+	git -C zero-padded update-ref HEAD "$commit"
+'
+
+test_expect_success 'index-pack --verify --strict preserves zero-padded file modes' '
+	(
+		cd zero-padded &&
+		pack=.git/objects/pack/pack-$zero_padded_pack.pack &&
+		git index-pack --verify --strict "$pack" 2>err &&
+		test_grep "^warning:.*zeroPaddedFilemode:" err &&
+		test_cmp_bin ../zero-padded-source/zero-padded-$zero_padded_pack.pack "$pack" &&
+		git cat-file tree HEAD: >actual.tree &&
+		test_cmp_bin ../zero-padded-source/zero-padded.tree actual.tree &&
+		git rev-parse HEAD HEAD: HEAD:file >actual.objects &&
+		test_cmp ../zero-padded-source/zero-padded.objects actual.objects
+	)
+'
+
+test_expect_success 'fsck --strict warns about packed zero-padded file modes' '
+	git -C zero-padded fsck --strict 2>err &&
+	test_grep "^warning in tree .*: zeroPaddedFilemode:" err
+'
+
+test_expect_success 'unrelated severity overrides still allow canonical padded modes' '
+	git -C zero-padded index-pack --verify --strict=missingEmail=ignore \
+		".git/objects/pack/pack-$zero_padded_pack.pack" 2>err &&
+	test_grep "^warning:.*zeroPaddedFilemode:" err &&
+	git -C zero-padded -c fsck.missingEmail=ignore fsck --strict 2>err &&
+	test_grep "^warning in tree .*: zeroPaddedFilemode:" err
+'
+
+test_expect_success 'index-pack --verify --strict can reject zero-padded file modes explicitly' '
+	test_must_fail git -C zero-padded-source index-pack --verify \
+		--strict=zeroPaddedFilemode=error \
+		zero-padded-$zero_padded_pack.pack 2>err &&
+	test_grep "error:.*zeroPaddedFilemode:" err
+'
+
+for kind in hasDotdot duplicateEntries
+do
+	test_expect_success "index-pack --verify --strict rejects $kind" '
+		pack=$(cat zero-padded-source/$kind.name) &&
+		test_must_fail git -C zero-padded-source index-pack --verify \
+			--strict "$kind-$pack.pack" 2>err &&
+		test_grep "$kind:" err
+	'
+done
+
+for mode in 0 0100000 0100664 0300644
+do
+	test_expect_success "index-pack --verify --strict rejects padded mode $mode" '
+		git init "padded-mode-$mode" &&
+		pack=$(cat zero-padded-source/$mode.name) &&
+		git -C "padded-mode-$mode" index-pack --stdin \
+			<"zero-padded-source/$mode-$pack.pack" &&
+		commit=$(head -n 1 zero-padded-source/$mode.objects) &&
+		git -C "padded-mode-$mode" update-ref HEAD "$commit" &&
+		test_must_fail git -C "padded-mode-$mode" index-pack --verify \
+			--strict ".git/objects/pack/pack-$pack.pack" 2>err &&
+		test_grep "error:.*zeroPaddedFilemode:" err
+	'
+
+	test_expect_success "fsck --strict rejects padded mode $mode" '
+		test_must_fail git -C "padded-mode-$mode" fsck --strict 2>err &&
+		test_grep "^error in tree .*: zeroPaddedFilemode:" err
+	'
+done
+
+test_expect_success 'unrelated severity overrides keep malformed padded modes fatal' '
+	pack=$(cat zero-padded-source/0.name) &&
+	test_must_fail git -C padded-mode-0 index-pack --verify \
+		--strict=missingEmail=ignore ".git/objects/pack/pack-$pack.pack" 2>err &&
+	test_grep "error:.*zeroPaddedFilemode:" err &&
+	test_must_fail git -C padded-mode-0 -c fsck.missingEmail=ignore \
+		fsck --strict 2>err &&
+	test_grep "^error in tree .*: zeroPaddedFilemode:" err
+'
+
+test_expect_success 'explicit severity overrides still allow malformed padded modes' '
+	pack=$(cat zero-padded-source/0.name) &&
+	git -C padded-mode-0 index-pack --verify --strict=zeroPaddedFilemode=warn \
+		".git/objects/pack/pack-$pack.pack" 2>err &&
+	test_grep "^warning:.*zeroPaddedFilemode:" err &&
+	git -C padded-mode-0 -c fsck.zeroPaddedFilemode=warn fsck --strict 2>err &&
+	test_grep "^warning in tree .*: zeroPaddedFilemode:" err
+'
+
+test_expect_success 'setup packs with damaged checksums and valid objects' '
+	(
+		cd zero-padded-source &&
+		pack=normal-$(cat normal.name) &&
+		git index-pack --verify --strict "$pack.pack" &&
+		size=$(test_file_size "$pack.pack") &&
+		checksum=$(test_trailing_hash "$pack.pack") &&
+		test_copy_bytes "$((size - 1))" <"$pack.pack" >truncated.pack &&
+		cp "$pack.idx" truncated.idx &&
+		cp truncated.pack bad-checksum.pack &&
+		cp "$pack.idx" bad-checksum.idx &&
+		case "$checksum" in
+		*00) printf "\001" ;;
+		*) printf "\000" ;;
+		esac >>bad-checksum.pack
+	)
+'
+
+test_expect_success 'index-pack --verify --strict rejects a damaged pack checksum' '
+	test_must_fail git -C zero-padded-source index-pack --verify \
+		--strict bad-checksum.pack 2>err &&
+	test_grep "pack is corrupted" err
+'
+
+test_expect_success 'index-pack --verify --strict rejects a truncated pack' '
+	test_must_fail git -C zero-padded-source index-pack --verify \
+		--strict truncated.pack 2>err &&
+	test_grep "early EOF" err
+'
+
 test_expect_success 'honor pack.packSizeLimit' '
 	git config pack.packSizeLimit 3m &&
 	packname_10=$(git pack-objects test-10 <obj-list) &&

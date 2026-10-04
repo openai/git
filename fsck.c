@@ -625,6 +625,7 @@ static int fsck_tree(const struct object_id *tree_oid,
 	int has_dotdot = 0;
 	int has_dotgit = 0;
 	int has_zero_pad = 0;
+	int has_invalid_zero_pad = 0;
 	int has_bad_modes = 0;
 	int has_dup_entries = 0;
 	int not_properly_sorted = 0;
@@ -658,7 +659,12 @@ static int fsck_tree(const struct object_id *tree_oid,
 		has_dot |= !strcmp(name, ".");
 		has_dotdot |= !strcmp(name, "..");
 		has_dotgit |= is_hfs_dotgit(name) || is_ntfs_dotgit(name);
-		has_zero_pad |= *(char *)desc.buffer == '0';
+		if (*(const char *)desc.buffer == '0') {
+			has_zero_pad = 1;
+			/* parse_mode() truncates to uint16_t; check the original value. */
+			has_invalid_zero_pad |= strtoul(desc.buffer, NULL, 8) != mode ||
+				mode != canon_mode(mode);
+		}
 		has_large_name |= tree_entry_len(&desc.entry) > max_tree_entry_len;
 
 		if (is_hfs_dotgitmodules(name) || is_ntfs_dotgitmodules(name)) {
@@ -786,10 +792,28 @@ static int fsck_tree(const struct object_id *tree_oid,
 		retval += report(options, tree_oid, OBJ_TREE,
 				 FSCK_MSG_HAS_DOTGIT,
 				 "contains '.git'");
-	if (has_zero_pad)
-		retval += report(options, tree_oid, OBJ_TREE,
+	if (has_zero_pad) {
+		struct fsck_options zero_pad_options = *options;
+		enum fsck_msg_type msg_types[FSCK_MSG_MAX];
+
+		/*
+		 * Only redundant zeroes on canonical modes are compatible.
+		 * Keep strict rejection of other encodings unless the caller
+		 * explicitly set the zeroPaddedFilemode severity.
+		 */
+		if (options->strict && has_invalid_zero_pad &&
+		    fsck_msg_type(FSCK_MSG_ZERO_PADDED_FILEMODE, options) == FSCK_INFO) {
+			int i;
+
+			for (i = 0; i < FSCK_MSG_MAX; i++)
+				msg_types[i] = fsck_msg_type(i, options);
+			msg_types[FSCK_MSG_ZERO_PADDED_FILEMODE] = FSCK_ERROR;
+			zero_pad_options.msg_type = msg_types;
+		}
+		retval += report(&zero_pad_options, tree_oid, OBJ_TREE,
 				 FSCK_MSG_ZERO_PADDED_FILEMODE,
 				 "contains zero-padded file modes");
+	}
 	if (has_bad_modes)
 		retval += report(options, tree_oid, OBJ_TREE,
 				 FSCK_MSG_BAD_FILEMODE,

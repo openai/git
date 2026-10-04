@@ -250,4 +250,8 @@
 	(ERROR) Found a zero padded date in an author/committer line.
 
 `zeroPaddedFilemode`::
-	(WARN) Found a zero padded filemode in a tree.
+	(INFO) Found a zero-padded filemode in a tree. Redundant leading zeroes
+	on canonical modes are a warning even with `--strict`. Zero-padded
+	noncanonical or overflowing modes remain errors with `--strict` unless
+	this message's severity is explicitly set. Set the severity to `error`
+	to reject all zero-padded filemodes.
