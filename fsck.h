@@ -86,7 +86,6 @@ enum fsck_msg_type {
 	FUNC(LARGE_PATHNAME, WARN) \
 	FUNC(NULL_SHA1, WARN) \
 	FUNC(NUL_IN_COMMIT, WARN) \
-	FUNC(ZERO_PADDED_FILEMODE, WARN) \
 	/* infos (reported as warnings, but ignored by default) */ \
 	FUNC(BAD_FILEMODE, INFO) \
 	FUNC(BAD_TAG_NAME, INFO) \
@@ -100,6 +99,7 @@ enum fsck_msg_type {
 	FUNC(SYMLINK_REF, INFO) \
 	FUNC(SYMREF_TARGET_IS_NOT_A_REF, INFO) \
 	FUNC(TRAILING_REF_CONTENT, INFO) \
+	FUNC(ZERO_PADDED_FILEMODE, INFO) \
 	/* ignored (elevated when requested) */ \
 	FUNC(EXTRA_HEADER_ENTRY, IGNORE)
 

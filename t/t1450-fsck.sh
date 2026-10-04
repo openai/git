@@ -355,6 +355,36 @@ test_expect_success PERL_TEST_HELPERS 'tree entry with bogus mode' '
 	test_cmp expect err
 '
 
+test_expect_success 'fsck warns about zero-padded file modes, even with --strict' '
+	git init zero-padded &&
+	(
+		cd zero-padded &&
+		test_commit base file content &&
+		normal_tree=$(git rev-parse HEAD:) &&
+		{
+			printf 0 &&
+			git cat-file tree "$normal_tree"
+		} >tree &&
+		tree=$(git hash-object --literally -w -t tree tree) &&
+		commit=$(git commit-tree "$tree" -m "zero-padded mode") &&
+		git update-ref HEAD "$commit" &&
+		cat >expect <<-EOF &&
+		warning in tree $tree: zeroPaddedFilemode: contains zero-padded file modes
+		EOF
+		git fsck 2>err &&
+		test_cmp expect err &&
+		git fsck --strict 2>err &&
+		test_cmp expect err
+	)
+'
+
+test_expect_success 'fsck can reject zero-padded file modes explicitly' '
+	tree=$(git -C zero-padded rev-parse HEAD:) &&
+	test_must_fail git -C zero-padded -c fsck.zeroPaddedFilemode=error \
+		fsck --strict 2>err &&
+	test_grep "error in tree $tree: zeroPaddedFilemode:" err
+'
+
 test_expect_success 'tag pointing to nonexistent' '
 	badoid=$(test_oid deadbeef) &&
 	cat >invalid-tag <<-EOF &&
