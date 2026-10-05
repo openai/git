@@ -159,6 +159,6 @@
 [branch "tn/codex/http-pack-transient-retry"]
 	remote = .
 	source-ref = refs/heads/tn/codex/http-pack-transient-retry
-	source-tip = e1186e8ddfcc19d2f2345b0c7e25eeab1075ddf4
+	source-tip = 540401f2f3be07bfa4c9cf32ec99c8cad7e5bcd1
 	source-base = bd3090bbf2e02e230c4a816288512eab27cb289f
 	merge = refs/heads/af/codex/packfile-uri-credentials
