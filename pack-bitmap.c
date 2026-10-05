@@ -513,10 +513,9 @@ static int open_midx_bitmap(struct bitmap_index *bitmap_git,
 		goto cleanup;
 	}
 
-	for (i = 0; i < bitmap_git->midx->num_packs + bitmap_git->midx->num_packs_in_base; i++) {
-		if (prepare_midx_pack(bitmap_git->midx, i)) {
-			warning(_("could not open pack %s"),
-				bitmap_git->midx->pack_names[i]);
+	for (i = 0; i < midx->num_packs; i++) {
+		if (prepare_midx_pack(midx, midx->num_packs_in_base + i)) {
+			warning(_("could not open pack %s"), midx->pack_names[i]);
 			goto cleanup;
 		}
 	}
@@ -1944,7 +1943,7 @@ static void filter_bitmap_blob_limit(struct bitmap_index *bitmap_git,
 	}
 
 	for (i = 0; i < eindex->count; i++) {
-		size_t pos = st_add(i, bitmap_num_objects(bitmap_git));
+		size_t pos = st_add(i, bitmap_num_objects_total(bitmap_git));
 		if (eindex->objects[i]->type == OBJ_BLOB &&
 		    bitmap_get(to_filter, pos) &&
 		    !bitmap_get(tips, pos) &&
@@ -2092,7 +2091,7 @@ int for_each_bitmapped_object(struct bitmap_index *bitmap_git,
 		goto out;
 	}
 
-	objects_nr = bitmap_num_objects(bitmap_git);
+	objects_nr = bitmap_num_objects_total(bitmap_git);
 	full_word_count = objects_nr / BITS_IN_EWORD;
 
 	/* We start from the all-1 bitmap and then filter down from there. */

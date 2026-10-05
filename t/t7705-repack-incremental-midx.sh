@@ -522,4 +522,104 @@ test_expect_success 'repack rejects invalid midxNewLayerThreshold' '
 	)
 '
 
+test_expect_success 'failed MIDX write does not publish its checksum' '
+	git init failed-midx-write &&
+	(
+		cd failed-midx-write &&
+		test_commit_bulk 3 &&
+		git multi-pack-index write --incremental &&
+		cp "$midx_chain" before &&
+		test_commit extra &&
+		git repack -d &&
+		layer=$(git multi-pack-index write --incremental --no-write-chain-file) &&
+		rm "$midxdir/multi-pack-index-$layer.midx" &&
+		mkdir "$midxdir/multi-pack-index-$layer.midx" &&
+		ls "$packdir"/pack-*.pack >packs.before &&
+
+		test_must_fail git -c repack.midxNewLayerThreshold=100 \
+			repack --geometric=2 -d --write-midx=incremental 2>err &&
+		test_grep "unable to execute compaction step" err &&
+		test_cmp before "$midx_chain" &&
+		ls "$packdir"/pack-*.pack >packs.after &&
+		test_cmp packs.before packs.after &&
+		rmdir "$midxdir/multi-pack-index-$layer.midx" &&
+		git multi-pack-index verify
+	)
+'
+
+test_lazy_prereq ULIMIT_FSIZE '
+	(ulimit -f 1 && trap "" XFSZ)
+'
+
+with_small_file_limit () (
+	ulimit -f 1 &&
+	trap "" XFSZ &&
+	"$@"
+)
+
+test_expect_success ULIMIT_FSIZE 'failed chain publication leaves the old chain intact' '
+	git init failed-chain-write &&
+	(
+		cd failed-chain-write &&
+		for i in $(test_seq 1 26)
+		do
+			echo "$i" | git hash-object -w --stdin >oid &&
+			git pack-objects "$packdir/pack" <oid &&
+			git multi-pack-index write --incremental || return 1
+		done &&
+		cp "$midx_chain" before &&
+		ls "$packdir"/pack-*.pack >packs.before &&
+		test_expect_code 255 with_small_file_limit \
+			git repack --write-midx=incremental >/dev/null 2>err &&
+		test_grep "could not write multi-pack-index chain" err &&
+		test_cmp before "$midx_chain" &&
+		ls "$packdir"/pack-*.pack >packs.after &&
+		test_cmp packs.before packs.after &&
+		test_path_is_missing "$midx_chain.lock" &&
+		git multi-pack-index verify
+	)
+'
+
+test_expect_success 'repacking duplicates does not append an empty layer' '
+	git init duplicate-packs &&
+	(
+		cd duplicate-packs &&
+		test_commit_bulk 10 &&
+		git multi-pack-index write --incremental &&
+		cp "$midx_chain" before &&
+		for rev in HEAD HEAD^{tree}
+		do
+			git rev-parse "$rev" >oid &&
+			git pack-objects "$packdir/pack" <oid || return 1
+		done &&
+
+		git -c repack.midxNewLayerThreshold=100 repack \
+			--geometric=2 -d --write-midx=incremental &&
+		test_cmp before "$midx_chain" &&
+		git multi-pack-index verify &&
+		git fsck
+	)
+'
+
+test_expect_success 'repacking layers without reverse indexes' '
+	git init no-reverse-index &&
+	(
+		cd no-reverse-index &&
+		for i in 1 2 3 4
+		do
+			echo "$i" | git hash-object -w --stdin >oid &&
+			git pack-objects "$packdir/pack" <oid &&
+			if test "$i" -le 2
+			then
+				git multi-pack-index write --incremental
+			fi || return 1
+		done &&
+		git -c repack.midxNewLayerThreshold=100 repack \
+			--geometric=2 -d --write-midx=incremental &&
+		test_line_count = 1 "$midx_chain" &&
+		git multi-pack-index verify &&
+		git fsck
+	)
+'
+
 test_done

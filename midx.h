@@ -10,6 +10,7 @@ struct bitmapped_pack;
 struct git_hash_algo;
 struct odb_source;
 struct strvec;
+struct lock_file;
 
 #define MIDX_SIGNATURE 0x4d494458 /* "MIDX" */
 #define MIDX_VERSION_V1 1
@@ -85,6 +86,8 @@ struct multi_pack_index {
 #define MIDX_WRITE_INCREMENTAL (1 << 5)
 #define MIDX_WRITE_COMPACT (1 << 6)
 #define MIDX_WRITE_NO_CHAIN (1 << 7)
+/* Internal: the caller holds the object store's MIDX writer lock. */
+#define MIDX_WRITE_LOCK_HELD (1 << 8)
 
 #define MIDX_EXT_REV "rev"
 #define MIDX_EXT_BITMAP "bitmap"
@@ -103,6 +106,7 @@ void get_split_midx_filename_ext(struct odb_source_packed *source, struct strbuf
 struct multi_pack_index *get_multi_pack_index(struct odb_source_packed *source);
 struct multi_pack_index *load_multi_pack_index(struct odb_source_packed *source);
 int prepare_midx_pack(struct multi_pack_index *m, uint32_t pack_int_id);
+void clear_midx_pack_errors(struct multi_pack_index *m);
 struct packed_git *nth_midxed_pack(struct multi_pack_index *m,
 				   uint32_t pack_int_id);
 int nth_bitmapped_pack(struct multi_pack_index *m,
@@ -117,8 +121,25 @@ uint32_t nth_midxed_pack_int_id(struct multi_pack_index *m, uint32_t pos);
 struct object_id *nth_midxed_object_oid(struct object_id *oid,
 					struct multi_pack_index *m,
 					uint32_t n);
-int fill_midx_entry(struct multi_pack_index *m, const struct object_id *oid,
-		    struct pack_entry *e, struct packed_git **bad_pack);
+/*
+ * Result of looking an object up in a multi-pack-index.  MIDX_FILL_HIT means
+ * "e was filled in"; the two miss variants distinguish an object the midx does
+ * not know about (MIDX_FILL_MISS) from one it does know about but whose owning
+ * pack is unavailable or whose selected copy is corrupt
+ * (MIDX_FILL_OWNER_UNAVAILABLE). A known-bad object also sets *bad_pack, if
+ * provided, to the owning pack so the caller can tell "corrupt" apart from
+ * "absent".
+ */
+enum midx_fill_result {
+	MIDX_FILL_MISS = 0,
+	MIDX_FILL_HIT,
+	MIDX_FILL_OWNER_UNAVAILABLE,
+};
+
+enum midx_fill_result midx_fill_entry(struct multi_pack_index *m,
+				      const struct object_id *oid,
+				      struct pack_entry *e,
+				      struct packed_git **bad_pack);
 int midx_contains_pack(struct multi_pack_index *m,
 		       const char *idx_or_pack_name);
 int midx_layer_contains_pack(struct multi_pack_index *m,
@@ -132,7 +153,7 @@ int prepare_multi_pack_index_one(struct odb_source_packed *source);
  */
 int write_midx_file(struct odb_source_packed *source,
 		    const char *preferred_pack_name, const char *refs_snapshot,
-		    unsigned flags);
+		    const char *incremental_base, unsigned flags);
 int write_midx_file_only(struct odb_source_packed *source,
 			 struct string_list *packs_to_include,
 			 const char *preferred_pack_name,
@@ -144,6 +165,9 @@ int write_midx_file_compact(struct odb_source_packed *source,
 			    struct multi_pack_index *to,
 			    const char *incremental_base,
 			    unsigned flags);
+void hold_midx_write_lock(struct odb_source_packed *source,
+			  struct lock_file *lock);
+/* The caller must hold the MIDX writer lock while clearing files. */
 void clear_midx_file(struct repository *r);
 void clear_incremental_midx_files(struct repository *r,
 				  const struct strvec *keep_hashes);

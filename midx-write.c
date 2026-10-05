@@ -115,6 +115,7 @@ struct write_midx_context {
 	struct multi_pack_index *compact_from;
 	struct multi_pack_index *compact_to;
 	int compact;
+	int compact_reuse;
 
 	struct string_list *to_include;
 
@@ -133,28 +134,41 @@ static uint32_t midx_pack_perm(struct write_midx_context *ctx,
 static int should_include_pack(const struct write_midx_context *ctx,
 			       const char *file_name)
 {
+	struct multi_pack_index *m = ctx->m;
 	/*
-	 * Note that at most one of ctx->m and ctx->to_include are set,
-	 * so we are testing midx_contains_pack() and
-	 * string_list_has_string() independently (guarded by the
-	 * appropriate NULL checks).
-	 *
-	 * We could support passing to_include while reusing an existing
-	 * MIDX, but don't currently since the reuse process drags
-	 * forward all packs from an existing MIDX (without checking
-	 * whether or not they appear in the to_include list).
-	 *
-	 * If we added support for that, these next two conditional
-	 * should be performed independently (likely checking
-	 * to_include before the existing MIDX).
+	 * When writing incrementally, ctx->m may contain layers above
+	 * the selected base MIDX, which must be included in the new
+	 * layer.
 	 */
-	if (ctx->m && midx_contains_pack(ctx->m, file_name))
+	if (ctx->incremental)
+		m = ctx->base_midx;
+
+	/*
+	 * Note that it is OK for both ctx->base_midx and
+	 * ctx->to_include to be non-NULL, but at most one of ctx->m
+	 * and ctx->to_include may be non-NULL.
+	 *
+	 * When ctx->m is NULL we are writing a new MIDX without reusing
+	 * any packs from the previous layer(s). In that case, we care
+	 * that both:
+	 *
+	 *   - the new layer's base MIDX (ctx->base_midx) does not
+	 *     already contain the pack we are considering, or the new
+	 *     layer has no base (including --incremental --base=none)
+	 *
+	 *   - the pack appears in ctx->to_include, or ctx->to_include
+	 *     is NULL, meaning that we can include any pack provided
+	 *     the above condition is met.
+	 *
+	 * When ctx->m is non-NULL for a non-incremental write, we reuse
+	 * its packs without checking ctx->to_include. We could support
+	 * filtering those packs too, but currently don't. Incremental
+	 * writes instead exclude only packs covered by ctx->base_midx.
+	 */
+	if (ctx->to_include &&
+	    !string_list_has_string(ctx->to_include, file_name))
 		return 0;
-	else if (ctx->base_midx && midx_contains_pack(ctx->base_midx,
-						      file_name))
-		return 0;
-	else if (ctx->to_include &&
-		 !string_list_has_string(ctx->to_include, file_name))
+	if (m && midx_contains_pack(m, file_name))
 		return 0;
 	return 1;
 }
@@ -372,6 +386,19 @@ static void midx_fanout_add_compact(struct midx_fanout *fanout,
 
 	ASSERT(ctx->compact);
 
+	if (!ctx->compact_reuse) {
+		for (uint32_t i = 0; i < ctx->nr; i++) {
+			size_t start = fanout->nr;
+
+			midx_fanout_add_pack_fanout(fanout, ctx->info, i,
+						    i == ctx->preferred_pack_idx,
+						    cur_fanout);
+			for (size_t j = start; j < fanout->nr; j++)
+				fanout->entries[j].pack_int_id = ctx->info[i].orig_pack_int_id;
+		}
+		return;
+	}
+
 	while (m && m != ctx->compact_from->base_midx) {
 		midx_fanout_add_midx_fanout_1(fanout, m, cur_fanout,
 					      NO_PREFERRED_PACK);
@@ -432,7 +459,8 @@ static void compute_sorted_entries(struct write_midx_context *ctx,
 			if (cur_object && oideq(&fanout.entries[cur_object - 1].oid,
 						&fanout.entries[cur_object].oid))
 				continue;
-			if (ctx->incremental && ctx->base_midx &&
+			/* Reused entries already exclude objects in their base. */
+			if (ctx->incremental && !ctx->compact_reuse && ctx->base_midx &&
 			    midx_has_oid(ctx->base_midx,
 					 &fanout.entries[cur_object].oid))
 				continue;
@@ -675,7 +703,7 @@ static uint32_t *midx_pack_order(struct write_midx_context *ctx)
 		struct pack_midx_entry *e = &ctx->entries[i];
 		data[i].nr = i;
 		data[i].pack = midx_pack_perm(ctx, e->pack_int_id);
-		if (!e->preferred || ctx->compact)
+		if (!e->preferred || ctx->compact_reuse)
 			data[i].pack |= (1U << 31);
 		data[i].offset = e->offset;
 	}
@@ -1021,6 +1049,8 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 					     ctx->compact_to);
 
 	ALLOC_GROW(ctx->info, packs_nr, ctx->alloc);
+	/* Layers are visited newest first, leaving holes until the end. */
+	memset(ctx->info, 0, st_mult(packs_nr, sizeof(*ctx->info)));
 
 	while (m != ctx->compact_from->base_midx) {
 		uint32_t pack_int_id, preferred_pack_id;
@@ -1037,7 +1067,7 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 
 		if (fill_pack_from_midx(&ctx->info[pack_int_id++], m,
 					preferred_pack_id) < 0)
-			return -1;
+			goto error;
 
 		for (i = m->num_packs_in_base;
 		     i < m->num_packs_in_base + m->num_packs; i++) {
@@ -1046,7 +1076,7 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 
 			if (fill_pack_from_midx(&ctx->info[pack_int_id++], m,
 						i) < 0)
-				return -1;
+				goto error;
 		}
 
 		ctx->nr += m->num_packs;
@@ -1055,7 +1085,22 @@ static int fill_packs_from_midx_range(struct write_midx_context *ctx,
 
 	ASSERT(ctx->nr == packs_nr);
 
+	if (!ctx->compact_reuse) {
+		for (size_t i = 0; i < ctx->nr; i++) {
+			if (open_pack_index(ctx->info[i].p)) {
+				error(_("failed to open pack-index '%s'"),
+				      ctx->info[i].pack_name);
+				goto error;
+			}
+		}
+	}
+
 	return 0;
+
+error:
+	/* Include initialized slots beyond the completed layers in cleanup. */
+	ctx->nr = packs_nr;
+	return -1;
 }
 
 static struct {
@@ -1066,6 +1111,44 @@ static struct {
 	{MIDX_EXT_BITMAP, MIDX_EXT_BITMAP},
 	{MIDX_EXT_REV, MIDX_EXT_REV},
 };
+
+static int link_midx_file(const char *from, const char *to)
+{
+	struct stat from_stat, to_stat;
+	int saved_errno;
+
+	if (!link(from, to) || errno == ENOENT)
+		return 0;
+	saved_errno = errno;
+
+	/* An interrupted promotion may have linked this file already. */
+	if (saved_errno == EEXIST &&
+	    !lstat(from, &from_stat) && !lstat(to, &to_stat) &&
+	    from_stat.st_ino &&
+	    from_stat.st_dev == to_stat.st_dev &&
+	    from_stat.st_ino == to_stat.st_ino)
+		return 0;
+
+	errno = saved_errno;
+	return error_errno(_("unable to link '%s' to '%s'"), from, to);
+}
+
+static int check_midx_link(struct multi_pack_index *m, const char *path)
+{
+	const struct git_hash_algo *algop = m->source->base.odb->repo->hash_algo;
+	unsigned char hash[GIT_MAX_RAWSZ];
+	int fd, ret = 0;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return error_errno(_("unable to open promoted multi-pack-index '%s'"), path);
+	if (lseek(fd, -(off_t)algop->rawsz, SEEK_END) < 0 ||
+	    read_in_full(fd, hash, algop->rawsz) != (ssize_t)algop->rawsz ||
+	    hashcmp(hash, midx_get_checksum_hash(m), algop))
+		ret = error(_("multi-pack-index changed during promotion"));
+	close(fd);
+	return ret;
+}
 
 static int link_midx_to_chain(struct multi_pack_index *m)
 {
@@ -1091,11 +1174,11 @@ static int link_midx_to_chain(struct multi_pack_index *m)
 		get_split_midx_filename_ext(m->source, &to, hash,
 					    midx_exts[i].split);
 
-		if (link(from.buf, to.buf) < 0 && errno != ENOENT) {
-			ret = error_errno(_("unable to link '%s' to '%s'"),
-					  from.buf, to.buf);
+		ret = link_midx_file(from.buf, to.buf);
+		if (!ret && !midx_exts[i].non_split)
+			ret = check_midx_link(m, to.buf);
+		if (ret)
 			goto done;
-		}
 
 		strbuf_reset(&from);
 		strbuf_reset(&to);
@@ -1126,11 +1209,8 @@ static void clear_midx_files(struct odb_source_packed *source,
 
 	for (i = 0; i < ARRAY_SIZE(exts); i++) {
 		clear_incremental_midx_files_ext(source, exts[i], hashes);
-		if (hashes) {
-			for (size_t j = 0; j < hashes->nr; j++)
-				clear_midx_files_ext(source, exts[i],
-						     hashes->v[j]);
-		}
+		clear_midx_files_ext(source, exts[i],
+				    incremental ? NULL : hashes->v[0]);
 	}
 
 	if (incremental)
@@ -1151,6 +1231,14 @@ static bool midx_needs_update(struct multi_pack_index *midx, struct write_midx_c
 	bool needed = true;
 
 	/*
+	 * Incremental writes either add a new pack or bail out later when
+	 * there is nothing to add. Compaction always requires an update.
+	 * Neither can reuse the existing MIDX unchanged.
+	 */
+	if (ctx->incremental || ctx->compact)
+		return true;
+
+	/*
 	 * Ensure that we have a valid checksum before consulting the
 	 * existing MIDX in order to determine if we can avoid an
 	 * update.
@@ -1169,17 +1257,6 @@ static bool midx_needs_update(struct multi_pack_index *midx, struct write_midx_c
 	 */
 	if (midx->version != ctx->version)
 		goto out;
-
-	/*
-	 * Ignore incremental updates for now. The assumption is that any
-	 * incremental update would be either empty (in which case we will bail
-	 * out later) or it would actually cover at least one new pack.
-	 */
-	if (ctx->incremental)
-		goto out;
-
-	if (ctx->compact)
-		goto out; /* Compaction always requires an update. */
 
 	/*
 	 * Otherwise, we need to verify that the packs covered by the existing
@@ -1259,6 +1336,7 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	uint32_t start_pack;
 	struct hashfile *f = NULL;
 	struct lock_file lk = LOCK_INIT;
+	struct lock_file write_lock = LOCK_INIT;
 	struct tempfile *incr;
 	struct write_midx_context ctx = {
 		.preferred_pack_idx = NO_PREFERRED_PACK,
@@ -1272,6 +1350,9 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	struct chunkfile *cf;
 
 	trace2_region_enter("midx", "write_midx_internal", r);
+
+	if (!(opts->flags & MIDX_WRITE_LOCK_HELD))
+		hold_midx_write_lock(opts->source, &write_lock);
 
 	ctx.repo = r;
 	ctx.source = opts->source;
@@ -1357,6 +1438,21 @@ static int write_midx_internal(struct write_midx_opts *opts)
 		}
 	}
 
+	if (ctx.compact) {
+		/* A standalone MIDX must index every object in its packs. */
+		if (!ctx.incremental)
+			ctx.base_midx = NULL;
+		ctx.compact_reuse = ctx.base_midx == ctx.compact_from->base_midx;
+
+		/* Retained layers depend on their original bitmap positions. */
+		if (!ctx.compact_reuse && ctx.incremental &&
+		    !(opts->flags & MIDX_WRITE_NO_CHAIN) &&
+		    ctx.compact_to != ctx.m) {
+			error(_("cannot change the base when retaining layers above the compacted range"));
+			goto cleanup;
+		}
+	}
+
 	ctx.nr = 0;
 	ctx.alloc = ctx.m ? ctx.m->num_packs + ctx.m->num_packs_in_base : 16;
 	ctx.info = NULL;
@@ -1393,14 +1489,15 @@ static int write_midx_internal(struct write_midx_opts *opts)
 		else if (opts->flags & (MIDX_WRITE_REV_INDEX | MIDX_WRITE_BITMAP))
 			bitmap_order |= 1;
 
-		fill_packs_from_midx_range(&ctx, bitmap_order);
+		if (fill_packs_from_midx_range(&ctx, bitmap_order) < 0)
+			goto cleanup;
 	} else {
 		ctx.to_include = opts->packs_to_include;
 		for_each_file_in_pack_dir(opts->source->base.path, add_pack_to_midx, &ctx);
 	}
 	stop_progress(&ctx.progress);
 
-	if (!opts->packs_to_drop) {
+	if (!opts->packs_to_drop && !ctx.incremental && !ctx.compact) {
 		/*
 		 * If there is no MIDX then either it doesn't exist, or we're
 		 * doing a geometric repack. Try to load it from the source to
@@ -1617,9 +1714,8 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	}
 
 	if (!ctx.entries_nr) {
-		if (opts->flags & MIDX_WRITE_BITMAP)
-			warning(_("refusing to write multi-pack .bitmap without any objects"));
-		opts->flags &= ~(MIDX_WRITE_REV_INDEX | MIDX_WRITE_BITMAP);
+		result = 0;
+		goto cleanup;
 	}
 
 	if (ctx.incremental) {
@@ -1760,6 +1856,7 @@ static int write_midx_internal(struct write_midx_opts *opts)
 
 		if (rename_tempfile(&incr, final_midx_name.buf) < 0) {
 			error_errno(_("unable to rename new multi-pack-index layer"));
+			strbuf_release(&final_midx_name);
 			goto cleanup;
 		}
 
@@ -1827,6 +1924,8 @@ static int write_midx_internal(struct write_midx_opts *opts)
 	result = 0;
 
 cleanup:
+	rollback_lock_file(&lk);
+	rollback_lock_file(&write_lock);
 	for (size_t i = 0; i < ctx.nr; i++) {
 		if (ctx.info[i].p) {
 			close_pack(ctx.info[i].p);
@@ -1851,12 +1950,14 @@ cleanup:
 int write_midx_file(struct odb_source_packed *source,
 		    const char *preferred_pack_name,
 		    const char *refs_snapshot,
+		    const char *incremental_base,
 		    unsigned flags)
 {
 	struct write_midx_opts opts = {
 		.source = source,
 		.preferred_pack_name = preferred_pack_name,
 		.refs_snapshot = refs_snapshot,
+		.incremental_base = incremental_base,
 		.flags = flags,
 	};
 
@@ -1903,11 +2004,14 @@ int expire_midx_packs(struct odb_source_packed *source, unsigned flags)
 {
 	uint32_t i, *count, result = 0;
 	struct string_list packs_to_drop = STRING_LIST_INIT_DUP;
-	struct multi_pack_index *m = get_multi_pack_index(source);
+	struct multi_pack_index *m;
+	struct lock_file write_lock = LOCK_INIT;
 	struct progress *progress = NULL;
 
+	hold_midx_write_lock(source, &write_lock);
+	m = get_multi_pack_index(source);
 	if (!m)
-		return 0;
+		goto cleanup;
 
 	if (m->base_midx)
 		die(_("cannot expire packs from an incremental multi-pack-index"));
@@ -1959,11 +2063,13 @@ int expire_midx_packs(struct odb_source_packed *source, unsigned flags)
 		struct write_midx_opts opts = {
 			.source = source,
 			.packs_to_drop = &packs_to_drop,
-			.flags = flags & MIDX_PROGRESS,
+			.flags = (flags & MIDX_PROGRESS) | MIDX_WRITE_LOCK_HELD,
 		};
 		result = write_midx_internal(&opts);
 	}
 
+cleanup:
+	rollback_lock_file(&write_lock);
 	string_list_clear(&packs_to_drop, 0);
 
 	return result;
@@ -2091,13 +2197,14 @@ int midx_repack(struct odb_source_packed *source, size_t batch_size, unsigned fl
 	struct repository *r = source->base.odb->repo;
 	int result = 0;
 	uint32_t i, packs_to_repack = 0;
-	unsigned char *include_pack;
+	unsigned char *include_pack = NULL;
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	FILE *cmd_in;
-	struct multi_pack_index *m = get_multi_pack_index(source);
+	struct multi_pack_index *m;
+	struct lock_file write_lock = LOCK_INIT;
 	struct write_midx_opts opts = {
 		.source = source,
-		.flags = flags,
+		.flags = flags | MIDX_WRITE_LOCK_HELD,
 	};
 
 	/*
@@ -2108,8 +2215,10 @@ int midx_repack(struct odb_source_packed *source, size_t batch_size, unsigned fl
 	int delta_base_offset = 1;
 	int use_delta_islands = 0;
 
+	hold_midx_write_lock(source, &write_lock);
+	m = get_multi_pack_index(source);
 	if (!m)
-		return 0;
+		goto cleanup;
 	if (m->base_midx)
 		die(_("cannot repack an incremental multi-pack-index"));
 
@@ -2176,6 +2285,7 @@ int midx_repack(struct odb_source_packed *source, size_t batch_size, unsigned fl
 	result = write_midx_internal(&opts);
 
 cleanup:
+	rollback_lock_file(&write_lock);
 	free(include_pack);
 	return result;
 }

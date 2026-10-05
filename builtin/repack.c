@@ -9,6 +9,7 @@
 #include "server-info.h"
 #include "string-list.h"
 #include "midx.h"
+#include "lockfile.h"
 #include "packfile.h"
 #include "prune-packed.h"
 #include "promisor-remote.h"
@@ -167,6 +168,7 @@ int cmd_repack(int argc,
 	struct oidset drop_oids = OIDSET_INIT;
 	struct pack_geometry geometry = { 0 };
 	struct tempfile *refs_snapshot = NULL;
+	struct lock_file midx_write_lock = LOCK_INIT;
 	int i, ret;
 	int show_progress;
 
@@ -276,6 +278,9 @@ int cmd_repack(int argc,
 
 	argc = parse_options(argc, argv, prefix, builtin_repack_options,
 				git_repack_usage, 0);
+
+	hold_midx_write_lock(odb_source_files_downcast(repo->objects->sources)->packed,
+			     &midx_write_lock);
 
 	po_args.window = xstrdup_or_null(opt_window);
 	po_args.window_memory = xstrdup_or_null(opt_window_memory);
@@ -771,14 +776,15 @@ int cmd_repack(int argc,
 
 	if (git_env_bool(GIT_TEST_MULTI_PACK_INDEX, 0)) {
 		struct odb_source_files *files = odb_source_files_downcast(existing.source);
-		unsigned flags = 0;
+		unsigned flags = MIDX_WRITE_LOCK_HELD;
 
 		if (git_env_bool(GIT_TEST_MULTI_PACK_INDEX_WRITE_INCREMENTAL, 0))
 			flags |= MIDX_WRITE_INCREMENTAL;
-		write_midx_file(files->packed, NULL, NULL, flags);
+		write_midx_file(files->packed, NULL, NULL, NULL, flags);
 	}
 
 cleanup:
+	rollback_lock_file(&midx_write_lock);
 	string_list_clear(&keep_pack_list, 0);
 	string_list_clear(&names, 1);
 	oidset_clear(&drop_oids);
