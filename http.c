@@ -350,6 +350,18 @@ static void finish_active_slot(struct active_request_slot *slot)
 
 		curl_easy_getinfo(slot->curl, CURLINFO_HTTP_CONNECTCODE,
 			&slot->results->http_connectcode);
+		slot->results->retry_after = -1;
+#ifdef GIT_CURL_HAVE_CURLINFO_RETRY_AFTER
+		{
+			curl_off_t retry_after;
+
+			if (curl_easy_getinfo(slot->curl, CURLINFO_RETRY_AFTER,
+					      &retry_after) == CURLE_OK &&
+			    retry_after > 0)
+				slot->results->retry_after =
+					retry_after > LONG_MAX ? LONG_MAX : retry_after;
+		}
+#endif
 	}
 
 	/* Run callback if appropriate */
@@ -2286,15 +2298,6 @@ static int http_request(const char *url,
 
 	ret = run_one_slot(slot, &results);
 
-#ifdef GIT_CURL_HAVE_CURLINFO_RETRY_AFTER
-	if (ret == HTTP_RATE_LIMITED) {
-		curl_off_t retry_after;
-		if (curl_easy_getinfo(slot->curl, CURLINFO_RETRY_AFTER,
-				      &retry_after) == CURLE_OK && retry_after > 0)
-			results.retry_after = (long)retry_after;
-	}
-#endif
-
 	options->retry_after = results.retry_after;
 
 	if (options->content_type) {
@@ -2801,7 +2804,7 @@ static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
-	int attempts = 3;
+	int auth_attempts = 3, retries = 0;
 	int ret;
 
 	if (offset < 0)
@@ -2832,15 +2835,26 @@ int run_http_pack_request(struct http_pack_request *preq)
 			break;
 		}
 
-		if (ret != HTTP_REAUTH || !--attempts)
+		/* Never truncate a partial pack to recover from an error response. */
+		if (ftello(preq->packfile) != offset)
 			break;
 
-		/* Never truncate a partial pack to recover from an error response. */
-		if (ftello(preq->packfile) != offset) {
-			ret = HTTP_ERROR;
+		if (ret == HTTP_REAUTH && --auth_attempts) {
+			http_reauth_prepare(1);
+		} else if (results.curl_result != CURLE_HTTP_RETURNED_ERROR) {
 			break;
+		} else {
+			int delay;
+
+			if (retries == 2 ||
+			    (results.http_code != 502 && results.http_code != 503 &&
+			     results.http_code != 504) || results.retry_after > 10)
+				break;
+			delay = (1000 << retries++) + git_rand(0) % 1000;
+			if (results.retry_after * 1000 > delay)
+				delay = results.retry_after * 1000;
+			sleep_millisec(delay);
 		}
-		http_reauth_prepare(1);
 		prepare_http_pack_request(preq, offset);
 	}
 	return ret;

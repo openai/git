@@ -1005,6 +1005,7 @@ test_expect_success 'fetch no-ref-delta requires advertisement' '
 # Test protocol v2 with 'http://' transport
 #
 . "$TEST_DIRECTORY"/lib-httpd.sh
+enable_cgipassauth
 start_httpd
 
 test_expect_success 'create repo to be served by http:// transport' '
@@ -1405,6 +1406,113 @@ test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
 	done <no-ref-uris &&
 	test_grep "Fetching packs: 100% (3/3), $bytes bytes |.*done" no-ref-progress &&
 	test_grep ! "^bytes " no-ref-progress
+'
+
+test_lazy_prereq CURL_RETRY_AFTER '
+	version=$(git version --build-options | sed -n "s/^libcurl: //p") &&
+	major=${version%%.*} &&
+	minor=${version#*.} &&
+	minor=${minor%%.*} &&
+	{ test "$major" -gt 7 || { test "$major" = 7 && test "$minor" -ge 66; }; }
+'
+
+test_expect_success 'set up packfile retries' '
+	read object pack_hash uri <no-ref-uris &&
+	pack="$HTTPD_DOCUMENT_ROOT_PATH/mypack-$pack_hash.pack" &&
+	pack_url="$HTTPD_URL/pack_retry/mypack-$pack_hash.pack" &&
+	test_copy_bytes 12 <"$pack" >pack-prefix
+'
+
+setup_pack_retry () {
+	test_when_finished "rm -rf pack-retry-client" &&
+	git init pack-retry-client &&
+	printf "%s\n" "$@" >"$HTTPD_ROOT_PATH/pack-retry.responses" &&
+	>"$HTTPD_ROOT_PATH/pack-retry.requests"
+}
+
+fetch_pack () {
+	"$@" git -C pack-retry-client -c http.minSessions=0 http-fetch \
+		--packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin "$pack_url"
+}
+
+test_expect_success 'resumed packfile download survives two transient errors' '
+	setup_pack_retry 503 502 200 &&
+	cp pack-prefix "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	fetch_pack &&
+	printf "GET|bytes=12-|\nGET|bytes=12-|\nGET|bytes=12-|\n" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success 'exhausted HTTP 503 retries preserve the partial pack' '
+	setup_pack_retry 503 503 503 200 &&
+	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	cp pack-prefix "$partial" &&
+	fetch_pack test_must_fail &&
+	test_cmp pack-prefix "$partial" &&
+	printf "GET|bytes=12-|\nGET|bytes=12-|\nGET|bytes=12-|\n" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests"
+'
+
+for status in 403 429
+do
+	test_expect_success "HTTP $status is not retried by default" '
+		setup_pack_retry "$status" 200 &&
+		fetch_pack test_must_fail &&
+		test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests"
+	'
+done
+
+test_expect_success 'an interrupted response is not retried or truncated' '
+	setup_pack_retry truncated 200 &&
+	fetch_pack test_must_fail &&
+	test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	test_cmp pack-prefix "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp"
+'
+
+test_expect_success CURL_RETRY_AFTER 'HTTP 503 honors Retry-After' '
+	setup_pack_retry "503 3" 200 &&
+	start=$(test-tool date getnanos) &&
+	fetch_pack &&
+	duration=$(test-tool date getnanos "$start") &&
+	test "${duration%.*}" -ge 3 &&
+	test_line_count = 2 "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success CURL_RETRY_AFTER 'HTTP 503 rejects excessive Retry-After' '
+	setup_pack_retry "503 3600" 200 &&
+	fetch_pack test_must_fail &&
+	test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests"
+'
+
+test_expect_success CGIPASSAUTH 'authentication and 5xx retries have separate limits' '
+	setup_pack_retry 503 401 504 200 &&
+	test_config_global credential.helper "!f() {
+		cat >/dev/null
+		echo capability[]=authtype
+		echo authtype=Bearer
+		echo credential=pack-token
+	}; f" &&
+	fetch_pack &&
+	printf "%s\n" "GET||" "GET||" \
+		"GET||Bearer pack-token" "GET||Bearer pack-token" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests"
+'
+
+test_expect_success 'parallel packfile URI fetch completes after HTTP 503' '
+	read object pack uri <no-ref-uris &&
+	test_when_finished "git -C \"$P\" config --replace-all \
+		uploadpack.blobpackfileuri \"$object $pack $uri\" \"^$object \"" &&
+	git -C "$P" config --replace-all uploadpack.blobpackfileuri \
+		"$object $pack $HTTPD_URL/pack_retry/mypack-$pack.pack" "^$object " &&
+	printf "%s\n" 503 200 >"$HTTPD_ROOT_PATH/pack-retry.responses" &&
+	>"$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	GIT_TEST_SIDEBAND_ALL=1 git -c protocol.version=2 \
+		-c fetch.uriprotocols=http -c fetch.packfileUriJobs=2 \
+		clone "$HTTPD_URL/smart/http_parent" http_child-retry &&
+	test_line_count = 2 "$HTTPD_ROOT_PATH/pack-retry.requests"
 '
 
 test_expect_success 'parallel URI progress respects quiet and no-progress' '
