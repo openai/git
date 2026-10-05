@@ -21,6 +21,7 @@
 	topic = refs/heads/af/codex/http-auth-retry-redirect-v2
 	topic = refs/heads/tb/codex/incremental-midx
 	topic = refs/heads/tb/codex/debian12-http2-auth
+	topic = refs/heads/tn/codex/http-pack-transient-retry
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -154,3 +155,10 @@
 	source-tip = 003e6089a2598e2f37eb2326ab3947836ebb86c0
 	source-base = 50f753ee38ef84de2fc22ca5cdde6698f0479f85
 	merge = refs/heads/tb/codex/remote-curl-gzip-reauth
+
+[branch "tn/codex/http-pack-transient-retry"]
+	remote = .
+	source-ref = refs/heads/tn/codex/http-pack-transient-retry
+	source-tip = e1186e8ddfcc19d2f2345b0c7e25eeab1075ddf4
+	source-base = bd3090bbf2e02e230c4a816288512eab27cb289f
+	merge = refs/heads/af/codex/packfile-uri-credentials
