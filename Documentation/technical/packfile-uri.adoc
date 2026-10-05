@@ -67,6 +67,8 @@ Pack downloads retry HTTP 502, 503, and 504 up to twice, after one and two
 seconds plus up to one second of jitter. With libcurl 7.66.0 or newer,
 `Retry-After` can extend the delay up to ten seconds; longer requested delays
 fail without retrying. Interrupted pack transfers are not retried.
+HTTP 429 uses `http.maxRetries`, `http.retryAfter`, and `http.maxRetryTime`
+(disabled by default).
 
 When the client downloads the given URIs, it should store them with "keep"
 files, just like it does with the packfile in the `packfile` section. These
