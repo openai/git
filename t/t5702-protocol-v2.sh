@@ -1445,15 +1445,19 @@ test_expect_success 'resumed packfile download survives two transient errors' '
 	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
 '
 
-test_expect_success 'exhausted HTTP 503 retries preserve the partial pack' '
-	setup_pack_retry 503 503 503 200 &&
-	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
-	cp pack-prefix "$partial" &&
-	fetch_pack test_must_fail &&
-	test_cmp pack-prefix "$partial" &&
-	printf "GET|bytes=12-|\nGET|bytes=12-|\nGET|bytes=12-|\n" >expect &&
-	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests"
-'
+for status in 429 503
+do
+	test_expect_success "exhausted HTTP $status retries preserve the partial pack" '
+		setup_pack_retry "$status" "$status" "$status" 200 &&
+		test_config_global http.maxRetries 3 &&
+		partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+		cp pack-prefix "$partial" &&
+		fetch_pack test_must_fail &&
+		test_cmp pack-prefix "$partial" &&
+		printf "GET|bytes=12-|\nGET|bytes=12-|\nGET|bytes=12-|\n" >expect &&
+		test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests"
+	'
+done
 
 for status in 403 429
 do
@@ -1487,8 +1491,9 @@ test_expect_success CURL_RETRY_AFTER 'HTTP 503 rejects excessive Retry-After' '
 	test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests"
 '
 
-test_expect_success CGIPASSAUTH 'authentication and 5xx retries have separate limits' '
-	setup_pack_retry 503 401 504 200 &&
+test_expect_success CGIPASSAUTH 'authentication, HTTP 429 and 5xx retries have separate limits' '
+	setup_pack_retry 503 401 429 504 429 200 &&
+	test_config_global http.maxRetries 3 &&
 	test_config_global credential.helper "!f() {
 		cat >/dev/null
 		echo capability[]=authtype
@@ -1497,22 +1502,24 @@ test_expect_success CGIPASSAUTH 'authentication and 5xx retries have separate li
 	}; f" &&
 	fetch_pack &&
 	printf "%s\n" "GET||" "GET||" \
+		"GET||Bearer pack-token" "GET||Bearer pack-token" \
 		"GET||Bearer pack-token" "GET||Bearer pack-token" >expect &&
 	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests"
 '
 
-test_expect_success 'parallel packfile URI fetch completes after HTTP 503' '
+test_expect_success 'parallel packfile URI fetch completes after HTTP 503 and 429' '
+	test_config_global http.maxRetries 3 &&
 	read object pack uri <no-ref-uris &&
 	test_when_finished "git -C \"$P\" config --replace-all \
 		uploadpack.blobpackfileuri \"$object $pack $uri\" \"^$object \"" &&
 	git -C "$P" config --replace-all uploadpack.blobpackfileuri \
 		"$object $pack $HTTPD_URL/pack_retry/mypack-$pack.pack" "^$object " &&
-	printf "%s\n" 503 200 >"$HTTPD_ROOT_PATH/pack-retry.responses" &&
+	printf "%s\n" 503 429 200 >"$HTTPD_ROOT_PATH/pack-retry.responses" &&
 	>"$HTTPD_ROOT_PATH/pack-retry.requests" &&
 	GIT_TEST_SIDEBAND_ALL=1 git -c protocol.version=2 \
 		-c fetch.uriprotocols=http -c fetch.packfileUriJobs=2 \
 		clone "$HTTPD_URL/smart/http_parent" http_child-retry &&
-	test_line_count = 2 "$HTTPD_ROOT_PATH/pack-retry.requests"
+	test_line_count = 3 "$HTTPD_ROOT_PATH/pack-retry.requests"
 '
 
 test_expect_success 'parallel URI progress respects quiet and no-progress' '

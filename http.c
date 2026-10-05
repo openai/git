@@ -2371,9 +2371,8 @@ static int update_url_from_redirect(struct strbuf *base,
 }
 
 /*
- * Compute the retry delay for an HTTP 429 response.
- * Returns a negative value if configuration is invalid (delay exceeds
- * http.maxRetryTime), otherwise returns the delay in seconds (>= 0).
+ * Wait before retrying an HTTP 429 response. Return a negative value if
+ * the delay is invalid, otherwise the number of seconds waited.
  */
 static long handle_rate_limit_retry(long slot_retry_after)
 {
@@ -2389,7 +2388,6 @@ static long handle_rate_limit_retry(long slot_retry_after)
 				  "http/429-requested-delay", slot_retry_after);
 			return -1;
 		}
-		return slot_retry_after;
 	} else {
 		/* No Retry-After header provided, use configured default */
 		if (http_retry_after > http_max_retry_time) {
@@ -2401,8 +2399,16 @@ static long handle_rate_limit_retry(long slot_retry_after)
 		}
 		trace2_data_string("http", the_repository,
 			"http/429-retry-source", "config-default");
-		return http_retry_after;
+		slot_retry_after = http_retry_after;
 	}
+
+	if (slot_retry_after > 0) {
+		warning(_("rate limited, waiting %ld seconds before retry"), slot_retry_after);
+		trace2_data_intmax("http", the_repository,
+				   "http/retry-sleep-seconds", slot_retry_after);
+		sleep(slot_retry_after);
+	}
+	return slot_retry_after;
 }
 
 static int http_request_recoverable(const char *url,
@@ -2439,7 +2445,6 @@ static int http_request_recoverable(const char *url,
 
 	while ((ret == HTTP_REAUTH && --i) ||
 	       (ret == HTTP_RATE_LIMITED && --rate_limit_retries)) {
-		long retry_delay = -1;
 		/*
 		 * The previous request may have put cruft into our output stream; we
 		 * should clear it out before making our next request.
@@ -2465,16 +2470,8 @@ static int http_request_recoverable(const char *url,
 			BUG("Unknown http_request target");
 		}
 		if (ret == HTTP_RATE_LIMITED) {
-			retry_delay = handle_rate_limit_retry(options->retry_after);
-			if (retry_delay < 0)
+			if (handle_rate_limit_retry(options->retry_after) < 0)
 				return HTTP_ERROR;
-
-			if (retry_delay > 0) {
-				warning(_("rate limited, waiting %ld seconds before retry"), retry_delay);
-				trace2_data_intmax("http", the_repository,
-						   "http/retry-sleep-seconds", retry_delay);
-				sleep(retry_delay);
-			}
 		} else if (ret == HTTP_REAUTH) {
 			http_reauth_prepare(1);
 		}
@@ -2805,6 +2802,7 @@ int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
 	int auth_attempts = 3, retries = 0;
+	long rate_limit_retries = http_max_retries;
 	int ret;
 
 	if (offset < 0)
@@ -2843,6 +2841,11 @@ int run_http_pack_request(struct http_pack_request *preq)
 			http_reauth_prepare(1);
 		} else if (results.curl_result != CURLE_HTTP_RETURNED_ERROR) {
 			break;
+		} else if (ret == HTTP_RATE_LIMITED) {
+			if (rate_limit_retries <= 1 ||
+			    handle_rate_limit_retry(results.retry_after) < 0)
+				break;
+			rate_limit_retries--;
 		} else {
 			int delay;
 
