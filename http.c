@@ -352,6 +352,18 @@ static void finish_active_slot(struct active_request_slot *slot)
 
 		curl_easy_getinfo(slot->curl, CURLINFO_HTTP_CONNECTCODE,
 			&slot->results->http_connectcode);
+		slot->results->retry_after = -1;
+#ifdef GIT_CURL_HAVE_CURLINFO_RETRY_AFTER
+		{
+			curl_off_t retry_after;
+
+			if (curl_easy_getinfo(slot->curl, CURLINFO_RETRY_AFTER,
+					      &retry_after) == CURLE_OK &&
+			    retry_after > 0)
+				slot->results->retry_after =
+					retry_after > LONG_MAX ? LONG_MAX : retry_after;
+		}
+#endif
 	}
 
 	/* Run callback if appropriate */
@@ -2452,15 +2464,6 @@ static int http_request(const char *url,
 			ret = HTTP_REDIRECT;
 	}
 
-#ifdef GIT_CURL_HAVE_CURLINFO_RETRY_AFTER
-	if (ret == HTTP_RATE_LIMITED) {
-		curl_off_t retry_after;
-		if (curl_easy_getinfo(slot->curl, CURLINFO_RETRY_AFTER,
-				      &retry_after) == CURLE_OK && retry_after > 0)
-			results.retry_after = (long)retry_after;
-	}
-#endif
-
 	options->retry_after = results.retry_after;
 
 	if (options->content_type) {
@@ -2534,9 +2537,8 @@ static int update_url_from_redirect(struct strbuf *base,
 }
 
 /*
- * Compute the retry delay for an HTTP 429 response.
- * Returns a negative value if configuration is invalid (delay exceeds
- * http.maxRetryTime), otherwise returns the delay in seconds (>= 0).
+ * Wait before retrying an HTTP 429 response. Return a negative value if
+ * the delay is invalid, otherwise the number of seconds waited.
  */
 static long handle_rate_limit_retry(long slot_retry_after)
 {
@@ -2552,7 +2554,6 @@ static long handle_rate_limit_retry(long slot_retry_after)
 				  "http/429-requested-delay", slot_retry_after);
 			return -1;
 		}
-		return slot_retry_after;
 	} else {
 		/* No Retry-After header provided, use configured default */
 		if (http_retry_after > http_max_retry_time) {
@@ -2564,8 +2565,16 @@ static long handle_rate_limit_retry(long slot_retry_after)
 		}
 		trace2_data_string("http", the_repository,
 			"http/429-retry-source", "config-default");
-		return http_retry_after;
+		slot_retry_after = http_retry_after;
 	}
+
+	if (slot_retry_after > 0) {
+		warning(_("rate limited, waiting %ld seconds before retry"), slot_retry_after);
+		trace2_data_intmax("http", the_repository,
+				   "http/retry-sleep-seconds", slot_retry_after);
+		sleep(slot_retry_after);
+	}
+	return slot_retry_after;
 }
 
 /* Discard response bodies before following a redirect or retrying a request. */
@@ -2712,13 +2721,6 @@ static int http_request_recoverable(const char *url,
 			retry_delay = handle_rate_limit_retry(options->retry_after);
 			if (retry_delay < 0)
 				return HTTP_ERROR;
-
-			if (retry_delay > 0) {
-				warning(_("rate limited, waiting %ld seconds before retry"), retry_delay);
-				trace2_data_intmax("http", the_repository,
-						   "http/retry-sleep-seconds", retry_delay);
-				sleep(retry_delay);
-			}
 		} else if (ret == HTTP_REAUTH) {
 			http_reauth_prepare(1);
 		}
@@ -3050,7 +3052,8 @@ static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
-	int attempts = 3;
+	int auth_attempts = 3, retries = 0;
+	long rate_limit_retries = http_max_retries;
 	int ret;
 
 	if (offset < 0)
@@ -3081,15 +3084,31 @@ int run_http_pack_request(struct http_pack_request *preq)
 			break;
 		}
 
-		if (ret != HTTP_REAUTH || !--attempts)
+		/* Never truncate a partial pack to recover from an error response. */
+		if (ftello(preq->packfile) != offset)
 			break;
 
-		/* Never truncate a partial pack to recover from an error response. */
-		if (ftello(preq->packfile) != offset) {
-			ret = HTTP_ERROR;
+		if (ret == HTTP_REAUTH && --auth_attempts) {
+			http_reauth_prepare(1);
+		} else if (results.curl_result != CURLE_HTTP_RETURNED_ERROR) {
 			break;
+		} else if (ret == HTTP_RATE_LIMITED) {
+			if (rate_limit_retries <= 1 ||
+			    handle_rate_limit_retry(results.retry_after) < 0)
+				break;
+			rate_limit_retries--;
+		} else {
+			int delay;
+
+			if (retries == 2 ||
+			    (results.http_code != 502 && results.http_code != 503 &&
+			     results.http_code != 504) || results.retry_after > 10)
+				break;
+			delay = (1000 << retries++) + git_rand(0) % 1000;
+			if (results.retry_after * 1000 > delay)
+				delay = results.retry_after * 1000;
+			sleep_millisec(delay);
 		}
-		http_reauth_prepare(1);
 		prepare_http_pack_request(preq, offset);
 	}
 	return ret;

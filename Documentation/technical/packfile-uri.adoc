@@ -63,6 +63,13 @@ for the pack URL, including its path when `credential.useHttpPath` is
 enabled, rather than copied from the fetch negotiation. A pack served by
 another host can use credentials configured for that host.
 
+Pack downloads retry HTTP 502, 503, and 504 up to twice, after one and two
+seconds plus up to one second of jitter. With libcurl 7.66.0 or newer,
+`Retry-After` can extend the delay up to ten seconds; longer requested delays
+fail without retrying. Interrupted pack transfers are not retried.
+HTTP 429 uses `http.maxRetries`, `http.retryAfter`, and `http.maxRetryTime`
+(disabled by default).
+
 When the client downloads the given URIs, it should store them with "keep"
 files, just like it does with the packfile in the `packfile` section. These
 additional "keep" files can only be removed after the refs have been updated -
