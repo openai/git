@@ -1,6 +1,6 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
-exports_files(["curl-public-static-symbols.patch", "curl-windows-gnu.patch"])
+exports_files(glob(["*.patch"]))
 
 cc_test(
     name = "transport_features_test",

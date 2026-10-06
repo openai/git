@@ -1,0 +1,31 @@
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -49,7 +49,16 @@
+             "#cmakedefine HAVE_GETRANDOM": "",  # not available on macos
+             "#cmakedefine HAVE_SYSCALL_GETRANDOM": "",  # not available on macos
+         },
+-        # Only support Linux and Mac for now.
++        "@platforms//os:windows": {
++            "#cmakedefine HAVE_DLFCN_H": "",
++            "#cmakedefine HAVE_GETPAGESIZE": "",
++            "#cmakedefine HAVE_GETRANDOM": "",
++            "#cmakedefine HAVE_MMAP": "",
++            "#cmakedefine HAVE_STRINGS_H": "",
++            "#cmakedefine HAVE_SYSCALL_GETRANDOM": "",
++            "#cmakedefine HAVE_UNISTD_H": "",
++            "#cmakedefine XML_DEV_URANDOM": "",
++        },
+     }),
+     template = "expat/expat_config.h.cmake",
+ )
+@@ -63,6 +72,10 @@
+         "expat/lib/*.h",
+     ]),
+     includes = ["expat/lib"],
++    defines = select({
++        "@platforms//os:windows": ["XML_STATIC"],
++        "//conditions:default": [],
++    }),
+ )
+ 
+ alias(

@@ -1,0 +1,24 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -687,5 +687,5 @@
+ collate_into_directory(
+-    name = "install",
++    name = "gen_dir",
+     bins = [
+         ":openssl",
+     ],
+@@ -699,5 +699,5 @@
+ alias(
+-    name = "gen_dir",
+-    actual = ":install",
++    name = "install",
++    actual = ":gen_dir",
+     visibility = ["//visibility:public"],
+ )
+diff --git a/bazel/collate_into_directory.bzl b/bazel/collate_into_directory.bzl
+--- a/bazel/collate_into_directory.bzl
++++ b/bazel/collate_into_directory.bzl
+@@ -65 +65 @@ def _collate_into_directory_impl(ctx):
+-    outdir = ctx.actions.declare_directory(ctx.label.name)
++    outdir = ctx.actions.declare_directory(ctx.label.name + "_out")
