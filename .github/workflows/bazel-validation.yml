@@ -1,0 +1,78 @@
+name: Bazel validation
+
+on:
+  push:
+    branches: [tb/codex/bazel-build-check-138]
+
+permissions:
+  contents: read
+
+env:
+  USE_BAZEL_VERSION: 9.2.0
+
+concurrency:
+  group: bazel-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            toolchain: --extra_toolchains=@llvm//toolchain:all
+          - runner: ubuntu-22.04-arm
+            toolchain: --extra_toolchains=@llvm//toolchain:all
+          - runner: macos-15-intel
+          - runner: macos-15
+          - runner: windows-2025
+            toolchain: --extra_toolchains=@llvm//toolchain:all
+          - runner: windows-11-arm
+            toolchain: --extra_toolchains=@llvm//toolchain:all
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - name: Build binaries, helpers, and runtime data
+        run: bazel build -c opt ${{ matrix.toolchain }} //:git //:scalar //:git-shell //:git-daemon //:git-http-backend //:git-http-fetch //:git-http-push //:git-imap-send //:git-remote-http //:git-sh-i18n--envsubst //:git_difftool__helper //:git_filter_branch //:git_merge_octopus //:git_merge_one_file //:git_merge_resolve //:git_mergetool //:git_quiltimport //:git_request_pull //:git_submodule //:git_web__browse //:git_sh_i18n //:git_sh_setup //:git_mergetool__lib //:git_version_file //:templates //:mergetools
+      - name: Check transport features
+        run: bazel test -c opt --test_output=errors ${{ matrix.toolchain }} //contrib/bazel/validation:transport_features_test
+      - name: Exercise the executable
+        run: |
+          git_binary="$PWD/bazel-bin/git"
+          if test -f "$git_binary.exe"; then git_binary="$git_binary.exe"; fi
+          "$git_binary" version --build-options
+          test_dir=$(mktemp -d)
+          "$git_binary" init --template= "$test_dir"
+          printf 'hello 123\n' > "$test_dir/file.txt"
+          "$git_binary" -C "$test_dir" add file.txt
+          "$git_binary" -C "$test_dir" grep --cached -P '[0-9]+'
+          "$git_binary" -C "$test_dir" -c user.name=Test -c user.email=test@example.invalid commit -m initial
+          "$git_binary" -C "$test_dir" repack -ad
+          "$git_binary" -C "$test_dir" fsck --strict
+      - name: Build from a consuming module
+        if: matrix.runner == 'ubuntu-22.04'
+        run: |
+          source_dir="$PWD"
+          consumer_dir=$(mktemp -d)
+          cd "$consumer_dir"
+          cat > MODULE.bazel <<EOF
+          module(name = "consumer")
+          bazel_dep(name = "git", version = "0.0.0")
+          local_path_override(module_name = "git", path = "$source_dir")
+          bazel_dep(name = "llvm", version = "0.8.24")
+          register_toolchains("@llvm//toolchain:all")
+          EOF
+          touch BUILD.bazel
+          bazel build -c opt @git//:git @git//:scalar @git//:git-shell @git//:git-daemon @git//:git-http-backend @git//:git-http-fetch @git//:git-http-push @git//:git-imap-send @git//:git-remote-http @git//:git-sh-i18n--envsubst
+          "$(bazel cquery -c opt @git//:git --output=files)" version --build-options
