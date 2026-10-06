@@ -1,0 +1,289 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//contrib/bazel:config.bzl", "GIT_COPTS", "git_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Exclude executable entry points and sources selected separately below.
+_CORE_SRCS = glob([
+    "*.c",
+    "compiler-tricks/*.c",
+    "ewah/*.c",
+    "negotiator/*.c",
+    "odb/*.c",
+    "refs/*.c",
+    "reftable/*.c",
+    "trace2/*.c",
+    "xdiff/*.c",
+], exclude = [
+    "common-main.c",
+    "daemon.c",
+    "git.c",
+    "http-backend.c",
+    "http-fetch.c",
+    "http-push.c",
+    "http-walker.c",
+    "http.c",
+    "imap-send.c",
+    "remote-curl.c",
+    "scalar.c",
+    "sh-i18n--envsubst.c",
+    "sha1dc_git.c",
+    "shell.c",
+    "unix-socket.c",
+    "unix-stream-server.c",
+]) + [
+    "compat/nonblock.c",
+    "compat/obstack.c",
+    "compat/open.c",
+    "compat/terminal.c",
+]
+
+_BUILTIN_SRCS = glob(["builtin/*.c"])
+_SHELL_SCRIPTS = [
+    "git-difftool--helper.sh",
+    "git-filter-branch.sh",
+    "git-merge-octopus.sh",
+    "git-merge-one-file.sh",
+    "git-merge-resolve.sh",
+    "git-mergetool.sh",
+    "git-quiltimport.sh",
+    "git-request-pull.sh",
+    "git-submodule.sh",
+    "git-web--browse.sh",
+    "git-sh-i18n.sh",
+    "git-sh-setup.sh",
+    "git-mergetool--lib.sh",
+]
+
+# Use upstream generators and derive the source root from declared inputs.
+# This also works when this package is in an external repository.
+[
+    sh_binary(name = "generate_" + kind, srcs = ["tools/generate-" + kind + ".sh"])
+    for kind in ["cmdlist", "configlist", "hooklist"]
+]
+
+genrule(
+    name = "command_list",
+    srcs = ["command-list.txt", "Documentation/scalar.adoc"] + glob(["Documentation/git*.adoc"]),
+    outs = ["command-list.h"],
+    cmd = '$(location :generate_cmdlist) "$$(dirname "$(location command-list.txt)")" "$@"',
+    tools = [":generate_cmdlist"],
+)
+
+genrule(
+    name = "config_list",
+    srcs = glob(["Documentation/*config.adoc", "Documentation/config/*.adoc"]),
+    outs = ["config-list.h"],
+    cmd = '$(location :generate_configlist) "$$(dirname "$$(dirname "$(location Documentation/git-config.adoc)")")" "$@"',
+    tools = [":generate_configlist"],
+)
+
+genrule(
+    name = "hook_list",
+    srcs = ["Documentation/githooks.adoc"],
+    outs = ["hook-list.h"],
+    cmd = '$(location :generate_hooklist) "$$(dirname "$$(dirname "$(location Documentation/githooks.adoc)")")" "$@"',
+    tools = [":generate_hooklist"],
+)
+
+# Supply every version field explicitly so an external build cannot discover
+# the consuming repository's identity. GIT-VERSION-GEN remains the authority
+# for the development version and template substitutions.
+[
+    genrule(
+        name = name,
+        srcs = ["GIT-VERSION-GEN", template],
+        outs = [out],
+        cmd = """
+          export GIT_VERSION="$$(sed -n 's/^DEF_VER=v//p' $(location GIT-VERSION-GEN))"
+          export GIT_BUILT_FROM_COMMIT=unknown GIT_DATE=1970-01-01
+          export GIT_USER_AGENT="git/$$GIT_VERSION"
+          $(location :generate_version) "$$(dirname $(location GIT-VERSION-GEN))" "$(location %s)" "$@"
+        """ % template,
+        tools = [":generate_version"],
+    )
+    for name, template, out in [
+        ("version_def", "version-def.h.in", "version-def.h"),
+        ("git_version_file", "GIT-VERSION-FILE.in", "GIT-VERSION-FILE"),
+        ("windows_resource_file", "git.rc.in", "git.rc"),
+    ]
+]
+
+sh_binary(name = "generate_version", srcs = ["GIT-VERSION-GEN"])
+sh_binary(name = "generate_script", srcs = ["tools/generate-script.sh"])
+
+[
+    genrule(
+        name = script[:-3].replace("-", "_"),
+        srcs = [script, "//contrib/bazel:script-options.sh"],
+        outs = [script[:-3]],
+        cmd = "$(location :generate_script) $(location %s) $@ $(location //contrib/bazel:script-options.sh)" % script,
+        tools = [":generate_script"],
+    )
+    for script in _SHELL_SCRIPTS
+]
+
+cc_library(
+    name = "git_headers",
+    hdrs = glob([
+        "*.h",
+        "compat/**/*.h",
+        "ewah/*.h",
+        "negotiator/*.h",
+        "odb/*.h",
+        "refs/*.h",
+        "reftable/*.h",
+        "sha1dc/*.h",
+        "sha256/**/*.h",
+        "trace2/*.h",
+        "xdiff/*.h",
+    ]) + [":command_list", ":config_list", ":hook_list", ":version_def"],
+    includes = ["."] + select({
+        "@platforms//os:windows": ["compat", "compat/poll", "compat/regex", "compat/win32"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "@pcre2",
+        "@zlib-ng//:zlib_ng_native",
+    ] + select({
+        "@platforms//os:windows": ["@win_iconv//:win_iconv"],
+        "//conditions:default": ["@openssl//:ssl"],
+    }),
+)
+
+cc_library(
+    name = "windows_regex",
+    srcs = ["compat/regex/regex.c"],
+    textual_hdrs = glob(["compat/regex/*.c"]),
+    copts = GIT_COPTS + ["-DGAWK", "-DNO_MBSUPPORT"],
+    deps = [":git_headers"],
+    target_compatible_with = ["@platforms//os:windows"],
+    tags = ["manual"],
+)
+
+cc_library(
+    name = "libgit",
+    srcs = _CORE_SRCS + [
+        "compat/fopen.c",
+        "compat/qsort_s.c",
+        "compat/strlcpy.c",
+        "compat/simple-ipc/ipc-shared.c",
+        "sha1dc_git.c",
+        "sha1dc/sha1.c",
+        "sha1dc/ubc_check.c",
+        "sha256/block/sha256.c",
+        "unix-socket.c",
+        "unix-stream-server.c",
+    ] + select({
+        "@platforms//os:linux": [
+            "compat/linux/procinfo.c",
+            "compat/simple-ipc/ipc-unix-socket.c",
+            "compat/fsmonitor/fsm-health-linux.c",
+            "compat/fsmonitor/fsm-ipc-unix.c",
+            "compat/fsmonitor/fsm-listen-linux.c",
+            "compat/fsmonitor/fsm-path-utils-linux.c",
+            "compat/fsmonitor/fsm-settings-unix.c",
+        ],
+        "@platforms//os:macos": [
+            "compat/darwin/procinfo.c",
+            "compat/memmem.c",
+            "compat/precompose_utf8.c",
+            "compat/regcomp_enhanced.c",
+            "compat/simple-ipc/ipc-unix-socket.c",
+            "compat/fsmonitor/fsm-health-darwin.c",
+            "compat/fsmonitor/fsm-ipc-unix.c",
+            "compat/fsmonitor/fsm-listen-darwin.c",
+            "compat/fsmonitor/fsm-path-utils-darwin.c",
+            "compat/fsmonitor/fsm-settings-unix.c",
+        ],
+        "@platforms//os:windows": [
+            "compat/basename.c",
+            "compat/memmem.c",
+            "compat/mingw.c",
+            "compat/poll/poll.c",
+            "compat/pread.c",
+            "compat/setenv.c",
+            "compat/strcasestr.c",
+            "compat/strtoimax.c",
+            "compat/strtoumax.c",
+            "compat/win32/dirent.c",
+            "compat/win32/flush.c",
+            "compat/win32/path-utils.c",
+            "compat/win32/pthread.c",
+            "compat/win32/syslog.c",
+            "compat/win32/trace2_win32_process_info.c",
+            "compat/win32mmap.c",
+            "compat/winansi.c",
+            "compat/writev.c",
+            "compat/simple-ipc/ipc-win32.c",
+            "compat/fsmonitor/fsm-health-win32.c",
+            "compat/fsmonitor/fsm-ipc-win32.c",
+            "compat/fsmonitor/fsm-listen-win32.c",
+            "compat/fsmonitor/fsm-path-utils-win32.c",
+            "compat/fsmonitor/fsm-settings-win32.c",
+        ],
+    }),
+    copts = GIT_COPTS,
+    deps = [":git_headers", "@curl"] + select({
+        "@platforms//os:windows": [":windows_regex"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_library(
+    name = "builtins",
+    srcs = _BUILTIN_SRCS,
+    copts = GIT_COPTS,
+    deps = [":libgit"],
+)
+
+cc_library(
+    name = "libgit_http",
+    srcs = ["http.c", "http-walker.c"],
+    copts = GIT_COPTS,
+    deps = [":libgit", "@curl"],
+)
+
+genrule(
+    name = "windows_resource_object",
+    srcs = [":windows_resource_file", "compat/win32/git.manifest", "GIT-VERSION-GEN"],
+    outs = ["git-resource.o"],
+    cmd = """
+      sed 's/RT_MANIFEST/24/' $(location :windows_resource_file) > "$(@D)/git-windres.rc"
+      $(location @llvm//tools:llvm-windres) --input="$(@D)/git-windres.rc" --output="$@" \
+        --output-format=coff --include-dir="$$(dirname $(location GIT-VERSION-GEN))" \
+        --no-preprocess """ + select({
+        "@platforms//cpu:x86_64": " --target=pe-x86-64",
+        "@platforms//cpu:aarch64": " --target=aarch64-w64-mingw32",
+    }),
+    tools = ["@llvm//tools:llvm-windres"],
+    target_compatible_with = ["@platforms//os:windows"],
+    tags = ["manual"],
+)
+
+cc_library(
+    name = "windows_resources",
+    srcs = [":windows_resource_object"],
+    alwayslink = True,
+    target_compatible_with = ["@platforms//os:windows"],
+    tags = ["manual"],
+)
+
+git_binary(name = "git", srcs = ["git.c"], deps = [":builtins"])
+git_binary(name = "scalar", srcs = ["scalar.c"])
+git_binary(name = "git-shell", srcs = ["shell.c"])
+git_binary(name = "git-daemon", srcs = ["daemon.c"])
+git_binary(name = "git-http-backend", srcs = ["http-backend.c"])
+git_binary(name = "git-http-fetch", srcs = ["http-fetch.c"], deps = [":libgit_http"])
+git_binary(name = "git-http-push", srcs = ["http-push.c"], deps = [":libgit_http", "@libexpat"])
+git_binary(name = "git-imap-send", srcs = ["imap-send.c"], deps = [":libgit_http"])
+git_binary(name = "git-remote-http", srcs = ["remote-curl.c"], deps = [":libgit_http"])
+git_binary(name = "git-sh-i18n--envsubst", srcs = ["sh-i18n--envsubst.c"])
+
+filegroup(
+    name = "templates",
+    srcs = glob(["templates/hooks/*.sample"]) + ["templates/description", "templates/info/exclude"],
+)
+
+filegroup(name = "mergetools", srcs = glob(["mergetools/*"]))
