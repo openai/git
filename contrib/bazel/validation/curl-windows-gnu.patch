@@ -1,0 +1,65 @@
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -14,6 +14,12 @@
+ )
+ 
+ exports_files(["COPYING"])
++
++config_setting(
++    name = "windows_gnu",
++    constraint_values = ["@platforms//os:windows"],
++    values = {"compiler": "clang"},
++)
+ 
+ config_setting(
+     name = "use_boringssl",
+@@ -289,16 +295,7 @@
+         ]),
+         hdrs = glob(["include/curl/*.h"]),
+         copts = select({
+-            "@platforms//os:windows": [
+-                "/DBUILDING_LIBCURL",
+-                "/DCURL_DISABLE_LDAP",
+-                "/DUSE_IPV6",
+-                "/DUSE_SCHANNEL",
+-                "/DUSE_WIN32_IDN",
+-                "/DUSE_WINDOWS_SSPI",
+-                "/DWANT_IDN_PROTOTYPES",
+-                "/DWIN32",
+-            ],
++            "@platforms//os:windows": [],
+             "@platforms//os:macos": _BASE_CURL_COPTS,
+             "//conditions:default": _BASE_CURL_COPTS + [
+                 "-DHAVE_LINUX_TCP_H=1",
+@@ -322,6 +319,14 @@
+             ],
+             "//conditions:default": [],
+         }) + select({
++            ":windows_gnu": [
++                "-lws2_32",
++                "-ladvapi32",
++                "-lbcrypt",
++                "-lcrypt32",
++                "-lnormaliz",
++                "-lsecur32",
++            ],
+             "@platforms//os:windows": [
+                 "-DEFAULTLIB:ws2_32.lib",
+                 "-DEFAULTLIB:advapi32.lib",
+@@ -337,6 +342,16 @@
+         }),
+         linkstatic = True,
+         local_defines = select({
++            "@platforms//os:windows": [
++                "BUILDING_LIBCURL",
++                "CURL_DISABLE_LDAP",
++                "USE_IPV6",
++                "USE_SCHANNEL",
++                "USE_WIN32_IDN",
++                "USE_WINDOWS_SSPI",
++                "WANT_IDN_PROTOTYPES",
++                "WIN32",
++            ],
+             "@platforms//os:macos": [
+                 'CURL_CA_BUNDLE=\\"/etc/ssl/cert.pem\\"',
+                 'CURL_CA_PATH=\\"/etc/ssl/certs\\"',

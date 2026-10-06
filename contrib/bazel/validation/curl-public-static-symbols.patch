@@ -1,0 +1,12 @@
+diff --git a/include/curl/curl.h b/include/curl/curl.h
+--- a/include/curl/curl.h
++++ b/include/curl/curl.h
+@@ -122,7 +122,7 @@ typedef void CURLSH;
+  */
+
+-#ifdef CURL_STATICLIB
++#if defined(CURL_STATICLIB) && !(defined(BUILDING_LIBCURL) && defined(CURL_HIDDEN_SYMBOLS))
+ #  define CURL_EXTERN
+ #elif defined(_WIN32) || \
+      (__has_declspec_attribute(dllexport) && \
+       __has_declspec_attribute(dllimport))

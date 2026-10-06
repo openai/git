@@ -1,5 +1,0 @@
-exports_files([
-    "curl.BUILD.bazel",
-    "curl-config-win32.patch",
-    "win-iconv.BUILD.bazel",
-])

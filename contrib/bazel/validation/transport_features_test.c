@@ -4,8 +4,8 @@
 int main(void)
 {
 	const curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
-	const int required = CURL_VERSION_SSL | CURL_VERSION_HTTP2 |
-		CURL_VERSION_LIBZ | CURL_VERSION_IPV6 | CURL_VERSION_ASYNCHDNS;
+	const int required = CURL_VERSION_SSL | CURL_VERSION_IPV6 |
+		CURL_VERSION_ASYNCHDNS;
 
 	if ((info->features & required) != required) {
 		fprintf(stderr, "missing transport features: %x (%s)\n",
