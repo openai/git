@@ -2997,6 +2997,8 @@ static void prepare_http_pack_request(struct http_pack_request *preq,
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
+	preq->resume_offset = offset;
+	preq->range_valid = 0;
 	if (offset > 0)
 		http_opt_request_remainder(preq->slot->curl, offset);
 }
@@ -3032,6 +3034,51 @@ static void update_http_pack_url(void *data)
 	urlmatch_config_release(&config);
 }
 
+static size_t fwrite_http_pack_header(char *ptr, size_t size, size_t nmemb,
+				     void *data)
+{
+	struct http_pack_request *preq = data;
+	size_t len = st_mult(size, nmemb);
+	const char *value;
+	size_t value_len;
+
+	fwrite_wwwauth(ptr, size, nmemb, NULL);
+	if (!preq->resume_offset)
+		return len;
+	if (len >= 5 && !memcmp(ptr, "HTTP/", 5))
+		preq->range_valid = 0;
+	if (skip_iprefix_mem(ptr, len, "content-range:", &value, &value_len)) {
+		struct strbuf range = STRBUF_INIT;
+		char *end;
+		uintmax_t start;
+
+		strbuf_add(&range, value, value_len);
+		strbuf_trim(&range);
+		preq->range_valid = 0;
+		if (range.len > 6 && !strncasecmp(range.buf, "bytes ", 6) &&
+		    isdigit(range.buf[6])) {
+			errno = 0;
+			start = strtoumax(range.buf + 6, &end, 10);
+			preq->range_valid = !errno && *end == '-' &&
+				start == (uintmax_t)preq->resume_offset;
+		}
+		strbuf_release(&range);
+	}
+	if ((len == 2 && ptr[0] == '\r' && ptr[1] == '\n') ||
+	    (len == 1 && ptr[0] == '\n')) {
+		long code;
+
+		if (curl_easy_getinfo(preq->slot->curl, CURLINFO_HTTP_CODE, &code) != CURLE_OK)
+			return 0;
+		if (code >= 200 && code < 300 &&
+		    (code != 206 || !preq->range_valid)) {
+			error(_("server did not honor the pack resume offset"));
+			return 0;
+		}
+	}
+	return len;
+}
+
 static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 {
 	struct http_pack_request *preq = data;
@@ -3052,7 +3099,7 @@ static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
-	int auth_attempts = 3, retries = 0;
+	int auth_attempts = 3, retries = 0, partial_retries = 0;
 	long rate_limit_retries = http_max_retries;
 	int ret;
 
@@ -3064,8 +3111,8 @@ int run_http_pack_request(struct http_pack_request *preq)
 
 		preq->headers = http_append_auth_header(&http_auth, preq->headers);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
-		curl_easy_setopt(preq->slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
-		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEHEADER, NULL);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_HEADERFUNCTION, fwrite_http_pack_header);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEHEADER, preq);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_http_pack);
 		/* Older curl versions omit challenge headers with FAILONERROR. */
@@ -3082,6 +3129,15 @@ int run_http_pack_request(struct http_pack_request *preq)
 		if (ret != HTTP_START_FAILED && results.http_code == 416) {
 			ret = HTTP_OK;
 			break;
+		}
+
+		/* A truncated response can resume without discarding sibling packs. */
+		if (results.curl_result == CURLE_PARTIAL_FILE &&
+		    ftello(preq->packfile) > offset && partial_retries < 2) {
+			offset = ftello(preq->packfile);
+			sleep_millisec((1000 << partial_retries++) + git_rand(0) % 1000);
+			prepare_http_pack_request(preq, offset);
+			continue;
 		}
 
 		/* Never truncate a partial pack to recover from an error response. */

@@ -225,6 +225,8 @@ struct http_pack_request {
 	unsigned preserve_index_pack_stdout : 1;
 
 	FILE *packfile;
+	off_t resume_offset;
+	unsigned range_valid : 1;
 	struct strbuf tmpfile;
 	struct active_request_slot *slot;
 	struct curl_slist *headers;

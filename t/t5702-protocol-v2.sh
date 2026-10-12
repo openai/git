@@ -1468,10 +1468,40 @@ do
 	'
 done
 
-test_expect_success 'an interrupted response is not retried or truncated' '
-	setup_pack_retry truncated 200 &&
+for status in ignore-range wrong-range
+do
+	test_expect_success "resumed pack rejects $status" '
+		setup_pack_retry "$status" &&
+		partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+		cp pack-prefix "$partial" &&
+		fetch_pack test_must_fail &&
+		test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+		test_cmp pack-prefix "$partial"
+	'
+done
+
+test_expect_success 'a pack can resume after two interrupted responses' '
+	setup_pack_retry truncated truncated 200 &&
+	fetch_pack &&
+	printf "GET||\nGET|bytes=12-|\nGET|bytes=24-|\n" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success 'exhausted interruption retries preserve received bytes' '
+	setup_pack_retry truncated truncated truncated 200 &&
 	fetch_pack test_must_fail &&
-	test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	printf "GET||\nGET|bytes=12-|\nGET|bytes=24-|\n" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	test_copy_bytes 36 <"$pack" >expect &&
+	test_cmp expect "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp"
+'
+
+test_expect_success 'an interrupted retry without progress stops immediately' '
+	setup_pack_retry truncated empty 200 &&
+	fetch_pack test_must_fail &&
+	printf "GET||\nGET|bytes=12-|\n" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests" &&
 	test_cmp pack-prefix "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp"
 '
 
@@ -1520,6 +1550,22 @@ test_expect_success 'parallel packfile URI fetch completes after HTTP 503 and 42
 		-c fetch.uriprotocols=http -c fetch.packfileUriJobs=2 \
 		clone "$HTTPD_URL/smart/http_parent" http_child-retry &&
 	test_line_count = 3 "$HTTPD_ROOT_PATH/pack-retry.requests"
+'
+
+test_expect_success 'parallel packfile URI fetch recovers after an interruption' '
+	read object pack uri <no-ref-uris &&
+	test_when_finished "git -C \"$P\" config --replace-all \
+		uploadpack.blobpackfileuri \"$object $pack $uri\" \"^$object \"" &&
+	git -C "$P" config --replace-all uploadpack.blobpackfileuri \
+		"$object $pack $HTTPD_URL/pack_retry/mypack-$pack.pack" "^$object " &&
+	printf "%s\n" truncated 200 >"$HTTPD_ROOT_PATH/pack-retry.responses" &&
+	>"$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	GIT_TEST_SIDEBAND_ALL=1 git -c protocol.version=2 \
+		-c fetch.uriprotocols=http -c fetch.packfileUriJobs=2 \
+		clone "$HTTPD_URL/smart/http_parent" http_child-interrupted &&
+	printf "GET||\nGET|bytes=12-|\n" >expect &&
+	test_cmp expect "$HTTPD_ROOT_PATH/pack-retry.requests" &&
+	git -C http_child-interrupted fsck
 '
 
 test_expect_success 'parallel URI progress respects quiet and no-progress' '
