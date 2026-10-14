@@ -62,6 +62,7 @@ static int transfer_fsck_objects = -1;
 static struct strbuf fsck_msg_types = STRBUF_INIT;
 static int advertise_atomic_push = 1;
 static int advertise_explicit_haves;
+static int advertise_exact_old_oid_v1;
 static int advertise_no_ref_delta;
 static int advertise_push_options;
 static int advertise_sid;
@@ -275,6 +276,8 @@ static void show_ref(const char *path, const struct object_id *oid)
 			strbuf_addstr(&cap, " ofs-delta");
 		if (advertise_explicit_haves)
 			strbuf_addstr(&cap, " explicit-haves");
+		if (advertise_exact_old_oid_v1)
+			strbuf_addstr(&cap, " exact-old-oid-v1");
 		if (advertise_no_ref_delta)
 			strbuf_addstr(&cap, " no-ref-delta");
 		if (push_cert_nonce)
@@ -2516,6 +2519,8 @@ int cmd_receive_pack(int argc,
 		OPT_HIDDEN_BOOL(0, "reject-thin-pack-for-testing", &reject_thin, NULL),
 		OPT_HIDDEN_BOOL(0, "advertise-explicit-haves-for-testing",
 				&advertise_explicit_haves, NULL),
+		OPT_HIDDEN_BOOL(0, "advertise-exact-old-oid-v1-for-testing",
+				&advertise_exact_old_oid_v1, NULL),
 		OPT_HIDDEN_BOOL(0, "advertise-no-ref-delta-for-testing",
 				&advertise_no_ref_delta, NULL),
 		OPT_END()

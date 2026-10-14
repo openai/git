@@ -19,6 +19,7 @@ static const char * const send_pack_usage[] = {
 	N_("git send-pack [--mirror] [--dry-run] [--force]\n"
 	   "              [--receive-pack=<git-receive-pack>]\n"
 	   "              [--verbose] [--thin] [--atomic]\n"
+	   "              [--require-exact-old-oid]\n"
 	   "              [--[no-]signed | --signed=(true|false|if-asked)]\n"
 	   "              [<host>:]<directory> (--all | <ref>...)"),
 	NULL,
@@ -175,6 +176,7 @@ int cmd_send_pack(int argc,
 	struct string_list push_options = STRING_LIST_INIT_NODUP;
 	unsigned use_thin_pack = 0;
 	unsigned atomic = 0;
+	unsigned require_exact_old_oid = 0;
 	unsigned stateless_rpc = 0;
 	int flags;
 	unsigned int reject_reasons;
@@ -201,6 +203,9 @@ int cmd_send_pack(int argc,
 		OPT_BOOL(0, "progress", &progress, N_("force progress reporting")),
 		OPT_BOOL(0, "thin", &use_thin_pack, N_("use thin pack")),
 		OPT_BOOL(0, "atomic", &atomic, N_("request atomic transaction on remote side")),
+		OPT_BOOL(0, TRANS_OPT_REQUIRE_EXACT_OLD_OID,
+			 &require_exact_old_oid,
+			 N_("require exact old-OID receive-pack capability")),
 		OPT_BOOL(0, "stateless-rpc", &stateless_rpc, N_("use stateless RPC protocol")),
 		OPT_BOOL(0, "stdin", &from_stdin, N_("read refs from stdin")),
 		OPT_BOOL(0, "helper-status", &helper_status, N_("print status from remote helper")),
@@ -234,6 +239,7 @@ int cmd_send_pack(int argc,
 	args.progress = progress;
 	args.use_thin_pack = use_thin_pack;
 	args.atomic = atomic;
+	args.require_exact_old_oid = require_exact_old_oid;
 	args.stateless_rpc = stateless_rpc;
 	args.push_options = push_options.nr ? &push_options : NULL;
 	args.url = dest;

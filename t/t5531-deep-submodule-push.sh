@@ -79,6 +79,30 @@ test_expect_success 'push fails if submodule commit not on remote' '
 	)
 '
 
+test_expect_success 'exact-old requirement rejects on-demand submodule pushes' '
+	git -C submodule.git rev-parse main >expected_submodule &&
+	git -C pub.git rev-parse main >expected_pub &&
+	test_must_fail git -C work push --require-exact-old-oid \
+		--recurse-submodules=on-demand ../pub.git main 2>err &&
+	git -C submodule.git rev-parse main >actual_submodule &&
+	git -C pub.git rev-parse main >actual_pub &&
+	test_cmp expected_submodule actual_submodule &&
+	test_cmp expected_pub actual_pub &&
+	test_grep "recursive submodule pushes do not support --require-exact-old-oid" err
+'
+
+test_expect_success 'exact-old requirement rejects configured only submodule pushes' '
+	git -C submodule.git rev-parse main >expected_submodule &&
+	git -C pub.git rev-parse main >expected_pub &&
+	test_must_fail git -C work -c push.recurseSubmodules=only push \
+		--require-exact-old-oid ../pub.git main 2>err &&
+	git -C submodule.git rev-parse main >actual_submodule &&
+	git -C pub.git rev-parse main >actual_pub &&
+	test_cmp expected_submodule actual_submodule &&
+	test_cmp expected_pub actual_pub &&
+	test_grep "recursive submodule pushes do not support --require-exact-old-oid" err
+'
+
 test_expect_success 'push succeeds after commit was pushed to remote' '
 	(
 		cd work/gar/bage &&

@@ -108,6 +108,23 @@ test_expect_success 'receive-pack discovery combines version and explicit-haves'
 	test_grep "Git-Protocol: version=1:explicit-haves$" sent-explicit-haves
 '
 
+test_expect_success 'required exact-old-oid-v1 capability reaches send-pack after HTTP discovery redirect' '
+	>"$HTTPD_ROOT_PATH"/access.log &&
+	test_env GIT_TRACE_CURL=true test_must_fail git -C "$ROOT_PATH/test_repo_clone" push \
+		--require-exact-old-oid \
+		"$HTTPD_URL/smart-redir-perm/test_repo.git" HEAD:refs/heads/exact-old 2>err &&
+	test_grep "the receiving end does not support --require-exact-old-oid" err &&
+	grep "=> Send header: Git-Protocol:.*explicit-haves" err >sent-explicit-haves &&
+	test_line_count = 2 sent-explicit-haves &&
+	test_must_fail git -C "$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git" \
+		show-ref --verify refs/heads/exact-old &&
+	cat >exp <<-\EOF &&
+	GET  /smart-redir-perm/test_repo.git/info/refs?service=git-receive-pack HTTP/1.1 301
+	GET  /smart/test_repo.git/info/refs?service=git-receive-pack HTTP/1.1 200
+	EOF
+	check_access_log exp
+'
+
 test_expect_success 'push to remote repository (standard) with sending Accept-Language' '
 	cat >exp <<-\EOF &&
 	=> Send header: Accept-Language: ko-KR, *;q=0.9

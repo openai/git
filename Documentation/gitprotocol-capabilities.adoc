@@ -35,8 +35,9 @@ and server advertised.  As a consequence of these rules, server MUST
 NOT advertise capabilities it does not understand.
 
 The 'atomic', 'report-status', 'report-status-v2', 'delete-refs',
-'explicit-haves', 'no-ref-delta', 'quiet', and 'push-cert' capabilities
-are sent and recognized by the receive-pack (push to server) process.
+'explicit-haves', 'exact-old-oid-v1', 'no-ref-delta', 'quiet', and
+'push-cert' capabilities are sent and recognized by the receive-pack
+(push to server) process.
 
 The 'ofs-delta' and 'side-band-64k' capabilities are sent and recognized
 by both upload-pack and receive-pack protocols.  The 'agent' and 'session-id'
@@ -215,6 +216,18 @@ capability: the server must still advertise it, and the client must
 still request it in the update command. A server that ignores the Extra
 Parameter and does not advertise the capability retains the usual pack
 prerequisite behavior.
+
+exact-old-oid-v1
+----------------
+
+The receive-pack server can advertise 'exact-old-oid-v1' to promise
+that it preserves the old object ID in each update command rather than
+substituting another ref value. A client requesting this capability MUST
+also request 'explicit-haves', and MUST NOT request either capability unless
+the server advertised it.
+
+This capability does not choose an expected old object ID. The client still
+uses ordinary ref matching and lease checks to select the update command.
 
 agent
 -----

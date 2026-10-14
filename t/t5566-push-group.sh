@@ -78,6 +78,17 @@ test_expect_success '--atomic is rejected for group push' '
 	test_grep "atomic" err
 '
 
+test_expect_success 'required exact-old-oid-v1 capability is preserved for every group member' '
+	test_must_fail git push --require-exact-old-oid \
+		all-remotes HEAD:refs/heads/exact-old 2>err &&
+	test_grep "the receiving end does not support --require-exact-old-oid" err &&
+	for i in 1 2 3
+	do
+		test_must_fail git -C dest-$i.git show-ref --verify \
+			refs/heads/exact-old || return 1
+	done
+'
+
 test_expect_success 'push continues past rejection to remaining remotes' '
 	for i in c1 c2 c3
 	do

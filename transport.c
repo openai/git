@@ -964,6 +964,8 @@ static int git_transport_push(struct transport *transport, struct ref *remote_re
 	args.dry_run = !!(flags & TRANSPORT_PUSH_DRY_RUN);
 	args.porcelain = !!(flags & TRANSPORT_PUSH_PORCELAIN);
 	args.atomic = !!(flags & TRANSPORT_PUSH_ATOMIC);
+	args.require_exact_old_oid =
+		!!(flags & TRANSPORT_PUSH_REQUIRE_EXACT_OLD_OID);
 	args.push_options = transport->push_options;
 	args.url = transport->url;
 	args.negotiation_include = &transport->remote->negotiation_include;
@@ -1479,6 +1481,12 @@ int transport_push(struct repository *r,
 		TRANSPORT_LS_REFS_OPTIONS_INIT;
 
 	*reject_reasons = 0;
+
+	if ((flags & TRANSPORT_PUSH_REQUIRE_EXACT_OLD_OID) &&
+	    (flags & (TRANSPORT_RECURSE_SUBMODULES_ON_DEMAND |
+		      TRANSPORT_RECURSE_SUBMODULES_ONLY)))
+		die(_("recursive submodule pushes do not support --%s"),
+		    "require-exact-old-oid");
 
 	if (transport_color_config() < 0)
 		goto done;

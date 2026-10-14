@@ -63,6 +63,15 @@ test_expect_success 'clone remote repository' '
 	git clone $HTTPD_URL/dumb/test_repo.git test_repo_clone
 '
 
+test_expect_success 'required exact-old-oid-v1 capability rejects dumb HTTP' '
+	test_must_fail git -C "$ROOT_PATH/test_repo_clone" push \
+		--require-exact-old-oid \
+		origin HEAD:refs/heads/exact-old 2>err &&
+	test_grep "dumb HTTP does not support --require-exact-old-oid" err &&
+	test_must_fail git -C "$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git" \
+		show-ref --verify refs/heads/exact-old
+'
+
 test_expect_success 'push to remote repository with packed refs' '
 	cd "$ROOT_PATH"/test_repo_clone &&
 	: >path2 &&
