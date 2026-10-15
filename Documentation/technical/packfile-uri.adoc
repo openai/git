@@ -63,12 +63,21 @@ for the pack URL, including its path when `credential.useHttpPath` is
 enabled, rather than copied from the fetch negotiation. A pack served by
 another host can use credentials configured for that host.
 
-Pack downloads retry HTTP 502, 503, and 504 up to twice, after one and two
+Pack downloads retry HTTP 500, 502, 503, and 504 up to twice, after one and two
 seconds plus up to one second of jitter. With libcurl 7.66.0 or newer,
 `Retry-After` can extend the delay up to ten seconds; longer requested delays
-fail without retrying. Interrupted pack transfers are not retried.
+fail without retrying. Interrupted transfers are retried from the number of
+bytes already written. A resumed response must return HTTP 206 with a matching
+`Content-Range`; a response that does not prove it continues the same pack is
+rejected before its body is appended.
 HTTP 429 uses `http.maxRetries`, `http.retryAfter`, and `http.maxRetryTime`
 (disabled by default).
+
+Connection establishment and response-body inactivity have separate bounded
+defaults. The inactivity deadline begins after connection and protocol setup
+and resets whenever body bytes arrive, so it does not limit the total duration
+of a transfer that continues to make progress. See
+`http.packfileUriConnectTimeout` and `http.packfileUriInactivityTimeout`.
 
 When the client downloads the given URIs, it should store them with "keep"
 files, just like it does with the packfile in the `packfile` section. These
@@ -98,5 +107,4 @@ form the MVP. For example, the following can be done:
 There are some possible features that will require a change in protocol:
 
  * Additional HTTP headers (e.g. authentication)
- * Byte range support
  * Different file formats referenced by URIs (e.g. raw object)

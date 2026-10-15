@@ -1436,6 +1436,71 @@ fetch_pack () {
 		--index-pack-arg=index-pack --index-pack-arg=--stdin "$pack_url"
 }
 
+setup_loopback_pack_retry () {
+	test_when_finished "rm -rf pack-retry-client" &&
+	git init pack-retry-client
+}
+
+loopback_pack_cutoff=12
+
+start_loopback_pack_server () {
+	server_mode=$1 &&
+	server_pack=$2 &&
+	>pack-retry-server-ready &&
+	{
+		"$PERL_PATH" "$TEST_DIRECTORY/lib-http-pack-retry-server.pl" \
+			"$server_mode" "$server_pack" "$loopback_pack_cutoff" \
+			"$TRASH_DIRECTORY/pack-retry-server-ready" \
+			"$TRASH_DIRECTORY/pack-retry-server-result" \
+			>pack-retry-server.log 2>&1 &
+		pack_server_pid=$!
+	} &&
+	test_when_finished "
+		kill $pack_server_pid 2>/dev/null || :
+		wait $pack_server_pid 2>/dev/null || :
+		rm -f pack-retry-server-ready
+	" &&
+	pack_server_waits=30 &&
+	while test ! -s pack-retry-server-ready
+	do
+		if ! kill -0 "$pack_server_pid" 2>/dev/null
+		then
+			wait "$pack_server_pid"
+			return 1
+		fi &&
+		if test "$pack_server_waits" -eq 0
+		then
+			echo "loopback pack server did not become ready" >&2
+			return 1
+		fi &&
+		pack_server_waits=$((pack_server_waits - 1)) &&
+		sleep 1
+	done &&
+	read pack_server_port <pack-retry-server-ready &&
+	case "$pack_server_port" in
+	*[!0-9]*|"")
+		cat pack-retry-server.log >&2
+		echo "loopback pack server failed to start" >&2
+		return 1
+		;;
+	esac &&
+	loopback_pack_url="http://127.0.0.1:$pack_server_port/pack"
+}
+
+fetch_loopback_pack () {
+	git -C pack-retry-client "$@" http-fetch \
+		--packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$loopback_pack_url"
+}
+
+fetch_loopback_pack_must_fail () {
+	test_must_fail git -C pack-retry-client "$@" http-fetch \
+		--packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"$loopback_pack_url"
+}
+
 test_expect_success 'resumed packfile download survives two transient errors' '
 	setup_pack_retry 503 502 200 &&
 	cp pack-prefix "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
@@ -1468,11 +1533,160 @@ do
 	'
 done
 
-test_expect_success 'an interrupted response is not retried or truncated' '
-	setup_pack_retry truncated 200 &&
-	fetch_pack test_must_fail &&
-	test_line_count = 1 "$HTTPD_ROOT_PATH/pack-retry.requests" &&
-	test_cmp pack-prefix "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp"
+test_expect_success PERL,PIPE 'an interrupted response resumes with the requested range' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server interrupted-resume "$pack" &&
+	fetch_loopback_pack &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$loopback_pack_cutoff-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'a resumed packfile rejects a server that ignores Range' '
+	setup_loopback_pack_retry &&
+	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	test_copy_bytes "$loopback_pack_cutoff" <"$pack" >"$partial" &&
+	cp "$partial" partial.expect &&
+	start_loopback_pack_server ignore-range "$pack" &&
+	fetch_loopback_pack_must_fail 2>err &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$loopback_pack_cutoff-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp partial.expect "$partial"
+'
+
+test_expect_success PERL,PIPE 'a resumed packfile rejects a mismatched Content-Range' '
+	setup_loopback_pack_retry &&
+	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	test_copy_bytes "$loopback_pack_cutoff" <"$pack" >"$partial" &&
+	cp "$partial" partial.expect &&
+	start_loopback_pack_server invalid-range "$pack" &&
+	fetch_loopback_pack_must_fail 2>err &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$loopback_pack_cutoff-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp partial.expect "$partial"
+'
+
+test_expect_success PERL,PIPE 'a headerless 416 accepts an already complete packfile' '
+	setup_loopback_pack_retry &&
+	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	cp "$pack" "$partial" &&
+	chmod u+w "$partial" &&
+	pack_size=$(test_file_size "$pack") &&
+	start_loopback_pack_server complete-no-range "$pack" &&
+	fetch_loopback_pack &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$pack_size-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'a headerless 416 does not accept a corrupt complete packfile' '
+	setup_loopback_pack_retry &&
+	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	cp "$pack" "$partial" &&
+	chmod u+w "$partial" &&
+	printf X | dd of="$partial" bs=1 seek=0 conv=notrunc 2>/dev/null &&
+	pack_size=$(test_file_size "$pack") &&
+	start_loopback_pack_server complete-no-range "$pack" &&
+	fetch_loopback_pack_must_fail 2>err &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$pack_size-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_path_is_missing "$partial" &&
+	test_path_is_missing "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'a complete packfile rejects a mismatched 416 Content-Range' '
+	setup_loopback_pack_retry &&
+	partial="pack-retry-client/.git/objects/pack/pack-$pack_hash.pack.temp" &&
+	cp "$pack" "$partial" &&
+	chmod u+w "$partial" &&
+	cp "$partial" partial.expect &&
+	pack_size=$(test_file_size "$pack") &&
+	start_loopback_pack_server invalid-complete-range "$pack" &&
+	fetch_loopback_pack_must_fail 2>err &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$pack_size-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp partial.expect "$partial"
+'
+
+test_expect_success PERL,PIPE 'packfile inactivity retries a headers-only response' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server headers-stall-retry "$pack" &&
+	fetch_loopback_pack \
+		-c http.packfileUriConnectTimeout=4 \
+		-c http.packfileUriInactivityTimeout=1 &&
+	wait "$pack_server_pid" &&
+	echo retried >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'packfile inactivity retries before response headers' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server no-response-retry "$pack" &&
+	fetch_loopback_pack \
+		-c http.packfileUriConnectTimeout=4 \
+		-c http.packfileUriInactivityTimeout=1 &&
+	wait "$pack_server_pid" &&
+	echo retried >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'packfile retries a redirect target transport failure' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server redirect-target-failure-retry "$pack" &&
+	fetch_loopback_pack -c http.minSessions=0 \
+		-c http.packfileUriInactivityTimeout=0 &&
+	wait "$pack_server_pid" &&
+	echo retried >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'packfile inactivity resumes after partial body progress' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server partial-stall-resume "$pack" &&
+	fetch_loopback_pack \
+		-c http.packfileUriConnectTimeout=4 \
+		-c http.packfileUriInactivityTimeout=1 &&
+	wait "$pack_server_pid" &&
+	echo "bytes=$loopback_pack_cutoff-" >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'periodic packfile body progress resets inactivity timeout' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server slow-progress "$pack" &&
+	fetch_loopback_pack \
+		-c http.packfileUriConnectTimeout=4 \
+		-c http.packfileUriInactivityTimeout=1 &&
+	wait "$pack_server_pid" &&
+	echo completed >expect &&
+	test_cmp expect pack-retry-server-result &&
+	test_cmp "$pack" "pack-retry-client/.git/objects/pack/pack-$pack_hash.pack"
+'
+
+test_expect_success PERL,PIPE 'packfile inactivity starts after proxy connection setup' '
+	setup_loopback_pack_retry &&
+	start_loopback_pack_server delayed-proxy - &&
+	test_must_fail git -C pack-retry-client \
+		-c "http.proxy=http://127.0.0.1:$pack_server_port" \
+		-c http.sslVerify=false \
+		-c http.packfileUriConnectTimeout=4 \
+		-c http.packfileUriInactivityTimeout=1 \
+		http-fetch --packfile="$pack_hash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		"https://deadline.invalid/pack" 2>err &&
+	wait "$pack_server_pid" &&
+	echo alive >expect &&
+	test_cmp expect pack-retry-server-result
 '
 
 test_expect_success CURL_RETRY_AFTER 'HTTP 503 honors Retry-After' '

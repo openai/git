@@ -70,6 +70,8 @@ static char *ssl_pinnedkey;
 static char *ssl_cainfo;
 static long curl_low_speed_limit = -1;
 static long curl_low_speed_time = -1;
+static long http_packfile_uri_connect_timeout = 30;
+static long http_packfile_uri_inactivity_timeout = 60;
 static int curl_ftp_no_epsv;
 static char *curl_http_proxy;
 static char *http_proxy_authmethod;
@@ -470,6 +472,20 @@ static int http_options(const char *var, const char *value,
 	}
 	if (!strcmp("http.lowspeedtime", var)) {
 		curl_low_speed_time = git_config_int(var, value, ctx->kvi);
+		return 0;
+	}
+	if (!strcmp("http.packfileuriconnecttimeout", var)) {
+		http_packfile_uri_connect_timeout =
+			git_config_int(var, value, ctx->kvi);
+		if (http_packfile_uri_connect_timeout < 0)
+			return error(_("%s must be non-negative"), var);
+		return 0;
+	}
+	if (!strcmp("http.packfileuriinactivitytimeout", var)) {
+		http_packfile_uri_inactivity_timeout =
+			git_config_int(var, value, ctx->kvi);
+		if (http_packfile_uri_inactivity_timeout < 0)
+			return error(_("%s must be non-negative"), var);
 		return 0;
 	}
 
@@ -1777,6 +1793,8 @@ struct active_request_slot *get_active_slot(void)
 	slot->finished = NULL;
 	slot->callback_data = NULL;
 	slot->callback_func = NULL;
+	slot->custom_timeout_ms = NULL;
+	slot->custom_timeout_data = NULL;
 
 	if (curl_cookie_file && !strcmp(curl_cookie_file, "-")) {
 		warning(_("refusing to read cookies from http.cookiefile '-'"));
@@ -1795,12 +1813,18 @@ struct active_request_slot *get_active_slot(void)
 	curl_easy_setopt(slot->curl, CURLOPT_CUSTOMREQUEST, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_READFUNCTION, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
+	curl_easy_setopt(slot->curl, CURLOPT_WRITEHEADER, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_XFERINFOFUNCTION, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_XFERINFODATA, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_NOPROGRESS, 1L);
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, NULL);
 	curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, -1L);
 	curl_easy_setopt(slot->curl, CURLOPT_UPLOAD, 0L);
 	curl_easy_setopt(slot->curl, CURLOPT_HTTPGET, 1L);
 	curl_easy_setopt(slot->curl, CURLOPT_FAILONERROR, 1L);
 	curl_easy_setopt(slot->curl, CURLOPT_RANGE, NULL);
+	curl_easy_setopt(slot->curl, CURLOPT_CONNECTTIMEOUT, 0L);
 
 	/*
 	 * Default following to off unless "ALWAYS" is configured; this gives
@@ -1919,7 +1943,19 @@ void run_active_slot(struct active_request_slot *slot)
 		step_active_slots();
 
 		if (slot->in_use) {
-			long curl_timeout;
+			long curl_timeout, custom_timeout = -1;
+
+			if (slot->custom_timeout_ms) {
+				custom_timeout = slot->custom_timeout_ms(
+					slot->custom_timeout_data);
+				if (!custom_timeout) {
+					xmulti_remove_handle(slot);
+					slot->curl_result = CURLE_OPERATION_TIMEDOUT;
+					finish_active_slot(slot);
+					fill_active_slots();
+					continue;
+				}
+			}
 			curl_multi_timeout(curlm, &curl_timeout);
 			if (curl_timeout == 0) {
 				continue;
@@ -1929,6 +1965,15 @@ void run_active_slot(struct active_request_slot *slot)
 			} else {
 				select_timeout.tv_sec  =  curl_timeout / 1000;
 				select_timeout.tv_usec = (curl_timeout % 1000) * 1000;
+			}
+			if (custom_timeout > 0 &&
+			    (select_timeout.tv_sec > custom_timeout / 1000 ||
+			     (select_timeout.tv_sec == custom_timeout / 1000 &&
+			      select_timeout.tv_usec >
+				(custom_timeout % 1000) * 1000))) {
+				select_timeout.tv_sec = custom_timeout / 1000;
+				select_timeout.tv_usec =
+					(custom_timeout % 1000) * 1000;
 			}
 
 			max_fd = -1;
@@ -2675,8 +2720,16 @@ static int http_request_with_redirects(const char *url, void *result, int target
 		}
 		strbuf_swap(&current, &redirect);
 	}
-	if (ret == HTTP_OK || ret == HTTP_REAUTH || ret == HTTP_RATE_LIMITED)
+	if (ret == HTTP_OK || ret == HTTP_REAUTH || ret == HTTP_RATE_LIMITED) {
+		/*
+		 * We followed each redirect ourselves. libcurl may omit URL
+		 * credentials from CURLINFO_EFFECTIVE_URL even without a redirect,
+		 * so use the URL we requested to preserve the repository URL.
+		 */
+		strbuf_reset(options->effective_url);
+		strbuf_addbuf(options->effective_url, &current);
 		update_url_from_redirect(options->base_url, asked, options->effective_url);
+	}
 out:
 	free(asked);
 	strbuf_release(&current);
@@ -2987,16 +3040,99 @@ struct http_pack_request *new_http_pack_request(
 					    strbuf_detach(&buf, NULL));
 }
 
+static void update_http_pack_request_phase(struct http_pack_request *preq)
+{
+	curl_off_t pretransfer_us = 0, redirect_us = 0;
+
+	/*
+	 * PRETRANSFER is recorded after connection and protocol setup. Polling it
+	 * here keeps the response-body deadline separate from the connection
+	 * deadline, including when libcurl reuses an existing connection.
+	 */
+	if (curl_easy_getinfo(preq->slot->curl, CURLINFO_REDIRECT_TIME_T,
+			      &redirect_us) == CURLE_OK &&
+	    curl_easy_getinfo(preq->slot->curl, CURLINFO_PRETRANSFER_TIME_T,
+			      &pretransfer_us) == CURLE_OK) {
+		if (redirect_us > preq->last_redirect_us) {
+			preq->last_redirect_us = redirect_us;
+			preq->inactivity_clock_started = 0;
+		}
+		if (pretransfer_us > preq->last_pretransfer_us) {
+			preq->last_pretransfer_us = pretransfer_us;
+			preq->last_body_progress_ns = getnanotime();
+			preq->inactivity_clock_started = 1;
+		}
+	}
+}
+
+static int update_http_pack_request_phase_progress(void *data,
+						   curl_off_t dltotal UNUSED,
+						   curl_off_t dlnow UNUSED,
+						   curl_off_t ultotal UNUSED,
+						   curl_off_t ulnow UNUSED)
+{
+	update_http_pack_request_phase(data);
+	return 0;
+}
+
+static long http_pack_inactivity_timeout_ms(void *data)
+{
+	struct http_pack_request *preq = data;
+	uint64_t elapsed_ns, timeout_ns, remaining_ms;
+
+	if (!preq->inactivity_timeout)
+		return -1;
+	update_http_pack_request_phase(preq);
+
+	if (!preq->inactivity_clock_started)
+		return -1;
+	elapsed_ns = getnanotime() - preq->last_body_progress_ns;
+	timeout_ns = (uint64_t)preq->inactivity_timeout * 1000000000ULL;
+	if (elapsed_ns < timeout_ns) {
+		remaining_ms = (timeout_ns - elapsed_ns + 999999) / 1000000;
+		return remaining_ms > LONG_MAX ? LONG_MAX : (long)remaining_ms;
+	}
+	preq->inactivity_timed_out = 1;
+	return 0;
+}
+
+static void configure_http_pack_deadlines(struct http_pack_request *preq)
+{
+	curl_easy_setopt(preq->slot->curl, CURLOPT_CONNECTTIMEOUT,
+			 http_packfile_uri_connect_timeout);
+	preq->inactivity_timeout = http_packfile_uri_inactivity_timeout;
+	preq->last_body_progress_ns = 0;
+	preq->last_pretransfer_us = 0;
+	preq->last_redirect_us = 0;
+	preq->inactivity_clock_started = 0;
+	preq->inactivity_timed_out = 0;
+	if (preq->inactivity_timeout) {
+		preq->slot->custom_timeout_ms = http_pack_inactivity_timeout_ms;
+		preq->slot->custom_timeout_data = preq;
+		curl_easy_setopt(preq->slot->curl, CURLOPT_XFERINFOFUNCTION,
+				 update_http_pack_request_phase_progress);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_XFERINFODATA, preq);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_NOPROGRESS, 0L);
+	}
+}
+
 static void prepare_http_pack_request(struct http_pack_request *preq,
 				      off_t offset)
 {
 	preq->slot = get_active_slot();
+	preq->requested_offset = offset;
+	preq->response_range_valid = 0;
+	preq->response_range_unsatisfied = 0;
+	preq->response_range_error = 0;
+	preq->response_content_length_valid = 0;
 	curl_slist_free_all(preq->headers);
 	preq->headers = object_request_headers();
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq->packfile);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
+	/* Byte ranges must refer to the representation written to the pack file. */
+	curl_easy_setopt(preq->slot->curl, CURLOPT_ENCODING, NULL);
 	if (offset > 0)
 		http_opt_request_remainder(preq->slot->curl, offset);
 }
@@ -3008,6 +3144,8 @@ static void update_http_pack_url(void *data)
 	struct strvec wwwauth;
 	char *url;
 
+	/* The slot may be cleaned up immediately after this completion callback. */
+	update_http_pack_request_phase(preq);
 	if (preq->slot->http_code != 401 ||
 	    curl_easy_getinfo(preq->slot->curl, CURLINFO_EFFECTIVE_URL, &url) != CURLE_OK ||
 	    !url || !strcmp(preq->url, url))
@@ -3032,27 +3170,286 @@ static void update_http_pack_url(void *data)
 	urlmatch_config_release(&config);
 }
 
+static int parse_http_pack_number(const char **value, const char *end,
+				  uintmax_t *result)
+{
+	const char *p = *value;
+	uintmax_t parsed = 0;
+
+	if (p == end || !isdigit((unsigned char)*p))
+		return -1;
+	while (p < end && isdigit((unsigned char)*p)) {
+		unsigned int digit = *p - '0';
+
+		if (parsed > (UINTMAX_MAX - digit) / 10)
+			return -1;
+		parsed = parsed * 10 + digit;
+		p++;
+	}
+	*value = p;
+	*result = parsed;
+	return 0;
+}
+
+static int parse_http_pack_content_range(struct http_pack_request *preq,
+					 const char *value, size_t value_len)
+{
+	struct strbuf buf = STRBUF_INIT;
+	const char *p, *end;
+	uintmax_t start, range_end, total;
+	int ret = -1;
+
+	strbuf_add(&buf, value, value_len);
+	strbuf_trim(&buf);
+	p = buf.buf;
+	end = p + buf.len;
+	if (!skip_iprefix(p, "bytes ", &p))
+		goto out;
+	if (p < end && *p == '*') {
+		p++;
+		if (p == end || *p++ != '/' ||
+		    parse_http_pack_number(&p, end, &total) || p != end)
+			goto out;
+		preq->response_range_total = total;
+		preq->response_range_unsatisfied = 1;
+		ret = 0;
+		goto out;
+	}
+	if (parse_http_pack_number(&p, end, &start) ||
+	    p == end || *p++ != '-' ||
+	    parse_http_pack_number(&p, end, &range_end) ||
+	    p == end || *p++ != '/' ||
+	    parse_http_pack_number(&p, end, &total) ||
+	    p != end || start > range_end || range_end >= total)
+		goto out;
+	preq->response_range_start = start;
+	preq->response_range_end = range_end;
+	preq->response_range_total = total;
+	preq->response_range_valid = 1;
+	ret = 0;
+out:
+	strbuf_release(&buf);
+	return ret;
+}
+
+static int parse_http_pack_content_length(struct http_pack_request *preq,
+					  const char *value, size_t value_len)
+{
+	struct strbuf buf = STRBUF_INIT;
+	const char *p, *end;
+	uintmax_t parsed;
+	int ret = -1;
+
+	strbuf_add(&buf, value, value_len);
+	strbuf_trim(&buf);
+	p = buf.buf;
+	end = p + buf.len;
+	if (parse_http_pack_number(&p, end, &parsed) || p != end)
+		goto out;
+	if (preq->response_content_length_valid &&
+	    preq->response_content_length != parsed)
+		goto out;
+	preq->response_content_length = parsed;
+	preq->response_content_length_valid = 1;
+	ret = 0;
+out:
+	strbuf_release(&buf);
+	return ret;
+}
+
+static size_t fwrite_http_pack_header(char *ptr, size_t size, size_t nmemb,
+				      void *data)
+{
+	struct http_pack_request *preq = data;
+	const char *value;
+	size_t bytes = st_mult(size, nmemb), value_len;
+
+	fwrite_wwwauth(ptr, size, nmemb, NULL);
+	if (skip_iprefix_mem(ptr, bytes, "http/", &value, &value_len)) {
+		preq->response_range_valid = 0;
+		preq->response_range_unsatisfied = 0;
+		preq->response_range_error = 0;
+		preq->response_content_length_valid = 0;
+	} else if (skip_iprefix_mem(ptr, bytes, "content-range:",
+				    &value, &value_len)) {
+		if (preq->response_range_valid ||
+		    preq->response_range_unsatisfied ||
+		    parse_http_pack_content_range(preq, value, value_len))
+			preq->response_range_error = 1;
+	} else if (skip_iprefix_mem(ptr, bytes, "content-length:",
+				    &value, &value_len)) {
+		if (parse_http_pack_content_length(preq, value, value_len))
+			preq->response_range_error = 1;
+	}
+	return bytes;
+}
+
+static int validate_http_pack_response(struct http_pack_request *preq,
+				       long code)
+{
+	uintmax_t offset = preq->requested_offset;
+	uintmax_t response_length;
+
+	if (code >= 300)
+		return 0;
+	if (!offset) {
+		if (code != 200) {
+			xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+				  "expected HTTP 200 for initial packfile URI response");
+			return -1;
+		}
+		if (preq->response_content_length_valid) {
+			if (preq->expected_length_valid &&
+			    preq->expected_length != preq->response_content_length) {
+				xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+					  "packfile URI response length changed while retrying");
+				return -1;
+			}
+			preq->expected_length = preq->response_content_length;
+			preq->expected_length_valid = 1;
+		}
+		return 0;
+	}
+	if (code != 206 || preq->response_range_error ||
+	    !preq->response_range_valid || preq->response_range_unsatisfied ||
+	    preq->response_range_start != offset ||
+	    preq->response_range_end + 1 != preq->response_range_total) {
+		xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+			  "invalid Content-Range for packfile URI resume at byte %"PRIuMAX,
+			  offset);
+		return -1;
+	}
+	if (preq->expected_length_valid &&
+	    preq->expected_length != preq->response_range_total) {
+		xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+			  "packfile URI response length changed while resuming");
+		return -1;
+	}
+	response_length = preq->response_range_end -
+		preq->response_range_start + 1;
+	if (preq->response_content_length_valid &&
+	    preq->response_content_length != response_length) {
+		xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+			  "packfile URI Content-Length does not match Content-Range");
+		return -1;
+	}
+	preq->expected_length = preq->response_range_total;
+	preq->expected_length_valid = 1;
+	return 0;
+}
+
+static int http_pack_response_is_complete(struct http_pack_request *preq,
+					  long code)
+{
+	uintmax_t offset = preq->requested_offset;
+
+	/*
+	 * Some HTTP servers omit Content-Range from a 416 response. Treat that
+	 * response as a possible completion: index-pack still verifies the
+	 * existing temporary pack. When Content-Range is present, its total must
+	 * match the temporary pack exactly.
+	 */
+	if (code != 416 || !offset || preq->response_range_error ||
+	    preq->response_range_valid ||
+	    (preq->response_range_unsatisfied &&
+	     preq->response_range_total != offset) ||
+	    (preq->expected_length_valid && preq->expected_length != offset))
+		return 0;
+	preq->expected_length = offset;
+	preq->expected_length_valid = 1;
+	return 1;
+}
+
 static size_t fwrite_http_pack(char *ptr, size_t size, size_t nmemb, void *data)
 {
 	struct http_pack_request *preq = data;
 	long code;
+	size_t incoming = st_mult(size, nmemb);
 	size_t written;
 
+	if (incoming) {
+		preq->last_body_progress_ns = getnanotime();
+		preq->inactivity_clock_started = 1;
+	}
 	if (curl_easy_getinfo(preq->slot->curl, CURLINFO_HTTP_CODE, &code) != CURLE_OK)
 		return 0;
 	/* Error bodies must not overwrite a partial pack shared with another fetch. */
 	if (code >= 300)
-		return size * nmemb;
-	written = fwrite(ptr, 1, st_mult(size, nmemb), preq->packfile);
+		return incoming;
+	/* Validate the response headers before appending any resumed bytes. */
+	if (validate_http_pack_response(preq, code)) {
+		preq->response_range_error = 1;
+		return 0;
+	}
+	if (preq->expected_length_valid) {
+		off_t offset = ftello(preq->packfile);
+
+		if (offset < 0 || (uintmax_t)offset > preq->expected_length ||
+		    (uintmax_t)incoming > preq->expected_length - (uintmax_t)offset) {
+			xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+				  "packfile URI response exceeds expected length %"PRIuMAX,
+				  preq->expected_length);
+			preq->response_range_error = 1;
+			return 0;
+		}
+	}
+	written = fwrite(ptr, 1, incoming, preq->packfile);
 	if (preq->progress)
 		preq->progress(preq->progress_data, written);
 	return written;
 }
 
+static int http_pack_curl_result_is_retryable(CURLcode result)
+{
+	switch (result) {
+	case CURLE_COULDNT_RESOLVE_PROXY:
+	case CURLE_COULDNT_RESOLVE_HOST:
+	case CURLE_COULDNT_CONNECT:
+	case CURLE_PARTIAL_FILE:
+	case CURLE_OPERATION_TIMEDOUT:
+	case CURLE_SEND_ERROR:
+	case CURLE_RECV_ERROR:
+	case CURLE_GOT_NOTHING:
+#if LIBCURL_VERSION_NUM >= 0x072100
+	case CURLE_HTTP2:
+#endif
+#if LIBCURL_VERSION_NUM >= 0x072b00
+	case CURLE_HTTP2_STREAM:
+#endif
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int http_pack_status_is_retryable(long code)
+{
+	return code == 500 || code == 502 || code == 503 || code == 504;
+}
+
+static int prepare_http_pack_retry(struct http_pack_request *preq,
+				   const char *reason)
+{
+	off_t offset;
+
+	if (fflush(preq->packfile))
+		return error_errno("unable to flush packfile URI temporary file");
+	offset = ftello(preq->packfile);
+	if (offset < 0)
+		return error_errno("unable to determine packfile URI retry offset");
+	trace2_data_string("http", the_repository, "http/pack-retry-reason",
+			   reason);
+	trace2_data_intmax("http", the_repository, "http/pack-retry-offset",
+			   offset);
+	prepare_http_pack_request(preq, offset);
+	return 0;
+}
+
 int run_http_pack_request(struct http_pack_request *preq)
 {
 	off_t offset = ftello(preq->packfile);
-	int auth_attempts = 3, retries = 0;
+	int auth_retries = 2;
+	int transient_retries = 2;
 	long rate_limit_retries = http_max_retries;
 	int ret;
 
@@ -3064,8 +3461,9 @@ int run_http_pack_request(struct http_pack_request *preq)
 
 		preq->headers = http_append_auth_header(&http_auth, preq->headers);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
-		curl_easy_setopt(preq->slot->curl, CURLOPT_HEADERFUNCTION, fwrite_wwwauth);
-		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEHEADER, NULL);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_HEADERFUNCTION,
+				 fwrite_http_pack_header);
+		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEHEADER, preq);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEDATA, preq);
 		curl_easy_setopt(preq->slot->curl, CURLOPT_WRITEFUNCTION, fwrite_http_pack);
 		/* Older curl versions omit challenge headers with FAILONERROR. */
@@ -3074,42 +3472,118 @@ int run_http_pack_request(struct http_pack_request *preq)
 			curl_easy_setopt(preq->slot->curl, CURLOPT_FOLLOWLOCATION, 1L);
 		preq->slot->callback_func = update_http_pack_url;
 		preq->slot->callback_data = preq;
+		configure_http_pack_deadlines(preq);
 		ret = run_one_slot(preq->slot, &results);
+		if (preq->inactivity_timed_out)
+			xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+				  "packfile URI response made no body progress for %ld seconds",
+				  preq->inactivity_timeout);
 		preq->slot->results = NULL;
 		preq->slot->callback_func = NULL;
 		preq->slot->callback_data = NULL;
 
-		if (ret != HTTP_START_FAILED && results.http_code == 416) {
-			ret = HTTP_OK;
-			break;
-		}
-
-		/* Never truncate a partial pack to recover from an error response. */
-		if (ftello(preq->packfile) != offset)
-			break;
-
-		if (ret == HTTP_REAUTH && --auth_attempts) {
+		if (ret == HTTP_REAUTH) {
+			if (!auth_retries--)
+				break;
+			/* Authentication responses must not append to the pack. */
+			if (fflush(preq->packfile) ||
+			    ftello(preq->packfile) != preq->requested_offset) {
+				ret = HTTP_ERROR;
+				break;
+			}
 			http_reauth_prepare(1);
-		} else if (results.curl_result != CURLE_HTTP_RETURNED_ERROR) {
-			break;
-		} else if (ret == HTTP_RATE_LIMITED) {
-			if (rate_limit_retries <= 1 ||
-			    handle_rate_limit_retry(results.retry_after) < 0)
+			if (prepare_http_pack_retry(preq, "authentication")) {
+				ret = HTTP_START_FAILED;
 				break;
+			}
+			continue;
+		}
+		if (ret == HTTP_RATE_LIMITED) {
+			if (rate_limit_retries <= 1)
+				break;
+			if (handle_rate_limit_retry(results.retry_after) < 0) {
+				ret = HTTP_ERROR;
+				break;
+			}
 			rate_limit_retries--;
-		} else {
-			int delay;
-
-			if (retries == 2 ||
-			    (results.http_code != 502 && results.http_code != 503 &&
-			     results.http_code != 504) || results.retry_after > 10)
+			if (prepare_http_pack_retry(preq, "rate-limit")) {
+				ret = HTTP_START_FAILED;
 				break;
-			delay = (1000 << retries++) + git_rand(0) % 1000;
+			}
+			continue;
+		}
+		if (http_pack_status_is_retryable(results.http_code)) {
+			int retry_number, delay;
+
+			if (!transient_retries || results.retry_after > 10)
+				break;
+			retry_number = 2 - transient_retries--;
+			delay = (1000 << retry_number) + git_rand(0) % 1000;
 			if (results.retry_after * 1000 > delay)
 				delay = results.retry_after * 1000;
 			sleep_millisec(delay);
+			if (prepare_http_pack_retry(preq, "transient")) {
+				ret = HTTP_START_FAILED;
+				break;
+			}
+			continue;
 		}
-		prepare_http_pack_request(preq, offset);
+		if (http_pack_response_is_complete(preq, results.http_code)) {
+			ret = HTTP_OK;
+			break;
+		}
+		if (results.http_code >= 200 && results.http_code < 300 &&
+		    (preq->response_range_error ||
+		     validate_http_pack_response(preq, results.http_code))) {
+			ret = HTTP_ERROR;
+			break;
+		}
+		if ((results.http_code == 0 ||
+		     (results.http_code >= 200 && results.http_code < 300) ||
+		     (results.http_code >= 300 && results.http_code < 400 &&
+		      preq->last_redirect_us > 0)) &&
+		    http_pack_curl_result_is_retryable(results.curl_result)) {
+			if (!transient_retries--)
+				break;
+			if (prepare_http_pack_retry(preq,
+						 preq->inactivity_timed_out ?
+						 "inactivity" : "transient")) {
+				ret = HTTP_START_FAILED;
+				break;
+			}
+			continue;
+		}
+		if (ret == HTTP_OK && preq->expected_length_valid) {
+			off_t response_end;
+
+			if (fflush(preq->packfile)) {
+				ret = HTTP_ERROR;
+				break;
+			}
+			response_end = ftello(preq->packfile);
+			if (response_end < 0) {
+				ret = HTTP_ERROR;
+				break;
+			}
+			if ((uintmax_t)response_end != preq->expected_length) {
+				if ((uintmax_t)response_end > preq->expected_length ||
+				    !transient_retries--) {
+					xsnprintf(curl_errorstr, sizeof(curl_errorstr),
+						  "packfile URI response ended at byte %"PRIuMAX
+						  ", expected %"PRIuMAX,
+						  (uintmax_t)response_end,
+						  preq->expected_length);
+					ret = HTTP_ERROR;
+					break;
+				}
+				if (prepare_http_pack_retry(preq, "incomplete")) {
+					ret = HTTP_START_FAILED;
+					break;
+				}
+				continue;
+			}
+		}
+		break;
 	}
 	return ret;
 }

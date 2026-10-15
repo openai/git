@@ -32,6 +32,12 @@ struct active_request_slot {
 	struct slot_results *results;
 	void *callback_data;
 	void (*callback_func)(void *data);
+	/*
+	 * custom_timeout_ms returns the maximum time run_active_slot() may
+	 * block, or 0 when run_active_slot() must abort this request.
+	 */
+	long (*custom_timeout_ms)(void *data);
+	void *custom_timeout_data;
 	struct active_request_slot *next;
 };
 
@@ -224,6 +230,34 @@ struct http_pack_request {
 	const char **index_pack_args;
 	unsigned preserve_index_pack_stdout : 1;
 
+	/*
+	 * A resumed response may append only the byte range that begins at
+	 * requested_offset. Once expected_length is known, every later response
+	 * must describe the same complete representation.
+	 */
+	off_t requested_offset;
+	uintmax_t expected_length;
+	uintmax_t response_range_start;
+	uintmax_t response_range_end;
+	uintmax_t response_range_total;
+	uintmax_t response_content_length;
+	unsigned expected_length_valid : 1;
+	unsigned response_range_valid : 1;
+	unsigned response_range_unsatisfied : 1;
+	unsigned response_range_error : 1;
+	unsigned response_content_length_valid : 1;
+
+	/*
+	 * The inactivity deadline starts after connection and protocol setup and
+	 * resets on every response-body write. It is not a total transfer limit.
+	 */
+	uint64_t last_body_progress_ns;
+	curl_off_t last_pretransfer_us;
+	curl_off_t last_redirect_us;
+	long inactivity_timeout;
+	unsigned inactivity_clock_started : 1;
+	unsigned inactivity_timed_out : 1;
+
 	FILE *packfile;
 	struct strbuf tmpfile;
 	struct active_request_slot *slot;
@@ -236,8 +270,11 @@ struct http_pack_request *new_direct_http_pack_request(
 	const unsigned char *packed_git_hash, char *url);
 
 /*
- * Run a direct pack request, retrying authentication and HTTP errors.
- * Returns HTTP_OK (also for 416), or an HTTP error.
+ * Run a direct pack request, retrying authentication, rate limits, and
+ * bounded transient failures. Returns HTTP_OK (also when a 416 response makes
+ * the local temporary pack a completion candidate), or an HTTP error. The
+ * caller must run finish_http_pack_request() to validate and install that
+ * candidate.
  * The caller must initialize HTTP credentials from the pack URL, not the Git
  * remote, before constructing the request.
  */

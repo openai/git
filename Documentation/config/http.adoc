@@ -308,6 +308,18 @@ http.lowSpeedTime::
 	Can be overridden by the `GIT_HTTP_LOW_SPEED_LIMIT` and
 	`GIT_HTTP_LOW_SPEED_TIME` environment variables.
 
+http.packfileUriConnectTimeout::
+	Maximum time in seconds allowed to establish a direct packfile URI
+	connection, including name resolution and protocol handshakes. Defaults
+	to 30 seconds. Set to 0 to use libcurl's default connection timeout.
+
+http.packfileUriInactivityTimeout::
+	Maximum time in seconds that a direct packfile URI response may make no
+	response-body progress. The timer starts after connection and protocol
+	setup and resets whenever response-body bytes arrive, so this setting is
+	not a total transfer deadline. Defaults to 60 seconds. Set to 0 to disable
+	the inactivity deadline.
+
 http.keepAliveIdle::
 	Specifies how long in seconds to wait on an idle connection
 	before sending TCP keepalive probes (if supported by the OS). If
