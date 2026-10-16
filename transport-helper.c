@@ -20,6 +20,7 @@
 #include "transport-internal.h"
 #include "protocol.h"
 #include "packfile.h"
+#include "send-pack.h"
 
 static int debug;
 
@@ -33,6 +34,8 @@ struct helper_data {
 		export : 1,
 		option : 1,
 		push : 1,
+		/* The helper enforces inherited push.negotiate=required. */
+		push_negotiate_required : 1,
 		connect : 1,
 		stateless_connect : 1,
 		signed_tags : 1,
@@ -203,6 +206,8 @@ static struct child_process *get_helper(struct transport *transport)
 			data->option = 1;
 		else if (!strcmp(capname, "push"))
 			data->push = 1;
+		else if (!strcmp(capname, "push-negotiate-required"))
+			data->push_negotiate_required = 1;
 		else if (!strcmp(capname, "import"))
 			data->import = 1;
 		else if (!strcmp(capname, "bidi-import"))
@@ -1109,6 +1114,11 @@ static int push_refs_with_push(struct transport *transport,
 		return 0;
 	}
 
+	if (get_push_negotiation_mode(the_repository) == PUSH_NEGOTIATE_REQUIRED &&
+	    !data->push_negotiate_required)
+		die(_("helper %s does not support required push negotiation"),
+		    data->name);
+
 	for_each_string_list_item(cas_option, &cas_options)
 		set_helper_option(transport, "cas", cas_option->string);
 	set_common_push_options(transport, data->name, flags);
@@ -1129,6 +1139,10 @@ static int push_refs_with_export(struct transport *transport,
 	struct helper_data *data = transport->data;
 	struct string_list revlist_args = STRING_LIST_INIT_DUP;
 	struct strbuf buf = STRBUF_INIT;
+
+	/* Git starts fast-export before the helper can negotiate the export. */
+	if (get_push_negotiation_mode(the_repository) == PUSH_NEGOTIATE_REQUIRED)
+		die(_("required push negotiation is not supported with helper export"));
 
 	if (!data->rs.nr)
 		die(_("remote-helper doesn't support push; refspec needed"));

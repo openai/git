@@ -132,7 +132,28 @@ This will result in only b (a and c are cleared).
 	sent by rounds of negotiation in which the client and the
 	server attempt to find commits in common. If `false`, Git will
 	rely solely on the server's ref advertisement to find commits
-	in common.
+	in common. Defaults to `false`.
++
+If set to `required`, abort the push before constructing or sending a
+packfile if negotiation fails, including when the server or protocol does
+not support negotiation. With `true`, a negotiation failure only produces
+a warning and the push proceeds.
++
+WebDAV and remote-helper `export` do not support required negotiation.
+Remote-helper `push` requires the helper to advertise
+`push-negotiate-required`; otherwise Git rejects the push before submitting
+it to the helper. Helpers that connect to Git's native protocol use the
+normal negotiation implementation. See linkgit:gitremote-helpers[7].
++
+A successful negotiation need not find any common commits. `required`
+does not limit the size of the resulting packfile or change which commits
+the server acknowledges. On a supported transport, negotiation is skipped
+when there are no negotiation tips, as with a deletion-only push without
+explicitly configured tips. Unsupported transports reject updates, including
+deletions, without starting object transfer. To permit a push after a
+negotiation failure, explicitly use
+`git -c push.negotiate=true push`; to skip negotiation, use
+`git -c push.negotiate=false push`.
 
 `push.useBitmaps`::
 	If set to `false`, disable use of bitmaps for `git push` even if

@@ -804,6 +804,7 @@ void get_version_info(struct strbuf *buf, int show_build_options)
 
 		if (fsmonitor_ipc__is_supported())
 			strbuf_addstr(buf, "feature: fsmonitor--daemon\n");
+		strbuf_addstr(buf, "feature: push-negotiate-required\n");
 #if !defined NO_GETTEXT
 		strbuf_addstr(buf, "gettext: enabled\n");
 #endif

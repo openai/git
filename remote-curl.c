@@ -1354,6 +1354,9 @@ static int push_dav(const char **specs)
 {
 	struct child_process child = CHILD_PROCESS_INIT;
 
+	if (get_push_negotiation_mode(the_repository) == PUSH_NEGOTIATE_REQUIRED)
+		die(_("WebDAV does not support required push negotiation"));
+
 	child.git_cmd = 1;
 	strvec_push(&child.args, "http-push");
 	strvec_push(&child.args, "--helper-status");
@@ -1655,6 +1658,7 @@ int cmd_main(int argc, const char **argv)
 			printf("get\n");
 			printf("option\n");
 			printf("push\n");
+			printf("push-negotiate-required\n");
 			printf("check-connectivity\n");
 			printf("object-format\n");
 			printf("\n");

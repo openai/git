@@ -80,6 +80,29 @@ test_expect_success 'pushing to local repo' '
 	compare_refs local HEAD server HEAD
 '
 
+for mode in true false required
+do
+	test_expect_success "export helper with push.negotiate=$mode" '
+		test_when_finished "rm -rf export-server export-client export-trace" &&
+		git clone server export-server &&
+		git clone "testgit::$PWD/export-server" export-client &&
+		test_commit -C export-client outgoing &&
+		git -C export-server rev-parse HEAD >before &&
+		if test "$mode" = required
+		then
+			test_must_fail env GIT_TRACE2_EVENT="$PWD/export-trace" \
+				git -C export-client -c push.negotiate=$mode push 2>err &&
+			test_grep "required push negotiation is not supported with helper export" err &&
+			test_grep ! "fast-export" export-trace &&
+			git -C export-server rev-parse HEAD >after &&
+			test_cmp before after
+		else
+			git -C export-client -c push.negotiate=$mode push &&
+			compare_refs export-client HEAD export-server HEAD
+		fi
+	'
+done
+
 test_expect_success 'fetch new branch' '
 	(cd server &&
 	 git reset --hard &&

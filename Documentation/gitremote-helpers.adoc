@@ -116,6 +116,20 @@ Supported commands: 'stateless-connect'.
 +
 Supported commands: 'list for-push', 'push'.
 
+'push-negotiate-required'::
+	With 'push', the helper promises to honor `push.negotiate=required`
+	in the inherited Git configuration. When required, supported
+	negotiation must complete successfully before enumerating objects for
+	transfer, constructing a pack, or uploading objects. Failed or
+	unsupported negotiation must fail the push. Successful negotiation
+	may find no common commits. On a supported transport, negotiation may
+	be skipped when there are no negotiation tips, as described for
+	`push.negotiate` in linkgit:git-config[1].
++
+This capability does not enable required negotiation by itself. It does not
+apply to 'export', which Git rejects when negotiation is required because
+Git would start 'fast-export' before the helper can negotiate.
+
 'export'::
 	Can discover remote refs and push specified objects from a
 	fast-import stream to remote refs.

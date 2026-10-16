@@ -30,6 +30,11 @@ detection algorithm and thus may be vulnerable to known SHA-1 collision
 attacks. When a faster SHA-1 implementation without collision detection is used
 for only non-cryptographic purposes, the algorithm is displayed in the form
 `non-collision-detecting-SHA-1: <option>`.
++
+The line `feature: push-negotiate-required` indicates support for
+`push.negotiate=required`, including rejection of unsupported push transports.
+It does not indicate that a particular remote supports negotiation. See
+linkgit:git-config[1].
 
 GIT
 ---

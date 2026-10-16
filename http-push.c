@@ -22,6 +22,7 @@
 #include "object-file.h"
 #include "odb.h"
 #include "commit-reach.h"
+#include "send-pack.h"
 
 #ifdef EXPAT_NEEDS_XMLPARSE_H
 #include <xmlparse.h>
@@ -1791,6 +1792,9 @@ int cmd_main(int argc, const char **argv)
 		die("You must specify only one branch name when deleting a remote branch");
 
 	gitdir = setup_git_directory(the_repository);
+
+	if (get_push_negotiation_mode(the_repository) == PUSH_NEGOTIATE_REQUIRED)
+		die(_("WebDAV does not support required push negotiation"));
 
 	memset(remote_dir_exists, -1, 256);
 
