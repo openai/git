@@ -760,6 +760,7 @@ static int mingw_open_append(wchar_t const *wfilename, int oflags, ...)
  */
 static int mingw_open_existing(const wchar_t *filename, int oflags, ...)
 {
+	DECLARE_PROC_ADDR(ntdll.dll, NTSTATUS, NTAPI, RtlGetLastNtStatus, void);
 	SECURITY_ATTRIBUTES security_attributes = {
 		.nLength = sizeof(security_attributes),
 		.bInheritHandle = !(oflags & O_NOINHERIT),
@@ -786,11 +787,25 @@ static int mingw_open_existing(const wchar_t *filename, int oflags, ...)
 		break;
 	}
 
+	/* Resolve this before CreateFileW() so loading it cannot change its status. */
+	INIT_PROC_ADDR(RtlGetLastNtStatus);
 	handle = CreateFileW(filename, access,
 			     FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
 			     &security_attributes, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (handle == INVALID_HANDLE_VALUE) {
 		DWORD err = GetLastError();
+
+		/*
+		 * A deleted file may remain pending while another handle is open.
+		 * Report it as absent so readers of an obsolete reftable list can
+		 * retry with the current list instead of failing with EACCES.
+		 */
+		if (err == ERROR_ACCESS_DENIED && RtlGetLastNtStatus &&
+		    RtlGetLastNtStatus() == STATUS_DELETE_PENDING) {
+			errno = ENOENT;
+			return -1;
+		}
+
 		if (err == ERROR_ACCESS_DENIED) {
 			DWORD attrs = GetFileAttributesW(filename);
 			if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))

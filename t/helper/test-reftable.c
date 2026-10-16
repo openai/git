@@ -2,6 +2,7 @@
 #include "hash.h"
 #include "hex.h"
 #include "reftable/system.h"
+#include "reftable/blocksource.h"
 #include "reftable/reftable-constants.h"
 #include "reftable/reftable-error.h"
 #include "reftable/reftable-merged.h"
@@ -17,6 +18,7 @@ static void print_help(void)
 	       "  -t dump table\n"
 	       "  -s dump stack\n"
 	       "  -6 sha256 hash format\n"
+	       "  --read-after-unlink check opening a deleted file\n"
 	       "  -h this help\n"
 	       "\n");
 }
@@ -217,12 +219,33 @@ done:
 	return err;
 }
 
+static int read_after_unlink(const char *path)
+{
+	struct reftable_block_source source = { 0 };
+	int fd, err;
+
+	/* Keep the file pending deletion on Windows with legacy unlink semantics. */
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		die_errno("cannot open %s", path);
+	if (unlink(path))
+		die_errno("cannot unlink %s", path);
+
+	err = reftable_block_source_from_file(&source, path);
+	block_source_close(&source);
+	close(fd);
+	if (err != REFTABLE_NOT_EXIST_ERROR)
+		die("expected REFTABLE_NOT_EXIST_ERROR, got %d", err);
+	return 0;
+}
+
 int cmd__dump_reftable(int argc, const char **argv)
 {
 	int err = 0;
 	int opt_dump_blocks = 0;
 	int opt_dump_table = 0;
 	int opt_dump_stack = 0;
+	int opt_read_after_unlink = 0;
 	uint32_t opt_hash_id = REFTABLE_HASH_SHA1;
 	const char *arg = NULL, *argv0 = argv[0];
 
@@ -237,6 +260,8 @@ int cmd__dump_reftable(int argc, const char **argv)
 			opt_hash_id = REFTABLE_HASH_SHA256;
 		else if (!strcmp("-s", argv[1]))
 			opt_dump_stack = 1;
+		else if (!strcmp("--read-after-unlink", argv[1]))
+			opt_read_after_unlink = 1;
 		else if (!strcmp("-?", argv[1]) || !strcmp("-h", argv[1])) {
 			print_help();
 			return 2;
@@ -250,7 +275,9 @@ int cmd__dump_reftable(int argc, const char **argv)
 
 	arg = argv[1];
 
-	if (opt_dump_blocks) {
+	if (opt_read_after_unlink) {
+		err = read_after_unlink(arg);
+	} else if (opt_dump_blocks) {
 		err = dump_blocks(arg);
 	} else if (opt_dump_table) {
 		err = dump_reftable(arg);
