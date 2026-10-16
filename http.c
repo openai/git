@@ -2675,8 +2675,16 @@ static int http_request_with_redirects(const char *url, void *result, int target
 		}
 		strbuf_swap(&current, &redirect);
 	}
-	if (ret == HTTP_OK || ret == HTTP_REAUTH || ret == HTTP_RATE_LIMITED)
+	if (ret == HTTP_OK || ret == HTTP_REAUTH || ret == HTTP_RATE_LIMITED) {
+		/*
+		 * We followed each redirect ourselves. libcurl may omit URL
+		 * credentials from CURLINFO_EFFECTIVE_URL even without a redirect,
+		 * so use the URL we requested to preserve the repository URL.
+		 */
+		strbuf_reset(options->effective_url);
+		strbuf_addbuf(options->effective_url, &current);
 		update_url_from_redirect(options->base_url, asked, options->effective_url);
+	}
 out:
 	free(asked);
 	strbuf_release(&current);
