@@ -193,6 +193,20 @@ grep_wrote () {
 	grep 'write_pack_file/wrote.*"value":"'$1'"' $2
 }
 
+test_expect_success 'push Trace2 records selected remote ref state' '
+	mk_empty testrepo &&
+	GIT_TRACE2_EVENT="$PWD/testrepo/new.trace" git push \
+		--receive-pack="git receive-pack --advertise-explicit-haves-for-testing" \
+		testrepo $the_commit:refs/heads/topic &&
+	test_grep "\"key\":\"ref_state\",\"value\":\"absent_explicit_haves\"" testrepo/new.trace &&
+	GIT_TRACE2_EVENT="$PWD/testrepo/force.trace" git push --force testrepo $the_first_commit:refs/heads/topic &&
+	test_grep "\"key\":\"ref_state\",\"value\":\"existing\"" testrepo/force.trace &&
+	GIT_TRACE2_EVENT="$PWD/testrepo/noop.trace" git push testrepo $the_first_commit:refs/heads/topic &&
+	test_grep "\"key\":\"ref_state\",\"value\":\"existing\"" testrepo/noop.trace &&
+	GIT_TRACE2_EVENT="$PWD/testrepo/mixed.trace" git push testrepo $the_first_commit:refs/heads/topic $the_first_commit:refs/heads/another &&
+	test_grep "\"key\":\"ref_state\",\"value\":\"mixed\"" testrepo/mixed.trace
+'
+
 test_expect_success 'push without negotiation' '
 	mk_empty testrepo &&
 	git push testrepo $the_first_commit:refs/remotes/origin/first_commit &&

@@ -313,6 +313,49 @@ static int check_to_send_update(const struct ref *ref, const struct send_pack_ar
 	}
 }
 
+static void trace_push_ref_state(struct repository *r,
+				 const struct ref *refs,
+				 const struct send_pack_args *args)
+{
+	enum { REF_ABSENT = 1, REF_EXISTING = 2, REF_OTHER = 4 };
+	unsigned int state = 0;
+	const char *value;
+
+	if (!trace2_is_enabled())
+		return;
+
+	for (; refs; refs = refs->next) {
+		if (check_to_send_update(refs, args) == CHECK_REF_NO_PUSH)
+			continue;
+		if (refs->deletion || !starts_with(refs->name, "refs/heads/"))
+			state |= REF_OTHER;
+		else if (is_null_oid(&refs->old_oid))
+			state |= REF_ABSENT;
+		else
+			state |= REF_EXISTING;
+	}
+
+	switch (state) {
+	case 0:
+		value = "unknown";
+		break;
+	case REF_ABSENT:
+		value = server_supports("explicit-haves") ?
+			"absent_explicit_haves" : "absent";
+		break;
+	case REF_EXISTING:
+		value = "existing";
+		break;
+	case REF_OTHER:
+		value = "other";
+		break;
+	default:
+		value = "mixed";
+		break;
+	}
+	trace2_data_string("send_pack", r, "ref_state", value);
+}
+
 /*
  * the beginning of the next line, or the end of buffer.
  *
@@ -524,6 +567,7 @@ int send_pack(struct repository *r,
 		goto out;
 	}
 
+	trace_push_ref_state(r, remote_refs, args);
 	repo_config_get_bool(r, "push.negotiate", &push_negotiate);
 	if (push_negotiate) {
 		trace2_region_enter("send_pack", "push_negotiate", r);
