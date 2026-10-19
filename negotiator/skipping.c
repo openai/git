@@ -125,7 +125,7 @@ static void mark_common(struct data *data, struct commit *seen_commit)
  * entry has the correct flags and ttl.
  *
  * This function returns 1 if an entry was found or created, and 0 otherwise
- * (because the entry for this commit had already been popped).
+ * (because the commit could not be parsed or its entry had already been popped).
  */
 static int push_parent(struct data *data, struct entry *entry,
 		       struct commit *to_push)
@@ -151,6 +151,9 @@ static int push_parent(struct data *data, struct entry *entry,
 parent_found:
 		;
 	} else {
+		/* Parse the parent before using its date to order the queue. */
+		if (repo_parse_commit(the_repository, to_push))
+			return 0;
 		parent_entry = rev_list_push(data, to_push, 0);
 	}
 
