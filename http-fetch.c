@@ -6,6 +6,8 @@
 #include "gettext.h"
 #include "hex.h"
 #include "http.h"
+#include "packfile.h"
+#include "run-command.h"
 #include "walker.h"
 #include "setup.h"
 #include "strvec.h"
@@ -82,7 +84,26 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 {
 	struct http_pack_request *preq;
 	struct packfile_progress progress = { 0 };
-	int ret;
+	struct strbuf pack_path = STRBUF_INIT;
+	int fd, ret;
+
+	odb_pack_name(the_repository, &pack_path, packfile_hash->hash, "pack");
+	fd = git_open(pack_path.buf);
+	strbuf_release(&pack_path);
+	if (fd >= 0) {
+		struct child_process ip = CHILD_PROCESS_INIT;
+
+		/* Retain index-pack validation, output and keep-file handling. */
+		ip.git_cmd = 1;
+		ip.in = fd;
+		ip.clean_on_exit = 1;
+		strvec_pushv(&ip.args, index_pack_args);
+		if (report_progress)
+			report_packfile_progress(&progress);
+		if (run_command(&ip))
+			die("index-pack failed for existing pack");
+		return;
+	}
 
 	http_init(NULL, url, 0);
 
