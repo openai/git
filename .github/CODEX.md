@@ -237,6 +237,14 @@ published pinned-plan trampoline remains valid while its reviewed automation
 topic is updated. Once the label-aware trampoline is published, moving back to
 the earlier version is rejected.
 
+The plan producer calls explicitly pass only `CODEX_PLAN_APP_PRIVATE_KEY`.
+GitHub requires this named mapping even when the key is stored in the
+`codex-plan` environment; that environment still supplies the job's value.
+The reusable workflow declares the secret optional so the controller can land
+before the updated automation topic. Both deployed trampolines remain valid
+during that update, but the controller rejects removal of the named mapping
+after it is published. The named mapping does not provision a missing key.
+
 No topic merge ref runs the pinning path. The default-branch scanner checks
 each open approved PR with the trusted `meta` controller, skips tips already
 present in the active plans or represented by an open plan PR, and only then

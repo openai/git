@@ -2,6 +2,11 @@ name: Propose Codex plan
 
 on:
   workflow_call:
+    secrets:
+      CODEX_PLAN_APP_PRIVATE_KEY:
+        description: Private key for the dedicated Codex plan App.
+        # Keep existing callers valid until named forwarding is published.
+        required: false
     inputs:
       lane:
         description: Target lane

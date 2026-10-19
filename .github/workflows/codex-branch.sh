@@ -657,6 +657,8 @@ jobs:
       contents: read
       pull-requests: read
     uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
+    secrets:
+      CODEX_PLAN_APP_PRIVATE_KEY: ${{ secrets.CODEX_PLAN_APP_PRIVATE_KEY }}
     with:
       lane: ${{ needs.topic_plan_scan.outputs.lane }}
       topic: ${{ needs.topic_plan_scan.outputs.topic }}
@@ -673,6 +675,8 @@ jobs:
       contents: read
       pull-requests: read
     uses: openai/git/.github/workflows/codex-plan-propose.yml@meta
+    secrets:
+      CODEX_PLAN_APP_PRIVATE_KEY: ${{ secrets.CODEX_PLAN_APP_PRIVATE_KEY }}
     with:
       lane: ${{ inputs.lane }}
       topic: ${{ inputs.topic }}
@@ -703,8 +707,12 @@ jobs:
 	EOF
 }
 
+write_automation_workflow_without_secrets () {
+	write_automation_workflow | sed '/^    secrets:$/ { N; d; }'
+}
+
 write_previous_pinned_automation_workflow () {
-	write_automation_workflow | sed '/^  pr_state:$/,$d'
+	write_automation_workflow_without_secrets | sed '/^  pr_state:$/,$d'
 }
 
 write_previous_automation_workflow () {
@@ -823,8 +831,19 @@ automation_workflow_is_latest () {
 		"$tmp_dir/actual-automation.yml"
 }
 
-automation_workflow_is_current () {
+automation_workflow_has_pr_state () {
 	if automation_workflow_is_latest "$1"
+	then
+		return 0
+	fi
+	write_automation_workflow_without_secrets \
+		>"$tmp_dir/expected-automation.yml"
+	cmp -s "$tmp_dir/expected-automation.yml" \
+		"$tmp_dir/actual-automation.yml"
+}
+
+automation_workflow_is_current () {
+	if automation_workflow_has_pr_state "$1"
 	then
 		return 0
 	fi
@@ -8463,6 +8482,11 @@ verify_control_paths () {
 			die "candidate changes the controller-only release publication guard"
 		if automation_workflow_is_latest "$published_codex" &&
 			! automation_workflow_is_latest "$candidate"
+		then
+			die "candidate downgrades the canonical Codex admission workflow"
+		fi
+		if automation_workflow_has_pr_state "$published_codex" &&
+			! automation_workflow_has_pr_state "$candidate"
 		then
 			die "candidate downgrades the canonical Codex admission workflow"
 		fi
