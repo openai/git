@@ -492,6 +492,16 @@ test_expect_success !CYGWIN 'ref transaction: many concurrent writers' '
 	)
 '
 
+for legacy_delete in 0 1
+do
+	test_expect_success "read table deleted with an open descriptor (legacy deletion: $legacy_delete)" '
+		test_when_finished "rm -f table" &&
+		echo content >table &&
+		GIT_TEST_LEGACY_DELETE=$legacy_delete \
+			test-tool dump-reftable --read-after-unlink table
+	'
+done
+
 test_expect_success 'pack-refs: compacts tables' '
 	test_when_finished "rm -rf repo" &&
 	git init repo &&
