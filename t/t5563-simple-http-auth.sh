@@ -52,6 +52,8 @@ expect_credential_query () {
 }
 
 per_test_cleanup () {
+	# Each pack test must use HTTP instead of reusing a completed pack.
+	rm -f .git/objects/pack/pack-"$pack_hash".* &&
 	rm -f *.cred &&
 	rm -f "$HTTPD_ROOT_PATH"/custom-auth.valid \
 	      "$HTTPD_ROOT_PATH"/custom-auth.challenge
