@@ -54,6 +54,7 @@ struct options {
 
 		refetch : 1,
 		atomic : 1,
+		require_exact_old_oid : 1,
 		object_format : 1,
 		force_if_includes : 1;
 	const struct git_hash_algo *hash_algo;
@@ -181,6 +182,15 @@ static int set_option(const char *name, size_t namelen, const char *value)
 			options.atomic = 1;
 		else if (!strcmp(value, "false"))
 			options.atomic = 0;
+		else
+			return -1;
+		return 0;
+	} else if (!strncmp(name, TRANS_OPT_REQUIRE_EXACT_OLD_OID,
+			   namelen)) {
+		if (!strcmp(value, "true"))
+			options.require_exact_old_oid = 1;
+		else if (!strcmp(value, "false"))
+			options.require_exact_old_oid = 0;
 		else
 			return -1;
 		return 0;
@@ -1354,6 +1364,9 @@ static int push_dav(const char **specs)
 {
 	struct child_process child = CHILD_PROCESS_INIT;
 
+	if (options.require_exact_old_oid)
+		die(_("dumb HTTP does not support --require-exact-old-oid"));
+
 	child.git_cmd = 1;
 	strvec_push(&child.args, "http-push");
 	strvec_push(&child.args, "--helper-status");
@@ -1392,6 +1405,8 @@ static int push_git(struct discovery *heads, const char **specs)
 		strvec_push(&args, "--signed=if-asked");
 	if (options.atomic)
 		strvec_push(&args, "--atomic");
+	if (options.require_exact_old_oid)
+		strvec_push(&args, "--require-exact-old-oid");
 	if (options.verbosity == 0)
 		strvec_push(&args, "--quiet");
 	else if (options.verbosity > 1)

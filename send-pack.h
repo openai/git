@@ -34,6 +34,7 @@ struct send_pack_args {
 		push_cert:2,
 		stateless_rpc:1,
 		atomic:1,
+		require_exact_old_oid:1,
 		disable_bitmaps:1;
 	const struct string_list *push_options;
 };

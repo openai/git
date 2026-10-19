@@ -13,6 +13,7 @@ git push [--all | --branches | --mirror | --tags] [--follow-tags] [--atomic] [-n
 	 [--repo=<repository>] [-f | --force] [-d | --delete] [--prune] [-q | --quiet] [-v | --verbose]
 	 [-u | --set-upstream] [-o <string> | --push-option=<string>]
 	 [--[no-]signed | --signed=(true|false|if-asked)]
+	 [--require-exact-old-oid]
 	 [--force-with-lease[=<refname>[:<expect>]] [--force-if-includes]]
 	 [--no-verify] [<repository> [<refspec>...]]
 
@@ -207,6 +208,19 @@ linkgit:git-receive-pack[1] for the details on the receiving end.
 	Use an atomic transaction on the remote side if available.
 	Either all refs are updated, or on error, no refs are updated.
 	If the server does not support atomic pushes the push will fail.
+
+`--require-exact-old-oid`::
+	Require the receiving end to advertise both `explicit-haves` and
+	`exact-old-oid-v1`, and request both capabilities in the update
+	command. If either capability is unavailable, abort before sending an
+	update command or pack data. For a direct remote, use an explicit
+	`--force-with-lease=<refname>:<expect>` to fix the expected old object ID
+	before remote discovery; this option does not choose that object ID.
+	The `on-demand` and `only` recursive submodule modes are rejected,
+	including when selected by configuration.
+	Dumb HTTP is rejected. Push and export remote helpers must
+	accept this option. Helpers that provide a native connection use the
+	native capability check.
 
 `-o <option>`::
 `--push-option=<option>`::

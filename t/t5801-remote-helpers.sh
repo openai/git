@@ -80,6 +80,13 @@ test_expect_success 'pushing to local repo' '
 	compare_refs local HEAD server HEAD
 '
 
+test_expect_success 'required exact-old-oid-v1 capability rejects an unsupported remote helper' '
+	test_must_fail git -C local push --require-exact-old-oid \
+		origin HEAD:refs/heads/exact-old 2>err &&
+	test_grep "helper testgit does not support --require-exact-old-oid" err &&
+	test_must_fail git -C server show-ref --verify refs/heads/exact-old
+'
+
 test_expect_success 'fetch new branch' '
 	(cd server &&
 	 git reset --hard &&

@@ -523,7 +523,8 @@ fetching protocol. Each reference obj-id and name on the server is sent
 in packet-line format to the client, followed by a flush-pkt.  The only
 real difference is that the capability listing is different - the only
 possible values are 'report-status', 'report-status-v2', 'delete-refs',
-'ofs-delta', 'atomic', 'push-options' and 'explicit-haves'.
+'ofs-delta', 'atomic', 'push-options', 'explicit-haves' and
+'exact-old-oid-v1'.
 
 Reference Update Request and Packfile Transfer
 ----------------------------------------------
