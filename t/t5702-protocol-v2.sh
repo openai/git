@@ -912,6 +912,46 @@ test_expect_success 'file:// --negotiate-only' '
 	test_grep "$COMMON" out
 '
 
+for algorithm in consecutive skipping
+do
+	test_expect_success "file:// --negotiate-only with no common commits ($algorithm)" '
+		test_when_finished "rm -rf unrelated-client unrelated-server" &&
+		git init unrelated-client &&
+		test_commit -C unrelated-client one &&
+		test_commit -C unrelated-client two &&
+		git init --bare unrelated-server &&
+		test_when_finished "rm -f negotiate-packet negotiate-event" &&
+		GIT_TRACE_PACKET="$PWD/negotiate-packet" \
+		GIT_TRACE2_EVENT="$PWD/negotiate-event" \
+		git -C unrelated-client -c protocol.version=2 \
+			-c fetch.negotiationAlgorithm=$algorithm \
+			fetch --negotiate-only --negotiation-tip=HEAD \
+			"file://$PWD/unrelated-server" >out &&
+		test_must_be_empty out &&
+		test_grep "fetch< NAK" negotiate-packet &&
+		test_grep ! "fetch< ACK" negotiate-packet &&
+		test_grep ! "pack-objects" negotiate-event &&
+		test_grep "\"key\":\"total_rounds\",\"value\":\"1\"" negotiate-event
+	'
+done
+
+for algorithm in consecutive skipping
+do
+	test_expect_success "file:// --negotiate-only with only included commits ($algorithm)" '
+		setup_negotiate_only server "file://$PWD/server" &&
+		test_when_finished "rm -f negotiate-event" &&
+		GIT_TRACE2_EVENT="$PWD/negotiate-event" \
+		git -C client -c protocol.version=2 \
+			-c fetch.negotiationAlgorithm=$algorithm \
+			fetch --negotiate-only --negotiation-tip=one \
+			--negotiation-include=one origin >out &&
+		git -C client rev-parse one >expect &&
+		test_cmp expect out &&
+		test_grep "\"key\":\"haves_added\",\"value\":\"0\"" negotiate-event &&
+		test_grep "\"key\":\"total_rounds\",\"value\":\"1\"" negotiate-event
+	'
+done
+
 test_expect_success 'file:// --negotiate-only with protocol v0' '
 	SERVER="server" &&
 	URI="file://$(pwd)/server" &&
@@ -1796,6 +1836,25 @@ test_expect_success 'http:// --negotiate-only' '
 		origin >out &&
 	COMMON=$(git -C "$SERVER" rev-parse two) &&
 	test_grep "$COMMON" out
+'
+
+test_expect_success 'http:// --negotiate-only with no common commits' '
+	test_when_finished "rm -rf unrelated-client \"$HTTPD_DOCUMENT_ROOT_PATH/unrelated-server\"" &&
+	git init unrelated-client &&
+	test_commit -C unrelated-client one &&
+	test_commit -C unrelated-client two &&
+	git init --bare "$HTTPD_DOCUMENT_ROOT_PATH/unrelated-server" &&
+	test_when_finished "rm -f negotiate-packet negotiate-event" &&
+	GIT_TRACE_PACKET="$PWD/negotiate-packet" \
+	GIT_TRACE2_EVENT="$PWD/negotiate-event" \
+	git -C unrelated-client -c protocol.version=2 fetch \
+		--negotiate-only --negotiation-tip=HEAD \
+		"$HTTPD_URL/smart/unrelated-server" >out &&
+	test_must_be_empty out &&
+	test_grep "fetch< NAK" negotiate-packet &&
+	test_grep ! "fetch< ACK" negotiate-packet &&
+	test_grep ! "packfile" negotiate-packet &&
+	test_grep "\"key\":\"total_rounds\",\"value\":\"1\"" negotiate-event
 '
 
 test_expect_success 'http:// --negotiate-only without wait-for-done support' '

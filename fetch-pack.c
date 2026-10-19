@@ -2556,6 +2556,20 @@ void negotiate_using_fetch(const struct oid_array *negotiation_restrict_tips,
 		trace2_data_intmax("negotiate_using_fetch", the_repository,
 				   "in_vain", in_vain);
 
+		/*
+		 * Previous responses are complete and there are no new haves.
+		 * An empty request could ask the server to send a pack instead.
+		 * Still send the first request: it may contain only explicit
+		 * negotiation-include commits, which add_haves() does not count.
+		 */
+		if (!haves_added && negotiation_round > 1) {
+			trace2_region_leave_printf("negotiate_using_fetch", "round",
+						   the_repository, "%d",
+						   negotiation_round);
+			negotiation_round--;
+			break;
+		}
+
 		/* Send request */
 		packet_buf_flush(&req_buf);
 		if (write_in_full(fd[1], req_buf.buf, req_buf.len) < 0)
@@ -2588,7 +2602,7 @@ void negotiate_using_fetch(const struct oid_array *negotiation_restrict_tips,
 						 REACH_SCRATCH, 0,
 						 min_generation))
 			last_iteration = 1;
-		trace2_region_leave_printf("negotiation", "round",
+		trace2_region_leave_printf("negotiate_using_fetch", "round",
 					   the_repository, "%d",
 					   negotiation_round);
 	}

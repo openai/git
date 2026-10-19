@@ -707,6 +707,7 @@ integration_tests = [
   't5553-set-upstream.sh',
   't5554-noop-fetch-negotiator.sh',
   't5555-http-smart-common.sh',
+  't5556-push-negotiate.sh',
   't5557-http-get.sh',
   't5558-clone-bundle-uri.sh',
   't5559-http-fetch-smart-http2.sh',

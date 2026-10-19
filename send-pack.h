@@ -8,6 +8,16 @@ struct oid_array;
 struct ref;
 struct repository;
 
+/* The push.negotiate policy for attempting negotiation and handling failure. */
+enum push_negotiation_mode {
+	PUSH_NEGOTIATE_DISABLED,
+	PUSH_NEGOTIATE_ENABLED,
+	PUSH_NEGOTIATE_REQUIRED,
+};
+
+/* Read push.negotiate, accepting Boolean values and "required". */
+enum push_negotiation_mode get_push_negotiation_mode(struct repository *r);
+
 /* Possible values for push_cert field in send_pack_args. */
 #define SEND_PACK_PUSH_CERT_NEVER 0
 #define SEND_PACK_PUSH_CERT_IF_ASKED 1

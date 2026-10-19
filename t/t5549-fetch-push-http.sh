@@ -69,4 +69,87 @@ EOF
 	test_cmp warning-expect warning-actual
 '
 
+test_expect_success 'push with required negotiation' '
+	setup_client_and_server &&
+	test_when_finished "rm -f event" &&
+	GIT_TRACE2_EVENT="$PWD/event" \
+		git -C client -c protocol.version=2 -c push.negotiate=required \
+		push "$URI" main:refs/remotes/origin/main &&
+	grep_wrote 3 event
+'
+
+for status in 400 500
+do
+	for mode in true required
+	do
+		test_expect_success "push.negotiate=$mode with HTTP $status during negotiation" '
+			setup_client_and_server &&
+			test_when_finished "rm -f event \"$HTTPD_ROOT_PATH/one-time-script\"" &&
+			write_script "$HTTPD_ROOT_PATH/one-time-script" <<-EOF &&
+			if test "\$REQUEST_METHOD" = POST &&
+			   test "\${PATH_INFO##*/}" = git-upload-pack
+			then
+				printf "Status: $status Test failure\\r\\n"
+				printf "Content-Type: text/plain\\r\\n\\r\\n"
+				echo "negotiation failed"
+			else
+				cat "\$1"
+			fi
+			EOF
+			if test "$mode" = required
+			then
+				test_must_fail env GIT_TRACE2_EVENT="$PWD/event" \
+					git -C client -c protocol.version=2 -c push.negotiate=$mode \
+					push "$HTTPD_URL/one_time_script/server" \
+					main:refs/remotes/origin/main 2>err &&
+				test_grep "push negotiation failed; aborting push" err &&
+				test_grep ! "proceeding anyway" err &&
+				test_grep ! "pack-objects" event &&
+				test_must_fail git -C "$SERVER" show-ref --verify refs/remotes/origin/main
+			else
+				GIT_TRACE2_EVENT="$PWD/event" \
+					git -C client -c protocol.version=2 -c push.negotiate=$mode \
+					push "$HTTPD_URL/one_time_script/server" \
+					main:refs/remotes/origin/main 2>err &&
+				test_grep "push negotiation failed; proceeding anyway" err &&
+				grep_wrote 6 event
+			fi &&
+			test_grep "HTTP $status" err &&
+			test_path_is_missing "$HTTPD_ROOT_PATH/one-time-script"
+		'
+	done
+done
+
+test_expect_success 'required negotiation rejects a missing wait-for-done capability' '
+	setup_client_and_server &&
+	test_when_finished "rm -f event \"$HTTPD_ROOT_PATH/one-time-script\"" &&
+	write_script "$HTTPD_ROOT_PATH/one-time-script" <<-\EOF &&
+	sed "s/ wait-for-done/ xxxx-xxx-xxxx/" "$1"
+	EOF
+	test_must_fail env GIT_TRACE2_EVENT="$PWD/event" \
+		git -C client -c protocol.version=2 -c push.negotiate=required \
+		push "$HTTPD_URL/one_time_script/server" \
+		main:refs/remotes/origin/main 2>err &&
+	test_grep "server does not support wait-for-done" err &&
+	test_grep "push negotiation failed; aborting push" err &&
+	test_grep ! "pack-objects" event &&
+	test_must_fail git -C "$SERVER" show-ref --verify refs/remotes/origin/main
+'
+
+test_expect_success 'required negotiation rejects an invalid acknowledgments section' '
+	setup_client_and_server &&
+	test_when_finished "rm -f event \"$HTTPD_ROOT_PATH/one-time-script\"" &&
+	write_script "$HTTPD_ROOT_PATH/one-time-script" <<-\EOF &&
+	sed "s/acknowledgments/not-ack-section/" "$1"
+	EOF
+	test_must_fail env GIT_TRACE2_EVENT="$PWD/event" \
+		git -C client -c protocol.version=2 -c push.negotiate=required \
+		push "$HTTPD_URL/one_time_script/server" \
+		main:refs/remotes/origin/main 2>err &&
+	test_grep "expected .acknowledgments." err &&
+	test_grep "push negotiation failed; aborting push" err &&
+	test_grep ! "pack-objects" event &&
+	test_must_fail git -C "$SERVER" show-ref --verify refs/remotes/origin/main
+'
+
 test_done
