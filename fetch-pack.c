@@ -2428,10 +2428,14 @@ struct ref *fetch_pack(struct fetch_pack_args *args,
 		       enum protocol_version version)
 {
 	struct ref *ref_cpy;
+	struct ref **original_sought;
+	int original_nr_sought = nr_sought;
+	int i;
 	struct shallow_info si;
 	struct oid_array shallows_scratch = OID_ARRAY_INIT;
 
 	fetch_pack_setup();
+	DUP_ARRAY(original_sought, sought, nr_sought);
 	if (nr_sought)
 		nr_sought = remove_duplicates_in_refs(sought, nr_sought);
 
@@ -2451,6 +2455,19 @@ struct ref *fetch_pack(struct fetch_pack_args *args,
 		ref_cpy = do_fetch_pack(args, fd, ref, sought, nr_sought,
 					&si, pack_lockfiles);
 	}
+
+	/*
+	 * Callers can use distinct ref objects for FETCH_HEAD and each tracking
+	 * destination. A wanted-refs response updates the deduplicated entry;
+	 * propagate its object ID to every original entry before callers use it.
+	 */
+	for (i = 0; i < original_nr_sought; i++) {
+		struct ref **found = bsearch(original_sought[i]->name, sought,
+					    nr_sought, sizeof(*sought), cmp_name_ref);
+		if (found)
+			oidcpy(&original_sought[i]->old_oid, &(*found)->old_oid);
+	}
+	free(original_sought);
 	odb_reprepare(the_repository->objects);
 
 	if (!args->cloning && args->deepen) {
