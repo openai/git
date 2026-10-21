@@ -522,6 +522,104 @@ test_expect_success PERL_TEST_HELPERS 'server is initially behind - ref in want'
 	test_cmp expected actual
 '
 
+test_expect_success PERL_TEST_HELPERS 'moving want-ref updates FETCH_HEAD and tracking ref' '
+	git -C "$REPO" config uploadpack.allowRefInWant true &&
+	rm -rf local &&
+	cp -r "$LOCAL_PRISTINE" local &&
+	inconsistency main "main^" &&
+	git -C local fetch origin main &&
+
+	git -C "$REPO" rev-parse main main >expected &&
+	git -C local rev-parse FETCH_HEAD refs/remotes/origin/main >actual &&
+	test_cmp expected actual
+'
+
+test_expect_success PERL_TEST_HELPERS 'moving want-ref updates every mapped destination' '
+	git -C "$REPO" config uploadpack.allowRefInWant true &&
+	rm -rf local &&
+	cp -r "$LOCAL_PRISTINE" local &&
+	inconsistency main "main^" &&
+	git -C local fetch origin main:refs/heads/actual main:refs/heads/extra &&
+
+	git -C "$REPO" rev-parse main main main main >expected &&
+	git -C local rev-parse FETCH_HEAD refs/heads/actual refs/heads/extra \
+		refs/remotes/origin/main >actual &&
+	test_cmp expected actual
+'
+
+test_expect_success PERL_TEST_HELPERS 'moving want-ref without a tracking mapping' '
+	git -C "$REPO" config uploadpack.allowRefInWant true &&
+	rm -rf local &&
+	cp -r "$LOCAL_PRISTINE" local &&
+	git -C local config remote.origin.fetch "+refs/heads/other:refs/remotes/origin/other" &&
+	git -C local rev-parse refs/remotes/origin/main >before &&
+	inconsistency main "main^" &&
+	git -C local fetch origin main &&
+
+	git -C "$REPO" rev-parse main >expected &&
+	git -C local rev-parse FETCH_HEAD >actual &&
+	test_cmp expected actual &&
+	git -C local rev-parse refs/remotes/origin/main >after &&
+	test_cmp before after
+'
+
+test_expect_success PERL_TEST_HELPERS 'moving ref without ref-in-want keeps the discovery OID' '
+	git -C "$REPO" config uploadpack.allowRefInWant false &&
+	rm -rf local &&
+	cp -r "$LOCAL_PRISTINE" local &&
+	inconsistency main "main^" &&
+	git -C local fetch origin main &&
+
+	git -C "$REPO" rev-parse "main^" "main^" >expected &&
+	git -C local rev-parse FETCH_HEAD refs/remotes/origin/main >actual &&
+	test_cmp expected actual
+'
+
+test_expect_success PERL_TEST_HELPERS 'setup a divergent ref' '
+	git -C "$REPO" checkout -b divergent "main~2" &&
+	test_commit -C "$REPO" divergent-tip &&
+	git -C "$REPO" tag -d divergent-tip &&
+	git -C "$REPO" checkout main
+'
+
+test_expect_success PERL_TEST_HELPERS 'moving want-ref does not require the discovery object' '
+	git -C "$REPO" config uploadpack.allowRefInWant true &&
+	rm -rf local &&
+	cp -r "$LOCAL_PRISTINE" local &&
+	discovery=$(git -C "$REPO" rev-parse "main^") &&
+	test_must_fail git -C local cat-file -e "$discovery" &&
+	inconsistency divergent "main^" &&
+	git -C local fetch origin divergent &&
+
+	git -C "$REPO" rev-parse divergent divergent >expected &&
+	git -C local rev-parse FETCH_HEAD refs/remotes/origin/divergent >actual &&
+	test_cmp expected actual &&
+	test_must_fail git -C local cat-file -e "$discovery" &&
+	git -C local fsck --no-dangling
+'
+
+test_expect_success PERL_TEST_HELPERS 'moving want-refs update their own tracking refs' '
+	git -C "$REPO" config uploadpack.allowRefInWant true &&
+	rm -rf local &&
+	cp -r "$LOCAL_PRISTINE" local &&
+	main=$(git -C "$REPO" rev-parse main) &&
+	divergent=$(git -C "$REPO" rev-parse divergent) &&
+	discovery=$(git -C "$REPO" rev-parse "main^") &&
+	write_script "$HTTPD_ROOT_PATH/one-time-script" <<-EOF &&
+	sed -e "s/$main/$discovery/" -e "s/$divergent/$discovery/" "\$1"
+	EOF
+	git -C local fetch origin main divergent &&
+
+	git -C "$REPO" rev-parse main divergent >expected &&
+	git -C local rev-parse refs/remotes/origin/main \
+		refs/remotes/origin/divergent >actual &&
+	test_cmp expected actual &&
+	sort expected >expected_heads &&
+	cut -f1 local/.git/FETCH_HEAD | sort >actual_heads &&
+	test_cmp expected_heads actual_heads &&
+	git -C local fsck --no-dangling
+'
+
 test_expect_success PERL_TEST_HELPERS 'server loses a ref - ref in want' '
 	git -C "$REPO" config uploadpack.allowRefInWant true &&
 	rm -rf local &&
