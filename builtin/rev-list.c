@@ -28,6 +28,8 @@
 #include "commit-reach.h"
 #include "quote.h"
 #include "strbuf.h"
+#include "promisor-remote.h"
+#include "shallow.h"
 
 struct rev_list_info {
 	struct rev_info *revs;
@@ -76,6 +78,7 @@ static const char rev_list_usage[] =
 "    --count\n"
 "    -z\n"
 "  special purpose:\n"
+"    --sparse-connectivity\n"
 "    --bisect\n"
 "    --bisect-vars\n"
 "    --bisect-all"
@@ -705,6 +708,7 @@ int cmd_rev_list(int argc,
 	int bisect_show_vars = 0;
 	int bisect_find_all = 0;
 	int use_bitmap_index = 0;
+	int test_bitmap = 0;
 	int filter_provided_objects = 0;
 	const char *show_progress = NULL;
 	int ret = 0;
@@ -803,9 +807,13 @@ int cmd_rev_list(int argc,
 			use_bitmap_index = 1;
 			continue;
 		}
+		if (!strcmp(arg, "--sparse-connectivity")) {
+			revs.sparse_connectivity = 1;
+			continue;
+		}
 		if (!strcmp(arg, "--test-bitmap")) {
-			test_bitmap_walk(&revs);
-			goto cleanup;
+			test_bitmap = 1;
+			continue;
 		}
 		if (skip_prefix(arg, "--progress=", &arg)) {
 			show_progress = arg;
@@ -867,6 +875,39 @@ int cmd_rev_list(int argc,
 
 		usage(rev_list_usage);
 
+	}
+
+	if (revs.sparse_connectivity) {
+		if (!(info.flags & REV_LIST_QUIET) ||
+		    !revs.tree_objects || !revs.blob_objects || !revs.tag_objects)
+			die(_("--sparse-connectivity requires --objects and --quiet"));
+		if (arg_missing_action != MA_ERROR || revs.ignore_missing ||
+		    revs.ignore_missing_links || revs.exclude_promisor_objects)
+			die(_("--sparse-connectivity requires missing objects to be errors"));
+		if (is_repository_shallow(repo) || repo_has_promisor_remote(repo))
+			die(_("--sparse-connectivity requires a full clone"));
+		if (revs.filter.choice || filter_provided_objects || arg_print_omitted ||
+		    revs.prune_data.nr || revs.no_walk || revs.first_parent_only ||
+		    revs.exclude_first_parent_only || revs.ancestry_path ||
+		    revs.simplify_merges || revs.simplify_by_decoration ||
+		    revs.remove_empty_trees || revs.maximal_only ||
+		    revs.skip_count >= 0 || revs.max_count >= 0 ||
+		    revs.max_age != -1 || revs.max_age_as_filter != -1 ||
+		    revs.min_age != -1 || revs.min_parents || revs.max_parents >= 0 ||
+		    revs.grep_filter.pattern_list || revs.grep_filter.header_list ||
+		    revs.unpacked || revs.no_kept_objects || revs.reflog_info ||
+		    revs.cherry_pick || revs.left_only || revs.right_only)
+			die(_("--sparse-connectivity cannot be combined with traversal filters"));
+		if (revs.count || show_disk_usage || use_bitmap_index || test_bitmap || bisect_list ||
+		    revs.edge_hint || revs.boundary || revs.verify_objects ||
+		    revs.left_right || revs.cherry_mark || revs.graph || !line_term ||
+		    revs.verbose_header || info.show_timestamp || revs.pretty_given)
+			die(_("--sparse-connectivity cannot be combined with other output modes"));
+	}
+
+	if (test_bitmap) {
+		test_bitmap_walk(&revs);
+		goto cleanup;
 	}
 
 	/*
@@ -936,7 +977,7 @@ int cmd_rev_list(int argc,
 	prepare_maximal_independent(&revs);
 
 	if (revs.tree_objects)
-		mark_edges_uninteresting(&revs, show_edge, 0);
+		mark_edges_uninteresting(&revs, show_edge, revs.sparse_connectivity);
 
 	if (bisect_list) {
 		int reaches, all;

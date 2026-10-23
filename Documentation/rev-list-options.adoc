@@ -264,6 +264,24 @@ ifdef::git-rev-list[]
 	connected (or not).  It is faster than redirecting stdout
 	to `/dev/null` as the output does not have to be formatted.
 
+`--sparse-connectivity`::
+	Use sparse tree traversal to check connectivity without first marking
+	every object in the excluded trees. Requires `--objects --quiet` and
+	a full clone. Without this option, the usual eager traversal is used.
++
+This option checks all objects reachable from the selected commits unless
+they belong to trusted excluded history. It also checks intermediate commits,
+not just the final snapshot. Sparse traversal can fail to recognize an old
+subtree copied to another path and check it again. As a result, it can detect
+missing objects in old history or reach `core.maxTreeDepth` where eager
+traversal would succeed.
++
+Missing objects must be errors; `--missing=error` is allowed, but other
+`--missing` modes, `--ignore-missing`, and `--exclude-promisor-objects` are not.
+Object filters, pathspecs, commit traversal limits, and other output modes
+(including `--count`, `--disk-usage`, and `--use-bitmap-index`) are incompatible.
+This option is unrelated to the history-simplification option `--sparse`.
+
 `--disk-usage`::
 `--disk-usage=human`::
 	Suppress normal output; instead, print the sum of the bytes used

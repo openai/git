@@ -452,7 +452,7 @@ static struct commit *handle_commit(struct rev_info *revs,
 		struct tree *tree = (struct tree *)object;
 		if (!revs->tree_objects)
 			return NULL;
-		if (flags & UNINTERESTING) {
+		if ((flags & UNINTERESTING) && !revs->sparse_connectivity) {
 			mark_tree_contents_uninteresting(revs->repo, tree);
 			return NULL;
 		}
