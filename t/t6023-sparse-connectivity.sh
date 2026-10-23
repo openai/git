@@ -4,6 +4,11 @@ test_description='opt-in sparse connectivity checks'
 
 . ./test-lib.sh
 
+# These tests remove objects after creating commits. Check that a commit still
+# exists before reading it from a commit-graph, as in t6022-rev-list-missing.sh.
+GIT_COMMIT_GRAPH_PARANOIA=true
+export GIT_COMMIT_GRAPH_PARANOIA
+
 # Keep the graph small, with an unchanged outer tree hiding a copied subtree.
 test_expect_success 'setup connected history and a copied subtree' '
 	mkdir -p source/deep &&
