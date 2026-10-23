@@ -9,7 +9,8 @@ git-ls-remote - List references in a remote repository
 SYNOPSIS
 --------
 [verse]
-'git ls-remote' [--branches] [--tags] [--refs] [--upload-pack=<exec>]
+'git ls-remote' [--branches[=<pattern>]] [--tags[=<pattern>]]
+	      [--refs] [--upload-pack=<exec>]
 	      [-q | --quiet] [--exit-code] [--get-url] [--sort=<key>]
 	      [--symref] [<repository> [<patterns>...]]
 
@@ -22,9 +23,9 @@ commit IDs.
 OPTIONS
 -------
 -b::
---branches::
+--branches[=<pattern>]::
 -t::
---tags::
+--tags[=<pattern>]::
 	Limit to only local branches and local tags, respectively.
 	These options are _not_ mutually exclusive; when given
 	both, references stored in refs/heads and refs/tags are
@@ -33,6 +34,29 @@ OPTIONS
 	the future.  Also note that `git ls-remote -h` used without
 	anything else on the command line gives help, consistent
 	with other git subcommands.
++
+The long options accept an optional pattern, attached with `=`. Match the
+whole branch or tag name, without its `refs/heads/` or `refs/tags/` prefix,
+using shell wildcards. A pattern without wildcards matches exactly; `main`
+does not match `team/main` or `main-next`. Use `topic/*` to match names
+under `topic/`; `*` can match across slashes. Quote patterns to prevent
+the shell from expanding them. Unlike `git rev-parse --branches=<pattern>`,
+these options do not append `/*` to a pattern without wildcards.
++
+Repeated patterns select names matching any pattern in their respective
+namespace. A branch pattern does not restrict tags, or vice versa. A bare
+option selects every name in its namespace, including when combined with
+patterns. `--no-branches` and `--no-tags` clear the selection and patterns
+for that namespace. The short options and `--heads` do not accept patterns.
++
+Positional `<patterns>` further filter the selected refs using the existing
+tail-matching rules. Output retains full ref names, and matching annotated
+tags include their peeled `^{}` entries unless `--refs` is given.
++
+With protocol version 2, these patterns limit the requested ref prefixes
+to the literal part before the first wildcard or escape. Servers may
+return additional refs, which are filtered by the client. Older protocols
+filter the complete advertisement on the client.
 
 --refs::
 	Do not show peeled tags or pseudorefs like `HEAD` in the output.
@@ -92,7 +116,7 @@ OPTIONS
 
 <patterns>...::
 	When unspecified, all references, after filtering done
-	with --heads and --tags, are shown.  When <patterns>... are
+	with --branches and --tags, are shown.  When <patterns>... are
 	specified, only references matching one or more of the given
 	patterns are displayed. Each pattern is interpreted as a glob
 	(see `glob` in linkgit:gitglossary[7]) which is matched against
@@ -146,6 +170,20 @@ $ git ls-remote --tags http://www.kernel.org/pub/scm/git/git.git v\*
 cbf04937d5b9fcf0a76c28f69e6294e9e3ecd7e6	refs/tags/v2.39.2^{}
 d4ca2e3147b409459955613c152220f4db848ee1	refs/tags/v2.40.0
 73876f4861cd3d187a4682290ab75c9dccadbc56	refs/tags/v2.40.0^{}
+----
+
+* Look up one branch by its exact name without requesting all branches
+  from a protocol-v2 server:
++
+----
+$ git ls-remote --branches=main origin
+950264636c68591989456e3ba0a5442f93152c1a	refs/heads/main
+----
+
+* List branches under `topic/` and tags whose names start with `v2.`:
++
+----
+$ git ls-remote --branches='topic/*' --tags='v2.*' origin
 ----
 
 SEE ALSO
