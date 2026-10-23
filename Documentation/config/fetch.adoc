@@ -10,6 +10,17 @@
 	reference.
 	Defaults to `on-demand`, or to the value of `submodule.recurse` if set.
 
+`fetch.sparseConnectivity`::
+	Use sparse tree traversal for connectivity checks in full clones.
+	This can avoid walking unchanged parts of the old trees when fetching
+	a small update. Defaults to `false`. Shallow and partial clones retain
+	the usual connectivity checks.
++
+Sparse traversal can check additional old objects, for example after copying
+a subtree to another path. It may therefore detect missing objects in old
+history or reach `core.maxTreeDepth` where the usual check would succeed.
+See `--sparse-connectivity` in linkgit:git-rev-list[1].
+
 `fetch.fsckObjects`::
 	If it is set to true, git-fetch-pack will check all fetched
 	objects. See `transfer.fsckObjects` for what's

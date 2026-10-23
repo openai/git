@@ -47,6 +47,9 @@ struct check_connected_options {
 	 */
 	unsigned is_deepening_fetch : 1;
 
+	/* Use sparse connectivity checking when the repository is a full clone. */
+	unsigned sparse : 1;
+
 	/*
 	 * If not NULL, use `--exclude-hidden=$section` to exclude all refs
 	 * hidden via the `$section.hideRefs` config from the set of

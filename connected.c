@@ -10,6 +10,7 @@
 #include "transport.h"
 #include "packfile.h"
 #include "promisor-remote.h"
+#include "shallow.h"
 
 static int promised_object_cb(const struct object_id *oid UNUSED,
 			      struct object_info *oi UNUSED,
@@ -129,6 +130,10 @@ int check_connected(oid_iterate_fn fn, void *cb_data,
 		strvec_push(&rev_list.args, "--all");
 	}
 	strvec_push(&rev_list.args, "--quiet");
+	if (opt->sparse && !opt->is_deepening_fetch && !opt->shallow_file &&
+	    !is_repository_shallow(the_repository) &&
+	    !repo_has_promisor_remote(the_repository))
+		strvec_push(&rev_list.args, "--sparse-connectivity");
 	strvec_push(&rev_list.args, "--alternate-refs");
 	if (opt->progress)
 		strvec_pushf(&rev_list.args, "--progress=%s",

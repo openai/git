@@ -2030,6 +2030,70 @@ test_expect_success REFFILES "HEAD is updated even with conflicts" '
 	)
 '
 
+test_expect_success 'setup sparse connectivity fetches' '
+	test_create_repo sparse-fetch-src &&
+	test_commit -C sparse-fetch-src old &&
+	for setting in unset false true
+	do
+		git clone --no-local sparse-fetch-src sparse-fetch-$setting || return 1
+	done &&
+	git -C sparse-fetch-false config fetch.sparseConnectivity true &&
+	test_commit -C sparse-fetch-src new &&
+	git -C sparse-fetch-src rev-parse HEAD >sparse-fetch-expect
+'
+
+for setting in unset false true
+do
+	test_expect_success "fetch.sparseConnectivity=$setting selects post-transfer check" '
+		trace="$TRASH_DIRECTORY/sparse-fetch-$setting.trace" &&
+		if test "$setting" = unset
+		then
+			GIT_TRACE2_EVENT="$trace" git -C sparse-fetch-$setting \
+				-c fetch.unpackLimit=100 fetch --no-auto-maintenance
+		else
+			GIT_TRACE2_EVENT="$trace" git -C sparse-fetch-$setting \
+				-c fetch.sparseConnectivity=$setting \
+				-c fetch.unpackLimit=100 fetch --no-auto-maintenance
+		fi &&
+		test_subcommand_flex git rev-list --quiet --alternate-refs <"$trace" &&
+		if test "$setting" = true
+		then
+			test_subcommand_flex git rev-list --sparse-connectivity <"$trace"
+		else
+			test_subcommand_flex ! git rev-list --sparse-connectivity <"$trace"
+		fi &&
+		git -C sparse-fetch-$setting rev-parse refs/remotes/origin/HEAD \
+			>sparse-fetch-actual &&
+		test_cmp sparse-fetch-expect sparse-fetch-actual
+	'
+done
+
+test_expect_success 'fetch.sparseConnectivity also selects the pre-transfer check' '
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/sparse-quick.trace" \
+		git -C sparse-fetch-true -c fetch.sparseConnectivity=true \
+		fetch --no-auto-maintenance &&
+	test_subcommand_flex git rev-list --sparse-connectivity \
+		<"$TRASH_DIRECTORY/sparse-quick.trace"
+'
+
+for kind in shallow partial
+do
+	test_expect_success "fetch.sparseConnectivity retains eager checking in $kind clone" '
+		git clone --no-local sparse-fetch-src sparse-fetch-$kind &&
+		if test "$kind" = shallow
+		then
+			git -C sparse-fetch-$kind rev-parse HEAD >sparse-fetch-$kind/.git/shallow
+		else
+			git -C sparse-fetch-$kind config remote.origin.promisor true
+		fi &&
+		trace="$TRASH_DIRECTORY/sparse-fetch-$kind.trace" &&
+		GIT_TRACE2_EVENT="$trace" git -C sparse-fetch-$kind \
+			-c fetch.sparseConnectivity=true fetch --no-auto-maintenance &&
+		test_subcommand_flex git rev-list --quiet --alternate-refs <"$trace" &&
+		test_subcommand_flex ! git rev-list --sparse-connectivity <"$trace"
+	'
+done
+
 . "$TEST_DIRECTORY"/lib-httpd.sh
 start_httpd
 

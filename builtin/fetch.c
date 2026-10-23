@@ -111,6 +111,7 @@ struct fetch_config {
 	int recurse_submodules;
 	int parallel;
 	int submodule_fetch_jobs;
+	int sparse_connectivity;
 };
 
 static int git_fetch_config(const char *k, const char *v,
@@ -120,6 +121,11 @@ static int git_fetch_config(const char *k, const char *v,
 
 	if (!strcmp(k, "fetch.all")) {
 		fetch_config->all = git_config_bool(k, v);
+		return 0;
+	}
+
+	if (!strcmp(k, "fetch.sparseconnectivity")) {
+		fetch_config->sparse_connectivity = git_config_bool(k, v);
 		return 0;
 	}
 
@@ -1249,6 +1255,7 @@ static int store_updated_refs(struct display_state *display_state,
 		struct check_connected_options opt = CHECK_CONNECTED_INIT;
 
 		opt.exclude_hidden_refs_section = "fetch";
+		opt.sparse = config->sparse_connectivity;
 		rm = ref_map;
 		if (check_connected(iterate_ref_map, &rm, &opt)) {
 			rc = error(_("%s did not send all necessary objects"),
@@ -1386,7 +1393,8 @@ static int store_updated_refs(struct display_state *display_state,
  * everything we are going to fetch already exists and is connected
  * locally.
  */
-static int check_exist_and_connected(struct ref *ref_map)
+static int check_exist_and_connected(struct ref *ref_map,
+				     const struct fetch_config *config)
 {
 	struct ref *rm = ref_map;
 	struct check_connected_options opt = CHECK_CONNECTED_INIT;
@@ -1422,6 +1430,7 @@ static int check_exist_and_connected(struct ref *ref_map)
 
 	opt.quiet = 1;
 	opt.exclude_hidden_refs_section = "fetch";
+	opt.sparse = config->sparse_connectivity;
 	return check_connected(iterate_ref_map, &rm, &opt);
 }
 
@@ -1440,7 +1449,7 @@ static int fetch_and_consume_refs(struct display_state *display_state,
 	 * We don't need to perform a fetch in case we can already satisfy all
 	 * refs.
 	 */
-	ret = check_exist_and_connected(ref_map);
+	ret = check_exist_and_connected(ref_map, config);
 	if (ret) {
 		trace2_region_enter("fetch", "fetch_refs", the_repository);
 		ret = transport_fetch_refs(transport, ref_map);
