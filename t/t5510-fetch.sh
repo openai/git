@@ -2045,22 +2045,22 @@ test_expect_success 'setup sparse connectivity fetches' '
 for setting in unset false true
 do
 	test_expect_success "fetch.sparseConnectivity=$setting selects post-transfer check" '
-		trace="$TRASH_DIRECTORY/sparse-fetch-$setting.trace" &&
+		sparse_fetch_trace="$TRASH_DIRECTORY/sparse-fetch-$setting.trace" &&
 		if test "$setting" = unset
 		then
-			GIT_TRACE2_EVENT="$trace" git -C sparse-fetch-$setting \
+			GIT_TRACE2_EVENT="$sparse_fetch_trace" git -C sparse-fetch-$setting \
 				-c fetch.unpackLimit=100 fetch --no-auto-maintenance
 		else
-			GIT_TRACE2_EVENT="$trace" git -C sparse-fetch-$setting \
+			GIT_TRACE2_EVENT="$sparse_fetch_trace" git -C sparse-fetch-$setting \
 				-c fetch.sparseConnectivity=$setting \
 				-c fetch.unpackLimit=100 fetch --no-auto-maintenance
 		fi &&
-		test_subcommand_flex git rev-list --quiet --alternate-refs <"$trace" &&
+		test_subcommand_flex git rev-list --quiet --alternate-refs <"$sparse_fetch_trace" &&
 		if test "$setting" = true
 		then
-			test_subcommand_flex git rev-list --sparse-connectivity <"$trace"
+			test_subcommand_flex git rev-list --sparse-connectivity <"$sparse_fetch_trace"
 		else
-			test_subcommand_flex ! git rev-list --sparse-connectivity <"$trace"
+			test_subcommand_flex ! git rev-list --sparse-connectivity <"$sparse_fetch_trace"
 		fi &&
 		git -C sparse-fetch-$setting rev-parse refs/remotes/origin/HEAD \
 			>sparse-fetch-actual &&
@@ -2086,11 +2086,11 @@ do
 		else
 			git -C sparse-fetch-$kind config remote.origin.promisor true
 		fi &&
-		trace="$TRASH_DIRECTORY/sparse-fetch-$kind.trace" &&
-		GIT_TRACE2_EVENT="$trace" git -C sparse-fetch-$kind \
+		sparse_fetch_trace="$TRASH_DIRECTORY/sparse-fetch-$kind.trace" &&
+		GIT_TRACE2_EVENT="$sparse_fetch_trace" git -C sparse-fetch-$kind \
 			-c fetch.sparseConnectivity=true fetch --no-auto-maintenance &&
-		test_subcommand_flex git rev-list --quiet --alternate-refs <"$trace" &&
-		test_subcommand_flex ! git rev-list --sparse-connectivity <"$trace"
+		test_subcommand_flex git rev-list --quiet --alternate-refs <"$sparse_fetch_trace" &&
+		test_subcommand_flex ! git rev-list --sparse-connectivity <"$sparse_fetch_trace"
 	'
 done
 

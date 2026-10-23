@@ -791,6 +791,7 @@ integration_tests = [
   't6020-bundle-misc.sh',
   't6021-rev-list-exclude-hidden.sh',
   't6022-rev-list-missing.sh',
+  't6023-sparse-connectivity.sh',
   't6030-bisect-porcelain.sh',
   't6040-tracking-info.sh',
   't6041-bisect-submodule.sh',
