@@ -418,4 +418,147 @@ test_expect_success 'helper with refspec capability fails gracefully' '
 	)
 '
 
+test_expect_success 'set up namespace pattern repository' '
+	git init pattern-repo &&
+	test_commit -C pattern-repo base &&
+	for branch in main-extra team/main dreynaud/one dreynaud/nested/two topic/one topic/two
+	do
+		git -C pattern-repo branch "$branch" || return 1
+	done &&
+	git -C pattern-repo tag -a -m release v2.0 &&
+	git -C pattern-repo tag v2.0-extra &&
+	git -C pattern-repo tag releases/v2.1
+'
+
+for protocol in 0 2
+do
+	test_expect_success "namespace patterns match whole branch names (v$protocol)" '
+		(
+			cd pattern-repo &&
+			generate_references refs/heads/main >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote --branches=main \
+			pattern-repo >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "namespace globs match nested branch names (v$protocol)" '
+		(
+			cd pattern-repo &&
+			generate_references refs/heads/dreynaud/nested/two \
+				refs/heads/dreynaud/one >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote \
+			--branches="dreynaud/*" pattern-repo >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "namespace patterns accumulate and support glob syntax (v$protocol)" '
+		(
+			cd pattern-repo &&
+			generate_references refs/heads/main refs/heads/topic/one \
+				refs/heads/topic/two >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote --branches="m\ain" \
+			--branches="topic/?ne" --branches="topic/[ot]*" \
+			pattern-repo >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "branch and tag patterns select independently and retain peeled tags (v$protocol)" '
+		(
+			cd pattern-repo &&
+			generate_references refs/heads/main refs/tags/v2.0 \
+				"refs/tags/v2.0^{}" >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote --branches=main \
+			--tags=v2.0 pattern-repo >actual &&
+		test_cmp expect actual &&
+		(
+			cd pattern-repo &&
+			generate_references refs/tags/v2.0 >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote --refs --tags=v2.0 \
+			pattern-repo >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "bare and short namespace options still select all names (v$protocol)" '
+		git -C pattern-repo show-ref --dereference >refs &&
+		sed "s/ /	/" refs >expect &&
+		git -c protocol.version=$protocol ls-remote --branches=main \
+			--tags=v2.0 -bt pattern-repo >actual &&
+		test_cmp expect actual &&
+		git -c protocol.version=$protocol ls-remote --branches=main \
+			--tags=v2.0 --heads --tags pattern-repo >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "negating a namespace clears its patterns (v$protocol)" '
+		(
+			cd pattern-repo &&
+			generate_references refs/heads/topic/one >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote --branches=main \
+			--no-branches --branches=topic/one --tags=v2.0 --no-tags \
+			pattern-repo >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "positional patterns further filter namespace patterns (v$protocol)" '
+		(
+			cd pattern-repo &&
+			generate_references refs/heads/dreynaud/nested/two >../expect
+		) &&
+		git -c protocol.version=$protocol ls-remote \
+			--branches="dreynaud/*" pattern-repo two >actual &&
+		test_cmp expect actual
+	'
+
+	test_expect_success "namespace patterns preserve no-match exit behavior (v$protocol)" '
+		git -c protocol.version=$protocol ls-remote --branches=missing \
+			pattern-repo >actual &&
+		test_must_be_empty actual &&
+		for pattern in missing ""
+		do
+			test_expect_code 2 git -c protocol.version=$protocol \
+				ls-remote --exit-code --tags="$pattern" \
+				pattern-repo >actual &&
+			test_must_be_empty actual || return 1
+		done
+	'
+done
+
+test_expect_success 'namespace patterns send only their literal prefixes in protocol v2' '
+	cat >expect <<-EOF &&
+	refs/heads/main
+	refs/tags/releases/v
+	EOF
+	GIT_TRACE_PACKET="$PWD/trace" git -c protocol.version=2 ls-remote \
+		--branches=main --tags="releases/v[23].*" \
+		"file://$PWD/pattern-repo" >actual &&
+	sed -n "s/.*ls-remote> ref-prefix //p" trace >prefixes &&
+	test_cmp expect prefixes &&
+	test_grep ! "upload-pack> .*refs/heads/team/main" trace
+'
+
+test_expect_success 'namespace patterns filter extra refs from a protocol v2 server' '
+	oid=$(git rev-parse HEAD) &&
+	hash=$(git rev-parse --show-object-format) &&
+	test-tool pkt-line pack >input <<-EOF &&
+	version 2
+	ls-refs
+	object-format=$hash
+	0000
+	$oid refs/heads/main
+	$oid refs/heads/main-extra
+	$oid refs/heads/team/main
+	0000
+	EOF
+	printf "%s\trefs/heads/main\n" "$oid" >expect &&
+	git -c protocol.version=2 ls-remote --branches=main \
+		--upload-pack=./cat-input . >actual &&
+	test_cmp expect actual
+'
+
 test_done
