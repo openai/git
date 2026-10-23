@@ -290,6 +290,15 @@ void mark_edges_uninteresting(struct rev_info *revs,
 		struct oidset set;
 		oidset_init(&set, 16);
 
+		if (revs->sparse_connectivity) {
+			/* Include both positive trees and deferred exclusion roots. */
+			for (size_t i = 0; i < revs->pending.nr; i++) {
+				struct object *obj = revs->pending.objects[i].item;
+				if (obj->type == OBJ_TREE)
+					oidset_insert(&set, &obj->oid);
+			}
+		}
+
 		for (list = revs->commits; list; list = list->next) {
 			struct commit *commit = list->item;
 			struct tree *tree = repo_get_commit_tree(the_repository,

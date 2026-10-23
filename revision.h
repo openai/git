@@ -189,6 +189,8 @@ struct rev_info {
 			tag_objects:1,
 			tree_objects:1,
 			blob_objects:1,
+			/* Defer excluded tree roots to sparse connectivity marking. */
+			sparse_connectivity:1,
 			verify_objects:1,
 			edge_hint:1,
 			edge_hint_aggressive:1,

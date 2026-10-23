@@ -708,7 +708,6 @@ int cmd_rev_list(int argc,
 	int bisect_show_vars = 0;
 	int bisect_find_all = 0;
 	int use_bitmap_index = 0;
-	int sparse_connectivity = 0;
 	int test_bitmap = 0;
 	int filter_provided_objects = 0;
 	const char *show_progress = NULL;
@@ -809,7 +808,7 @@ int cmd_rev_list(int argc,
 			continue;
 		}
 		if (!strcmp(arg, "--sparse-connectivity")) {
-			sparse_connectivity = 1;
+			revs.sparse_connectivity = 1;
 			continue;
 		}
 		if (!strcmp(arg, "--test-bitmap")) {
@@ -878,7 +877,7 @@ int cmd_rev_list(int argc,
 
 	}
 
-	if (sparse_connectivity) {
+	if (revs.sparse_connectivity) {
 		if (!(info.flags & REV_LIST_QUIET) ||
 		    !revs.tree_objects || !revs.blob_objects || !revs.tag_objects)
 			die(_("--sparse-connectivity requires --objects and --quiet"));
@@ -978,7 +977,7 @@ int cmd_rev_list(int argc,
 	prepare_maximal_independent(&revs);
 
 	if (revs.tree_objects)
-		mark_edges_uninteresting(&revs, show_edge, sparse_connectivity);
+		mark_edges_uninteresting(&revs, show_edge, revs.sparse_connectivity);
 
 	if (bisect_list) {
 		int reaches, all;

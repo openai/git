@@ -48,6 +48,41 @@ test_expect_success 'extra sparse traversal respects the depth limit' '
 	test_grep "exceeded maximum allowed tree depth" err
 '
 
+test_expect_success 'setup direct and tagged tree exclusion roots' '
+	git update-ref refs/checkpoints/old-tree "$(git rev-parse old^{tree})" &&
+	git tag -a old-tree -m "tree baseline" old^{tree} &&
+	added_blob=$(echo added | git hash-object -w --stdin) &&
+	shared_tree=$(git rev-parse old:source) &&
+	printf "100644 blob %s\tadded\n040000 tree %s\tsource\n" \
+		"$added_blob" "$shared_tree" >entries &&
+	positive_tree=$(git mktree <entries)
+'
+
+for baseline in refs/checkpoints/old-tree old-tree
+do
+	test_expect_success "sparse checks a copied blob with tree exclusion $baseline" '
+		test_when_finished "mv saved-blob $old_blob_path" &&
+		mv "$old_blob_path" saved-blob &&
+		git rev-list --objects --quiet copied ^old "^$baseline" &&
+		test_must_fail git rev-list --objects --quiet --sparse-connectivity \
+			copied ^old "^$baseline" 2>err &&
+		test_grep "missing blob object.*$old_blob" err
+	'
+
+	test_expect_success "sparse compares explicit positive trees with $baseline" '
+		test_when_finished "mv saved-blob $old_blob_path" &&
+		mv "$old_blob_path" saved-blob &&
+		git rev-list --objects --quiet --sparse-connectivity \
+			"$positive_tree" "^$baseline" &&
+		added_path=.git/objects/$(test_oid_to_path "$added_blob") &&
+		test_when_finished "mv saved-added $added_path" &&
+		mv "$added_path" saved-added &&
+		test_must_fail git rev-list --objects --quiet --sparse-connectivity \
+			"$positive_tree" "^$baseline" 2>err &&
+		test_grep "missing blob object.*$added_blob" err
+	'
+done
+
 test_expect_success 'setup intermediate and merge-side history absent from the tip tree' '
 	echo transient >transient &&
 	git add transient &&
