@@ -216,6 +216,8 @@ while (<>) {
 
     elsif ($event eq 'data') {
 	my $cat = $line->{'category'};
+	# Omit platform-specific process data, as in t0211/scrub_perf.perl.
+	next if $cat eq 'process';
 	my $key = $line->{'key'};
 	my $value = $line->{'value'};
 	$processes->{$sid}->{'data'}->{$cat}->{$key} = $value;

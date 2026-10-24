@@ -37,6 +37,17 @@ V=$(git version | sed -e 's/^git version //') && export V
 # We don't bother repeating the 001return and 002exit tests, since they
 # have coverage in the normal and perf targets.
 
+test_lazy_prereq LINUX 'test "$(uname -s)" = Linux'
+
+test_expect_success LINUX 'event stream reports Linux process usage' '
+	test_when_finished "rm trace.resource" &&
+	GIT_TRACE2_EVENT="$(pwd)/trace.resource" test-tool trace2 001return 0 &&
+	for key in peak_rss_bytes user_cpu_usec system_cpu_usec
+	do
+		test_grep "\"category\":\"process\",\"key\":\"$key\",\"value\":\"[0-9][0-9]*\"" trace.resource || return 1
+	done
+'
+
 # Verb 003error
 #
 # To the above, add multiple 'error <msg>' events
