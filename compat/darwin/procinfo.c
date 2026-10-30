@@ -110,6 +110,11 @@ void trace2_collect_process_info(enum trace2_process_info_reason reason)
 			trace2_data_intmax(
 				"process", NULL, "disk_write_bytes",
 				(intmax_t)info.ri_diskio_byteswritten);
+		} else {
+			int saved_errno = errno;
+
+			trace2_data_intmax("process", NULL,
+					   "proc_pid_rusage_errno", saved_errno);
 		}
 		break;
 
