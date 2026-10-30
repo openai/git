@@ -151,17 +151,30 @@ cleanup:
 void trace2_collect_process_info(enum trace2_process_info_reason reason)
 {
 	struct strvec names = STRVEC_INIT;
+	struct rusage usage;
 
 	if (!trace2_is_enabled())
 		return;
 
 	switch (reason) {
 	case TRACE2_PROCESS_INFO_EXIT:
-		/*
-		 * The Windows version of this calls its
-		 * get_peak_memory_info() here. We may want to insert
-		 * similar process-end statistics here in the future.
-		 */
+		if (!getrusage(RUSAGE_SELF, &usage)) {
+			trace2_data_intmax("process", NULL, "peak_rss_bytes",
+					   (intmax_t)usage.ru_maxrss * 1024);
+			trace2_data_intmax(
+				"process", NULL, "user_cpu_usec",
+				(intmax_t)usage.ru_utime.tv_sec * 1000000 +
+				usage.ru_utime.tv_usec);
+			trace2_data_intmax(
+				"process", NULL, "system_cpu_usec",
+				(intmax_t)usage.ru_stime.tv_sec * 1000000 +
+				usage.ru_stime.tv_usec);
+			/* Linux accounts for storage I/O in 512-byte units. */
+			trace2_data_intmax("process", NULL, "disk_read_bytes",
+					   (intmax_t)usage.ru_inblock * 512);
+			trace2_data_intmax("process", NULL, "disk_write_bytes",
+					   (intmax_t)usage.ru_oublock * 512);
+		}
 		break;
 	case TRACE2_PROCESS_INFO_STARTUP:
 		push_ancestry_name(&names, getppid());
