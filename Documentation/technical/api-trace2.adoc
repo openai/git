@@ -750,6 +750,17 @@ filter deeply nested regions and data events.  It defaults to "2".
 ------------
 +
 The "value" field may be an integer or a string.
++
+On Linux and macOS, process-exit data in the `process` category includes
+`user_cpu_usec`, `system_cpu_usec`, and `peak_rss_bytes`. These describe
+the process, including its worker threads but excluding child processes.
+`disk_read_bytes` and `disk_write_bytes` report kernel-accounted storage
+I/O. Linux reconstructs these byte counts from 512-byte units, with rounding;
+they are not counts of I/O requests. macOS also reports
+`peak_physical_footprint_bytes`, which excludes reclaimable clean file-backed
+memory and includes charged compressed memory. Fields are omitted when their
+OS query is unavailable. Exit-hook readings may miss later cleanup activity,
+and a process killed before the hook runs may emit no final reading.
 
 `"data-json"`::
 	This event is generated to log a pre-formatted JSON string

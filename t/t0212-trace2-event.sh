@@ -37,6 +37,31 @@ V=$(git version | sed -e 's/^git version //') && export V
 # We don't bother repeating the 001return and 002exit tests, since they
 # have coverage in the normal and perf targets.
 
+test_lazy_prereq PROCESS_RUSAGE '
+	case "$uname_s" in
+	Linux|Darwin)
+		true
+		;;
+	*)
+		false
+		;;
+	esac
+'
+
+test_expect_success PROCESS_RUSAGE 'event stream reports process resource usage' '
+	test_when_finished "rm trace.resource" &&
+	GIT_TRACE2_EVENT="$(pwd)/trace.resource" test-tool trace2 001return 0 &&
+	keys="peak_rss_bytes user_cpu_usec system_cpu_usec" &&
+	if test "$uname_s" = Linux
+	then
+		keys="$keys disk_read_bytes disk_write_bytes"
+	fi &&
+	for key in $keys
+	do
+		test_grep "\"category\":\"process\",\"key\":\"$key\",\"value\":\"[0-9][0-9]*\"" trace.resource || return 1
+	done
+'
+
 # Verb 003error
 #
 # To the above, add multiple 'error <msg>' events
