@@ -10892,6 +10892,8 @@ test_expect_success SHA1 'reviewed CI image updates retain exact workflow entrie
 		pinned=$(ci_tree 485e3be66581518bca55b62d97ebd2217be194b1) &&
 		updated=$(ci_tree 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8) &&
 		sdk=$(ci_tree 44337a67422e019f41a3c8404062487c3d603dfb) &&
+		macos=$(ci_tree 158b28608280d19b4dd682a9f81da5a87403e247) &&
+		macos_mode=$(ci_tree 158b28608280d19b4dd682a9f81da5a87403e247 100755) &&
 		sdk_mode=$(ci_tree 44337a67422e019f41a3c8404062487c3d603dfb 100755) &&
 		unknown=$(ci_tree 1111111111111111111111111111111111111111) &&
 		mode=$(ci_tree 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8 100755) &&
@@ -10902,6 +10904,11 @@ test_expect_success SHA1 'reviewed CI image updates retain exact workflow entrie
 		ci_workflow_pins_are_reviewed "$before" "$sdk" &&
 		ci_workflow_pins_are_reviewed "$pinned" "$sdk" &&
 		ci_workflow_pins_are_reviewed "$updated" "$sdk" &&
+		ci_workflow_pins_are_reviewed "$before" "$macos" &&
+		ci_workflow_pins_are_reviewed "$sdk" "$macos" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$macos" "$sdk" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$updated" "$macos" &&
+		test_expect_code 1 ci_workflow_pins_are_reviewed "$sdk" "$macos_mode" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$unknown" "$sdk" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$before" "$sdk_mode" &&
 		test_expect_code 1 ci_workflow_pins_are_reviewed "$updated" "$sdk_mode" &&
