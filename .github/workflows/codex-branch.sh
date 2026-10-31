@@ -377,7 +377,7 @@ ci_workflow_pins_are_reviewed () (
 	base_oid=$1
 	head_oid=$2
 
-	# Permit only the reviewed CI pins and optional image update.
+	# Permit only the reviewed CI pins, image and runner updates.
 	# Comparing tree entries also rejects mode changes, symlinks,
 	# and deletions. New upstream workflow contents need a new review.
 	while read -r path old_blob new_blob updated_blob
@@ -385,6 +385,16 @@ ci_workflow_pins_are_reviewed () (
 		old=$(git ls-tree "$base_oid" -- "$path") || return 1
 		new=$(git ls-tree "$head_oid" -- "$path") || return 1
 		test "$old" = "$new" && continue
+		if test "$path" = .github/workflows/main.yml
+		then
+			case "$old:$new" in
+			"100644 blob $old_blob$tab$path:100644 blob 0de67f8663cdc66551d9f1d29ab0be0d33fbe68f$tab$path"|\
+			"100644 blob $old_blob$tab$path:100644 blob 158b28608280d19b4dd682a9f81da5a87403e247$tab$path"|\
+			"100644 blob 44337a67422e019f41a3c8404062487c3d603dfb$tab$path:100644 blob 158b28608280d19b4dd682a9f81da5a87403e247$tab$path")
+				continue
+				;;
+			esac
+		fi
 		if test "$path" = .github/workflows/main.yml &&
 		   { test "$old" = "100644 blob $old_blob$tab$path" ||
 		     test "$old" = "100644 blob $new_blob$tab$path" ||
