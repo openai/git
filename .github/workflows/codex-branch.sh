@@ -388,7 +388,7 @@ ci_workflow_pins_are_reviewed () (
 		if test "$path" = .github/workflows/main.yml
 		then
 			case "$old:$new" in
-			"100644 blob $old_blob$tab$path:100644 blob 0de67f8663cdc66551d9f1d29ab0be0d33fbe68f$tab$path"|\
+			"100644 blob 09dbf0c59a288b752c9a41a2c8ed749e3af1a1e8$tab$path:100644 blob 572cbe48040fcd52b6c67ee5736bfd50f5429677$tab$path"|\
 			"100644 blob $old_blob$tab$path:100644 blob 158b28608280d19b4dd682a9f81da5a87403e247$tab$path"|\
 			"100644 blob 44337a67422e019f41a3c8404062487c3d603dfb$tab$path:100644 blob 158b28608280d19b4dd682a9f81da5a87403e247$tab$path")
 				continue
