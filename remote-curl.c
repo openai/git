@@ -508,7 +508,7 @@ static struct discovery *discover_refs(const char *service, int for_push)
 		else
 			strbuf_addstr(&protocol_header, GIT_PROTOCOL_HEADER ": ");
 		/* The server may need this before deciding which refs to advertise. */
-		strbuf_addstr(&protocol_header, "explicit-haves");
+		strbuf_addstr(&protocol_header, "explicit-haves:shallow-haves");
 	}
 	if (protocol_header.len)
 		string_list_append(&extra_headers, protocol_header.buf);

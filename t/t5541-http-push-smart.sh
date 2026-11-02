@@ -65,11 +65,11 @@ test_expect_success 'push to remote repository (standard)' '
 	EOF
 	sed -n \
 		-e "/=> Send header: GET .*service=git-receive-pack /s/.*/request/p" \
-		-e "/=> Send header: Git-Protocol: explicit-haves$/s/.*/explicit-haves/p" \
+		-e "/=> Send header: Git-Protocol: explicit-haves:shallow-haves$/s/.*/explicit-haves/p" \
 		-e "/<= Recv header: HTTP\/1.1 200/{s/.*/response/;p;q;}" \
 		err >actual-discovery &&
 	test_cmp expect-discovery actual-discovery &&
-	grep "=> Send header: Git-Protocol:.*explicit-haves" err >sent-explicit-haves &&
+	grep "=> Send header: Git-Protocol:.*explicit-haves:shallow-haves" err >sent-explicit-haves &&
 	test_line_count = 1 sent-explicit-haves &&
 	(cd "$HTTPD_DOCUMENT_ROOT_PATH"/test_repo.git &&
 	 test $HEAD = $(git rev-parse --verify HEAD))
@@ -84,12 +84,12 @@ test_expect_success 'used receive-pack service' '
 	check_access_log exp
 '
 
-test_expect_success 'receive-pack discovery retains explicit-haves across an HTTP redirect' '
+test_expect_success 'receive-pack discovery retains the push capabilities across an HTTP redirect' '
 	test_when_finished "git --git-dir=\"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-ref -d refs/heads/discovery-redirect" &&
 	>"$HTTPD_ROOT_PATH"/access.log &&
 	GIT_TRACE_CURL=true git push "$HTTPD_URL/smart-redir-perm/test_repo.git" \
 		HEAD:refs/heads/discovery-redirect 2>err &&
-	grep "=> Send header: Git-Protocol:.*explicit-haves" err >sent-explicit-haves &&
+	grep "=> Send header: Git-Protocol:.*explicit-haves:shallow-haves" err >sent-explicit-haves &&
 	test_line_count = 2 sent-explicit-haves &&
 	cat >exp <<-\EOF &&
 	GET  /smart-redir-perm/test_repo.git/info/refs?service=git-receive-pack HTTP/1.1 301
@@ -99,13 +99,13 @@ test_expect_success 'receive-pack discovery retains explicit-haves across an HTT
 	check_access_log exp
 '
 
-test_expect_success 'receive-pack discovery combines version and explicit-haves' '
+test_expect_success 'receive-pack discovery combines version and the push capabilities' '
 	test_when_finished "git --git-dir=\"$HTTPD_DOCUMENT_ROOT_PATH/test_repo.git\" update-ref -d refs/heads/discovery-v1" &&
 	GIT_TRACE_CURL=true git -c protocol.version=1 push origin \
 		HEAD:refs/heads/discovery-v1 2>err &&
-	grep "=> Send header: Git-Protocol:.*explicit-haves" err >sent-explicit-haves &&
+	grep "=> Send header: Git-Protocol:.*explicit-haves:shallow-haves" err >sent-explicit-haves &&
 	test_line_count = 1 sent-explicit-haves &&
-	test_grep "Git-Protocol: version=1:explicit-haves$" sent-explicit-haves
+	test_grep "Git-Protocol: version=1:explicit-haves:shallow-haves$" sent-explicit-haves
 '
 
 test_expect_success 'push to remote repository (standard) with sending Accept-Language' '

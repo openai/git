@@ -159,7 +159,7 @@ int cmd_send_pack(int argc,
 	const char *dest = NULL;
 	int fd[2];
 	struct child_process *conn;
-	struct oid_array extra_have = OID_ARRAY_INIT;
+	struct advertised_haves haves = { 0 };
 	struct oid_array shallow = OID_ARRAY_INIT;
 	struct ref *remote_refs, *local_refs;
 	int ret;
@@ -293,7 +293,7 @@ int cmd_send_pack(int argc,
 	case protocol_v1:
 	case protocol_v0:
 		get_remote_heads(&reader, &remote_refs, REF_NORMAL,
-				 &extra_have, &shallow);
+				 &haves, &shallow);
 		break;
 	case protocol_unknown_version:
 		BUG("unknown protocol version");
@@ -322,7 +322,7 @@ int cmd_send_pack(int argc,
 	set_ref_status_for_push(remote_refs, args.send_mirror,
 		args.force_update);
 
-	ret = send_pack(repo, &args, fd, conn, remote_refs, &extra_have);
+	ret = send_pack(repo, &args, fd, conn, remote_refs, &haves);
 
 	if (helper_status)
 		print_helper_status(remote_refs);
@@ -350,7 +350,7 @@ cleanup:
 	free_refs(remote_refs);
 	free_refs(local_refs);
 	refspec_clear(&rs);
-	oid_array_clear(&extra_have);
+	advertised_haves_clear(&haves);
 	oid_array_clear(&shallow);
 	clear_cas_option(&cas);
 	return ret;

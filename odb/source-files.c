@@ -3,6 +3,7 @@
 #include "blob.h"
 #include "chdir-notify.h"
 #include "config.h"
+#include "environment.h"
 #include "gettext.h"
 #include "hex.h"
 #include "lockfile.h"
@@ -825,10 +826,12 @@ static int odb_source_files_generate_pack(struct odb_source *source UNUSED,
 	 * that the repository itself may have, so the shallow file needs to
 	 * be neutralized.
 	 */
-	if (opts->shallows.nr) {
+	if (opts->shallows.nr || opts->ignore_local_grafts) {
 		strvec_push(&cp->args, "--shallow-file");
 		strvec_push(&cp->args, "");
 	}
+	if (opts->ignore_local_grafts)
+		strvec_push(&cp->env, GRAFT_ENVIRONMENT "=");
 	strvec_push(&cp->args, "pack-objects");
 	strvec_push(&cp->args, "--revs");
 	strvec_push(&cp->args, "--stdout");

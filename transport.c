@@ -233,7 +233,7 @@ struct git_transport_data {
 	int fd[2];
 	unsigned finished_handshake : 1;
 	enum protocol_version version;
-	struct oid_array extra_have;
+	struct advertised_haves haves;
 	struct oid_array shallow;
 };
 
@@ -373,7 +373,7 @@ static struct ref *handshake(struct transport *transport, int for_push,
 		die_if_server_options(transport);
 		get_remote_heads(&reader, &refs,
 				 for_push ? REF_NORMAL : 0,
-				 &data->extra_have,
+				 &data->haves,
 				 &data->shallow);
 		server_sid = server_feature_value("session-id", &sid_len);
 		if (server_sid) {
@@ -983,7 +983,7 @@ static int git_transport_push(struct transport *transport, struct ref *remote_re
 	case protocol_v1:
 	case protocol_v0:
 		ret = send_pack(the_repository, &args, data->fd, data->conn, remote_refs,
-				&data->extra_have);
+				&data->haves);
 		/*
 		 * Ignore the specific error code to maintain consistent behavior
 		 * with the "push_refs()" function across different transports,
@@ -1038,7 +1038,7 @@ static int disconnect_git(struct transport *transport)
 		free(data->options.negotiation_include_tips);
 	}
 	list_objects_filter_release(&data->options.filter_options);
-	oid_array_clear(&data->extra_have);
+	advertised_haves_clear(&data->haves);
 	oid_array_clear(&data->shallow);
 	free(data);
 	return 0;
