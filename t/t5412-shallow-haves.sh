@@ -152,6 +152,30 @@ test_expect_success 'an ungranted local shallow root cannot hide a missing paren
 	test_must_fail git -C incomplete.git rev-parse --verify refs/heads/main
 '
 
+test_expect_success 'a second receiver cannot inherit the first receiver token' '
+	prepare_receiver first.git "$left" "$right" &&
+	git init --bare second.git &&
+	{
+		# Empty SHA-1 repositories can send just a flush. SHA-256
+		# repositories must identify their object format.
+		if ! test_have_prereq SHA1
+		then
+			printf "%s capabilities^{}\0object-format=%s\n" \
+				"$ZERO_OID" "$test_hash_algo" | test-tool pkt-line pack-raw-stdin
+		fi &&
+		test-tool pkt-line pack 0000
+	} >second.git/advertisement &&
+	git remote add both first.git &&
+	git remote set-url --add --push both first.git &&
+	git remote set-url --add --push both second.git &&
+	GIT_TRACE_PACKET="$(pwd)/multi.trace" \
+		git push --receive-pack="$rcvpck" both HEAD:refs/heads/main &&
+	grep "push> .* shallow-haves=$token" multi.trace >echoes &&
+	test_line_count = 1 echoes &&
+	git -C second.git fsck --full &&
+	git -C second.git cat-file -e "$ancestor"
+'
+
 test_expect_success 'malformed token cannot be echoed' '
 	token=wrong &&
 	prepare_receiver malformed.git &&

@@ -1038,8 +1038,7 @@ static int disconnect_git(struct transport *transport)
 		free(data->options.negotiation_include_tips);
 	}
 	list_objects_filter_release(&data->options.filter_options);
-	oid_array_clear(&data->haves.full);
-	oid_array_clear(&data->haves.shallow);
+	advertised_haves_clear(&data->haves);
 	oid_array_clear(&data->shallow);
 	free(data);
 	return 0;

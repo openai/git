@@ -239,7 +239,6 @@ static void process_capabilities(struct packet_reader *reader, size_t *linelen)
 	const char *line = reader->line;
 	size_t nul_location = strlen(line);
 
-	FREE_AND_NULL(server_capabilities_v1);
 	if (nul_location == *linelen)
 		return;
 
@@ -337,6 +336,14 @@ enum get_remote_heads_state {
 	EXPECTING_DONE,
 };
 
+void advertised_haves_clear(struct advertised_haves *haves)
+{
+	oid_array_clear(&haves->full);
+	oid_array_clear(&haves->shallow);
+	FREE_AND_NULL(haves->shallow_token);
+	haves->explicit_haves = 0;
+}
+
 /*
  * Read all the refs from the other end
  */
@@ -350,6 +357,9 @@ struct ref **get_remote_heads(struct packet_reader *reader,
 	enum get_remote_heads_state state = EXPECTING_FIRST_REF;
 
 	*list = NULL;
+	FREE_AND_NULL(server_capabilities_v1);
+	if (haves)
+		advertised_haves_clear(haves);
 
 	while (state != EXPECTING_DONE) {
 		switch (packet_reader_read(reader)) {
@@ -389,6 +399,14 @@ struct ref **get_remote_heads(struct packet_reader *reader,
 		}
 	}
 
+	if (haves) {
+		size_t token_len;
+		const char *token = server_feature_value("shallow-haves", &token_len);
+
+		haves->explicit_haves = server_supports("explicit-haves");
+		if (token)
+			haves->shallow_token = xmemdupz(token, token_len);
+	}
 	annotate_refs_with_symref_info(*orig_list);
 
 	return list;

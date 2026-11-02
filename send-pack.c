@@ -538,8 +538,7 @@ int send_pack(struct repository *r,
 	int push_options_supported = 0;
 	int object_format_supported = 0;
 	enum pack_prerequisites prerequisites = REF_AND_EXPLICIT_HAVES;
-	size_t token_len;
-	const char *shallow_token = server_feature_value("shallow-haves", &token_len);
+	const char *shallow_token = haves->shallow_token;
 	unsigned cmds_sent = 0;
 	int ret;
 	struct async demux;
@@ -554,11 +553,12 @@ int send_pack(struct repository *r,
 		goto out;
 	}
 
-	if (server_supports("explicit-haves"))
+	if (haves->explicit_haves)
 		prerequisites = EXPLICIT_HAVES;
 	if (shallow_token) {
-		if (prerequisites != EXPLICIT_HAVES || token_len != GIT_SHA256_HEXSZ ||
-		    strspn(shallow_token, "0123456789abcdef") != token_len)
+		if (prerequisites != EXPLICIT_HAVES ||
+		    strlen(shallow_token) != GIT_SHA256_HEXSZ ||
+		    strspn(shallow_token, "0123456789abcdef") != GIT_SHA256_HEXSZ)
 			die(_("invalid shallow-haves advertisement"));
 		prerequisites = SHALLOW_HAVES;
 	}
@@ -648,7 +648,7 @@ int send_pack(struct repository *r,
 	if (prerequisites != REF_AND_EXPLICIT_HAVES)
 		strbuf_addstr(&cap_buf, " explicit-haves");
 	if (shallow_token)
-		strbuf_addf(&cap_buf, " shallow-haves=%.*s", (int)token_len, shallow_token);
+		strbuf_addf(&cap_buf, " shallow-haves=%s", shallow_token);
 	if (object_format_supported)
 		strbuf_addf(&cap_buf, " object-format=%s", r->hash_algo->name);
 	if (agent_supported)

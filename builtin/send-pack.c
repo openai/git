@@ -350,8 +350,7 @@ cleanup:
 	free_refs(remote_refs);
 	free_refs(local_refs);
 	refspec_clear(&rs);
-	oid_array_clear(&haves.full);
-	oid_array_clear(&haves.shallow);
+	advertised_haves_clear(&haves);
 	oid_array_clear(&shallow);
 	clear_cas_option(&cas);
 	return ret;

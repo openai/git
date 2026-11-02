@@ -246,7 +246,10 @@ void free_refs(struct ref *ref);
 struct advertised_haves {
 	struct oid_array full;     /* Objects named by .have. */
 	struct oid_array shallow;  /* Commits named by .shallow-have. */
+	char *shallow_token;       /* Token binding these snapshots to an update. */
+	unsigned explicit_haves:1; /* Named refs are not prerequisites. */
 };
+void advertised_haves_clear(struct advertised_haves *haves);
 
 struct packet_reader;
 struct strvec;
