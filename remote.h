@@ -3,6 +3,7 @@
 
 #include "hash.h"
 #include "hashmap.h"
+#include "oid-array.h"
 #include "refspec.h"
 #include "string-list.h"
 #include "strvec.h"
@@ -241,13 +242,18 @@ int check_ref_type(const struct ref *ref, int flags);
 void free_one_ref(struct ref *ref);
 void free_refs(struct ref *ref);
 
-struct oid_array;
+/* The receive-pack advertisement distinguishes full history from a snapshot. */
+struct advertised_haves {
+	struct oid_array full;     /* Objects named by .have. */
+	struct oid_array shallow;  /* Commits named by .shallow-have. */
+};
+
 struct packet_reader;
 struct strvec;
 struct string_list;
 struct ref **get_remote_heads(struct packet_reader *reader,
 			      struct ref **list, unsigned int flags,
-			      struct oid_array *extra_have,
+			      struct advertised_haves *haves,
 			      struct oid_array *shallow_points);
 
 /* Used for protocol v2 in order to retrieve refs from a remote */

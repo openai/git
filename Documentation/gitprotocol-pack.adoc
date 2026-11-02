@@ -77,10 +77,10 @@ unrecognized keys. The "version" Extra Parameter takes a value of '1' or
 '2'. See linkgit:gitprotocol-v2[5] for more information on protocol
 version 2.
 
-For smart HTTP receive-pack discovery, a client that supports the
-'explicit-haves' capability can send the bare 'explicit-haves' Extra
-Parameter before the server advertises refs. See linkgit:gitprotocol-capabilities[5]
-for how this parameter relates to the receive-pack capability of the same name.
+For smart HTTP receive-pack discovery, a client can send the bare
+'explicit-haves' and 'shallow-haves' Extra Parameters before the server
+advertises refs. See linkgit:gitprotocol-capabilities[5] for the
+corresponding receive-pack capabilities.
 
 Git Transport
 -------------
@@ -523,7 +523,7 @@ fetching protocol. Each reference obj-id and name on the server is sent
 in packet-line format to the client, followed by a flush-pkt.  The only
 real difference is that the capability listing is different - the only
 possible values are 'report-status', 'report-status-v2', 'delete-refs',
-'ofs-delta', 'atomic', 'push-options' and 'explicit-haves'.
+'ofs-delta', 'atomic', 'push-options', 'explicit-haves' and 'shallow-haves'.
 
 Reference Update Request and Packfile Transfer
 ----------------------------------------------
@@ -587,10 +587,11 @@ references will be sent.
 
 When 'explicit-haves' is in effect, the client MUST NOT infer pack
 prerequisites from the object IDs of named refs in the reference
-advertisement. Only ".have" pseudo-refs and common objects explicitly
-acknowledged by push negotiation may be used as pack prerequisites. The
-advertised object ID of a named ref is still used as the old-id in the
-corresponding update command.
+advertisement. Unless 'shallow-haves' is also in effect, only ".have"
+pseudo-refs and common objects explicitly acknowledged by push negotiation
+may be used as pack prerequisites. The advertised object ID of a named ref
+is still used as the old-id in the corresponding update command.
+With 'shallow-haves', only advertised commit snapshots can be prerequisites.
 
 ----
   packfile          =  "PACK" 28*(OCTET)

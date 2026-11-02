@@ -783,6 +783,9 @@ struct odb_generate_pack_options {
 	/* The generated pack is destined for a shallow consumer. */
 	unsigned shallow:1;
 
+	/* Walk true parents except at the explicitly supplied shallows. */
+	unsigned ignore_local_grafts:1;
+
 	/* Allow objects that may be missing due to a promisor remote. */
 	unsigned missing_allow_promisor:1;
 

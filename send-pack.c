@@ -55,6 +55,13 @@ static void append_negative_object(struct repository *r,
 	oid_array_append(haves, oid);
 }
 
+/* Which advertised objects may pack-objects omit from this push? */
+enum pack_prerequisites {
+	REF_AND_EXPLICIT_HAVES,
+	EXPLICIT_HAVES,
+	SHALLOW_HAVES
+};
+
 static int check_to_send_update(const struct ref *ref,
 				const struct send_pack_args *args);
 
@@ -62,9 +69,9 @@ static int check_to_send_update(const struct ref *ref,
  * Make a pack stream and spit it out into file descriptor fd
  */
 static int pack_objects(struct repository *r,
-			int fd, struct ref *refs, struct oid_array *advertised,
+			int fd, struct ref *refs, const struct advertised_haves *advertised,
 			struct oid_array *negotiated,
-			int use_explicit_haves,
+			enum pack_prerequisites prerequisites,
 			struct send_pack_args *args)
 {
 	struct odb_generate_pack_options opts = ODB_GENERATE_PACK_OPTIONS_INIT;
@@ -78,8 +85,9 @@ static int pack_objects(struct repository *r,
 	opts.no_ref_delta = args->no_ref_delta;
 	if (args->progress)
 		opts.progress = ODB_GENERATE_PACK_PROGRESS_VERBOSE;
-	opts.shallow = is_repository_shallow(r);
-	opts.disable_bitmaps = args->disable_bitmaps;
+	opts.shallow = prerequisites == SHALLOW_HAVES || is_repository_shallow(r);
+	opts.ignore_local_grafts = prerequisites == SHALLOW_HAVES;
+	opts.disable_bitmaps = prerequisites == SHALLOW_HAVES || args->disable_bitmaps;
 
 	/*
 	 * The pack is either written directly to the remote's descriptor, or,
@@ -88,17 +96,37 @@ static int pack_objects(struct repository *r,
 	 */
 	opts.pack_fd = args->stateless_rpc ? -1 : fd;
 
-	for (size_t i = 0; i < advertised->nr; i++)
-		append_negative_object(r, &opts.haves, &advertised->oid[i]);
-	for (size_t i = 0; i < negotiated->nr; i++)
-		append_negative_object(r, &opts.haves, &negotiated->oid[i]);
+	if (prerequisites == SHALLOW_HAVES) {
+		/*
+		 * Register each commit as a root before excluding it. Otherwise
+		 * pack-objects could omit objects found only in its ancestors,
+		 * or reuse them as external delta bases.
+		 */
+		for (size_t i = 0; i < advertised->shallow.nr; i++) {
+			const struct object_id *oid = &advertised->shallow.oid[i];
+			enum object_type type;
+			struct object_info oi = { .typep = &type };
+
+			if (odb_read_object_info_extended(r->objects, oid, &oi,
+							  OBJECT_INFO_SKIP_FETCH_OBJECT) ||
+			    type != OBJ_COMMIT)
+				continue;
+			oid_array_append(&opts.shallows, oid);
+			oid_array_append(&opts.haves, oid);
+		}
+	} else {
+		for (size_t i = 0; i < advertised->full.nr; i++)
+			append_negative_object(r, &opts.haves, &advertised->full.oid[i]);
+		for (size_t i = 0; i < negotiated->nr; i++)
+			append_negative_object(r, &opts.haves, &negotiated->oid[i]);
+	}
 
 	while (refs) {
 		/*
 		 * Named refs still describe the remote state for update checks,
 		 * but are not pack prerequisites under explicit-haves.
 		 */
-		if (!use_explicit_haves && !is_null_oid(&refs->old_oid))
+		if (prerequisites == REF_AND_EXPLICIT_HAVES && !is_null_oid(&refs->old_oid))
 			append_negative_object(r, &opts.haves, &refs->old_oid);
 		if (check_to_send_update(refs, args) == 0 &&
 		    !is_null_oid(&refs->new_oid))
@@ -488,7 +516,7 @@ int send_pack(struct repository *r,
 	      struct send_pack_args *args,
 	      int fd[], struct child_process *conn,
 	      struct ref *remote_refs,
-	      struct oid_array *extra_have)
+	      const struct advertised_haves *haves)
 {
 	struct oid_array commons = OID_ARRAY_INIT;
 	int in = fd[0];
@@ -509,7 +537,9 @@ int send_pack(struct repository *r,
 	int use_push_options = 0;
 	int push_options_supported = 0;
 	int object_format_supported = 0;
-	int use_explicit_haves = 0;
+	enum pack_prerequisites prerequisites = REF_AND_EXPLICIT_HAVES;
+	size_t token_len;
+	const char *shallow_token = server_feature_value("shallow-haves", &token_len);
 	unsigned cmds_sent = 0;
 	int ret;
 	struct async demux;
@@ -524,8 +554,17 @@ int send_pack(struct repository *r,
 		goto out;
 	}
 
+	if (server_supports("explicit-haves"))
+		prerequisites = EXPLICIT_HAVES;
+	if (shallow_token) {
+		if (prerequisites != EXPLICIT_HAVES || token_len != GIT_SHA256_HEXSZ ||
+		    strspn(shallow_token, "0123456789abcdef") != token_len)
+			die(_("invalid shallow-haves advertisement"));
+		prerequisites = SHALLOW_HAVES;
+	}
+
 	repo_config_get_bool(r, "push.negotiate", &push_negotiate);
-	if (push_negotiate) {
+	if (push_negotiate && !shallow_token) {
 		trace2_region_enter("send_pack", "push_negotiate", r);
 		get_commons_through_negotiation(r, args->url,
 					       args->negotiation_include,
@@ -550,8 +589,6 @@ int send_pack(struct repository *r,
 		args->use_ofs_delta = 1;
 	if (server_supports("no-ref-delta"))
 		args->no_ref_delta = 1;
-	if (server_supports("explicit-haves"))
-		use_explicit_haves = 1;
 	if (server_supports("side-band-64k"))
 		use_sideband = 1;
 	if (server_supports("quiet"))
@@ -608,8 +645,10 @@ int send_pack(struct repository *r,
 		strbuf_addstr(&cap_buf, " atomic");
 	if (use_push_options)
 		strbuf_addstr(&cap_buf, " push-options");
-	if (use_explicit_haves)
+	if (prerequisites != REF_AND_EXPLICIT_HAVES)
 		strbuf_addstr(&cap_buf, " explicit-haves");
+	if (shallow_token)
+		strbuf_addf(&cap_buf, " shallow-haves=%.*s", (int)token_len, shallow_token);
 	if (object_format_supported)
 		strbuf_addf(&cap_buf, " object-format=%s", r->hash_algo->name);
 	if (agent_supported)
@@ -661,7 +700,7 @@ int send_pack(struct repository *r,
 			ref->status = REF_STATUS_EXPECTING_REPORT;
 	}
 
-	if (!args->dry_run)
+	if (!args->dry_run && !shallow_token)
 		advertise_shallow_grafts_buf(r, &req_buf);
 
 	/*
@@ -727,8 +766,8 @@ int send_pack(struct repository *r,
 			   PACKET_READ_DIE_ON_ERR_PACKET);
 
 	if (need_pack_data && cmds_sent) {
-		if (pack_objects(r, out, remote_refs, extra_have, &commons,
-				 use_explicit_haves, args) < 0) {
+		if (pack_objects(r, out, remote_refs, haves, &commons,
+				 prerequisites, args) < 0) {
 			if (args->stateless_rpc)
 				close(out);
 			if (git_connection_is_socket(conn))

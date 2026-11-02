@@ -4,7 +4,7 @@
 #include "string-list.h"
 
 struct child_process;
-struct oid_array;
+struct advertised_haves;
 struct ref;
 struct repository;
 
@@ -54,6 +54,6 @@ int option_parse_push_signed(const struct option *opt,
  */
 int send_pack(struct repository *r, struct send_pack_args *args,
 	      int fd[], struct child_process *conn,
-	      struct ref *remote_refs, struct oid_array *extra_have);
+	      struct ref *remote_refs, const struct advertised_haves *haves);
 
 #endif

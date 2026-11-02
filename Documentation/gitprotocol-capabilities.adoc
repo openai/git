@@ -35,8 +35,8 @@ and server advertised.  As a consequence of these rules, server MUST
 NOT advertise capabilities it does not understand.
 
 The 'atomic', 'report-status', 'report-status-v2', 'delete-refs',
-'explicit-haves', 'no-ref-delta', 'quiet', and 'push-cert' capabilities
-are sent and recognized by the receive-pack (push to server) process.
+'explicit-haves', 'shallow-haves', 'no-ref-delta', 'quiet', and 'push-cert'
+capabilities are sent and recognized by the receive-pack (push to server) process.
 
 The 'ofs-delta' and 'side-band-64k' capabilities are sent and recognized
 by both upload-pack and receive-pack protocols.  The 'agent' and 'session-id'
@@ -215,6 +215,34 @@ capability: the server must still advertise it, and the client must
 still request it in the update command. A server that ignores the Extra
 Parameter and does not advertise the capability retains the usual pack
 prerequisite behavior.
+
+shallow-haves=<token>
+---------------------
+
+A receive-pack server that has a commit and its tree but lacks some of
+its history can advertise the commit as an "<obj-id> .shallow-have"
+pseudo-ref. The server MUST also advertise 'explicit-haves' and
+'shallow-haves=<token>'. The token consists of 64 lowercase hexadecimal
+digits and identifies the advertised set of snapshots for this push. A
+snapshot includes the commit, its root tree and all recursively contained
+trees and blobs. Gitlinks do not add objects to a snapshot.
+
+To use these prerequisites, the client MUST request 'explicit-haves' and
+echo 'shallow-haves=<token>' with the same token in its update command.
+The client walks from the new tips, stopping the parent walk at commits
+named by ".shallow-have". Every object reached by this walk MUST
+be in the pack or in an advertised snapshot. Only objects in those
+snapshots can serve as external delta bases. Named refs, ".have"
+pseudo-refs and common objects from push negotiation grant no additional
+prerequisites. An empty set therefore requires a complete pack of the
+objects reachable from the new tips.
+
+For smart HTTP, a client that implements this capability SHOULD send
+both bare 'explicit-haves' and 'shallow-haves' Extra Parameters during
+receive-pack discovery. Before relying on snapshot prerequisites, the
+server MUST verify that the update command echoed the token for the
+snapshots it advertised. A server that accepts a push without that
+agreement MUST apply the ordinary negotiated prerequisite rules.
 
 agent
 -----

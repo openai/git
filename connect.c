@@ -238,10 +238,11 @@ static void process_capabilities(struct packet_reader *reader, size_t *linelen)
 	size_t feat_len;
 	const char *line = reader->line;
 	size_t nul_location = strlen(line);
+
+	FREE_AND_NULL(server_capabilities_v1);
 	if (nul_location == *linelen)
 		return;
 
-	free(server_capabilities_v1);
 	server_capabilities_v1 = xstrdup(line + nul_location + 1);
 	*linelen = nul_location;
 
@@ -282,7 +283,7 @@ static void check_no_capabilities(const char *line, size_t len)
 
 static int process_ref(const struct packet_reader *reader, size_t len,
 		       struct ref ***list, unsigned int flags,
-		       struct oid_array *extra_have)
+		       struct advertised_haves *haves)
 {
 	const char *line = reader->line;
 	struct object_id old_oid;
@@ -294,8 +295,10 @@ static int process_ref(const struct packet_reader *reader, size_t len,
 		return 0;
 	name++;
 
-	if (extra_have && !strcmp(name, ".have")) {
-		oid_array_append(extra_have, &old_oid);
+	if (haves && !strcmp(name, ".have")) {
+		oid_array_append(&haves->full, &old_oid);
+	} else if (haves && !strcmp(name, ".shallow-have")) {
+		oid_array_append(&haves->shallow, &old_oid);
 	} else if (!strcmp(name, "capabilities^{}")) {
 		die(_("protocol error: unexpected capabilities^{}"));
 	} else if (check_ref(name, flags)) {
@@ -339,7 +342,7 @@ enum get_remote_heads_state {
  */
 struct ref **get_remote_heads(struct packet_reader *reader,
 			      struct ref **list, unsigned int flags,
-			      struct oid_array *extra_have,
+			      struct advertised_haves *haves,
 			      struct oid_array *shallow_points)
 {
 	struct ref **orig_list = list;
@@ -373,7 +376,7 @@ struct ref **get_remote_heads(struct packet_reader *reader,
 			state = EXPECTING_REF;
 			/* fallthrough */
 		case EXPECTING_REF:
-			if (process_ref(reader, len, &list, flags, extra_have))
+			if (process_ref(reader, len, &list, flags, haves))
 				break;
 			state = EXPECTING_SHALLOW;
 			/* fallthrough */
