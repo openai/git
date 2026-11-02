@@ -12,6 +12,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "editor.h"
 #include "pager.h"
 #include "progress.h"
 #include "repository.h"
@@ -32,6 +33,8 @@ struct throughput {
 	unsigned int last_bytes[TP_IDX_MAX];
 	unsigned int last_misecs[TP_IDX_MAX];
 	unsigned int idx;
+	unsigned int rate;
+	bool show_rate;
 	struct strbuf display;
 };
 
@@ -46,6 +49,9 @@ struct progress {
 	struct throughput *throughput;
 	uint64_t start_ns;
 	struct strbuf counters_sb;
+	struct strbuf status;
+	/* Number of transient rows below the primary progress line. */
+	unsigned int displayed_status_rows;
 	int title_len;
 	int split;
 };
@@ -109,6 +115,87 @@ static int is_foreground_fd(int fd)
 	return tpgrp < 0 || tpgrp == getpgid(0);
 }
 
+#ifdef GIT_WINDOWS_NATIVE
+static unsigned int status_rows(const struct progress *progress UNUSED,
+				int cols UNUSED, const char *done UNUSED)
+{
+	/* The Windows ANSI emulation does not support cursor-up. */
+	return 0;
+}
+#else
+static unsigned int status_rows(const struct progress *progress, int cols,
+				const char *done)
+{
+	int fd = fileno(stderr);
+	int rows = 0, terminal_rows = 0;
+	const char *line = progress->status.buf;
+	int primary_width;
+
+	if (!*line || progress->split || !isatty(fd) ||
+	    !is_foreground_fd(fd) || is_terminal_dumb())
+		return 0;
+#ifdef TIOCGWINSZ
+	{
+		struct winsize ws;
+
+		if (!ioctl(fd, TIOCGWINSZ, &ws)) {
+			if (ws.ws_col && (ws.ws_col < cols || !getenv("COLUMNS")))
+				cols = ws.ws_col;
+			terminal_rows = ws.ws_row;
+		}
+	}
+#endif
+
+	primary_width = progress->title_len + 2 +
+		utf8_strwidth(progress->counters_sb.buf);
+	if (done)
+		primary_width += utf8_strnwidth(done, strlen(done) - 1, 0);
+	if (primary_width >= cols)
+		return 0;
+
+	for (;;) {
+		const char *end = strchrnul(line, '\n');
+
+		if (++rows > 3 || utf8_strnwidth(line, end - line, 0) >= cols)
+			return 0;
+		if (!*end)
+			break;
+		line = end + 1;
+	}
+	return terminal_rows && rows >= terminal_rows ? 0 : rows;
+}
+#endif
+
+static void clear_progress_status(struct progress *progress)
+{
+	/* The cursor starts at the beginning of the last displayed row. */
+	while (progress->displayed_status_rows) {
+		fputs("\033[K\033[A\r", stderr);
+		progress->displayed_status_rows--;
+	}
+}
+
+static void display_status(struct progress *progress, unsigned int rows,
+			   const char *done)
+{
+	const char *line = progress->status.buf;
+
+	fprintf(stderr, "%s: %s%s", progress->title, progress->counters_sb.buf,
+		done ? done : "\033[K\r\n");
+	for (;;) {
+		const char *end = strchrnul(line, '\n');
+
+		fwrite(line, 1, end - line, stderr);
+		if (!*end) {
+			fputs(done ? "\n" : "\r", stderr);
+			break;
+		}
+		fputs(done ? "\n" : "\r\n", stderr);
+		line = end + 1;
+	}
+	progress->displayed_status_rows = done ? 0 : rows;
+}
+
 static void display(struct progress *progress, uint64_t n, const char *done)
 {
 	const char *tp;
@@ -145,13 +232,24 @@ static void display(struct progress *progress, uint64_t n, const char *done)
 	if (show_update) {
 		if (is_foreground_fd(fileno(stderr)) || done) {
 			const char *eol = done ? done : "\r";
-			size_t clear_len = counters_sb->len < last_count_len ?
+			size_t clear_len, progress_line_len;
+			int cols = term_columns();
+			unsigned int rows = status_rows(progress, cols, done);
+
+			clear_progress_status(progress);
+			if (rows) {
+				if (done)
+					term_clear_line();
+				display_status(progress, rows, done);
+				fflush(stderr);
+				return;
+			}
+			clear_len = counters_sb->len < last_count_len ?
 					last_count_len - counters_sb->len + 1 :
 					0;
 			/* The "+ 2" accounts for the ": ". */
-			size_t progress_line_len = progress->title_len +
-						counters_sb->len + 2;
-			int cols = term_columns();
+			progress_line_len = progress->title_len +
+				counters_sb->len + 2;
 
 			if (progress->split) {
 				fprintf(stderr, "  %s%*s", counters_sb->buf,
@@ -179,6 +277,7 @@ void clear_progress(struct progress *progress)
 	    !is_foreground_fd(fileno(stderr)))
 		return;
 
+	clear_progress_status(progress);
 	fprintf(stderr, "\r%*s\r",
 		(int)progress->counters_sb.len + 2 +
 		(progress->split ? 0 : progress->title_len), "");
@@ -187,13 +286,15 @@ void clear_progress(struct progress *progress)
 }
 
 static void throughput_string(struct strbuf *buf, uint64_t total,
-			      unsigned int rate)
+			      unsigned int rate, bool show_rate)
 {
 	strbuf_reset(buf);
 	strbuf_addstr(buf, ", ");
 	strbuf_humanise_bytes(buf, total);
-	strbuf_addstr(buf, " | ");
-	strbuf_humanise_rate(buf, rate * 1024);
+	if (show_rate) {
+		strbuf_addstr(buf, " | ");
+		strbuf_humanise_rate(buf, rate * 1024);
+	}
 }
 
 static uint64_t progress_getnanotime(struct progress *progress)
@@ -204,14 +305,15 @@ static uint64_t progress_getnanotime(struct progress *progress)
 		return getnanotime();
 }
 
-void display_throughput(struct progress *progress, uint64_t total)
+static bool update_throughput(struct progress *progress, uint64_t total,
+			      bool show_rate)
 {
 	struct throughput *tp;
 	uint64_t now_ns;
-	unsigned int misecs, count, rate;
+	unsigned int misecs, count;
 
 	if (!progress)
-		return;
+		return false;
 	tp = progress->throughput;
 
 	now_ns = progress_getnanotime(progress);
@@ -220,14 +322,22 @@ void display_throughput(struct progress *progress, uint64_t total)
 		progress->throughput = CALLOC_ARRAY(tp, 1);
 		tp->prev_total = tp->curr_total = total;
 		tp->prev_ns = now_ns;
+		tp->show_rate = show_rate;
 		strbuf_init(&tp->display, 0);
-		return;
+		if (!show_rate)
+			throughput_string(&tp->display, total, 0, false);
+		return false;
 	}
 	tp->curr_total = total;
 
+	if (show_rate != tp->show_rate) {
+		tp->show_rate = show_rate;
+		throughput_string(&tp->display, total, tp->rate, show_rate);
+		progress_update = 1;
+	}
 	/* only update throughput every 0.5 s */
 	if (now_ns - tp->prev_ns <= 500000000)
-		return;
+		return false;
 
 	/*
 	 * We have x = bytes and y = nanosecs.  We want z = KiB/s:
@@ -252,16 +362,43 @@ void display_throughput(struct progress *progress, uint64_t total)
 	tp->prev_ns = now_ns;
 	tp->avg_bytes += count;
 	tp->avg_misecs += misecs;
-	rate = tp->avg_bytes / tp->avg_misecs;
+	tp->rate = tp->avg_bytes / tp->avg_misecs;
 	tp->avg_bytes -= tp->last_bytes[tp->idx];
 	tp->avg_misecs -= tp->last_misecs[tp->idx];
 	tp->last_bytes[tp->idx] = count;
 	tp->last_misecs[tp->idx] = misecs;
 	tp->idx = (tp->idx + 1) % TP_IDX_MAX;
 
-	throughput_string(&tp->display, total, rate);
-	if (progress->last_value != -1 && progress_update)
+	throughput_string(&tp->display, total, tp->rate, show_rate);
+	return true;
+}
+
+void display_throughput_with_rate(struct progress *progress, uint64_t total,
+				  bool show_rate)
+{
+	update_throughput(progress, total, show_rate);
+}
+
+void display_throughput(struct progress *progress, uint64_t total)
+{
+	if (update_throughput(progress, total, true) &&
+	    progress->last_value != -1 && progress_update)
 		display(progress, progress->last_value, NULL);
+}
+
+void display_progress_with_status(struct progress *progress, uint64_t n,
+				  const char *status)
+{
+	if (!progress)
+		return;
+	if (!status)
+		status = "";
+	if (strcmp(progress->status.buf, status)) {
+		strbuf_reset(&progress->status);
+		strbuf_addstr(&progress->status, status);
+		progress_update = 1;
+	}
+	display(progress, n, NULL);
 }
 
 void display_progress(struct progress *progress, uint64_t n)
@@ -285,6 +422,8 @@ static struct progress *start_progress_delay(struct repository *r,
 	progress->throughput = NULL;
 	progress->start_ns = getnanotime();
 	strbuf_init(&progress->counters_sb, 0);
+	strbuf_init(&progress->status, 0);
+	progress->displayed_status_rows = 0;
 	progress->title_len = utf8_strwidth(title);
 	progress->split = 0;
 	set_progress_signal();
@@ -353,7 +492,7 @@ static void force_last_update(struct progress *progress, const char *msg)
 		unsigned int misecs, rate;
 		misecs = ((now_ns - progress->start_ns) * 4398) >> 32;
 		rate = tp->curr_total / (misecs ? misecs : 1);
-		throughput_string(&tp->display, tp->curr_total, rate);
+		throughput_string(&tp->display, tp->curr_total, rate, true);
 	}
 	progress_update = 1;
 	buf = xstrfmt(", %s.\n", msg);
@@ -392,6 +531,7 @@ void stop_progress_msg(struct progress **p_progress, const char *msg)
 
 	clear_progress_signal();
 	strbuf_release(&progress->counters_sb);
+	strbuf_release(&progress->status);
 	if (progress->throughput)
 		strbuf_release(&progress->throughput->display);
 	free(progress->throughput);

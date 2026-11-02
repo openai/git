@@ -60,9 +60,11 @@ struct packfile_progress {
 	uint64_t last_update;
 };
 
-static void report_packfile_progress(struct packfile_progress *progress)
+/* The indexing record carries the final count of bytes received over HTTP. */
+static void report_packfile_progress(struct packfile_progress *progress,
+				     const char *keyword)
 {
-	printf("bytes %"PRIu64"\n", progress->bytes);
+	printf("%s %"PRIu64"\n", keyword, progress->bytes);
 	if (fflush(stdout))
 		die_errno("unable to report packfile download progress");
 	progress->last_update = getnanotime();
@@ -74,17 +76,19 @@ static void update_packfile_progress(void *data, size_t bytes)
 
 	progress->bytes += bytes;
 	if (getnanotime() - progress->last_update >= 500000000)
-		report_packfile_progress(progress);
+		report_packfile_progress(progress, "bytes");
 }
 
 static void fetch_single_packfile(struct object_id *packfile_hash,
 				  const char *url,
 				  const char **index_pack_args,
-				  int report_progress)
+				  int report_progress,
+				  int report_indexing_progress)
 {
 	struct http_pack_request *preq;
 	struct packfile_progress progress = { 0 };
 	struct strbuf pack_path = STRBUF_INIT;
+	const char *final_record = report_indexing_progress ? "indexing" : "bytes";
 	int fd, ret;
 
 	odb_pack_name(the_repository, &pack_path, packfile_hash->hash, "pack");
@@ -99,7 +103,7 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 		ip.clean_on_exit = 1;
 		strvec_pushv(&ip.args, index_pack_args);
 		if (report_progress)
-			report_packfile_progress(&progress);
+			report_packfile_progress(&progress, final_record);
 		if (run_command(&ip))
 			die("index-pack failed for existing pack");
 		return;
@@ -138,7 +142,7 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 	}
 
 	if (report_progress)
-		report_packfile_progress(&progress);
+		report_packfile_progress(&progress, final_record);
 
 	if ((ret = finish_http_pack_request(preq)))
 		die("finish_http_pack_request gave result %d", ret);
@@ -158,6 +162,7 @@ int cmd_main(int argc, const char **argv)
 	int get_recover = 0;
 	int packfile = 0;
 	int report_progress = 0;
+	int report_indexing_progress = 0;
 	int nongit;
 	struct object_id packfile_hash;
 	struct strvec index_pack_args = STRVEC_INIT;
@@ -184,6 +189,8 @@ int cmd_main(int argc, const char **argv)
 			commits_on_stdin = 1;
 		} else if (!strcmp(argv[arg], "--report-progress")) {
 			report_progress = 1;
+		} else if (!strcmp(argv[arg], "--report-indexing-progress")) {
+			report_indexing_progress = report_progress = 1;
 		} else if (skip_prefix(argv[arg], "--packfile=", &p)) {
 			const char *end;
 
@@ -212,9 +219,12 @@ int cmd_main(int argc, const char **argv)
 	if (packfile) {
 		if (!index_pack_args.nr)
 			die(_("the option '%s' requires '%s'"), "--packfile", "--index-pack-arg");
+		if (report_indexing_progress)
+			strvec_push(&index_pack_args, "--report-progress");
 
 		fetch_single_packfile(&packfile_hash, argv[arg],
-				      index_pack_args.v, report_progress);
+				      index_pack_args.v, report_progress,
+				      report_indexing_progress);
 		ret = 0;
 		goto out;
 	}
