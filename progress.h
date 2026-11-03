@@ -20,11 +20,12 @@ void display_throughput_with_rate(struct progress *progress, uint64_t total,
 void clear_progress(struct progress *progress);
 void display_progress(struct progress *progress, uint64_t n);
 /*
- * Display up to three newline-separated status rows if they fit.
- * A NULL status clears the rows before the next render.
+ * Use compact (the single-line text after the title) and an optional
+ * single-line status if they fit on the terminal. NULL uses ordinary
+ * progress for compact, or omits the second line for status.
  */
 void display_progress_with_status(struct progress *progress, uint64_t n,
-				  const char *status);
+				  const char *compact, const char *status);
 struct progress *start_progress(struct repository *r,
 				const char *title, uint64_t total);
 struct progress *start_sparse_progress(struct repository *r,

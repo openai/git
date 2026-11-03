@@ -274,6 +274,28 @@ test_expect_success 'progress display with throughput and total' '
 	test_cmp expect out
 '
 
+test_expect_success 'progress display with more than 4 GiB in one sample' '
+	cat >expect <<-\EOF &&
+	Working hard: 1<CR>
+	Working hard: 2, 5.00 GiB | 5.00 GiB/s<CR>
+	Working hard: 2, 5.00 GiB | 5.00 GiB/s, done.
+	EOF
+
+	cat >in <<-\EOF &&
+	start 0
+	throughput 0 0
+	update
+	progress 1
+	throughput 5368709120 1000
+	update
+	progress 2
+	stop
+	EOF
+	test-tool progress <in 2>stderr &&
+	show_cr <stderr >out &&
+	test_cmp expect out
+'
+
 test_expect_success 'cover up after throughput shortens' '
 	cat >expect <<-\EOF &&
 	Working hard: 1<CR>
