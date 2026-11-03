@@ -1886,15 +1886,10 @@ static void finish_packfile_uri_task(struct packfile_uri_task *task)
 }
 
 static void append_packfile_uri_count(struct strbuf *buf, uint64_t count,
-				     uint64_t total, int min_width)
+				     uint64_t total)
 {
-	/* The totals only grow, so each count field keeps its width or widens. */
-	int width = decimal_width(total);
-
-	if (width < min_width)
-		width = min_width;
-	strbuf_addf(buf, "(%*"PRIuMAX"/%-*"PRIuMAX")",
-		    width, (uintmax_t)count, width, (uintmax_t)total);
+	strbuf_addf(buf, "(%*"PRIuMAX"/%"PRIuMAX")",
+		    decimal_width(total), (uintmax_t)count, (uintmax_t)total);
 }
 
 static void fetch_packfile_uris_parallel(
@@ -1941,23 +1936,23 @@ static void fetch_packfile_uris_parallel(
 		}
 		if (!diagnostic_incomplete && (fetch_progress || index_progress)) {
 			strbuf_reset(&index_count);
-			append_packfile_uri_count(&index_count, completed, uris->nr, 0);
+			append_packfile_uri_count(&index_count, completed, uris->nr);
 			if (total.object_total) {
 				strbuf_addf(&index_count, ", %s ", _("objects"));
 				append_packfile_uri_count(&index_count, total.objects,
-							  total.object_total, 5);
+							  total.object_total);
 			}
 			if (total.delta_total) {
 				strbuf_addf(&index_count, ", %s ", _("deltas"));
 				append_packfile_uri_count(&index_count, total.deltas,
-							  total.delta_total, 5);
+							  total.delta_total);
 			}
 			if (fetch_progress) {
 				/* A ready pack occupies its worker slot until indexing finishes. */
 				bool downloading = running > total.ready - completed;
 
 				strbuf_reset(&fetch_count);
-				append_packfile_uri_count(&fetch_count, total.ready, uris->nr, 0);
+				append_packfile_uri_count(&fetch_count, total.ready, uris->nr);
 				strbuf_reset(&index_status);
 				if (total.ready && total.ready < uris->nr)
 					strbuf_addf(&index_status, "%s %s", index_title,

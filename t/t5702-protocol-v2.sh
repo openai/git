@@ -1419,7 +1419,7 @@ test_expect_success TTY,!MINGW 'parallel URI progress shows object counts on a t
 			"$HTTPD_URL/smart/http_parent" http_child-terminal \
 		2>no-ref-terminal &&
 	test_grep -F "$(printf "\033[A")" no-ref-terminal &&
-	test_grep -E "Indexing packs \\(3/3\\), objects \\( +3/3 +\\), done\\." no-ref-terminal &&
+	test_grep -F "Indexing packs (3/3), objects (3/3), done." no-ref-terminal &&
 	test_grep ! ", deltas (" no-ref-terminal
 '
 
