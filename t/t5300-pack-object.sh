@@ -272,6 +272,21 @@ test_expect_success 'index-pack accepts OFS_DELTA when REF_DELTA is forbidden' '
 	test_path_is_file accepted-ofs-delta.idx
 '
 
+test_expect_success 'index-pack reports object scan and OFS_DELTA resolution separately' '
+	test_when_finished "rm -rf report-client" &&
+	git init --bare report-client &&
+	git -C report-client index-pack --stdin --no-ref-delta \
+		--report-progress <no-ref-ofs.pack >report &&
+	object_count=$(wc -l <obj-list) &&
+	test-tool pack-deltas --list-deltas no-ref-ofs.idx >report-deltas &&
+	delta_count=$(wc -l <report-deltas) &&
+	printf "objects 0 %d 0 0\nobjects %d %d %d 1\ndeltas %d 1\n" \
+		"$object_count" "$object_count" "$object_count" \
+		"$delta_count" "$delta_count" >report-expect &&
+	sed -n "1p; /^objects .* 1$/p; /^deltas .* 1$/p" report >report-actual &&
+	test_cmp report-expect report-actual
+'
+
 test_expect_success 'pack without REF_DELTA reuses deltas as OFS_DELTA' '
 	# Install the REF_DELTA pack above and disable delta search, so any
 	# output delta must be a reused REF_DELTA rewritten as OFS_DELTA.

@@ -31,6 +31,7 @@
 #include "run-command.h"
 #include "setup.h"
 #include "strvec.h"
+#include "trace.h"
 
 static const char index_pack_usage[] =
 "git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] [--no-ref-delta] (<pack-file> | --stdin [--fix-thin] [<pack-file>])";
@@ -141,10 +142,43 @@ static int verbose;
 static int no_ref_delta;
 static const char *progress_title;
 static int show_resolving_progress;
+static int report_progress;
 static int show_stat;
 static int check_self_contained_and_connected;
 
 static struct progress *progress;
+static uint64_t last_progress_report;
+
+/* The URI pack worker forwards these records on stdout to fetch-pack. */
+static int progress_report_due(int force)
+{
+	uint64_t now;
+
+	if (!report_progress)
+		return 0;
+	now = getnanotime();
+	if (!force && now - last_progress_report < 500000000)
+		return 0;
+	last_progress_report = now;
+	return 1;
+}
+
+static void report_object_progress(int scanned, int done)
+{
+	if (progress_report_due(!scanned || done) &&
+	    (printf("objects %d %d %d %d\n", scanned, nr_objects,
+		    nr_ofs_deltas + nr_ref_deltas, done) < 0 || fflush(stdout)))
+		die_errno(_("could not report pack progress"));
+}
+
+/* During delta resolution the caller holds counter_mutex. */
+static void report_delta_progress(int done)
+{
+	if (progress_report_due(done) &&
+	    (printf("deltas %d %d\n", nr_resolved_deltas, done) < 0 ||
+	     fflush(stdout)))
+		die_errno(_("could not report pack progress"));
+}
 
 static unsigned char input_buffer[DEFAULT_IO_BUFFER_SIZE];
 static unsigned int input_offset, input_len;
@@ -1116,6 +1150,7 @@ static void *threaded_second_pass(void *data)
 
 		counter_lock();
 		display_progress(progress, nr_resolved_deltas);
+		report_delta_progress(0);
 		counter_unlock();
 
 		work_lock();
@@ -1289,6 +1324,7 @@ static void parse_pack_objects(unsigned char *hash)
 				    &obj->idx.oid);
 		free(data);
 		display_progress(progress, i+1);
+		report_object_progress(i + 1, 0);
 	}
 	objects[i].idx.offset = consumed_bytes;
 	stop_progress(&progress);
@@ -1988,6 +2024,8 @@ int cmd_index_pack(int argc,
 				progress_title = argv[++i];
 			} else if (!strcmp(arg, "--show-resolving-progress")) {
 				show_resolving_progress = 1;
+			} else if (!strcmp(arg, "--report-progress")) {
+				report_progress = 1;
 			} else if (!strcmp(arg, "--report-end-of-input")) {
 				report_end_of_input = 1;
 			} else if (!strcmp(arg, "-o")) {
@@ -2028,6 +2066,8 @@ int cmd_index_pack(int argc,
 		usage(index_pack_usage);
 	if (fix_thin_pack && !from_stdin)
 		die(_("the option '%s' requires '%s'"), "--fix-thin", "--stdin");
+	if (report_progress && (!from_stdin || !no_ref_delta || verify))
+		usage(index_pack_usage);
 	if (promisor_msg && pack_name)
 		die(_("--promisor cannot be used with a pack name"));
 	if (from_stdin && !startup_info->have_repository)
@@ -2086,15 +2126,18 @@ int cmd_index_pack(int argc,
 
 	curr_pack = open_pack_file(pack_name);
 	parse_pack_header();
+	report_object_progress(0, 0);
 	CALLOC_ARRAY(objects, st_add(nr_objects, 1));
 	if (show_stat)
 		CALLOC_ARRAY(obj_stat, st_add(nr_objects, 1));
 	CALLOC_ARRAY(ofs_deltas, nr_objects);
 	parse_pack_objects(pack_hash);
+	report_object_progress(nr_objects, 1);
 	if (report_end_of_input)
 		write_in_full(2, "\0", 1);
 	resolve_deltas(&opts);
 	conclude_pack(fix_thin_pack, curr_pack, pack_hash);
+	report_delta_progress(1);
 	free(ofs_deltas);
 	free(ref_deltas);
 	if (strict)

@@ -12,6 +12,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "git-compat-util.h"
+#include "editor.h"
 #include "pager.h"
 #include "progress.h"
 #include "repository.h"
@@ -27,12 +28,16 @@ struct throughput {
 	off_t curr_total;
 	off_t prev_total;
 	uint64_t prev_ns;
-	unsigned int avg_bytes;
+	uint64_t avg_bytes;
 	unsigned int avg_misecs;
-	unsigned int last_bytes[TP_IDX_MAX];
+	uint64_t last_bytes[TP_IDX_MAX];
 	unsigned int last_misecs[TP_IDX_MAX];
 	unsigned int idx;
+	uint64_t rate;
+	bool show_rate;
 	struct strbuf display;
+	/* Zero disables padding. Otherwise retain the widest rate number. */
+	int rate_width;
 };
 
 struct progress {
@@ -46,6 +51,10 @@ struct progress {
 	struct throughput *throughput;
 	uint64_t start_ns;
 	struct strbuf counters_sb;
+	struct strbuf compact;
+	struct strbuf status;
+	bool displayed_compact;
+	bool displayed_status;
 	int title_len;
 	int split;
 };
@@ -109,6 +118,75 @@ static int is_foreground_fd(int fd)
 	return tpgrp < 0 || tpgrp == getpgid(0);
 }
 
+#ifdef GIT_WINDOWS_NATIVE
+static bool display_compact(struct progress *progress UNUSED,
+			    int cols UNUSED, const char *done UNUSED)
+{
+	/* The Windows ANSI emulation does not support cursor-up. */
+	return false;
+}
+#else
+static bool display_compact(struct progress *progress, int cols,
+			    const char *done)
+{
+	int fd = fileno(stderr);
+	int rows = 0, width;
+	struct throughput *tp = progress->throughput;
+	const char *throughput = tp ? tp->display.buf : "";
+
+	if (!progress->compact.len || progress->split || !isatty(fd) ||
+	    is_terminal_dumb())
+		return false;
+#ifdef TIOCGWINSZ
+	{
+		struct winsize ws;
+
+		if (!ioctl(fd, TIOCGWINSZ, &ws)) {
+			if (ws.ws_col && (ws.ws_col < cols || !getenv("COLUMNS")))
+				cols = ws.ws_col;
+			rows = ws.ws_row;
+		}
+	}
+#endif
+
+	width = progress->title_len + 1 + utf8_strwidth(progress->compact.buf) +
+		utf8_strwidth(throughput);
+	if (done)
+		width += utf8_strnwidth(done, strlen(done) - 1, 0);
+	if (width >= cols || (progress->status.len &&
+	    (rows == 1 || utf8_strwidth(progress->status.buf) >= cols)))
+		return false;
+
+	if (done)
+		term_clear_line();
+	fprintf(stderr, "%s %s%s%s", progress->title, progress->compact.buf,
+		throughput, done ? done : "\033[K\r");
+	if (progress->status.len)
+		fprintf(stderr, "%s%s%s", done ? "" : "\n", progress->status.buf,
+			done ? "\n" : "\r");
+	progress->displayed_compact = !done;
+	progress->displayed_status = !done && progress->status.len;
+	return true;
+}
+#endif
+
+static void clear_progress_status(struct progress *progress)
+{
+	/* Return from the transient status line to the primary progress line. */
+	if (progress->displayed_status) {
+		fputs("\033[K\033[A\r", stderr);
+		progress->displayed_status = false;
+	}
+}
+
+static void clear_compact_progress(struct progress *progress)
+{
+	if (progress->displayed_compact) {
+		term_clear_line();
+		progress->displayed_compact = false;
+	}
+}
+
 static void display(struct progress *progress, uint64_t n, const char *done)
 {
 	const char *tp;
@@ -143,15 +221,25 @@ static void display(struct progress *progress, uint64_t n, const char *done)
 	}
 
 	if (show_update) {
-		if (is_foreground_fd(fileno(stderr)) || done) {
+		int foreground = is_foreground_fd(fileno(stderr));
+
+		if (foreground || done) {
 			const char *eol = done ? done : "\r";
-			size_t clear_len = counters_sb->len < last_count_len ?
+			size_t clear_len, progress_line_len;
+			int cols = term_columns();
+
+			clear_progress_status(progress);
+			if (foreground && display_compact(progress, cols, done)) {
+				fflush(stderr);
+				return;
+			}
+			clear_compact_progress(progress);
+			clear_len = counters_sb->len < last_count_len ?
 					last_count_len - counters_sb->len + 1 :
 					0;
 			/* The "+ 2" accounts for the ": ". */
-			size_t progress_line_len = progress->title_len +
-						counters_sb->len + 2;
-			int cols = term_columns();
+			progress_line_len = progress->title_len +
+				counters_sb->len + 2;
 
 			if (progress->split) {
 				fprintf(stderr, "  %s%*s", counters_sb->buf,
@@ -179,21 +267,50 @@ void clear_progress(struct progress *progress)
 	    !is_foreground_fd(fileno(stderr)))
 		return;
 
-	fprintf(stderr, "\r%*s\r",
-		(int)progress->counters_sb.len + 2 +
-		(progress->split ? 0 : progress->title_len), "");
+	clear_progress_status(progress);
+	if (progress->displayed_compact)
+		clear_compact_progress(progress);
+	else
+		fprintf(stderr, "\r%*s\r",
+			(int)progress->counters_sb.len + 2 +
+			(progress->split ? 0 : progress->title_len), "");
 	fflush(stderr);
 	progress_update = 1;
 }
 
-static void throughput_string(struct strbuf *buf, uint64_t total,
-			      unsigned int rate)
+static void throughput_string(struct throughput *tp, uint64_t total,
+			      uint64_t rate, bool show_rate)
 {
-	strbuf_reset(buf);
-	strbuf_addstr(buf, ", ");
-	strbuf_humanise_bytes(buf, total);
-	strbuf_addstr(buf, " | ");
-	strbuf_humanise_rate(buf, rate * 1024);
+	struct strbuf *display = &tp->display;
+	uint64_t bytes_per_sec = rate * 1024;
+	struct strbuf padded = STRBUF_INIT;
+	char *number;
+	const char *unit;
+	int width;
+
+	strbuf_reset(display);
+	/* Reusing local packs can complete the fetch without transferring bytes. */
+	if (tp->rate_width && !total)
+		return;
+	strbuf_addstr(display, ", ");
+	strbuf_humanise_bytes(display, total);
+	if (!show_rate)
+		return;
+
+	strbuf_addstr(display, " | ");
+	if (!tp->rate_width) {
+		strbuf_humanise_rate(display, bytes_per_sec);
+		return;
+	}
+	humanise_bytes(bytes_per_sec, &number, &unit, HUMANISE_RATE);
+	width = utf8_strwidth(number);
+	if (width > tp->rate_width)
+		tp->rate_width = width;
+	strbuf_addchars(&padded, ' ', tp->rate_width - width);
+	strbuf_addstr(&padded, number);
+	strbuf_addf(display, _("%s %s"), padded.buf, unit);
+	strbuf_release(&padded);
+	free(number);
 }
 
 static uint64_t progress_getnanotime(struct progress *progress)
@@ -204,14 +321,15 @@ static uint64_t progress_getnanotime(struct progress *progress)
 		return getnanotime();
 }
 
-void display_throughput(struct progress *progress, uint64_t total)
+static bool update_throughput(struct progress *progress, uint64_t total,
+			      bool show_rate, bool compact)
 {
 	struct throughput *tp;
-	uint64_t now_ns;
-	unsigned int misecs, count, rate;
+	uint64_t now_ns, count;
+	unsigned int misecs;
 
 	if (!progress)
-		return;
+		return false;
 	tp = progress->throughput;
 
 	now_ns = progress_getnanotime(progress);
@@ -220,14 +338,23 @@ void display_throughput(struct progress *progress, uint64_t total)
 		progress->throughput = CALLOC_ARRAY(tp, 1);
 		tp->prev_total = tp->curr_total = total;
 		tp->prev_ns = now_ns;
+		tp->show_rate = show_rate;
 		strbuf_init(&tp->display, 0);
-		return;
+		tp->rate_width = compact ? 5 : 0;
+		if (!show_rate)
+			throughput_string(tp, total, 0, false);
+		return false;
 	}
 	tp->curr_total = total;
 
+	if (show_rate != tp->show_rate) {
+		tp->show_rate = show_rate;
+		throughput_string(tp, total, tp->rate, show_rate);
+		progress_update = 1;
+	}
 	/* only update throughput every 0.5 s */
 	if (now_ns - tp->prev_ns <= 500000000)
-		return;
+		return false;
 
 	/*
 	 * We have x = bytes and y = nanosecs.  We want z = KiB/s:
@@ -252,16 +379,49 @@ void display_throughput(struct progress *progress, uint64_t total)
 	tp->prev_ns = now_ns;
 	tp->avg_bytes += count;
 	tp->avg_misecs += misecs;
-	rate = tp->avg_bytes / tp->avg_misecs;
+	tp->rate = tp->avg_bytes / tp->avg_misecs;
 	tp->avg_bytes -= tp->last_bytes[tp->idx];
 	tp->avg_misecs -= tp->last_misecs[tp->idx];
 	tp->last_bytes[tp->idx] = count;
 	tp->last_misecs[tp->idx] = misecs;
 	tp->idx = (tp->idx + 1) % TP_IDX_MAX;
 
-	throughput_string(&tp->display, total, rate);
-	if (progress->last_value != -1 && progress_update)
+	throughput_string(tp, total, tp->rate, show_rate);
+	return true;
+}
+
+void display_throughput_with_rate(struct progress *progress, uint64_t total,
+				  bool show_rate)
+{
+	update_throughput(progress, total, show_rate, true);
+}
+
+void display_throughput(struct progress *progress, uint64_t total)
+{
+	if (update_throughput(progress, total, true, false) &&
+	    progress->last_value != -1 && progress_update)
 		display(progress, progress->last_value, NULL);
+}
+
+static void update_progress_line(struct strbuf *line, const char *text)
+{
+	if (!text)
+		text = "";
+	if (strcmp(line->buf, text)) {
+		strbuf_reset(line);
+		strbuf_addstr(line, text);
+		progress_update = 1;
+	}
+}
+
+void display_progress_with_status(struct progress *progress, uint64_t n,
+				  const char *compact, const char *status)
+{
+	if (!progress)
+		return;
+	update_progress_line(&progress->compact, compact);
+	update_progress_line(&progress->status, status);
+	display(progress, n, NULL);
 }
 
 void display_progress(struct progress *progress, uint64_t n)
@@ -285,6 +445,10 @@ static struct progress *start_progress_delay(struct repository *r,
 	progress->throughput = NULL;
 	progress->start_ns = getnanotime();
 	strbuf_init(&progress->counters_sb, 0);
+	strbuf_init(&progress->compact, 0);
+	strbuf_init(&progress->status, 0);
+	progress->displayed_compact = false;
+	progress->displayed_status = false;
 	progress->title_len = utf8_strwidth(title);
 	progress->split = 0;
 	set_progress_signal();
@@ -350,10 +514,11 @@ static void force_last_update(struct progress *progress, const char *msg)
 
 	if (tp) {
 		uint64_t now_ns = progress_getnanotime(progress);
-		unsigned int misecs, rate;
+		unsigned int misecs;
+		uint64_t rate;
 		misecs = ((now_ns - progress->start_ns) * 4398) >> 32;
 		rate = tp->curr_total / (misecs ? misecs : 1);
-		throughput_string(&tp->display, tp->curr_total, rate);
+		throughput_string(tp, tp->curr_total, rate, true);
 	}
 	progress_update = 1;
 	buf = xstrfmt(", %s.\n", msg);
@@ -392,6 +557,8 @@ void stop_progress_msg(struct progress **p_progress, const char *msg)
 
 	clear_progress_signal();
 	strbuf_release(&progress->counters_sb);
+	strbuf_release(&progress->compact);
+	strbuf_release(&progress->status);
 	if (progress->throughput)
 		strbuf_release(&progress->throughput->display);
 	free(progress->throughput);

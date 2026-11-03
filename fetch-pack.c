@@ -37,6 +37,7 @@
 #include "mergesort.h"
 #include "prio-queue.h"
 #include "promisor-remote.h"
+#include "pager.h"
 #include "progress.h"
 
 static int transfer_unpack_limit = -1;
@@ -1707,10 +1708,20 @@ static void precreate_packfile_uri_keep(const struct object_id *oid,
 		die_errno("fetch-pack: unable to close URI keep");
 }
 
+/* Cumulative counters, either for one worker or for the entire URI fetch. */
+struct packfile_uri_progress {
+	uint64_t bytes;
+	uint64_t objects, object_total;
+	uint64_t deltas, delta_total;
+	uint64_t ready;
+};
+
+/* An http-fetch worker that fetches and indexes one URI pack. */
 struct packfile_uri_task {
 	struct child_process cmd;
 	struct strbuf output;
-	uint64_t bytes;
+	struct packfile_uri_progress progress;
+	bool scan_done, resolve_done;
 	int got_pack;
 	struct object_id oid;
 	const char *uri;
@@ -1729,11 +1740,14 @@ static void start_packfile_uri_task(
 
 	child_process_init(&task->cmd);
 	strbuf_init(&task->output, 0);
-	task->bytes = 0;
+	memset(&task->progress, 0, sizeof(task->progress));
+	task->scan_done = task->resolve_done = false;
 	task->got_pack = 0;
 	strvec_push(&task->cmd.args, "http-fetch");
-	if (progress)
+	if (progress) {
 		strvec_push(&task->cmd.args, "--report-progress");
+		strvec_push(&task->cmd.args, "--report-indexing-progress");
+	}
 	strvec_pushf(&task->cmd.args, "--packfile=%s",
 		     oid_to_hex(&task->oid));
 	for (size_t i = 0; i < index_pack_args->nr; i++) {
@@ -1753,9 +1767,77 @@ static void start_packfile_uri_task(
 		die("fetch-pack: unable to spawn http-fetch");
 }
 
+static void parse_packfile_uri_counts(const char *line, const char *eol,
+				      uint64_t *counts, size_t nr)
+{
+	for (size_t i = 0; i < nr; i++) {
+		char *end;
+		uintmax_t count;
+
+		errno = 0;
+		count = strtoumax(line, &end, 10);
+		if (!isdigit(*line) || errno || count > UINT64_MAX ||
+		    (i + 1 == nr ? end != eol : *end != ' '))
+			die("fetch-pack: invalid http-fetch progress record");
+		counts[i] = count;
+		line = end + 1;
+	}
+}
+
+static void update_packfile_uri_count(uint64_t *previous, uint64_t *total,
+				      uint64_t value)
+{
+	if (value < *previous || UINT64_MAX - *total < value - *previous)
+		die("fetch-pack: invalid http-fetch progress count");
+	*total += value - *previous;
+	*previous = value;
+}
+
+static int read_packfile_uri_progress(struct packfile_uri_task *task,
+				      struct packfile_uri_progress *total,
+				      const char *line, const char *eol)
+{
+	struct packfile_uri_progress *worker = &task->progress;
+	uint64_t counts[4];
+	int indexing = skip_prefix(line, "indexing ", &line);
+
+	if (indexing || skip_prefix(line, "bytes ", &line)) {
+		parse_packfile_uri_counts(line, eol, counts, 1);
+		if (worker->ready)
+			die("fetch-pack: unexpected download progress during indexing");
+		update_packfile_uri_count(&worker->bytes, &total->bytes, counts[0]);
+		if (indexing) {
+			worker->ready = 1;
+			total->ready++;
+		}
+	} else if (skip_prefix(line, "objects ", &line)) {
+		parse_packfile_uri_counts(line, eol, counts, 4);
+		if (!worker->ready || task->scan_done || counts[0] > counts[1] ||
+		    counts[1] > UINT32_MAX || counts[2] > counts[0] || counts[3] > 1 ||
+		    (worker->object_total && worker->object_total != counts[1]) ||
+		    (counts[3] && counts[0] != counts[1]))
+			die("fetch-pack: invalid object scan progress");
+		update_packfile_uri_count(&worker->objects, &total->objects, counts[0]);
+		update_packfile_uri_count(&worker->object_total, &total->object_total, counts[1]);
+		update_packfile_uri_count(&worker->delta_total, &total->delta_total, counts[2]);
+		task->scan_done = counts[3];
+	} else if (skip_prefix(line, "deltas ", &line)) {
+		parse_packfile_uri_counts(line, eol, counts, 2);
+		if (!task->scan_done || task->resolve_done ||
+		    counts[0] > worker->delta_total || counts[1] > 1 ||
+		    (counts[1] && counts[0] != worker->delta_total))
+			die("fetch-pack: invalid delta resolution progress");
+		update_packfile_uri_count(&worker->deltas, &total->deltas, counts[0]);
+		task->resolve_done = counts[1];
+	} else {
+		return 0;
+	}
+	return 1;
+}
+
 static void read_packfile_uri_task(struct packfile_uri_task *task,
 				   struct oidset *gitmodules_oids,
-				   uint64_t *total_bytes)
+				   struct packfile_uri_progress *total)
 {
 	char *eol;
 	size_t consumed = 0;
@@ -1775,19 +1857,7 @@ static void read_packfile_uri_task(struct packfile_uri_task *task,
 		struct object_id oid;
 
 		*eol = '\0';
-		if (!task->got_pack && skip_prefix(line, "bytes ", &line)) {
-			char *end;
-			uint64_t bytes;
-
-			errno = 0;
-			bytes = strtoumax(line, &end, 10);
-			if (!isdigit(*line) || end != eol || errno ||
-			    bytes < task->bytes ||
-			    UINT64_MAX - *total_bytes < bytes - task->bytes)
-				die("fetch-pack: invalid download byte count");
-			*total_bytes += bytes - task->bytes;
-			task->bytes = bytes;
-		} else {
+		if (task->got_pack || !read_packfile_uri_progress(task, total, line, eol)) {
 			if (!task->got_pack && !skip_prefix(line, "pack\t", &line))
 				die("fetch-pack: expected pack then TAB at start of http-fetch output");
 			if (parse_oid_hex(line, &oid, &end) || end != eol)
@@ -1815,6 +1885,13 @@ static void finish_packfile_uri_task(struct packfile_uri_task *task)
 	strbuf_release(&task->output);
 }
 
+static void append_packfile_uri_count(struct strbuf *buf, uint64_t count,
+				     uint64_t total)
+{
+	strbuf_addf(buf, "(%*"PRIuMAX"/%"PRIuMAX")",
+		    decimal_width(total), (uintmax_t)count, (uintmax_t)total);
+}
+
 static void fetch_packfile_uris_parallel(
 	struct string_list *uris, struct strvec *index_pack_args,
 	struct string_list *pack_lockfiles, struct oidset *gitmodules_oids,
@@ -1825,14 +1902,18 @@ static void fetch_packfile_uris_parallel(
 	struct pollfd *pollfds;
 	int precreate_keeps = index_pack_args_have_keep(index_pack_args);
 	size_t next = 0, running = 0, completed = 0;
-	uint64_t total_bytes = 0;
-	struct progress *progress = NULL;
+	struct packfile_uri_progress total = { 0 };
+	struct progress *fetch_progress = NULL, *index_progress = NULL;
+	struct strbuf fetch_count = STRBUF_INIT;
+	struct strbuf index_count = STRBUF_INIT;
+	struct strbuf index_status = STRBUF_INIT;
+	const char *index_title = _("Indexing packs");
 	int diagnostic_incomplete = 0;
 
 	if (show_progress) {
-		progress = start_progress(the_repository, _("Fetching packs"), uris->nr);
-		display_throughput(progress, 0);
-		display_progress(progress, 0);
+		fetch_progress = start_progress(the_repository,
+						_("Fetching packs"), uris->nr);
+		display_throughput_with_rate(fetch_progress, 0, true);
 	}
 
 	if (task_nr > (size_t)fetch_packfile_uri_jobs)
@@ -1846,13 +1927,53 @@ static void fetch_packfile_uris_parallel(
 					pack_lockfiles, precreate_keeps, show_progress);
 	running = next;
 
-	while (running) {
+	for (;;) {
 		int ret;
 
-		if (!diagnostic_incomplete) {
-			display_throughput(progress, total_bytes);
-			display_progress(progress, completed);
+		if (!running && diagnostic_incomplete) {
+			fputc('\n', stderr);
+			diagnostic_incomplete = 0;
 		}
+		if (!diagnostic_incomplete && (fetch_progress || index_progress)) {
+			strbuf_reset(&index_count);
+			append_packfile_uri_count(&index_count, completed, uris->nr);
+			if (total.object_total) {
+				strbuf_addf(&index_count, ", %s ", _("objects"));
+				append_packfile_uri_count(&index_count, total.objects,
+							  total.object_total);
+			}
+			if (total.delta_total) {
+				strbuf_addf(&index_count, ", %s ", _("deltas"));
+				append_packfile_uri_count(&index_count, total.deltas,
+							  total.delta_total);
+			}
+			if (fetch_progress) {
+				/* A ready pack occupies its worker slot until indexing finishes. */
+				bool downloading = running > total.ready - completed;
+
+				strbuf_reset(&fetch_count);
+				append_packfile_uri_count(&fetch_count, total.ready, uris->nr);
+				strbuf_reset(&index_status);
+				if (total.ready && total.ready < uris->nr)
+					strbuf_addf(&index_status, "%s %s", index_title,
+						    index_count.buf);
+				if (total.bytes)
+					display_throughput_with_rate(fetch_progress, total.bytes,
+								     downloading);
+				display_progress_with_status(fetch_progress, total.ready,
+							     fetch_count.buf, index_status.buf);
+				if (total.ready == uris->nr) {
+					stop_progress(&fetch_progress);
+					index_progress = start_progress(the_repository,
+								       index_title, uris->nr);
+				}
+			}
+			if (index_progress)
+				display_progress_with_status(index_progress, completed,
+							     index_count.buf, NULL);
+		}
+		if (!running)
+			break;
 
 		for (size_t i = 0; i < task_nr; i++) {
 			pollfds[2 * i].fd = tasks[i].cmd.out;
@@ -1877,7 +1998,7 @@ static void fetch_packfile_uris_parallel(
 					die_errno("fetch-pack: unable to read http-fetch errors");
 				if (n) {
 					if (!diagnostic_incomplete)
-						clear_progress(progress);
+						clear_progress(fetch_progress ? fetch_progress : index_progress);
 					write_or_die(2, buf, n);
 					diagnostic_incomplete = buf[n - 1] != '\n';
 				} else {
@@ -1886,11 +2007,14 @@ static void fetch_packfile_uris_parallel(
 				}
 			}
 			if (pollfds[2 * i].revents)
-				read_packfile_uri_task(task, gitmodules_oids, &total_bytes);
+				read_packfile_uri_task(task, gitmodules_oids, &total);
 			if (task->cmd.out >= 0 || task->cmd.err >= 0)
 				continue;
 
 			finish_packfile_uri_task(task);
+			/* Older http-fetch workers report only bytes and the pack ID. */
+			if (!task->progress.ready)
+				total.ready++;
 			completed++;
 			if (next < uris->nr)
 				start_packfile_uri_task(task, uris->items[next++].string,
@@ -1900,12 +2024,11 @@ static void fetch_packfile_uris_parallel(
 				running--;
 		}
 	}
-	if (diagnostic_incomplete)
-		fputc('\n', stderr);
-	display_throughput(progress, total_bytes);
-	display_progress(progress, completed);
-	stop_progress(&progress);
+	stop_progress(&index_progress);
 
+	strbuf_release(&fetch_count);
+	strbuf_release(&index_count);
+	strbuf_release(&index_status);
 	free(pollfds);
 	free(tasks);
 }

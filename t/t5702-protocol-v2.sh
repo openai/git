@@ -8,6 +8,7 @@ GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
 export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
 
 . ./test-lib.sh
+. "$TEST_DIRECTORY"/lib-terminal.sh
 
 # Test protocol v2 with 'git://' transport
 #
@@ -1405,7 +1406,33 @@ test_expect_success 'no-ref-delta URI packs are indexed concurrently' '
 		bytes=$((bytes + size)) || return 1
 	done <no-ref-uris &&
 	test_grep "Fetching packs: 100% (3/3), $bytes bytes |.*done" no-ref-progress &&
-	test_grep ! "^bytes " no-ref-progress
+	test_grep "Indexing packs: .* ([012]/3)" no-ref-progress &&
+	test_grep "Indexing packs: 100% (3/3), done" no-ref-progress &&
+	test_grep ! -E "^(bytes|indexing|objects|deltas) " no-ref-progress &&
+	test_grep ! -E ", (objects|deltas) \\(" no-ref-progress
+'
+
+test_expect_success TTY,!MINGW 'parallel URI progress shows object counts on a terminal' '
+	test_env GIT_TEST_SIDEBAND_ALL=1 test_terminal \
+		git -c protocol.version=2 -c fetch.uriprotocols=http \
+			-c fetch.packfileUriJobs=2 clone --progress \
+			"$HTTPD_URL/smart/http_parent" http_child-terminal \
+		2>no-ref-terminal &&
+	test_grep -F "$(printf "\033[A")" no-ref-terminal &&
+	test_grep -F "Indexing packs (3/3), objects (3/3), done." no-ref-terminal &&
+	test_grep ! ", deltas (" no-ref-terminal
+'
+
+test_expect_success TTY,!MINGW 'parallel URI progress falls back on a narrow terminal' '
+	test_env COLUMNS=20 GIT_TEST_SIDEBAND_ALL=1 test_terminal \
+		git -c protocol.version=2 -c fetch.uriprotocols=http \
+			-c fetch.packfileUriJobs=2 clone --progress \
+			"$HTTPD_URL/smart/http_parent" http_child-narrow \
+		2>no-ref-narrow &&
+	test_grep "Indexing packs:" no-ref-narrow &&
+	test_grep "100% (3/3), done" no-ref-narrow &&
+	test_grep ! ", objects (" no-ref-narrow &&
+	test_grep ! -F "$(printf "\033[A")" no-ref-narrow
 '
 
 test_lazy_prereq CURL_RETRY_AFTER '
@@ -1530,7 +1557,7 @@ test_expect_success 'parallel URI progress respects quiet and no-progress' '
 			-c fetch.packfileUriJobs=2 clone "$option" \
 			"$HTTPD_URL/smart/http_parent" "http_child-$option" \
 			2>no-ref-progress &&
-		test_grep ! -E "Fetching packs|Receiving objects|^bytes " no-ref-progress ||
+		test_grep ! -E "Fetching packs|Indexing packs|Indexing objects|Resolving deltas|Receiving objects|^(bytes|indexing|objects|deltas) " no-ref-progress ||
 		return 1
 	done
 '
