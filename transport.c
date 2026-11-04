@@ -190,8 +190,10 @@ static int fetch_refs_from_bundle(struct transport *transport,
 				  int nr_heads UNUSED,
 				  struct ref **to_fetch UNUSED)
 {
+	/* Fetch and clone check connectivity before writing their refs. */
 	struct unbundle_opts opts = {
-		.flags = fetch_pack_fsck_objects() ? VERIFY_BUNDLE_FSCK : 0,
+		.flags = VERIFY_BUNDLE_SKIP_CONNECTIVITY |
+			(fetch_pack_fsck_objects() ? VERIFY_BUNDLE_FSCK : 0),
 	};
 	struct bundle_transport_data *data = transport->data;
 	struct strvec extra_index_pack_args = STRVEC_INIT;
