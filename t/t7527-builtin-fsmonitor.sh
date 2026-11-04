@@ -1097,6 +1097,10 @@ test_expect_success !UNICODE_COMPOSITION_SENSITIVE 'Unicode nfc/nfd' '
 
 	start_daemon -C test_unicode --tf "$PWD/unicode.trace" &&
 
+	# On macOS, the IPC socket can listen before FSEventStreamStart().
+	# Wait for a reply before creating the directories.
+	test-tool -C test_unicode fsmonitor-client query --token 0 >/dev/null &&
+
 	# Create a directory using an NFC spelling.
 	#
 	mkdir test_unicode/nfc &&
