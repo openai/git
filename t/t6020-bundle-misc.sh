@@ -651,7 +651,14 @@ test_expect_success 'verify catches unreachable, broken prerequisites' '
 		test_must_fail git bundle unbundle \
 			../clone-from/tip.bundle 2>err &&
 		test_grep "some prerequisite commits .* are not connected" err &&
-		test_line_count = 1 err
+		test_line_count = 1 err &&
+
+		# Fetch must reject the history before publishing its refs.
+		test_must_fail git fetch ../clone-from/tip.bundle \
+			tip:refs/heads/fetched 2>err &&
+		test_grep "did not send all necessary objects" err &&
+		test_must_fail git show-ref --verify refs/heads/fetched &&
+		test_must_be_empty .git/FETCH_HEAD
 	)
 '
 
