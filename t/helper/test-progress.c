@@ -13,6 +13,7 @@
  *                                  specify the time elapsed since the
  *                                  start_progress() call.
  *   "update" - Set the 'progress_update' flag.
+ *   "clear" - Call clear_progress().
  *   "stop" - Call stop_progress().
  *
  * See 't0500-progress-display.sh' for examples.
@@ -88,6 +89,8 @@ int cmd__progress(int argc, const char **argv)
 			display_throughput(progress, byte_count);
 		} else if (!strcmp(line.buf, "update")) {
 			progress_test_force_update();
+		} else if (!strcmp(line.buf, "clear")) {
+			clear_progress(progress);
 		} else if (!strcmp(line.buf, "stop")) {
 			stop_progress(&progress);
 		} else {

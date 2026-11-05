@@ -303,11 +303,12 @@ test_expect_success 'http-fetch --packfile accepts an already complete partial' 
 	cp "$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" "$tmpfile" &&
 	chmod u+w "$tmpfile" &&
 	GIT_TRACE_CURL="$TRASH_DIRECTORY/complete.trace" \
-	git -C packfileclient-complete http-fetch --packfile="$packhash" \
+	git -C packfileclient-complete http-fetch --report-progress --packfile="$packhash" \
 		--index-pack-arg=index-pack \
 		--index-pack-arg=--stdin --index-pack-arg=--keep \
 		"$HTTPD_URL/dumb/repo_pack.git/$p" >out &&
 	test_grep "416 Requested Range Not Satisfiable" complete.trace &&
+	test_grep "^bytes 0$" out &&
 	test_path_is_missing "$tmpfile" &&
 	git -C packfileclient-complete cat-file -e "$HASH"
 '
@@ -319,11 +320,13 @@ test_expect_success 'http-fetch --packfile resumes a partial download' '
 	tmpfile="packfileclient-resume/.git/objects/pack/pack-$ARBITRARY.pack.temp" &&
 	test_copy_bytes 64 <"$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" >"$tmpfile" &&
 	GIT_TRACE_CURL="$TRASH_DIRECTORY/resume.trace" \
-	git -C packfileclient-resume http-fetch --packfile="$ARBITRARY" \
+	git -C packfileclient-resume http-fetch --report-progress --packfile="$ARBITRARY" \
 		--index-pack-arg=index-pack --index-pack-arg=--stdin \
 		--index-pack-arg=--keep \
 		"$HTTPD_URL/dumb/repo_pack.git/$p" >out &&
 	test_grep "Range: bytes=64-" resume.trace &&
+	size=$(wc -c <"$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p") &&
+	test_grep "^bytes $((size - 64))$" out &&
 	test_path_is_missing "$tmpfile" &&
 	git -C packfileclient-resume cat-file -e "$HASH"
 '

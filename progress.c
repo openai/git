@@ -172,6 +172,20 @@ static void display(struct progress *progress, uint64_t n, const char *done)
 	}
 }
 
+/* Make room for a diagnostic without finishing the progress display. */
+void clear_progress(struct progress *progress)
+{
+	if (!progress || !progress->counters_sb.len ||
+	    !is_foreground_fd(fileno(stderr)))
+		return;
+
+	fprintf(stderr, "\r%*s\r",
+		(int)progress->counters_sb.len + 2 +
+		(progress->split ? 0 : progress->title_len), "");
+	fflush(stderr);
+	progress_update = 1;
+}
+
 static void throughput_string(struct strbuf *buf, uint64_t total,
 			      unsigned int rate)
 {

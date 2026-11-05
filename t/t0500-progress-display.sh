@@ -55,6 +55,41 @@ test_expect_success 'progress display with total' '
 	test_cmp expect out
 '
 
+test_expect_success 'clear progress without a total and redraw' '
+	cat >in <<-\EOF &&
+	start 0
+	update
+	progress 1
+	clear
+	progress 1
+	stop
+	EOF
+	{
+		printf "Working hard: 1\r" &&
+		printf "\r%15s\r" "" &&
+		printf "Working hard: 1\rWorking hard: 1, done.\n"
+	} >expect &&
+	test-tool progress <in 2>stderr &&
+	test_cmp expect stderr
+'
+
+test_expect_success 'clear split progress and redraw' '
+	cat >in <<-\EOF &&
+	start 3
+	progress 1
+	clear
+	progress 1
+	stop
+	EOF
+	{
+		printf "Working hard:\n   33%% (1/3)\r" &&
+		printf "\r%12s\r" "" &&
+		printf "   33%% (1/3)\r   33%% (1/3), done.\n"
+	} >expect &&
+	COLUMNS=10 test-tool progress <in 2>stderr &&
+	test_cmp expect stderr
+'
+
 test_expect_success 'progress display breaks long lines #1' '
 	sed -e "s/Z$//" >expect <<\EOF &&
 Working hard.......2.........3.........4.........5.........6:   0% (100/100000)<CR>
