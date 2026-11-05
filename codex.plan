@@ -11,7 +11,6 @@
 	topic = refs/heads/af/codex/pack-bytes
 	topic = refs/heads/tb/codex/parallel-packfile-uris
 	topic = refs/heads/tb/codex/release-tooling
-	topic = refs/heads/tb/codex/pin-ci-actions
 	topic = refs/heads/dr/codex/trace2-redact-url-signatures
 	topic = refs/heads/af/codex/packfile-uri-credentials
 	topic = refs/heads/tb/codex/pin-windows-sdk
@@ -86,13 +85,6 @@
 	remote = .
 	source-ref = refs/heads/tb/codex/release-tooling
 	source-tip = 66c1ed633a371bccb1abbe2297bfd3b27a498d87
-	source-base = 67ba20645b1792f43c8c8ea69c716687bda87ec3
-	merge = refs/heads/tb/codex/lto-pgo
-
-[branch "tb/codex/pin-ci-actions"]
-	remote = .
-	source-ref = refs/heads/tb/codex/pin-ci-actions
-	source-tip = 026ca78e79986a60637df0fec4f2089e84f19f7a
 	source-base = 67ba20645b1792f43c8c8ea69c716687bda87ec3
 	merge = refs/heads/tb/codex/lto-pgo
 
