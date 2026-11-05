@@ -236,7 +236,7 @@ struct http_pack_request *new_direct_http_pack_request(
 	const unsigned char *packed_git_hash, char *url);
 
 /*
- * Run a direct pack request, retrying HTTP authentication challenges.
+ * Run a direct pack request, retrying authentication and HTTP errors.
  * Returns HTTP_OK (also for 416), or an HTTP error.
  * The caller must initialize HTTP credentials from the pack URL, not the Git
  * remote, before constructing the request.
