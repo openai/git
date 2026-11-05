@@ -247,7 +247,8 @@ test_expect_success !HAVE_CURL_HTTP2_BUG \
 	test_cmp expect actual
 '
 
-test_expect_success 'http auth retries gzip-encoded requests' '
+test_expect_success !HAVE_CURL_HTTP2_BUG \
+	'http auth retries gzip-encoded requests' '
 	server_option=$(test-tool genzeros 1024 | tr "\000" x) &&
 	set_askpass user@host pass@host &&
 	GIT_TRACE_CURL="$TRASH_DIRECTORY/trace" \
