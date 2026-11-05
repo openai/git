@@ -190,6 +190,18 @@ test_expect_failure 'user was prompted only once for password' '
 	expect_askpass pass user@host
 '
 
+test_expect_success 'push with credentials in URL does not report a redirect' '
+	test_commit pw-user-pass &&
+	set_askpass wrong-user wrong-pass &&
+	git push "$HTTPD_URL_USER_PASS/auth/dumb/test_repo.git" HEAD 2>err &&
+	test_grep ! "redirecting to" err &&
+	expect_askpass none &&
+	git rev-parse --verify HEAD >expect &&
+	git --git-dir="$HTTPD_DOCUMENT_ROOT_PATH/auth/dumb/test_repo.git" \
+		rev-parse --verify HEAD >actual &&
+	test_cmp expect actual
+'
+
 test_expect_failure 'push to password-protected repository (no user in URL)' '
 	test_commit pw-nouser &&
 	set_askpass user@host pass@host &&
