@@ -285,7 +285,8 @@ static void repack_prepare_midx_command(struct child_process *cmd,
 {
 	cmd->git_cmd = 1;
 
-	strvec_pushl(&cmd->args, "multi-pack-index", subcommand, NULL);
+	strvec_pushl(&cmd->args, "multi-pack-index", subcommand,
+		     "--write-lock-held", NULL);
 
 	if (opts->show_progress)
 		strvec_push(&cmd->args, "--progress");
@@ -467,6 +468,8 @@ static int midx_compaction_step_exec_write(struct midx_compaction_step *step,
 	}
 
 	ret = repack_fill_midx_stdin_packs(&cmd, &step->u.write, &hash);
+	if (ret || !hash.nr)
+		goto out;
 	if (hash.nr != 1) {
 		ret = error(_("expected exactly one line during MIDX write, "
 			      "got: %"PRIuMAX),
@@ -514,6 +517,8 @@ static int midx_compaction_step_exec_compact(struct midx_compaction_step *step,
 	}
 
 	ret = finish_command(&cmd);
+	if (!ret && !step->csum)
+		ret = error(_("missing MIDX output during compaction"));
 
 out:
 	if (out)
@@ -771,7 +776,9 @@ static int repack_make_midx_compaction_plan(struct repack_write_midx_opts *opts,
 			break;
 		}
 
-		if (midx_preferred_pack(m, &preferred_pack_idx) < 0) {
+		preferred_pack_idx = m->num_packs_in_base;
+		if (opts->write_bitmaps &&
+		    midx_preferred_pack(m, &preferred_pack_idx) < 0) {
 			ret = error(_("could not find preferred pack for MIDX "
 				      "%s"), midx_get_checksum_hex(m));
 			goto out;
@@ -943,7 +950,7 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 	struct odb_source_files *files = odb_source_files_downcast(opts->existing->source);
 	struct midx_compaction_step *steps = NULL;
 	struct strbuf lock_name = STRBUF_INIT;
-	struct lock_file lf;
+	struct lock_file lf = LOCK_INIT;
 	struct strvec keep_hashes = STRVEC_INIT;
 	size_t steps_nr = 0;
 	size_t i;
@@ -978,7 +985,7 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 		if (i + 1 < steps_nr)
 			base = xstrdup(midx_compaction_step_base(&steps[i + 1]));
 
-		if (midx_compaction_step_exec(step, opts, base) < 0) {
+		if (midx_compaction_step_exec(step, opts, base)) {
 			ret = error(_("unable to execute compaction step %"PRIuMAX),
 				    (uintmax_t)i);
 			free(base);
@@ -991,6 +998,9 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 	i = steps_nr;
 	while (i--) {
 		struct midx_compaction_step *step = &steps[i];
+		/* A write containing only base objects produces no layer. */
+		if (!step->csum && step->type == MIDX_COMPACTION_STEP_WRITE)
+			continue;
 		if (!step->csum)
 			BUG("missing result for compaction step %"PRIuMAX,
 			    (uintmax_t)i);
@@ -998,11 +1008,15 @@ static int write_midx_incremental(struct repack_write_midx_opts *opts)
 		strvec_push(&keep_hashes, step->csum);
 	}
 
-	commit_lock_file(&lf);
+	if (commit_lock_file(&lf)) {
+		ret = error_errno(_("could not write multi-pack-index chain"));
+		goto done;
+	}
 
 	clear_incremental_midx_files(opts->existing->repo, &keep_hashes);
 
 done:
+	rollback_lock_file(&lf);
 	strvec_clear(&keep_hashes);
 	strbuf_release(&lock_name);
 	for (i = 0; i < steps_nr; i++)

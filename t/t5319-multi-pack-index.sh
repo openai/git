@@ -54,6 +54,41 @@ test_expect_success "don't write midx with no packs" '
 	test_path_is_missing pack/multi-pack-index
 '
 
+test_expect_success 'skip non-incremental MIDX with no objects' '
+	git init --bare empty.git &&
+	(
+		cd empty.git &&
+		git pack-objects objects/pack/pack </dev/null &&
+		ls objects/pack >files.expect &&
+
+		for bitmap in "" --bitmap
+		do
+			git multi-pack-index write $bitmap >out 2>&1 &&
+			test_must_be_empty out &&
+			test_path_is_missing objects/pack/multi-pack-index &&
+			ls objects/pack >files.actual &&
+			test_cmp files.expect files.actual || return 1
+		done &&
+
+		git multi-pack-index write --incremental --bitmap &&
+		test_dir_is_empty objects/pack/multi-pack-index.d &&
+
+		echo blob | git hash-object -w --stdin >in &&
+		git pack-objects objects/pack/pack <in &&
+		git multi-pack-index write --incremental --bitmap &&
+		test_line_count = 1 objects/pack/multi-pack-index.d/multi-pack-index-chain &&
+		git multi-pack-index verify &&
+
+		echo another | git hash-object -w --stdin >in &&
+		git pack-objects objects/pack/pack <in &&
+		git multi-pack-index write --bitmap &&
+		test_path_is_file objects/pack/multi-pack-index &&
+		midx="$(midx_checksum objects)" &&
+		test_path_is_file objects/pack/multi-pack-index-$midx.bitmap &&
+		git multi-pack-index verify
+	)
+'
+
 test_expect_success SHA1 'warn if a midx contains no oid' '
 	cp "$TEST_DIRECTORY"/t5319/no-objects.midx $objdir/pack/multi-pack-index &&
 	test_must_fail git multi-pack-index verify &&
@@ -1442,6 +1477,90 @@ test_expect_success 'lookup recovers object whose midx-owning pack was removed' 
 		echo blob >expect &&
 		git cat-file -t "$dup_oid" >actual &&
 		test_cmp expect actual
+	)
+'
+
+test_expect_success PIPE 'refresh retries a restored MIDX pack' '
+	test_when_finished "rm -fr repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		victim=$(echo victim | git hash-object -w --stdin) &&
+		pack=$(echo "$victim" | git pack-objects $objdir/pack/pack) &&
+		git multi-pack-index write --incremental &&
+		prime=$(echo prime | git hash-object -w --stdin) &&
+		echo "$prime" | git pack-objects $objdir/pack/pack &&
+		git prune-packed &&
+		git multi-pack-index write --incremental &&
+
+		mkfifo in out &&
+		(git cat-file --batch-check="%(objecttype)" <in >out &) &&
+		exec 9>in &&
+		exec 8<out &&
+		echo "$prime" >&9 &&
+		read response <&8 &&
+		test "$response" = blob &&
+
+		mv $objdir/pack/pack-$pack.pack saved.pack &&
+		echo "$victim" >&9 &&
+		read response <&8 &&
+		test "$response" = "$victim missing" &&
+		mv saved.pack $objdir/pack/pack-$pack.pack &&
+		echo "$victim" >&9 &&
+		read response <&8 &&
+		test "$response" = blob &&
+		exec 9>&- &&
+		exec 8<&-
+	)
+'
+
+test_expect_success 'lookup recovers from a corrupt MIDX-selected copy' '
+	test_when_finished "rm -fr repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit one &&
+		blob=$(git rev-parse HEAD:one.t) &&
+		git repack -ad &&
+		pack=$(echo "$blob" | git pack-objects $objdir/pack/pack) &&
+		git multi-pack-index write --preferred-pack="pack-$pack.idx" &&
+		chmod u+w $objdir/pack/pack-$pack.pack &&
+		# The four-byte blob has a one-byte pack header.
+		corrupt_data $objdir/pack/pack-$pack.pack 13 &&
+		git cat-file blob "$blob" >actual &&
+		test_cmp one.t actual
+	)
+'
+
+test_expect_success 'lookup tries all copies after corrupt packed objects' '
+	test_when_finished "rm -fr repo" &&
+	git init repo &&
+	(
+		cd repo &&
+		test_commit one &&
+		blob=$(git rev-parse HEAD:one.t) &&
+		pack1=$(echo "$blob" | git pack-objects $objdir/pack/pack) &&
+		git multi-pack-index write --incremental &&
+		test_commit two &&
+		{
+			echo "$blob" &&
+			git rev-parse HEAD:two.t
+		} >oids &&
+		pack2=$(git pack-objects $objdir/pack/pack <oids) &&
+		git multi-pack-index write --incremental &&
+		git pack-objects --all $objdir/pack/pack &&
+		git prune-packed &&
+		git multi-pack-index write --incremental &&
+		for pack in $pack1 $pack2
+		do
+			git show-index <$objdir/pack/pack-$pack.idx >index &&
+			offset=$(grep " $blob " index | cut -d" " -f1) &&
+			chmod u+w $objdir/pack/pack-$pack.pack &&
+			corrupt_data $objdir/pack/pack-$pack.pack $((offset + 1)) ||
+			return 1
+		done &&
+		git cat-file blob "$blob" >actual &&
+		test_cmp one.t actual
 	)
 '
 
