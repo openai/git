@@ -17,6 +17,7 @@
 #include "trace2/tr2_tgt.h"
 #include "trace2/tr2_tls.h"
 #include "trace2/tr2_tmr.h"
+#include "url.h"
 
 static int trace2_enabled;
 static int trace2_redact = 1;
@@ -249,32 +250,134 @@ int trace2_is_enabled(void)
 	return trace2_enabled;
 }
 
+static int is_signature_parameter(const char *parameter, int is_format)
+{
+	struct strbuf unescaped = STRBUF_INIT;
+	char *name, *p;
+	int ret;
+
+	/* A literal percent sign is doubled in a printf format string. */
+	if (is_format) {
+		while (*parameter && *parameter != '=') {
+			if (parameter[0] == '%' && parameter[1] == '%')
+				parameter++;
+			strbuf_addch(&unescaped, *parameter++);
+		}
+		parameter = unescaped.buf;
+	}
+
+	name = url_decode_parameter_name(&parameter);
+	for (p = name; *p; p++)
+		*p = tolower(*p);
+	ret = !strcmp(name, "sig") || !strcmp(name, "signature") ||
+	      ends_with(name, "-signature");
+
+	free(name);
+	strbuf_release(&unescaped);
+	return ret;
+}
+
 /*
- * Redacts an argument, i.e. ensures that no password in
- * https://user:password@host/-style URLs is logged.
+ * Redact passwords and signature query parameters in HTTP(S) URLs.
  *
  * Returns the original if nothing needed to be redacted.
  * Returns a pointer that needs to be `free()`d otherwise.
  */
-static const char *redact_arg(const char *arg)
+static const char *redact_url(const char *arg, int is_format)
 {
 	const char *p, *colon;
+	const char *unredacted = arg;
+	struct strbuf buf = STRBUF_INIT;
 	size_t at;
 
 	if (!trace2_redact ||
-	    (!skip_prefix(arg, "https://", &p) &&
-	     !skip_prefix(arg, "http://", &p)))
+	    (!skip_iprefix(arg, "https://", &p) &&
+	     !skip_iprefix(arg, "http://", &p)))
 		return arg;
 
-	at = strcspn(p, "@/");
-	if (p[at] != '@')
-		return arg;
+	/* Only an '@' in the authority can terminate user information. */
+	at = strcspn(p, "@/?#");
+	if (p[at] == '@') {
+		colon = memchr(p, ':', at);
+		if (colon) {
+			strbuf_add(&buf, arg, colon + 1 - arg);
+			strbuf_addstr(&buf, "<REDACTED>");
+			unredacted = p + at;
+		}
+	}
 
-	colon = memchr(p, ':', at);
-	if (!colon)
-		return arg;
+	/* A '?' following a fragment marker does not start a query. */
+	p += strcspn(p, "?#");
+	if (*p == '?') {
+		p++;
+		while (*p && *p != '#') {
+			const char *end = p + strcspn(p, "&#");
+			const char *equals = memchr(p, '=', end - p);
 
-	return xstrfmt("%.*s:<REDACTED>%s", (int)(colon - arg), arg, p + at);
+			if (equals && equals + 1 < end &&
+			    is_signature_parameter(p, is_format)) {
+				strbuf_add(&buf, unredacted,
+					   equals + 1 - unredacted);
+				strbuf_addstr(&buf, "<REDACTED>");
+				unredacted = end;
+			}
+			p = *end == '&' ? end + 1 : end;
+		}
+	}
+
+	if (!buf.len)
+		return arg;
+	strbuf_addstr(&buf, unredacted);
+	return strbuf_detach(&buf, NULL);
+}
+
+static const char *redact_arg(const char *arg)
+{
+	return redact_url(arg, 0);
+}
+
+void tr2_redact_error(struct strbuf *buf, int is_format)
+{
+	size_t pos = 0;
+
+	if (!trace2_redact)
+		return;
+
+	while (pos < buf->len) {
+		const char *p = strcasestr(buf->buf + pos, "http");
+		const char *end, *scheme_end;
+		const char *redacted;
+		char *url;
+		size_t start;
+
+		if (!p)
+			break;
+		start = p - buf->buf;
+		pos = start + 4;
+		if (!skip_iprefix(p, "http://", &scheme_end) &&
+		    !skip_iprefix(p, "https://", &scheme_end))
+			continue;
+
+		/*
+		 * Whitespace, double quotes and angle brackets delimit URLs.
+		 * Other punctuation can belong to a signature, so preserve a
+		 * single quote only at the end of a single-quoted token.
+		 */
+		end = p + strcspn(p, " \t\r\n\v\f\"<>");
+		if (start && p[-1] == '\'' && end[-1] == '\'')
+			end--;
+
+		/* Also examine any further URLs in the unredacted text. */
+		pos = scheme_end - buf->buf;
+		url = xmemdupz(p, end - p);
+		redacted = redact_url(url, is_format);
+		if (redacted != url) {
+			strbuf_splice(buf, start, end - p,
+				      redacted, strlen(redacted));
+			free((char *)redacted);
+		}
+		free(url);
+	}
 }
 
 /*
@@ -457,14 +560,19 @@ void trace2_cmd_alias_fl(const char *file, int line, const char *alias,
 			 const char **argv)
 {
 	struct tr2_tgt *tgt_j;
+	const char **redacted;
 	int j;
 
 	if (!trace2_enabled)
 		return;
 
+	redacted = redact_argv(argv);
+
 	for_each_wanted_builtin (j, tgt_j)
 		if (tgt_j->pfn_alias_fl)
-			tgt_j->pfn_alias_fl(file, line, alias, argv);
+			tgt_j->pfn_alias_fl(file, line, alias, redacted);
+
+	free_redacted_argv(redacted, argv);
 }
 
 void trace2_cmd_list_config_fl(const char *file, int line)
