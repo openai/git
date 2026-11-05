@@ -28,6 +28,7 @@
 #include "object-name.h"
 #include "parse-options.h"
 #include "path.h"
+#include "replace-object.h"
 #include "repository.h"
 #include "unpack-trees.h"
 #include "cache-tree.h"
@@ -118,12 +119,27 @@ static int reset_index(const char *ref, const struct object_id *oid, int reset_t
 		goto out;
 
 	if (reset_type == MIXED || reset_type == HARD) {
+		struct index_state *index = the_repository->index;
+		struct cache_tree *cache_tree = index->cache_tree;
+
 		tree = repo_parse_tree_indirect(the_repository, oid);
 		if (!tree) {
 			error(_("unable to read tree (%s)"), oid_to_hex(oid));
 			goto out;
 		}
-		prime_cache_tree(the_repository, the_repository->index, tree);
+		if (replace_refs_enabled(the_repository))
+			prepare_replace_object(the_repository);
+
+		/*
+		 * unpack_trees() carries the cache tree forward and invalidates
+		 * it when index entries change. An unstaged edit can leave the
+		 * index tree already matching the hard reset target.
+		 */
+		if (reset_type != HARD || index->sparse_index != INDEX_EXPANDED ||
+		    !cache_tree || cache_tree->entry_count < 0 ||
+		    !oideq(&cache_tree->oid, &tree->object.oid) ||
+		    oidmap_get_size(&the_repository->objects->replace_map))
+			prime_cache_tree(the_repository, index, tree);
 	}
 
 	ret = 0;
