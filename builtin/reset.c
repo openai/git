@@ -121,13 +121,14 @@ static int reset_index(const char *ref, const struct object_id *oid, int reset_t
 	if (reset_type == MIXED || reset_type == HARD) {
 		struct index_state *index = the_repository->index;
 		struct cache_tree *cache_tree = index->cache_tree;
+		int use_replace_refs = replace_refs_enabled(the_repository);
 
 		tree = repo_parse_tree_indirect(the_repository, oid);
 		if (!tree) {
 			error(_("unable to read tree (%s)"), oid_to_hex(oid));
 			goto out;
 		}
-		if (replace_refs_enabled(the_repository))
+		if (use_replace_refs)
 			prepare_replace_object(the_repository);
 
 		/*
@@ -138,7 +139,8 @@ static int reset_index(const char *ref, const struct object_id *oid, int reset_t
 		if (reset_type != HARD || index->sparse_index != INDEX_EXPANDED ||
 		    !cache_tree || cache_tree->entry_count < 0 ||
 		    !oideq(&cache_tree->oid, &tree->object.oid) ||
-		    oidmap_get_size(&the_repository->objects->replace_map))
+		    (use_replace_refs &&
+		     oidmap_get_size(&the_repository->objects->replace_map)))
 			prime_cache_tree(the_repository, index, tree);
 	}
 
