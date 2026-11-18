@@ -11,6 +11,7 @@
 #include "strvec.h"
 #include "url.h"
 #include "urlmatch.h"
+#include "trace.h"
 #include "trace2.h"
 
 static const char http_fetch_usage[] = "git http-fetch "
@@ -52,11 +53,36 @@ static int fetch_using_walker(const char *raw_url, int get_verbosely,
 	return rc;
 }
 
+struct packfile_progress {
+	uint64_t bytes;
+	uint64_t last_update;
+};
+
+static void report_packfile_progress(struct packfile_progress *progress)
+{
+	printf("bytes %"PRIu64"\n", progress->bytes);
+	if (fflush(stdout))
+		die_errno("unable to report packfile download progress");
+	progress->last_update = getnanotime();
+}
+
+static void update_packfile_progress(void *data, size_t bytes)
+{
+	struct packfile_progress *progress = data;
+
+	progress->bytes += bytes;
+	if (getnanotime() - progress->last_update >= 500000000)
+		report_packfile_progress(progress);
+}
+
 static void fetch_single_packfile(struct object_id *packfile_hash,
 				  const char *url,
-				  const char **index_pack_args) {
+				  const char **index_pack_args,
+				  int report_progress)
+{
 	struct http_pack_request *preq;
 	struct slot_results results;
+	struct packfile_progress progress = { 0 };
 	int ret;
 
 	http_init(NULL, url, 0);
@@ -67,6 +93,11 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 	preq->slot->results = &results;
 	preq->index_pack_args = index_pack_args;
 	preq->preserve_index_pack_stdout = 1;
+	if (report_progress) {
+		progress.last_update = getnanotime();
+		preq->progress = update_packfile_progress;
+		preq->progress_data = &progress;
+	}
 
 	if (start_active_slot(preq->slot)) {
 		run_active_slot(preq->slot);
@@ -88,6 +119,9 @@ static void fetch_single_packfile(struct object_id *packfile_hash,
 		die("Unable to start request");
 	}
 
+	if (report_progress)
+		report_packfile_progress(&progress);
+
 	if ((ret = finish_http_pack_request(preq)))
 		die("finish_http_pack_request gave result %d", ret);
 
@@ -105,6 +139,7 @@ int cmd_main(int argc, const char **argv)
 	int get_verbosely = 0;
 	int get_recover = 0;
 	int packfile = 0;
+	int report_progress = 0;
 	int nongit;
 	struct object_id packfile_hash;
 	struct strvec index_pack_args = STRVEC_INIT;
@@ -129,6 +164,8 @@ int cmd_main(int argc, const char **argv)
 			get_recover = 1;
 		} else if (!strcmp(argv[arg], "--stdin")) {
 			commits_on_stdin = 1;
+		} else if (!strcmp(argv[arg], "--report-progress")) {
+			report_progress = 1;
 		} else if (skip_prefix(argv[arg], "--packfile=", &p)) {
 			const char *end;
 
@@ -159,10 +196,13 @@ int cmd_main(int argc, const char **argv)
 			die(_("the option '%s' requires '%s'"), "--packfile", "--index-pack-arg");
 
 		fetch_single_packfile(&packfile_hash, argv[arg],
-				      index_pack_args.v);
+				      index_pack_args.v, report_progress);
 		ret = 0;
 		goto out;
 	}
+
+	if (report_progress)
+		die(_("the option '%s' requires '%s'"), "--report-progress", "--packfile");
 
 	if (index_pack_args.nr)
 		die(_("the option '%s' requires '%s'"), "--index-pack-arg", "--packfile");
