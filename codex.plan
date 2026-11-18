@@ -24,6 +24,7 @@
 	topic = refs/heads/tb/codex/skipping-parse-parents
 	topic = refs/heads/af/codex/webdav-redirect-credentials
 	topic = refs/heads/dr/codex/reuse-packfile-uri
+	topic = refs/heads/tb/codex/windows-bundled-bash
 
 [branch "tb/codex/automation"]
 	remote = .
@@ -178,3 +179,10 @@
 	source-tip = d5e2b6b47fd4acc9d013718e71fd6818d1f9ce72
 	source-base = 540401f2f3be07bfa4c9cf32ec99c8cad7e5bcd1
 	merge = refs/heads/tn/codex/http-pack-transient-retry
+
+[branch "tb/codex/windows-bundled-bash"]
+	remote = .
+	source-ref = refs/heads/tb/codex/windows-bundled-bash
+	source-tip = d751f4e76c41812c61a3f63f009188498bb9f512
+	source-base = 3a704dfc85e3e691f90af6a3ecb151ac11166568
+	merge = refs/heads/tb/codex/pin-windows-sdk
