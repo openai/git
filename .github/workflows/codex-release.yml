@@ -1,0 +1,551 @@
+name: Codex Git release
+
+on:
+  push:
+    branches:
+      - codex
+      - codex-unstable
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-git-release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  publication:
+    name: Verify controller publication
+    runs-on: ubuntu-24.04
+    if: github.event.deleted == false
+    outputs:
+      published: ${{ steps.verify.outputs.published }}
+    steps:
+      - name: Check the published controller output
+        id: verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+          refs/heads/codex)
+            output_key=codex.output-tip
+            ;;
+          refs/heads/codex-unstable)
+            output_key=codex-unstable.output-tip
+            ;;
+          *)
+            printf 'unexpected release ref: %s\n' "$GITHUB_REF" >&2
+            exit 1
+            ;;
+          esac
+
+          meta=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/heads/meta" \
+            --jq '.object.sha')
+          recorded=$(gh api \
+            "repos/$GITHUB_REPOSITORY/contents/codex.config?ref=$meta" \
+            -H 'Accept: application/vnd.github.raw+json' |
+            git config --no-includes --file /dev/stdin \
+              --get "$output_key")
+
+          if test "$GITHUB_SHA" = "$recorded"
+          then
+            printf 'published=true\n' >>"$GITHUB_OUTPUT"
+            printf 'Releasing controller-published commit %s.\n' "$GITHUB_SHA"
+          else
+            printf 'published=false\n' >>"$GITHUB_OUTPUT"
+            printf 'Skipping non-controller publication %s.\n' "$GITHUB_SHA"
+          fi
+
+  version:
+    name: Determine version
+    needs: publication
+    if: needs.publication.outputs.published == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      describe: ${{ steps.version.outputs.describe }}
+      upstream_tag: ${{ steps.version.outputs.upstream_tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive OpenAI version from git describe
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          describe="$(git describe \
+            --match 'v[0-9]*' \
+            --exclude 'v*-openai.*' \
+            --long \
+            --always \
+            --abbrev=12 \
+            "$GITHUB_SHA")"
+
+          if [[ "$describe" =~ ^(.+)-([0-9]+)-g([0-9a-f]+)$ ]]
+          then
+            upstream_tag="${BASH_REMATCH[1]}"
+            version="$upstream_tag-openai.${BASH_REMATCH[2]}.g${BASH_REMATCH[3]}"
+          else
+            upstream_tag=
+            version="openai-$describe"
+          fi
+          git check-ref-format "refs/tags/$version"
+          printf 'describe=%s\n' "$describe" | tee -a "$GITHUB_OUTPUT"
+          printf 'upstream_tag=%s\n' "$upstream_tag" | tee -a "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            target_platform: macOS
+            asset_platform: macOS
+            arch: arm64
+            binary: /tmp/build/git/bin/git
+            file_pattern: Mach-O 64-bit executable arm64
+            has_gcm: false
+            max_tar_bytes: 67108864
+          - name: macOS x64
+            os: macos-15-intel
+            target_platform: macOS
+            asset_platform: macOS
+            arch: x64
+            binary: /tmp/build/git/bin/git
+            file_pattern: Mach-O 64-bit executable x86_64
+            has_gcm: false
+            max_tar_bytes: 67108864
+          - name: Linux arm64
+            os: ubuntu-22.04
+            target_platform: ubuntu
+            asset_platform: ubuntu
+            arch: arm64
+            binary: /tmp/build/git/bin/git
+            file_pattern: ELF 64-bit.*ARM aarch64
+            has_gcm: false
+            max_tar_bytes: 67108864
+          - name: Linux x64
+            os: ubuntu-22.04
+            target_platform: ubuntu
+            asset_platform: ubuntu
+            arch: x64
+            binary: /tmp/build/git/bin/git
+            file_pattern: ELF 64-bit.*x86-64
+            has_gcm: false
+            max_tar_bytes: 67108864
+          - name: Windows arm64
+            os: windows-11-arm
+            target_platform: win32
+            asset_platform: windows
+            arch: arm64
+            binary: /tmp/build/git/clangarm64/bin/git.exe
+            file_pattern: PE32\+.*ARM64
+            has_gcm: true
+            max_tar_bytes: 134217728
+            sdk_arch: aarch64
+            sdk_flavor: full
+            mingw_dir: clangarm64
+            mingit_arch: arm64
+            mingit_filename: MinGit-2.55.0.2-arm64.zip
+            mingit_url: https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.2/MinGit-2.55.0.2-arm64.zip
+            mingit_sha256: 0b2b81fdce284efd174cbb51b886ccea2fd271679c4b5c21f07d9e03bae51413
+          - name: Windows x64
+            os: windows-2025
+            target_platform: win32
+            asset_platform: windows
+            arch: x64
+            binary: /tmp/build/git/mingw64/bin/git.exe
+            file_pattern: PE32\+.*x86-64
+            has_gcm: true
+            max_tar_bytes: 134217728
+            sdk_arch: x86_64
+            sdk_flavor: full
+            mingw_dir: mingw64
+            mingit_arch: amd64
+            mingit_filename: MinGit-2.55.0.2-64-bit.zip
+            mingit_url: https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.2/MinGit-2.55.0.2-64-bit.zip
+            mingit_sha256: e3ea2944cea4b3fabcd69c7c1669ef69b1b66c05ac7806d81224d0abad2dec31
+
+    steps:
+      # Keep the packaging contract, dependency pins, and platform build logic
+      # aligned with the artifacts already consumed by Codex and GitHub Desktop.
+      - name: Check out Dugite Native
+        uses: actions/checkout@v6
+        with:
+          repository: desktop/dugite-native
+          ref: f97e50add48cdcff053a69d95aa343a4a4a258c2
+          path: dugite-native
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out this Git revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: dugite-native/git
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Give the source an immutable package version
+        shell: bash
+        working-directory: dugite-native/git
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git \
+            -c 'user.name=github-actions[bot]' \
+            -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' \
+            tag -a "$VERSION" -m "$VERSION"
+
+      # Match Dugite Native's compatibility choice for its macOS x64 build.
+      - name: Select Xcode 16.4
+        if: matrix.target_platform == 'macOS' && matrix.arch == 'x64'
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer/
+          sudo rm -rf /Library/Developer/CommandLineTools
+
+      - name: Install Linux build dependencies
+        if: matrix.target_platform == 'ubuntu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            build-essential \
+            ca-certificates \
+            curl \
+            gettext \
+            jq \
+            lsb-release \
+            pkg-config
+
+      - name: Install Linux x64 build dependencies
+        if: matrix.target_platform == 'ubuntu' && matrix.arch == 'x64'
+        run: |
+          sudo apt-get install -y \
+            libcurl4-gnutls-dev \
+            libexpat1-dev \
+            libssl-dev \
+            zlib1g-dev
+
+      - name: Install Linux arm64 build dependencies
+        if: matrix.target_platform == 'ubuntu' && matrix.arch == 'arm64'
+        run: |
+          sudo sed -i "s/^deb/deb [arch=amd64,i386]/g" /etc/apt/sources.list
+          release="$(lsb_release -s -c)"
+          echo "deb [arch=arm64,armhf] http://azure.ports.ubuntu.com/ ${release} main universe multiverse restricted" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64,armhf] http://azure.ports.ubuntu.com/ ${release}-updates main universe multiverse restricted" | sudo tee -a /etc/apt/sources.list
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            libcurl4-gnutls-dev:arm64 \
+            libexpat1-dev:arm64 \
+            libssl-dev:arm64 \
+            zlib1g-dev:arm64
+
+      # Dugite Native currently pins MinGit 2.53. Keep its build script and
+      # dependency schema, but match the runtime to the Git series we compile.
+      - name: Select the matching MinGit runtime
+        if: matrix.target_platform == 'win32'
+        shell: bash
+        working-directory: dugite-native
+        env:
+          MINGIT_ARCH: ${{ matrix.mingit_arch }}
+          MINGIT_FILENAME: ${{ matrix.mingit_filename }}
+          MINGIT_SHA256: ${{ matrix.mingit_sha256 }}
+          MINGIT_URL: ${{ matrix.mingit_url }}
+          MINGIT_VERSION: v2.55.0
+          SOURCE_UPSTREAM_TAG: ${{ needs.version.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_UPSTREAM_TAG" = "$MINGIT_VERSION"
+          updated="$(mktemp)"
+          jq \
+            --arg arch "$MINGIT_ARCH" \
+            --arg checksum "$MINGIT_SHA256" \
+            --arg filename "$MINGIT_FILENAME" \
+            --arg url "$MINGIT_URL" \
+            --arg version "$MINGIT_VERSION" \
+            '.git.version = $version |
+             (.git.files[] |
+                select(.platform == "windows" and .arch == $arch)) |=
+               (.filename = $filename |
+                .url = $url |
+                .checksum = $checksum)' \
+            dependencies.json >"$updated"
+          mv "$updated" dependencies.json
+
+      # Codex does not configure or invoke GCM on macOS or Linux. The
+      # self-contained .NET payload accounts for most of those bundles, while
+      # Windows MinGit configures credential.helper=manager and must retain it.
+      - name: Omit unused GCM from POSIX bundles
+        if: matrix.target_platform != 'win32'
+        shell: bash
+        working-directory: dugite-native
+        run: |
+          set -euo pipefail
+          updated="$(mktemp)"
+          jq '."git-credential-manager".files = []' \
+            dependencies.json >"$updated"
+          mv "$updated" dependencies.json
+
+      # Dugite cross-compiles several targets. Keep Git's optional Rust
+      # library disabled until its Makefile can direct Cargo at those targets.
+      - name: Build the Dugite Native distribution
+        shell: bash
+        working-directory: dugite-native
+        env:
+          NO_RUST: 1
+          TARGET_PLATFORM: ${{ matrix.target_platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          script/build.sh
+
+      - name: Set up Git for Windows SDK
+        if: matrix.target_platform == 'win32'
+        uses: git-for-windows/setup-git-for-windows-sdk@v2
+        with:
+          architecture: ${{ matrix.sdk_arch }}
+          flavor: ${{ matrix.sdk_flavor }}
+          cache: false
+
+      # Dugite Native compiles its Git submodule on macOS and Linux. On
+      # Windows it starts from MinGit, so replace MinGit's Git programs with
+      # the build from this repository while retaining the portable runtime.
+      # MinGit omits dashed builtin aliases; installing them as copies would
+      # add hundreds of redundant MiB to the archive.
+      - name: Install this Git build into the Windows distribution
+        if: matrix.target_platform == 'win32'
+        shell: bash
+        working-directory: dugite-native/git
+        env:
+          MINGW_DIR: ${{ matrix.mingw_dir }}
+        run: |
+          set -euo pipefail
+
+          make_args=(
+            "prefix=/$MINGW_DIR"
+            NO_PERL=YesPlease
+            NO_RUST=YesPlease
+            NO_TCLTK=YesPlease
+            NO_GETTEXT=YesPlease
+            NO_INSTALL_HARDLINKS=YesPlease
+            NO_CROSS_DIRECTORY_HARDLINKS=YesPlease
+            SKIP_DASHED_BUILT_INS=YesPlease
+          )
+          jobs="${NUMBER_OF_PROCESSORS:-2}"
+          make -j"$jobs" "${make_args[@]}" all
+          make "${make_args[@]}" DESTDIR=/tmp/build/git strip install
+
+      - name: Verify distribution layout and provenance
+        shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.target_platform }}
+          MINGW_DIR: ${{ matrix.mingw_dir }}
+          GIT_BINARY: ${{ matrix.binary }}
+          FILE_PATTERN: ${{ matrix.file_pattern }}
+          HAS_GCM: ${{ matrix.has_gcm }}
+        run: |
+          set -euo pipefail
+          if test "$TARGET_PLATFORM" = win32
+          then
+            test -f /tmp/build/git/cmd/git.exe
+            test -f "/tmp/build/git/$MINGW_DIR/libexec/git-core/git-lfs.exe"
+            test -d "/tmp/build/git/$MINGW_DIR/share/git-core/templates"
+            test ! -e "/tmp/build/git/$MINGW_DIR/libexec/git-core/git-add.exe"
+            if test "$HAS_GCM" = true
+            then
+              test -f "/tmp/build/git/$MINGW_DIR/bin/git-credential-manager.exe"
+            fi
+          else
+            test -x /tmp/build/git/libexec/git-core/git-lfs
+            test -d /tmp/build/git/share/git-core/templates
+            if test "$HAS_GCM" = true
+            then
+              test -x /tmp/build/git/libexec/git-core/git-credential-manager
+            else
+              test ! -e /tmp/build/git/libexec/git-core/git-credential-manager
+            fi
+          fi
+          test -f /tmp/build/git/etc/gitconfig
+
+          file "$GIT_BINARY" | tee /tmp/git-file-type
+          grep -E "$FILE_PATTERN" /tmp/git-file-type
+          strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
+
+      - name: Smoke-test the native distribution
+        if: matrix.arch == 'x64' || matrix.target_platform == 'win32'
+        shell: bash
+        env:
+          TARGET_PLATFORM: ${{ matrix.target_platform }}
+          MINGW_DIR: ${{ matrix.mingw_dir }}
+          HAS_GCM: ${{ matrix.has_gcm }}
+        run: |
+          set -euo pipefail
+          smoke=/tmp/codex-git-smoke
+          mkdir -p "$smoke/home"
+
+          if test "$TARGET_PLATFORM" = win32
+          then
+            git_binary=/tmp/build/git/cmd/git.exe
+            git_env=(
+              "PATH=/tmp/build/git/cmd:/tmp/build/git/$MINGW_DIR/bin:/tmp/build/git/usr/bin:$PATH"
+            )
+          else
+            git_binary=/tmp/build/git/bin/git
+            git_env=(
+              GIT_CONFIG_SYSTEM=/tmp/build/git/etc/gitconfig
+              GIT_EXEC_PATH=/tmp/build/git/libexec/git-core
+              GIT_TEMPLATE_DIR=/tmp/build/git/share/git-core/templates
+            )
+            if test "$TARGET_PLATFORM" = ubuntu
+            then
+              git_env+=(
+                GIT_SSL_CAINFO=/tmp/build/git/ssl/cacert.pem
+                PREFIX=/tmp/build/git
+              )
+            fi
+          fi
+          git_env+=("HOME=$smoke/home" GIT_TERMINAL_PROMPT=0)
+
+          build_options="$(env "${git_env[@]}" "$git_binary" --version --build-options)"
+          printf '%s\n' "$build_options"
+          grep -F "built from commit: $GITHUB_SHA" <<<"$build_options"
+          env "${git_env[@]}" "$git_binary" lfs version
+          if test "$HAS_GCM" = true
+          then
+            env "${git_env[@]}" "$git_binary" credential-manager --version
+          fi
+
+          env "${git_env[@]}" "$git_binary" init --quiet "$smoke/repo"
+          echo test >"$smoke/repo/file"
+          env "${git_env[@]}" "$git_binary" -C "$smoke/repo" add file
+          env "${git_env[@]}" "$git_binary" -C "$smoke/repo" \
+            -c user.name='Codex Git CI' \
+            -c user.email='codex-git-ci@openai.com' \
+            commit --quiet -m initial
+          test -z "$(env "${git_env[@]}" "$git_binary" -C "$smoke/repo" status --porcelain)"
+
+      - name: Package with Dugite Native
+        shell: bash
+        working-directory: dugite-native
+        env:
+          ASSET_PLATFORM: ${{ matrix.asset_platform }}
+          TARGET_PLATFORM: ${{ matrix.target_platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.version.outputs.version }}
+          MAX_TAR_BYTES: ${{ matrix.max_tar_bytes }}
+        run: |
+          set -euo pipefail
+          script/package.sh
+
+          for extension in tar.gz lzma
+          do
+            matches=(
+              output/dugite-native-"$VERSION"-*-"$ASSET_PLATFORM"-"$TARGET_ARCH.$extension"
+            )
+            test "${#matches[@]}" -eq 1
+            test -f "${matches[0]}"
+
+            destination="output/git-$VERSION-$ASSET_PLATFORM-$TARGET_ARCH.$extension"
+            mv "${matches[0]}" "$destination"
+            mv "${matches[0]}.sha256" "$destination.sha256"
+          done
+
+          for checksum in output/*.sha256
+          do
+            archive="${checksum%.sha256}"
+            expected="$(tr -d '\r\n' <"$checksum")"
+            if command -v sha256sum >/dev/null 2>&1
+            then
+              actual="$(sha256sum "$archive" | awk '{print $1}')"
+            else
+              actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+            fi
+            test "$actual" = "$expected"
+          done
+
+          tarball="output/git-$VERSION-$ASSET_PLATFORM-$TARGET_ARCH.tar.gz"
+          tar_bytes="$(wc -c <"$tarball")"
+          printf '%s bytes: %s\n' "$tar_bytes" "$tarball"
+          test "$tar_bytes" -le "$MAX_TAR_BYTES"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: git-${{ matrix.asset_platform }}-${{ matrix.arch }}
+          path: dugite-native/output/git-*
+          if-no-files-found: error
+          retention-days: 7
+
+      # The arm64 SDK puts its target Git first on PATH, but action cleanup
+      # runs on the x64 host and therefore needs the runner's native Git.
+      - name: Restore native Git for action cleanup
+        if: always() && matrix.target_platform == 'win32'
+        shell: pwsh
+        run: |
+          "C:\Program Files\Git\cmd" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+  release:
+    name: Publish GitHub prerelease
+    needs:
+      - version
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: git-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish immutable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_DESCRIPTION: ${{ needs.version.outputs.describe }}
+          SOURCE_REF: ${{ github.ref }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          assets=(artifacts/git-*)
+          release_notes=$(
+            printf '%s\n' \
+              "source_ref=$SOURCE_REF" \
+              "source_sha=$GITHUB_SHA" \
+              "" \
+              "OpenAI Git release artifacts for $SOURCE_DESCRIPTION, built from $GITHUB_SHA for Codex."
+          )
+
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          then
+            gh release upload "$VERSION" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$VERSION" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$VERSION" \
+              --notes "$release_notes" \
+              --prerelease
+          fi
