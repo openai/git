@@ -436,6 +436,9 @@ jobs:
           make -j"$jobs" "${make_args[@]}" OPENAI_PROFILE=BUILD all
           make "${make_args[@]}" OPENAI_PROFILE=USE DESTDIR=/tmp/build/git strip install
 
+          # MinGit ships Bash as sh.exe. Hooks using /usr/bin/env bash need both names.
+          cp /tmp/build/git/usr/bin/sh.exe /tmp/build/git/usr/bin/bash.exe
+
       - name: Verify distribution layout and provenance
         shell: bash
         env:
@@ -495,6 +498,7 @@ jobs:
           if test "$TARGET_PLATFORM" = win32
           then
             git_binary=/tmp/build/git/cmd/git.exe
+            /tmp/build/git/usr/bin/bash.exe -c 'test -n "$BASH_VERSION"'
             git_env=(
               "PATH=/tmp/build/git/cmd:/tmp/build/git/$MINGW_DIR/bin:/tmp/build/git/usr/bin:$PATH"
             )
