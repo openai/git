@@ -5927,6 +5927,7 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 				--output="$support/extra-head.zip" HEAD
 		) &&
 		cat >"$support/duplicate.py" <<-\EOF &&
+		import copy
 		import sys
 		import zipfile
 
@@ -5936,7 +5937,11 @@ test_expect_success PYTHON 'publish-run authenticates the artifact and promotes 
 		        data = src.read(item.filename)
 		        dst.writestr(item, data)
 		        if item.filename == "codex-run":
-		            dst.writestr(item, data)
+		            # writestr() changes header_offset; do not share the ZipInfo.
+		            dst.writestr(copy.copy(item), data)
+		with zipfile.ZipFile(target) as check:
+		    entries = check.infolist()
+		    assert len({item.header_offset for item in entries}) == len(entries)
 		EOF
 		python3 "$support/duplicate.py" "$support/good.zip" \
 			"$support/duplicate.zip" 2>/dev/null &&
