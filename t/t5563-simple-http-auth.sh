@@ -54,7 +54,11 @@ expect_credential_query () {
 per_test_cleanup () {
 	rm -f *.cred &&
 	rm -f "$HTTPD_ROOT_PATH"/custom-auth.valid \
-	      "$HTTPD_ROOT_PATH"/custom-auth.challenge
+	      "$HTTPD_ROOT_PATH"/custom-auth.challenge \
+	      "$HTTPD_ROOT_PATH"/custom-auth.routes \
+	      "$HTTPD_ROOT_PATH"/custom-auth.requests \
+	      "$HTTPD_ROOT_PATH"/custom-auth.destination.valid \
+	      "$HTTPD_ROOT_PATH"/custom-auth.destination.challenge
 }
 
 test_expect_success 'setup repository' '
@@ -905,6 +909,252 @@ test_expect_success SPNEGO 'http.emptyAuth=false skips Negotiate' '
 	# credential_fill is called right away. Only one 401 response.
 	grep "HTTP/[0-9.]* 401" "$TRASH_DIRECTORY/trace-false" >actual_401s &&
 	test_line_count = 1 actual_401s
+'
+
+for auth in challenged preauthenticated redirected
+do
+test_expect_success "push follows discovery redirects ($auth)" '
+	test_when_finished per_test_cleanup &&
+	test_config -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" http.receivepack true &&
+	set_credential_reply get <<-EOF &&
+	capability[]=authtype
+	authtype=Bearer
+	credential=redirect-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Bearer redirect-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=302 response=Location: $HTTPD_URL/smart/repo.git/info/refs?service=git-receive-pack
+	id=default response=WWW-Authenticate: Bearer realm="example.com"
+	EOF
+	test_config_global credential.helper test-helper &&
+	url="$HTTPD_URL/custom_auth/repo.git" &&
+	>expect &&
+	if test "$auth" = redirected
+	then
+		url="$HTTPD_URL/redir-to/custom_auth/repo.git" &&
+		cat >>expect <<-EOF
+		GET  /redir-to/custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 302
+		GET  /really-redir-to?path=custom_auth/repo.git/info/refs&qs=service=git-receive-pack HTTP/1.1 302
+		EOF
+	fi &&
+	if test "$auth" = preauthenticated
+	then
+		test_config_global http.extraHeader "Authorization: Bearer redirect-token"
+	else
+		echo "GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -" >>expect
+	fi &&
+	cat >>expect <<-EOF &&
+	GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -
+	GET  /smart/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200
+	POST /smart/repo.git/git-receive-pack HTTP/1.1 200
+	EOF
+	>"$HTTPD_ROOT_PATH/access.log" &&
+	GIT_TRACE_CURL="$TRASH_DIRECTORY/redirect-$auth.trace" \
+	git -c http.followRedirects=initial push \
+		"$url" HEAD:refs/heads/redirect-$auth &&
+	# Apache does not record the status written by the NPH CGI.
+	test_grep "Recv header: HTTP/1.1 302" "redirect-$auth.trace" &&
+	if test "$auth" = preauthenticated
+	then
+		test_grep ! "Recv header: HTTP/1.1 401" "redirect-$auth.trace"
+	else
+		test_grep "Recv header: HTTP/1.1 401" "redirect-$auth.trace"
+	fi &&
+	check_access_log expect &&
+	git rev-parse HEAD >expect-oid &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" \
+		rev-parse refs/heads/redirect-$auth >actual-oid &&
+	test_cmp expect-oid actual-oid
+'
+done
+
+for extra_header in none cookie
+do
+test_expect_success "select credentials after cross-host retry redirect ($extra_header)" '
+	test_when_finished per_test_cleanup &&
+	test_config -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" http.receivepack true &&
+	write_script "$TRASH_DIRECTORY/bin/git-credential-redirect-helper" <<-\EOF &&
+	test "$1" = get || exit 0
+	host=
+	while IFS= read -r line
+	do
+		case "$line" in host=*) host=${line#host=} ;; esac
+	done
+	case "$host" in
+	"$ORIGIN_HOST") echo username=alice ;;
+	"$DESTINATION_HOST") echo username=bob ;;
+	*) exit 1 ;;
+	esac
+	echo password=secret-passwd
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Basic YWxpY2U6c2VjcmV0LXBhc3N3ZA==
+	id=2 creds=Basic Ym9iOnNlY3JldC1wYXNzd2Q=
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=302 response=Location: $HTTPD_PROTO://localhost:$LIB_HTTPD_PORT/custom_auth/repo.git/info/refs?service=git-receive-pack
+	id=2 status=200
+	id=default response=WWW-Authenticate: Basic realm="example.com"
+	EOF
+	test_config_global credential.helper redirect-helper &&
+	if test "$extra_header" = cookie
+	then
+		test_config_global "http.$HTTPD_URL/.extraHeader" "Cookie: origin-secret"
+	fi &&
+	>"$HTTPD_ROOT_PATH/access.log" &&
+	ORIGIN_HOST=$HTTPD_DEST DESTINATION_HOST=localhost:$LIB_HTTPD_PORT \
+	git -c http.followRedirects=initial push \
+		"$HTTPD_URL/custom_auth/repo.git" \
+		HEAD:refs/heads/cross-host-$extra_header 2>err &&
+	cat >expect <<-EOF &&
+	GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -
+	GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -
+	GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -
+	GET  /custom_auth/repo.git/info/refs?service=git-receive-pack HTTP/1.1 200 -
+	POST /custom_auth/repo.git/git-receive-pack HTTP/1.1 200 -
+	EOF
+	check_access_log expect &&
+	git rev-parse HEAD >expect-oid &&
+	git -C "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" \
+		rev-parse refs/heads/cross-host-$extra_header >actual-oid &&
+	test_cmp expect-oid actual-oid
+'
+done
+
+setup_redirect_credentials () {
+	test_when_finished per_test_cleanup &&
+	test_when_finished "unset REDIRECT_HELPER_LOG" &&
+	REDIRECT_HELPER_LOG="$TRASH_DIRECTORY/redirect-helper.calls" &&
+	export REDIRECT_HELPER_LOG &&
+	>"$REDIRECT_HELPER_LOG" &&
+	>"$HTTPD_ROOT_PATH/custom-auth.requests" &&
+	origin_url="$HTTPD_URL/custom_auth/repo.git" &&
+	destination_url="$HTTPD_PROTO://$1/custom_auth/$2" &&
+	if ! test -d "$HTTPD_DOCUMENT_ROOT_PATH/other.git"
+	then
+		git clone --bare "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" \
+			"$HTTPD_DOCUMENT_ROOT_PATH/other.git"
+	fi &&
+	test_config -C "$HTTPD_DOCUMENT_ROOT_PATH/$2" http.receivepack true &&
+	test_config_global credential.helper "" &&
+	write_script "$TRASH_DIRECTORY/bin/git-credential-redirect-trace" <<-\EOF &&
+	provider=$1
+	operation=$2
+	path=
+	while IFS= read -r line
+	do
+		case "$line" in path=*) path=${line#path=} ;; esac
+	done
+	if test "$provider" = by-path
+	then
+		case "$path" in
+		custom_auth/other.git) provider=destination ;;
+		*) provider=origin ;;
+		esac
+	fi
+	echo "$provider $operation" >>"$REDIRECT_HELPER_LOG"
+	if test "$operation" = get
+	then
+		echo "capability[]=authtype"
+		echo "authtype=Bearer"
+		echo "credential=$provider-token"
+	fi
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.valid" <<-EOF &&
+	id=1 creds=Bearer origin-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.challenge" <<-EOF &&
+	id=1 status=302 response=Location: $destination_url/info/refs?service=git-receive-pack
+	id=default response=WWW-Authenticate: Bearer realm="origin"
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.destination.valid" <<-EOF &&
+	id=1 creds=Bearer $3-token
+	EOF
+	cat >"$HTTPD_ROOT_PATH/custom-auth.destination.challenge" <<-EOF &&
+	id=1 status=200
+	id=default response=WWW-Authenticate: Bearer realm="destination"
+	EOF
+	echo "$1/$2 custom-auth.destination" >"$HTTPD_ROOT_PATH/custom-auth.routes"
+}
+
+test_expect_success 'same credential identity retains Bearer auth after redirect' '
+	setup_redirect_credentials "$HTTPD_DEST" other.git origin &&
+	test_config_global credential.helper "redirect-trace origin" &&
+	git push "$origin_url" HEAD:refs/heads/same-identity &&
+	cat >expect <<-EOF &&
+	GET $HTTPD_DEST /repo.git/info/refs|||
+	GET $HTTPD_DEST /repo.git/info/refs|Bearer origin-token||
+	GET $HTTPD_DEST /other.git/info/refs|Bearer origin-token||
+	POST $HTTPD_DEST /other.git/git-receive-pack|Bearer origin-token||
+	EOF
+	test_cmp expect "$HTTPD_ROOT_PATH/custom-auth.requests" &&
+	grep " get$" "$REDIRECT_HELPER_LOG" >actual &&
+	echo "origin get" >expect &&
+	test_cmp expect actual &&
+	test_grep ! " erase$" "$REDIRECT_HELPER_LOG"
+'
+
+test_expect_success 'destination proactive auth applies to the first redirected GET' '
+	setup_redirect_credentials "localhost:$LIB_HTTPD_PORT" repo.git destination &&
+	test_config_global "credential.$origin_url.helper" "redirect-trace origin" &&
+	test_config_global "credential.$destination_url.helper" "redirect-trace destination" &&
+	test_config_global "http.$origin_url.proactiveAuth" none &&
+	test_config_global "http.$destination_url.proactiveAuth" auto &&
+	git push "$origin_url" HEAD:refs/heads/destination-proactive &&
+	cat >expect <<-EOF &&
+	GET $HTTPD_DEST /repo.git/info/refs|||
+	GET $HTTPD_DEST /repo.git/info/refs|Bearer origin-token||
+	GET localhost:$LIB_HTTPD_PORT /repo.git/info/refs|Bearer destination-token||
+	POST localhost:$LIB_HTTPD_PORT /repo.git/git-receive-pack|Bearer destination-token||
+	EOF
+	test_cmp expect "$HTTPD_ROOT_PATH/custom-auth.requests" &&
+	test_grep ! " erase$" "$REDIRECT_HELPER_LOG"
+'
+
+for scope in useHttpPath helper
+do
+test_expect_success "redirect selects path-scoped credentials ($scope)" '
+	setup_redirect_credentials "$HTTPD_DEST" other.git destination &&
+	if test "$scope" = useHttpPath
+	then
+		test_config_global credential.useHttpPath true &&
+		test_config_global credential.helper "redirect-trace by-path"
+	else
+		test_config_global credential.useHttpPath false &&
+		test_config_global "credential.$origin_url.helper" "redirect-trace origin" &&
+		test_config_global "credential.$destination_url.helper" "redirect-trace destination"
+	fi &&
+	git push "$origin_url" HEAD:refs/heads/path-$scope &&
+	cat >expect <<-EOF &&
+	GET $HTTPD_DEST /repo.git/info/refs|||
+	GET $HTTPD_DEST /repo.git/info/refs|Bearer origin-token||
+	GET $HTTPD_DEST /other.git/info/refs|||
+	GET $HTTPD_DEST /other.git/info/refs|Bearer destination-token||
+	POST $HTTPD_DEST /other.git/git-receive-pack|Bearer destination-token||
+	EOF
+	test_cmp expect "$HTTPD_ROOT_PATH/custom-auth.requests" &&
+	test_grep ! " erase$" "$REDIRECT_HELPER_LOG"
+'
+done
+
+test_expect_success 'redirect selects destination headers before its first GET' '
+	setup_redirect_credentials "localhost:$LIB_HTTPD_PORT" repo.git destination &&
+	test_config_global "credential.$origin_url.helper" "redirect-trace origin" &&
+	test_config_global "credential.$destination_url.helper" "redirect-trace destination" &&
+	test_config_global "http.$origin_url.extraHeader" "X-Origin-Secret: origin-only" &&
+	test_config_global "http.$destination_url.extraHeader" "X-Destination-Secret: destination-only" &&
+	git config --global --add "http.$origin_url.extraHeader" "Authorization: Bearer origin-token" &&
+	git config --global --add "http.$destination_url.extraHeader" "Authorization: Bearer destination-token" &&
+	git push "$origin_url" HEAD:refs/heads/destination-headers &&
+	cat >expect <<-EOF &&
+	GET $HTTPD_DEST /repo.git/info/refs|Bearer origin-token|origin-only|
+	GET localhost:$LIB_HTTPD_PORT /repo.git/info/refs|Bearer destination-token||destination-only
+	POST localhost:$LIB_HTTPD_PORT /repo.git/git-receive-pack|Bearer destination-token||destination-only
+	EOF
+	test_cmp expect "$HTTPD_ROOT_PATH/custom-auth.requests" &&
+	test_grep ! " erase$" "$REDIRECT_HELPER_LOG"
 '
 
 test_done
