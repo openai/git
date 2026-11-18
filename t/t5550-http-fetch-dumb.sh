@@ -293,6 +293,30 @@ test_expect_success 'http-fetch --packfile' '
 	git -C packfileclient cat-file -e "$HASH"
 '
 
+test_expect_success 'http-fetch --packfile reuses a completed pack without HTTP' '
+	git init packfileclient-reuse &&
+	p=$(cd "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git &&
+		ls objects/pack/pack-*.pack) &&
+	git -C packfileclient-reuse index-pack --stdin --keep \
+		<"$HTTPD_DOCUMENT_ROOT_PATH/repo_pack.git/$p" >out &&
+	packhash=$(cut -f2 out) &&
+	pack="packfileclient-reuse/.git/objects/pack/pack-$packhash" &&
+	>reuse.trace &&
+	GIT_TRACE_CURL="$TRASH_DIRECTORY/reuse.trace" \
+	git -C packfileclient-reuse http-fetch --report-progress --packfile="$packhash" \
+		--index-pack-arg=index-pack --index-pack-arg=--stdin \
+		--index-pack-arg=--keep \
+		"$HTTPD_URL/missing.pack" >out &&
+	printf "bytes 0\npack\t%s\n" "$packhash" >expect &&
+	test_cmp expect out &&
+	test_must_be_empty reuse.trace &&
+	test_path_is_file "$pack.pack" &&
+	test_path_is_file "$pack.idx" &&
+	test_path_is_file "$pack.keep" &&
+	test_path_is_missing "$pack.pack.temp" &&
+	git -C packfileclient-reuse cat-file -e "$HASH"
+'
+
 test_expect_success 'http-fetch --packfile accepts an already complete partial' '
 	git init packfileclient-complete &&
 	p=$(cd "$HTTPD_DOCUMENT_ROOT_PATH"/repo_pack.git &&
