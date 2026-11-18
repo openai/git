@@ -46,11 +46,11 @@ static int find_pack_entry(struct odb_source_packed *store,
 	}
 
 	/*
-	 * Recovery for a concurrent-repack race: a stale MIDX may still name a
-	 * vanished owning pack even though the object survives in another pack
-	 * the same MIDX covers.  The regular fallback above skips MIDX-covered
-	 * packs, and repreparing the on-disk pack set does not reload the
-	 * borrowed, cached MIDX, so scan its packs directly for the survivor.
+	 * A stale MIDX may name a vanished owning pack, or its selected copy
+	 * may be corrupt, even though another covered pack has a usable copy.
+	 * The regular fallback above skips MIDX-covered packs, and repreparing
+	 * the on-disk pack set does not reload the borrowed, cached MIDX, so
+	 * scan its packs directly for the survivor.
 	 *
 	 * Skip the scan for quick lookups, which are expected to accept false
 	 * negatives in favor of speed.
@@ -85,6 +85,7 @@ static enum odb_read_status odb_source_packed_read_object_info(struct odb_source
 	struct pack_entry e;
 	int ret;
 
+retry:
 	if (!find_pack_entry(packed, oid, &e, flags, &bad_pack)) {
 		/*
 		 * The lookup may have failed because the object is known to be
@@ -113,7 +114,7 @@ static enum odb_read_status odb_source_packed_read_object_info(struct odb_source
 	if (ret < 0) {
 		bad_pack = e.p;
 		mark_bad_packed_object(e.p, oid);
-		goto out;
+		goto retry;
 	}
 
 	ret = 0;
@@ -338,7 +339,8 @@ static int odb_source_packed_for_each_prefixed_object(
 
 	store->skip_mru_updates = true;
 
-	m = get_multi_pack_index(store);
+	/* A MIDX owner need not be the copy that satisfies the pack flags. */
+	m = opts->flags ? NULL : get_multi_pack_index(store);
 	if (m) {
 		ret = for_each_prefixed_object_in_midx(store, m, opts, data);
 		if (ret)
@@ -346,7 +348,7 @@ static int odb_source_packed_for_each_prefixed_object(
 	}
 
 	for (e = packfile_store_get_packs(store); e; e = e->next) {
-		if (e->pack->multi_pack_index)
+		if (m && e->pack->multi_pack_index)
 			continue;
 		if (should_exclude_pack(e->pack, opts->flags))
 			continue;
@@ -727,6 +729,7 @@ static void report_pack_garbage(struct string_list *list)
 struct prepare_pack_data {
 	struct odb_source_packed *source;
 	struct string_list *garbage;
+	struct strset midx_packs;
 };
 
 static void prepare_pack(const char *full_name, size_t full_name_len,
@@ -736,8 +739,7 @@ static void prepare_pack(const char *full_name, size_t full_name_len,
 	size_t base_len = full_name_len;
 
 	if (strip_suffix_mem(full_name, &base_len, ".idx") &&
-	    !(data->source->midx &&
-	      midx_contains_pack(data->source->midx, file_name))) {
+	    !strset_contains(&data->midx_packs, file_name)) {
 		char *trimmed_path = xstrndup(full_name, full_name_len);
 		packfile_store_load_pack(data->source,
 					 trimmed_path, data->source->local);
@@ -771,12 +773,19 @@ static void prepare_packed_git_one(struct odb_source_packed *source)
 	struct prepare_pack_data data = {
 		.source = source,
 		.garbage = &garbage,
+		.midx_packs = STRSET_INIT,
 	};
+	struct multi_pack_index *m;
+
+	for (m = source->midx; m; m = m->base_midx)
+		for (uint32_t i = 0; i < m->num_packs; i++)
+			strset_add(&data.midx_packs, m->pack_names[i]);
 
 	for_each_file_in_pack_dir(source->base.path, prepare_pack, &data);
 
 	report_pack_garbage(data.garbage);
 	string_list_clear(data.garbage, 0);
+	strset_clear(&data.midx_packs);
 }
 
 DEFINE_LIST_SORT(static, sort_packs, struct packfile_list_entry, next);
@@ -813,8 +822,10 @@ static void odb_source_packed_prepare(struct odb_source *source,
 {
 	struct odb_source_packed *packed = odb_source_packed_downcast(source);
 
-	if (flags & ODB_PREPARE_FLUSH_CACHES)
+	if (flags & ODB_PREPARE_FLUSH_CACHES) {
 		packed->initialized = false;
+		clear_midx_pack_errors(packed->midx);
+	}
 	if (packed->initialized)
 		return;
 
