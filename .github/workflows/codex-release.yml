@@ -104,7 +104,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +117,9 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable arm64
             has_gcm: false
+            lto: thin
+            profile_format: LLVM
+            llvm_profdata: xcrun llvm-profdata
             max_tar_bytes: 67108864
           - name: macOS x64
             os: macos-15-intel
@@ -126,15 +129,21 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: Mach-O 64-bit executable x86_64
             has_gcm: false
+            lto: thin
+            profile_format: LLVM
+            llvm_profdata: xcrun llvm-profdata
             max_tar_bytes: 67108864
+          # Keep arm64 builds native so release smoke tests can execute them.
           - name: Linux arm64
-            os: ubuntu-22.04
+            os: ubuntu-22.04-arm
             target_platform: ubuntu
             asset_platform: ubuntu
             arch: arm64
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*ARM aarch64
             has_gcm: false
+            lto: auto
+            profile_format: GCC
             max_tar_bytes: 67108864
           - name: Linux x64
             os: ubuntu-22.04
@@ -144,6 +153,8 @@ jobs:
             binary: /tmp/build/git/bin/git
             file_pattern: ELF 64-bit.*x86-64
             has_gcm: false
+            lto: auto
+            profile_format: GCC
             max_tar_bytes: 67108864
           - name: Windows arm64
             os: windows-11-arm
@@ -153,6 +164,9 @@ jobs:
             binary: /tmp/build/git/clangarm64/bin/git.exe
             file_pattern: PE32\+.*ARM64
             has_gcm: true
+            lto: thin
+            profile_format: LLVM
+            llvm_profdata: llvm-profdata
             max_tar_bytes: 134217728
             sdk_arch: aarch64
             sdk_flavor: full
@@ -169,6 +183,8 @@ jobs:
             binary: /tmp/build/git/mingw64/bin/git.exe
             file_pattern: PE32\+.*x86-64
             has_gcm: true
+            lto: auto
+            profile_format: GCC
             max_tar_bytes: 134217728
             sdk_arch: x86_64
             sdk_flavor: full
@@ -209,6 +225,11 @@ jobs:
             -c 'user.email=41898282+github-actions[bot]@users.noreply.github.com' \
             tag -a "$VERSION" -m "$VERSION"
 
+      - name: Install OpenAI build configuration
+        shell: bash
+        working-directory: dugite-native/git
+        run: cp config.mak.openai config.mak
+
       # Match Dugite Native's compatibility choice for its macOS x64 build.
       - name: Select Xcode 16.4
         if: matrix.target_platform == 'macOS' && matrix.arch == 'x64'
@@ -243,19 +264,13 @@ jobs:
       - name: Install Linux arm64 build dependencies
         if: matrix.target_platform == 'ubuntu' && matrix.arch == 'arm64'
         run: |
-          sudo sed -i "s/^deb/deb [arch=amd64,i386]/g" /etc/apt/sources.list
-          release="$(lsb_release -s -c)"
-          echo "deb [arch=arm64,armhf] http://azure.ports.ubuntu.com/ ${release} main universe multiverse restricted" | sudo tee -a /etc/apt/sources.list
-          echo "deb [arch=arm64,armhf] http://azure.ports.ubuntu.com/ ${release}-updates main universe multiverse restricted" | sudo tee -a /etc/apt/sources.list
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
           sudo apt-get install -y \
             binutils-aarch64-linux-gnu \
             gcc-aarch64-linux-gnu \
-            libcurl4-gnutls-dev:arm64 \
-            libexpat1-dev:arm64 \
-            libssl-dev:arm64 \
-            zlib1g-dev:arm64
+            libcurl4-gnutls-dev \
+            libexpat1-dev \
+            libssl-dev \
+            zlib1g-dev
 
       # Dugite Native currently pins MinGit 2.53. Keep its build script and
       # dependency schema, but match the runtime to the Git series we compile.
@@ -303,13 +318,18 @@ jobs:
             dependencies.json >"$updated"
           mv "$updated" dependencies.json
 
-      # Dugite cross-compiles several targets. Keep Git's optional Rust
-      # library disabled until its Makefile can direct Cargo at those targets.
+      # Build an instrumented Git, run a representative local workload, then
+      # rebuild with its profile. Keep Git's optional Rust library disabled
+      # until its Makefile can direct Cargo at these targets.
       - name: Build the Dugite Native distribution
         shell: bash
         working-directory: dugite-native
         env:
           NO_RUST: 1
+          OPENAI_LLVM_PROFDATA: ${{ matrix.llvm_profdata }}
+          OPENAI_LTO: ${{ matrix.lto }}
+          OPENAI_PROFILE: BUILD
+          OPENAI_PROFILE_FORMAT: ${{ matrix.profile_format }}
           TARGET_PLATFORM: ${{ matrix.target_platform }}
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
@@ -335,6 +355,9 @@ jobs:
         working-directory: dugite-native/git
         env:
           MINGW_DIR: ${{ matrix.mingw_dir }}
+          OPENAI_LLVM_PROFDATA: ${{ matrix.llvm_profdata }}
+          OPENAI_LTO: ${{ matrix.lto }}
+          OPENAI_PROFILE_FORMAT: ${{ matrix.profile_format }}
         run: |
           set -euo pipefail
 
@@ -349,8 +372,8 @@ jobs:
             SKIP_DASHED_BUILT_INS=YesPlease
           )
           jobs="${NUMBER_OF_PROCESSORS:-2}"
-          make -j"$jobs" "${make_args[@]}" all
-          make "${make_args[@]}" DESTDIR=/tmp/build/git strip install
+          make -j"$jobs" "${make_args[@]}" OPENAI_PROFILE=BUILD all
+          make "${make_args[@]}" OPENAI_PROFILE=USE DESTDIR=/tmp/build/git strip install
 
       - name: Verify distribution layout and provenance
         shell: bash
@@ -360,6 +383,8 @@ jobs:
           GIT_BINARY: ${{ matrix.binary }}
           FILE_PATTERN: ${{ matrix.file_pattern }}
           HAS_GCM: ${{ matrix.has_gcm }}
+          LTO: ${{ matrix.lto }}
+          PROFILE_FORMAT: ${{ matrix.profile_format }}
         run: |
           set -euo pipefail
           if test "$TARGET_PLATFORM" = win32
@@ -387,9 +412,15 @@ jobs:
           file "$GIT_BINARY" | tee /tmp/git-file-type
           grep -E "$FILE_PATTERN" /tmp/git-file-type
           strings "$GIT_BINARY" | grep -F "$GITHUB_SHA"
+          grep -F -- "-flto=$LTO" dugite-native/git/GIT-CFLAGS
+          if test "$PROFILE_FORMAT" = LLVM
+          then
+            grep -F -- "-fprofile-instr-use=" dugite-native/git/GIT-CFLAGS
+          else
+            grep -F -- "-fprofile-use=" dugite-native/git/GIT-CFLAGS
+          fi
 
       - name: Smoke-test the native distribution
-        if: matrix.arch == 'x64' || matrix.target_platform == 'win32'
         shell: bash
         env:
           TARGET_PLATFORM: ${{ matrix.target_platform }}
