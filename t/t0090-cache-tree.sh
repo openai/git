@@ -190,7 +190,23 @@ test_expect_success 'commit in child dir has cache-tree' '
 
 test_expect_success 'reset --hard gives cache-tree' '
 	test-tool scrap-cache-tree &&
-	git reset --hard &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/.git/reset-rebuild.trace" git reset --hard &&
+	test_region cache-tree prime_cache_tree .git/reset-rebuild.trace &&
+	test_cache_tree
+'
+
+test_expect_success 'reset --hard reuses cache-tree after an unstaged edit' '
+	echo changed >dir/child.t &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/.git/reset-reuse.trace" git reset --hard &&
+	test_region ! cache-tree prime_cache_tree .git/reset-reuse.trace &&
+	test_cache_tree
+'
+
+test_expect_success 'reset --hard reuses cache-tree with replace refs disabled' '
+	echo changed >dir/child.t &&
+	GIT_TRACE2_EVENT="$TRASH_DIRECTORY/.git/reset-no-replace.trace" \
+		git -c core.useReplaceRefs=false reset --hard &&
+	test_region ! cache-tree prime_cache_tree .git/reset-no-replace.trace &&
 	test_cache_tree
 '
 
