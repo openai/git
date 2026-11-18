@@ -85,9 +85,16 @@ write_reviewed_automation_workflow () {
 	sed '1,2d;$d' | sed '$d;s/^\t//' >"$output"
 }
 
-write_previous_pinned_reviewed_automation_workflow () {
+write_reviewed_automation_workflow_without_secrets () {
 	output=$1 &&
 	write_reviewed_automation_workflow "$output" &&
+	sed "/^    secrets:$/ { N; d; }" "$output" >"$output.previous" &&
+	mv "$output.previous" "$output"
+}
+
+write_previous_pinned_reviewed_automation_workflow () {
+	output=$1 &&
+	write_reviewed_automation_workflow_without_secrets "$output" &&
 	sed '/^  pr_state:$/,$d' "$output" >"$output.previous" &&
 	mv "$output.previous" "$output"
 }
@@ -107,6 +114,10 @@ install_reviewed_automation_topic () {
 		;;
 	pinned-previous)
 		write_previous_pinned_reviewed_automation_workflow \
+			.github/workflows/codex.yml
+		;;
+	without-secrets)
+		write_reviewed_automation_workflow_without_secrets \
 			.github/workflows/codex.yml
 		;;
 	*) return 1 ;;
@@ -1980,6 +1991,28 @@ test_expect_success 'plan admission checks pinned topic heads from trusted meta'
 		"$codex_plan_admission_workflow"
 '
 
+test_expect_success 'plan producer callers forward only the named App secret' '
+	write_reviewed_automation_workflow caller.yml &&
+	sed -n "/^    secrets:/,/^    inputs:/p" \
+		"$codex_plan_propose_workflow" >declared-secrets &&
+	test_grep "^      CODEX_PLAN_APP_PRIVATE_KEY:$" declared-secrets &&
+	test_grep "^        required: false$" declared-secrets &&
+	test_grep "^    environment: codex-plan$" \
+		"$codex_plan_propose_workflow" &&
+	cat >expect <<-\EOF &&
+	      CODEX_PLAN_APP_PRIVATE_KEY: ${{ secrets.CODEX_PLAN_APP_PRIVATE_KEY }}
+	EOF
+	for job in topic_plan_propose policy_plan_propose
+	do
+		sed -n "/^  $job:/,/^  [a-z_]*:/p" caller.yml >caller-job &&
+		test_grep "^    secrets:$" caller-job &&
+		grep "^      CODEX_PLAN_APP_PRIVATE_KEY:" caller-job >actual &&
+		test_cmp expect actual || return 1
+	done &&
+	test "$(grep -c "^    secrets:$" caller.yml)" = 2 &&
+	! grep -F "secrets: inherit" caller.yml
+'
+
 test_expect_success 'pull request labels run from pinned meta without publisher credentials' '
 	test_path_is_file "$codex_pr_state" &&
 	test_path_is_file "$codex_pr_state_workflow" &&
@@ -2587,8 +2620,9 @@ test_expect_success 'topics cannot change the convenience wrappers' '
 '
 
 test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
-	for direction in upgrade stable-upgrade label-upgrade downgrade \
-		stable-downgrade dual-downgrade label-downgrade
+	for direction in upgrade stable-upgrade label-upgrade secret-upgrade \
+		downgrade stable-downgrade dual-downgrade label-downgrade \
+		secret-downgrade
 	do
 		fixture="automation-$direction" &&
 		git init --bare "$fixture.git" &&
@@ -2615,7 +2649,11 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 				write_previous_pinned_reviewed_automation_workflow \
 					.github/workflows/codex.yml
 				;;
-			downgrade|dual-downgrade|label-downgrade)
+			secret-upgrade|label-downgrade)
+				write_reviewed_automation_workflow_without_secrets \
+					.github/workflows/codex.yml
+				;;
+			downgrade|dual-downgrade|secret-downgrade)
 				write_reviewed_automation_workflow \
 					.github/workflows/codex.yml
 				;;
@@ -2626,8 +2664,12 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 			git branch meta master &&
 			install_meta_state meta master codex &&
 			case "$direction" in
-			upgrade|stable-upgrade|label-upgrade)
+			upgrade|stable-upgrade|secret-upgrade)
 				write_reviewed_automation_workflow \
+					.github/workflows/codex.yml
+				;;
+			label-upgrade|secret-downgrade)
+				write_reviewed_automation_workflow_without_secrets \
 					.github/workflows/codex.yml
 				;;
 			downgrade|stable-downgrade)
@@ -2653,7 +2695,8 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 			fetch_all &&
 			if test "$direction" = upgrade ||
 				test "$direction" = stable-upgrade ||
-				test "$direction" = label-upgrade
+				test "$direction" = label-upgrade ||
+				test "$direction" = secret-upgrade
 			then
 				sh "$codex_branch" rewrite --remote origin \
 					--base master --codex codex \
@@ -2680,36 +2723,38 @@ test_expect_success 'the reviewed automation trampoline cannot be downgraded' '
 	done
 '
 
-test_expect_success 'the deployed pinned trampoline remains valid during the label rollout' '
-	git init --bare previous-pinned-automation.git &&
-	test_create_repo previous-pinned-automation-source &&
-	(
-		cd previous-pinned-automation-source &&
-		git remote add origin ../previous-pinned-automation.git &&
-		write base tracked &&
-		git add tracked &&
-		install_rerere_train &&
-		git commit -m "previous pinned automation base" &&
-		install_reviewed_automation_topic aa/codex/automation \
-			pinned-previous &&
-		git branch codex "$automation_codex_tip" &&
-		git branch meta master &&
-		install_pinned_meta_state meta master codex &&
-		git push origin --all
-	) &&
-	git clone previous-pinned-automation.git \
-		previous-pinned-automation-runner &&
-	(
-		cd previous-pinned-automation-runner &&
-		fetch_all &&
-		sh "$codex_branch" rewrite --remote origin \
-			--base master --codex codex --require-automation \
-			--result result --updates updates \
-			--inputs inputs --failure failure &&
-		git show "$(cat result):.github/workflows/codex.yml" \
-			>candidate-workflow &&
-		! grep -F "pr_state:" candidate-workflow
-	)
+test_expect_success 'deployed trampolines remain valid during named secret rollout' '
+	for style in pinned-previous without-secrets
+	do
+		fixture="previous-automation-$style" &&
+		git init --bare "$fixture.git" &&
+		test_create_repo "$fixture-source" &&
+		(
+			cd "$fixture-source" &&
+			git remote add origin "../$fixture.git" &&
+			write base tracked &&
+			git add tracked &&
+			install_rerere_train &&
+			git commit -m "previous automation base" &&
+			install_reviewed_automation_topic aa/codex/automation "$style" &&
+			git branch codex "$automation_codex_tip" &&
+			git branch meta master &&
+			install_pinned_meta_state meta master codex &&
+			git push origin --all
+		) &&
+		git clone "$fixture.git" "$fixture-runner" &&
+		(
+			cd "$fixture-runner" &&
+			fetch_all &&
+			sh "$codex_branch" rewrite --remote origin \
+				--base master --codex codex --require-automation \
+				--result result --updates updates \
+				--inputs inputs --failure failure &&
+			git show origin/codex:.github/workflows/codex.yml >expect &&
+			git show "$(cat result):.github/workflows/codex.yml" >actual &&
+			test_cmp expect actual
+		) || return 1
+	done
 '
 
 test_expect_success 'published release provenance gates cannot be removed' '
